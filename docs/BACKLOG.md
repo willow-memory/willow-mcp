@@ -22,10 +22,10 @@ code itself.
 | W-06 | gap | Done | gate / kart | `check_kart_task()` exception silently swallowed in `task_submit` |
 | W-07 | gap | Done | integrations | Jira stub has hardcoded placeholder `example.atlassian.net` URL |
 | W-08 | gap | Done | deploy | Dockerfile bakes in `WILLOW_APP_ID=glama-inspect` |
-| W-09 | debt | Open | error handling | 30+ `except Exception: pass` blocks with no logging (nest/ files need upstream-first) |
-| W-10 | debt | Open | file I/O | Non-atomic writes in `session_inject.py`, `nest/taxonomy.py`, `nest/selflearn.py` (nest/ files need upstream-first) |
+| W-09 | debt | Done | error handling | 30+ `except Exception: pass` blocks with no logging |
+| W-10 | debt | Done | file I/O | Non-atomic writes in `session_inject.py`, `nest/taxonomy.py`, `nest/selflearn.py` |
 | W-11 | debt | Done | integrations | Mutable default dict `extra_headers: dict = {}` as class attribute on `BaseAdapter` |
-| W-12 | debt | Open | web_search | Global cache replacement race in `reset_search_cache()` and `nest/embed.py` (nest/ file needs upstream-first) |
+| W-12 | debt | Done | web_search | Global cache replacement race in `reset_search_cache()` and `nest/embed.py` |
 | W-13 | debt | Done | types | `type: ignore[return-value]` in `bound_receipt.py:312` |
 | W-14 | debt | Done | integrations | Pinned `X-GitHub-Api-Version: 2022-11-28` will eventually deprecate |
 | W-15 | debt | Done | packaging | `nestor-meaning` published on PyPI — optional extra `nestor` wired in pyproject.toml |
@@ -154,10 +154,8 @@ have no logging at all. Most notable:
 At minimum, these should `logger.debug()` the exception so failures are
 diagnosable.
 
-**Partially blocked:** The `nest/ocr.py` fix is vendored from upstream
-`safe-app-store/libs/nest-pipeline/`. The change must land in
-safe-app-store first, then be re-vendored here. The non-nest files
-(`server.py`, `integrations.py`, etc.) can be fixed directly.
+**Done (2026-08-24).** `nest/ocr.py` fix landed upstream in
+safe-app-store#210, then re-vendored here.
 
 ### W-10 · debt · Non-atomic file writes
 
@@ -169,10 +167,8 @@ corruption on crash. The main codebase uses atomic writes correctly (e.g.
 - `nest/selflearn.py:91, 204` -- learned store
 - `session_inject.py:67` -- dedup marker
 
-**Partially blocked:** The `nest/taxonomy.py` and `nest/selflearn.py` fixes
-are vendored from upstream `safe-app-store/libs/nest-pipeline/`. The changes
-must land in safe-app-store first, then be re-vendored here.
-`session_inject.py` can be fixed directly.
+**Done (2026-08-24).** `nest/taxonomy.py` and `nest/selflearn.py` fixes
+landed upstream in safe-app-store#210, then re-vendored here.
 
 ### W-11 · debt · Mutable class-level default dict
 
@@ -187,10 +183,8 @@ Currently safe (GitHubAdapter overrides with a new literal) but fragile.
 the old cache while another replaces it is a race. Same pattern in
 `nest/embed.py:36` with `installed_models()`.
 
-**Partially blocked:** The `nest/embed.py` fix is vendored from upstream
-`safe-app-store/libs/nest-pipeline/`. The change must land in
-safe-app-store first, then be re-vendored here. The `web_search.py` fix
-can be applied directly.
+**Done (2026-08-24).** `nest/embed.py` fix landed upstream in
+safe-app-store#210, then re-vendored here.
 
 ### W-13 · debt · type: ignore override
 
