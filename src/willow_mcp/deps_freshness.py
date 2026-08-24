@@ -17,12 +17,15 @@ least one is not (offenders named on stderr), which the bootstrap turns into an
 """
 from __future__ import annotations
 
+import logging
 import sys
 import tomllib
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from packaging.requirements import Requirement
+
+logger = logging.getLogger("willow_mcp.deps_freshness")
 
 
 def _pyproject_path() -> Path:
@@ -51,6 +54,7 @@ def unsatisfied(pyproject: Path | None = None) -> list[str]:
         try:
             req = Requirement(raw)
         except Exception:
+            logger.debug("unparseable requirement: %s", raw, exc_info=True)
             continue
         if req.marker is not None and not req.marker.evaluate():
             continue

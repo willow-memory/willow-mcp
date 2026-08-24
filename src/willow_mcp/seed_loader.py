@@ -9,15 +9,19 @@ See docs/design/agent-seed.md.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+
 from typing import Any
 
 from .paths import seeds_dir, store_root, willow_home
 from . import pgp
 from .db import Store
+
+logger = logging.getLogger("willow_mcp.seed_loader")
 
 SEED_FORMAT = "agent_seed_v1"
 _AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
@@ -211,6 +215,7 @@ def seed_corpus_corrections() -> int:
             )
             seeded += 1
         except Exception:
+            logger.debug("seed store_put failed for %s", record_id, exc_info=True)
             continue
     return seeded
 

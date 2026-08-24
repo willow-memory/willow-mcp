@@ -8,14 +8,18 @@ or vice versa.
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
 from typing import Optional
 
 from . import paths
+
+logger = logging.getLogger("willow_mcp.receipts")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS receipts (
@@ -176,7 +180,7 @@ class ReceiptLog:
             try:
                 self.on_record(app_id, tool, outcome, detail)
             except Exception:
-                pass
+                logger.debug("on_record observer failed for %s/%s", app_id, tool, exc_info=True)
 
     def since(self, app_id: str, ts_iso: str, outcome: Optional[str] = None,
               limit: int = 2000) -> list[dict]:

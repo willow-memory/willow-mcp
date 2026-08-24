@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import uuid
@@ -17,7 +18,8 @@ def handle(payload: dict) -> dict:
     try:
         seed_corpus_corrections()
     except Exception:
-        pass
+        logging.getLogger("willow_mcp.session_start_hook").debug(
+            "seed_corpus_corrections failed", exc_info=True)
 
     workspace = (
         payload.get("workspace")

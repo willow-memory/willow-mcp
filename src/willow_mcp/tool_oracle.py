@@ -15,6 +15,8 @@ gitignored; nothing oracle-side lives in the repo except the shipped catalog.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -22,6 +24,8 @@ from typing import Optional
 from .paths import store_root
 
 DOMAIN = "tool"
+logger = logging.getLogger("willow_mcp.tool_oracle")
+_PENDING_MAX_LINES = int(os.environ.get("WILLOW_TOOL_ORACLE_PENDING_MAX", "500"))
 
 # ── soft Nestor seam ─────────────────────────────────────────────────────────
 _NESTOR = None
@@ -86,6 +90,8 @@ def _bundle_path() -> Path:
 
 def _store():
     parts = _nestor()
+    if parts is None:
+        return None
     _, _, _, cascade, SqliteStore = parts
     _oracle_dir().mkdir(parents=True, exist_ok=True)
     cascade.set_ledger_path(_ledger_path())
@@ -117,11 +123,22 @@ def _ensure_seeded(store) -> Optional[str]:
 
 
 def _record_pending(surface: str, closest: Optional[dict]) -> None:
-    """Append an unserved intent to the teach-queue (append-only jsonl)."""
+    """Append an unserved intent to the teach-queue, rotating when oversized."""
     _oracle_dir().mkdir(parents=True, exist_ok=True)
-    with _pending_path().open("a") as fh:
+    path = _pending_path()
+    with path.open("a") as fh:
         fh.write(json.dumps({"surface": surface, "at": int(time.time()),
                              "closest": closest}) + "\n")
+    try:
+        lines = path.read_text().splitlines()
+        if len(lines) > _PENDING_MAX_LINES * 2:
+            keep = lines[-_PENDING_MAX_LINES:]
+            tmp = path.with_suffix(f".tmp-{os.getpid()}")
+            tmp.write_text("\n".join(keep) + "\n")
+            os.replace(tmp, path)
+            logger.debug("rotated pending.jsonl: %d -> %d lines", len(lines), len(keep))
+    except Exception:
+        logger.debug("pending.jsonl rotation failed", exc_info=True)
 
 
 # ── operations the MCP verbs call ────────────────────────────────────────────
@@ -166,14 +183,17 @@ def seal(surface: str, tool: str, verifier: str) -> dict:
 
 def pending(limit: int = 20) -> list:
     """The teach-queue: recent unserved intents, newest first, deduped by
-    surface. Empty when every routed intent has a sealed home."""
+    surface. Empty when every routed intent has a sealed home.
+
+    Reads at most ``_PENDING_MAX_LINES`` from the tail to bound memory."""
     if _nestor() is None:
         return [_unavailable()]
     path = _pending_path()
     if not path.is_file():
         return []
+    lines = path.read_text().splitlines()[-_PENDING_MAX_LINES:]
     seen, out = set(), []
-    for line in reversed(path.read_text().splitlines()):
+    for line in reversed(lines):
         try:
             row = json.loads(line)
         except json.JSONDecodeError:

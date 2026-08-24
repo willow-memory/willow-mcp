@@ -116,7 +116,7 @@ class WorkerHeartbeat:
         try:
             self.path.unlink(missing_ok=True)
         except Exception:
-            pass
+            logger.debug("heartbeat close unlink failed: %s", self.path, exc_info=True)
 
 
 def _classify(record: dict, now: float) -> tuple[str, float]:
@@ -170,7 +170,8 @@ def read_workers(root: Path | None = None) -> dict:
             try:
                 record = json.loads(f.read_text())
             except Exception:
-                continue  # a torn or hand-mangled file is not a worker
+                logger.debug("unreadable heartbeat file %s", f, exc_info=True)
+                continue
             state, age = _classify(record, now)
             check["workers"].append({
                 "agent": record.get("agent"),
@@ -219,6 +220,7 @@ def live_worker_keys(root: Path | None = None) -> set:
         try:
             record = json.loads(f.read_text())
         except Exception:
+            logger.debug("unreadable heartbeat file %s", f, exc_info=True)
             continue
         if _classify(record, now)[0] != "alive":
             continue
@@ -239,11 +241,12 @@ def reap(root: Path | None = None) -> int:
         try:
             record = json.loads(f.read_text())
         except Exception:
+            logger.debug("unreadable heartbeat file %s", f, exc_info=True)
             continue
         if _classify(record, now)[0] == "dead":
             try:
                 f.unlink(missing_ok=True)
                 removed += 1
             except Exception:
-                pass
+                logger.debug("reap unlink failed: %s", f, exc_info=True)
     return removed

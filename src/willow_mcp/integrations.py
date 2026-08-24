@@ -83,7 +83,7 @@ class BaseAdapter:
     auth_header: str = "Authorization"
     auth_prefix: str = "Bearer "
     credential_required: bool = False
-    extra_headers: dict = {}
+    extra_headers: Optional[dict] = None
 
     # ── credentials ──────────────────────────────────────────────────────────
 
@@ -111,7 +111,7 @@ class BaseAdapter:
             if default_vault().has(vault_key(self.name)):
                 return "vault"
         except Exception:
-            pass
+            logger.debug("vault check failed for %s", self.name, exc_info=True)
         return None
 
     # ── transport ────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ class BaseAdapter:
         headers = {
             "Accept": "application/json",
             "User-Agent": "willow-mcp-integrations",
-            **self.extra_headers,
+            **(self.extra_headers or {}),
         }
         if cred:
             headers[self.auth_header] = f"{self.auth_prefix}{cred}"
@@ -196,7 +196,7 @@ class BaseAdapter:
                 try:
                     detail = e.read(500).decode("utf-8", errors="ignore")
                 except Exception:
-                    pass
+                    logger.debug("error body read failed", exc_info=True)
                 if e.code in _RETRYABLE and attempt + 1 < _MAX_ATTEMPTS:
                     time.sleep(_retry_delay(e.headers.get("Retry-After"), attempt))
                     continue
@@ -237,7 +237,7 @@ class GitHubAdapter(BaseAdapter):
     doc = "GitHub REST v3 — repos, PRs, issues, checks"
     env_vars = ("WILLOW_GITHUB_TOKEN", "GITHUB_TOKEN")
     extra_headers = {"Accept": "application/vnd.github+json",
-                     "X-GitHub-Api-Version": "2022-11-28"}
+                     "X-GitHub-Api-Version": os.environ.get("WILLOW_GITHUB_API_VERSION", "2022-11-28")}
 
 
 class HuggingFaceAdapter(BaseAdapter):
@@ -365,7 +365,7 @@ class DatadogStub(StubAdapter):
 
 class JiraStub(StubAdapter):
     name = "jira"
-    base_url = "https://example.atlassian.net"  # per-site host — set when earned
+    base_url = os.environ.get("WILLOW_JIRA_URL", "https://example.atlassian.net")  # per-site host — set when earned
     doc = "Jira Cloud API — issues, transitions"
     needs = "per-site base URL config + API token; mapping to task_queue states"
     earned_by = "a task-queue sync request against a real Jira site twice"

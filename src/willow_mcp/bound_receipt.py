@@ -305,11 +305,11 @@ def check_freshness(
     wire: dict[str, Any],
     *,
     now: Optional[datetime] = None,
-) -> tuple[bool, VerificationReason, str]:
+) -> tuple[bool, Optional[VerificationReason], str]:
     """Stage 2: expires_at must be in the future (UTC)."""
     ok, reason, detail = validate_structure(wire)
     if not ok:
-        return False, reason, detail  # type: ignore[return-value]
+        return False, reason, detail
     expires = _parse_timestamp(wire["payload"]["expires_at"])
     assert expires is not None
     now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)

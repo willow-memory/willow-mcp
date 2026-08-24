@@ -132,6 +132,7 @@ class _ServerConnection:
         self._signer: Optional[signing.ClientSigner] = None
         self._signing_secret: Optional[bytes] = None
         self._tools_called: set[str] = set()
+        self._start_lock = threading.Lock()
 
     # -- lifecycle: ONE task owns connect, every call, and disconnect ----
     #
@@ -328,21 +329,22 @@ class _ServerConnection:
                 reply.set_exception(e)
 
     def _ensure_started(self) -> None:
-        if self._thread is not None:
+        with self._start_lock:
+            if self._thread is not None:
+                if self._ready_error is not None:
+                    raise self._ready_error
+                return
+            self._thread = threading.Thread(
+                target=self._run, name=f"mcp-fed-{self.server_id}", daemon=True,
+            )
+            self._thread.start()
+            if not self._ready.wait(timeout=_LOOP_START_TIMEOUT_SECONDS):
+                raise FederationClientError(
+                    f"server {self.server_id!r}: did not become ready in "
+                    f"{_LOOP_START_TIMEOUT_SECONDS}s")
             if self._ready_error is not None:
                 raise self._ready_error
-            return
-        self._thread = threading.Thread(
-            target=self._run, name=f"mcp-fed-{self.server_id}", daemon=True,
-        )
-        self._thread.start()
-        if not self._ready.wait(timeout=_LOOP_START_TIMEOUT_SECONDS):
-            raise FederationClientError(
-                f"server {self.server_id!r}: did not become ready in "
-                f"{_LOOP_START_TIMEOUT_SECONDS}s")
-        if self._ready_error is not None:
-            raise self._ready_error
-        self.connected_at = time.time()
+            self.connected_at = time.time()
 
     def _request(self, kind: str, payload: Any, timeout: float = CALL_TIMEOUT_SECONDS) -> Any:
         self._ensure_started()

@@ -344,7 +344,9 @@ def _announce_hook(app_id: str, tool: str, outcome: str, detail: Optional[str]) 
             safe_detail, _kinds = secret_scan.redact_egress(detail)
         _announce.announce(app_id, tool, outcome, trust, safe_detail)
     except Exception:
-        pass
+        import logging
+        logging.getLogger("willow_mcp.server").debug(
+            "announce hook failed for %s/%s", app_id, tool, exc_info=True)
 
 
 _receipt_log.on_record = _announce_hook
@@ -376,7 +378,9 @@ def _observe_binding(app_id: str, tool_name: str) -> None:
             _receipt_log.record(app_id, tool_name, "bind_observed",
                                 f"session tier={sess['tier']} (no per-call sig)")
     except Exception:
-        pass
+        import logging
+        logging.getLogger("willow_mcp.server").debug(
+            "binding observer failed for %s/%s", app_id, tool_name, exc_info=True)
 
 def _argv_opt(flag: str) -> Optional[str]:
     """Read `--flag value` or `--flag=value` from sys.argv at import time.
@@ -2136,7 +2140,9 @@ def task_submit(
     try:
         from kartikeya import check_kart_task
         blocked = check_kart_task(task or "")
-    except Exception:
+    except Exception as exc:
+        import logging
+        logging.getLogger("willow_mcp.server").warning("check_kart_task failed: %s", exc)
         blocked = None
     if blocked:
         return blocked
@@ -4077,7 +4083,9 @@ def _diag_bindings() -> dict:
                     if json.loads(f.read_text()).get("confirmed"):
                         check["confirmed"] += 1
                 except Exception:
-                    pass
+                    import logging
+                    logging.getLogger("willow_mcp.server").debug(
+                        "unreadable attestation file %s", f, exc_info=True)
         check["status"] = "ok"
     except Exception as e:
         check["status"] = "fail"
@@ -4873,7 +4881,9 @@ def diagnostic_summary(app_id: str = "") -> dict:
     try:
         _receipt_log.record(eff or "-", "diagnostic_summary", "ok" if verdict == "ok" else "warn", verdict)
     except Exception:
-        pass
+        import logging
+        logging.getLogger("willow_mcp.server").debug(
+            "diagnostic_summary receipt failed", exc_info=True)
     return report
 
 
