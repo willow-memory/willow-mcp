@@ -108,7 +108,7 @@ Imported lazily behind a cached `_nestor()` seam (the exact pattern merged for
 oakenscrolls' `almanac_seam`). Absent the engine, the verbs return
 `{"status": "unavailable", ...}` — never an `ImportError` at server import. Nestor
 is installed directly from git (`pip install "nestor @
-git+https://github.com/rudi193-cmd/Nestor@master"`); it briefly lived in a
+git+https://github.com/Die-Namic-Systems/Nestor@master"`); it briefly lived in a
 `[nestor]` optional extra, but PyPI refuses any package whose metadata carries a
 direct URL dependency, and that extra blocked the v2.8.0–v2.9.1 uploads (see
 pyproject.toml's note). `pip install willow-mcp` stands up the server without it.

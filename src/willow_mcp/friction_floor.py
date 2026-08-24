@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Vendored from willow-gate (rudi193-cmd/willow-gate, src/willow_gate/
+# Vendored from willow-gate (willow-memory/willow-gate, src/willow_gate/
 # friction_floor.py), Apache-2.0. Copied rather than depended-on because this
 # module is pure stdlib (re/statistics/dataclasses) with NO egress and NO PGP,
 # whereas the willow-gate package pulls python-gnupg for its encrypted ledger.

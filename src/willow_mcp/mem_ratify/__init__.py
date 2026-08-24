@@ -1,4 +1,4 @@
-# Vendored from willow (rudi193-cmd/willow, mem_ratify/__init__.py), Apache-2.0.
+# Vendored from willow (willow-memory/Willow, mem_ratify/__init__.py), Apache-2.0.
 # See ratify.py's header for why this is a vendored copy and not a dependency.
 # Kept byte-for-byte from the module docstring onward (this header excepted).
 """mem_ratify — Article IV Canon-promotion gate (advisory, off-by-default).

@@ -269,7 +269,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v7
         with:
-          repository: rudi193-cmd/willow-gate
+          repository: willow-memory/willow-gate
           ref: main
           path: .willow-gate-upstream
           # Fine-grained PAT with read on willow-gate if it's private; falls
@@ -291,7 +291,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v7
         with:
-          repository: rudi193-cmd/willow
+          repository: willow-memory/Willow
           path: .willow-upstream
           # mem_ratify (box audit B8) is vendored FROM the willow repo's canonical
           # mem_ratify package. Same soft-fetch posture as the others.
@@ -363,7 +363,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v7
         with:
-          repository: rudi193-cmd/Jeles
+          repository: hornbook-knowledge/Jeles
           path: .fleet/Jeles
           fetch-depth: 0
           token: ${{ secrets.FLEET_RO_TOKEN || github.token }}
@@ -373,7 +373,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v7
         with:
-          repository: rudi193-cmd/Nestor
+          repository: Die-Namic-Systems/Nestor
           path: .fleet/Nestor
           fetch-depth: 0
           token: ${{ secrets.FLEET_RO_TOKEN || github.token }}

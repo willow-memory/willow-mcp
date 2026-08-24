@@ -60,7 +60,7 @@ def main(argv: list) -> int:
         drift = True
         sys.stdout.write(
             f"::error title=mem_ratify drift::src/willow_mcp/mem_ratify/{name} has drifted "
-            "from rudi193-cmd/willow. Re-sync it (procedure in tests/test_mem_ratify.py) "
+            "from willow-memory/Willow. Re-sync it (procedure in tests/test_mem_ratify.py) "
             "and update the pinned hash there.\n")
         sys.stdout.writelines(difflib.unified_diff(
             theirs.splitlines(True), mine.splitlines(True),

@@ -21,7 +21,7 @@ from . import web_fetch
 
 log = logging.getLogger("willow_mcp.web_search")
 
-_USER_AGENT = "Mozilla/5.0 (compatible; Willow-mcp/2.0; +https://github.com/rudi193-cmd/willow-mcp)"
+_USER_AGENT = "Mozilla/5.0 (compatible; Willow-mcp/2.0; +https://github.com/willow-memory/willow-mcp)"
 _DDG_URL = "https://html.duckduckgo.com/html/"
 _LINK_RE = re.compile(
     r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',

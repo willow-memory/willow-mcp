@@ -1,4 +1,4 @@
-# Vendored from willow (rudi193-cmd/willow, mem_ratify/ratify.py), Apache-2.0.
+# Vendored from willow (willow-memory/Willow, mem_ratify/ratify.py), Apache-2.0.
 # Copied rather than depended-on because mem_ratify is pure stdlib (os/enum/
 # dataclasses/typing) with NO egress, NO DB, and NO crypto, and lives in the
 # *willow* repo which willow-mcp does not otherwise import. Vendoring keeps this

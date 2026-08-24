@@ -6,7 +6,7 @@ contributions that keep it agent-neutral and fail-closed are welcome.
 ## Development setup
 
 ```bash
-git clone https://github.com/rudi193-cmd/willow-mcp
+git clone https://github.com/willow-memory/willow-mcp
 cd willow-mcp
 python3 -m venv .venv
 .venv/bin/python3 -m pip install -e . pytest

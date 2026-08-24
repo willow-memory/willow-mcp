@@ -27,7 +27,7 @@ sys.path.insert(0, str(_REPO / "tools"))
 
 changelog_dedup = pytest.importorskip("changelog_dedup")
 
-_BASE = "https://github.com/rudi193-cmd/willow-mcp"
+_BASE = "https://github.com/willow-memory/willow-mcp"
 
 
 def _has(*revs: str) -> bool:

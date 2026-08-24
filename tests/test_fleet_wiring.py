@@ -159,8 +159,8 @@ def test_fleet_seams_job_exists_and_checks_out_both_siblings():
     job = _workflow()["jobs"]["fleet-seams"]
     repos = {s.get("with", {}).get("repository")
              for s in job["steps"] if s.get("uses", "").startswith("actions/checkout")}
-    assert "rudi193-cmd/Jeles" in repos
-    assert "rudi193-cmd/Nestor" in repos
+    assert "hornbook-knowledge/Jeles" in repos
+    assert "Die-Namic-Systems/Nestor" in repos
 
 
 def test_fleet_seams_checks_out_full_history():

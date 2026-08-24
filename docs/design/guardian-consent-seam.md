@@ -69,7 +69,7 @@ What the shipped core provides (and what it pointedly leaves out):
 
 Home: willow-mcp, beside [`consent.py`](../../src/willow_mcp/consent.py) and
 [`gate.py`](../../src/willow_mcp/gate.py). Reference implementation to generalize
-from: UTETY's [`utety/core/store.py`](https://github.com/rudi193-cmd/UTETY) +
+from: UTETY's [`utety/core/store.py`](https://github.com/hornbook-knowledge/UTETY) +
 `utety/knowledge.py`.
 
 ---

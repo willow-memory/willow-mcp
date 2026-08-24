@@ -55,7 +55,7 @@ def available() -> bool:
 def _unavailable() -> dict:
     return {"status": "unavailable",
             "detail": "Nestor engine not installed — pip install "
-                      "'nestor @ git+https://github.com/rudi193-cmd/Nestor@master'"}
+                      "'nestor @ git+https://github.com/Die-Namic-Systems/Nestor@master'"}
 
 
 # ── paths (vault-rooted, gitignored, per-fleet) ──────────────────────────────

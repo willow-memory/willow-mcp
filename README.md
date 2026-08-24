@@ -64,9 +64,9 @@ until you confirm the mapping once.
 ### The fleet (one command up)
 
 `sandbox-bootstrap.sh` proves this server works **alone**. Two sibling packages
-attach to it — [`jeles`](https://github.com/rudi193-cmd/Jeles), the verified-corpus
+attach to it — [`jeles`](https://github.com/hornbook-knowledge/Jeles), the verified-corpus
 organ this package already depends on for institutional search, and
-[`nestor`](https://github.com/rudi193-cmd/Nestor), which mirrors its hash-chained
+[`nestor`](https://github.com/Die-Namic-Systems/Nestor), which mirrors its hash-chained
 ledger into FRANK — and standing all three up together is a different claim:
 
 ```bash
@@ -418,8 +418,8 @@ $ export WILLOW_MCP_STRICT_TRUST_ROOT=1   # refuse egress when the keys are self
 
 Strict mode is **off by default** because turning it on before that separation
 exists would deny egress on every current install. This is tracked as B-32 in
-`docs/BUGS.md`, and as [issue #231](https://github.com/rudi193-cmd/willow-mcp/issues/231)
-(dedicated low-privilege agent uid) and [#232](https://github.com/rudi193-cmd/willow-mcp/issues/232)
+`docs/BUGS.md`, and as [issue #231](https://github.com/willow-memory/willow-mcp/issues/231)
+(dedicated low-privilege agent uid) and [#232](https://github.com/willow-memory/willow-mcp/issues/232)
 (store `.db` OS-level permission enforcement, which depends on it); requesting
 egress and confirming it are separate authorities, and until the filesystem
 says so, only convention does.
