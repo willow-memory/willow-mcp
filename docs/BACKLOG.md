@@ -34,7 +34,7 @@ code itself.
 | W-18 | idea | Open | voice | Wire the RealtimeSTT wake-gate (`voice/wake_gate.py:73`) |
 | W-19 | idea | Open | commitments | Wire Google Calendar sync transport (`commitments/calendar_source.py:116`) |
 | W-20 | idea | Done | server | Make hardcoded limits configurable via `WILLOW_*` env vars |
-| W-21 | idea | Open | tool_oracle | Rotate / truncate `pending.jsonl` (unbounded append-only file) |
+| W-21 | idea | Done | tool_oracle | Rotate / truncate `pending.jsonl` (unbounded append-only file) |
 | W-22 | idea | Open | mem_ratify | Finalize placeholder doctrine values before enabling enforcement |
 | W-23 | idea | Open | design | Finish specialist-registry TBD sections (store_scope, permissions, extensions) |
 
