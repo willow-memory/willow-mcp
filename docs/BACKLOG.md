@@ -28,7 +28,7 @@ code itself.
 | W-12 | debt | Done | web_search | Global cache replacement race in `reset_search_cache()` and `nest/embed.py` |
 | W-13 | debt | Done | types | `type: ignore[return-value]` in `bound_receipt.py:312` |
 | W-14 | debt | Done | integrations | Pinned `X-GitHub-Api-Version: 2022-11-28` will eventually deprecate |
-| W-15 | debt | Open | packaging | `nestor-meaning` unpublished on PyPI — 3 tool-oracle verbs unavailable on standard install (graceful degradation works) |
+| W-15 | debt | Done | packaging | `nestor-meaning` published on PyPI — optional extra `nestor` wired in pyproject.toml |
 | W-16 | debt | Done | docs | B-33 `Ref` column says `willow-mcp#TBD` -- issue number never recorded |
 | W-17 | debt | Done | packaging | Version falls back to `0.0.0+unknown` on fresh clone (no git tags) |
 | W-18 | idea | Open | voice | Wire the RealtimeSTT wake-gate (`voice/wake_gate.py:73`) |
@@ -165,17 +165,16 @@ the old cache while another replaces it is a race. Same pattern in
 `GitHubAdapter` at `integrations.py:240` pins `X-GitHub-Api-Version: 2022-11-28`.
 Should be tracked for periodic update or made configurable.
 
-### W-15 · debt · Nestor unpublished on PyPI
+### W-15 · debt · Nestor now published on PyPI — extra wired
 
-The Nestor repo (`Die-Namic-Systems/Nestor`) is already packaged as
-`nestor-meaning` (pyproject.toml `name`, hatch-vcs versioning, sdist/wheel
-build targets, `[publish]` extra with twine). The import name is `nestor`.
-Graceful degradation works — oracle verbs return `status='unavailable'`.
+`nestor-meaning` has been published on PyPI since v0.3.0 (latest: 0.11.0).
+The optional extra `nestor = ["nestor-meaning>=0.7.0,<1.0.0"]` is now wired
+in `pyproject.toml`, and `nestor-meaning` is added to the `[tool.willow.fleet]`
+roster with a Rule 2 surface row in `fleet-versioning.md`.
 
-**Resolution path:** tag a release in the Nestor repo, publish to PyPI as
-`nestor-meaning`, then restore the optional extra in willow-mcp's
-pyproject.toml: `nestor = ["nestor-meaning>=<version>"]`. The pyproject.toml
-comment already documents this with the correct package name.
+Floor at 0.7.0: `SqliteStore` landed in 0.6.0, `EntityResolver` in 0.7.0 —
+both are imported by `tool_oracle.py`. Cap at `<1.0.0` per Rule 1
+(nestor sets `bump-minor-pre-major: false`).
 
 ### W-16 · debt · B-33 missing issue number
 

@@ -102,12 +102,12 @@ web = [
 # Nestor verified-match engine backs the natural-language tool oracle
 # (willow_mcp.tool_oracle / nestor_tool_route — docs/design/nestor-tool-route.md).
 # PyPI package name: nestor-meaning (import name: nestor).
-# Currently unpublished — PyPI refuses direct-URL git dependencies, so the
-# extra is gone until nestor-meaning is published. Plain `pip install willow-mcp`
-# stands up the server without it (oracle verbs report status='unavailable');
-# to enable routing, install alongside:
-#   pip install "nestor-meaning @ git+https://github.com/Die-Namic-Systems/Nestor@master"
-# Once published:  nestor = ["nestor-meaning>=<first-published-tag>"]
+#
+# Floor is 0.7.0, not 0.6.0: SqliteStore landed in 0.6.0 but EntityResolver —
+# the other import tool_oracle.py needs — landed in 0.7.0. The cap follows
+# Rule 1 (docs/design/fleet-versioning.md): nestor sets bump-minor-pre-major
+# false, so <1.0.0 is a real compatibility range.
+nestor = ["nestor-meaning>=0.7.0,<1.0.0"]
 # Sentry telemetry for the Bug Smash observability experiment. Opt-in only:
 # inert unless WILLOW_SENTRY_DSN is set at runtime (see observability.py).
 observability = ["sentry-sdk>=2.0,<3.0"]
@@ -166,7 +166,7 @@ Changelog = "https://github.com/willow-memory/willow-mcp/blob/master/CHANGELOG.m
 # the test would pass — and that shrinking the set to `{"jeles"}` silently
 # disabled it. Adding a package here now forces both a correct pin and a row in
 # the doc's Rule 2 table, which is where its public surface gets decided.
-packages = ["willow-mcp", "jeles", "kartikeya"]
+packages = ["willow-mcp", "jeles", "kartikeya", "nestor-meaning"]
 
 [tool.hatch.version]
 # Derived from the git tag (hatch-vcs). At an exact tag `vX.Y.Z` the version is

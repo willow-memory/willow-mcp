@@ -81,7 +81,11 @@ def _requirements() -> list[str]:
     # `.get`, because declaring `dependencies` dynamic raised a bare KeyError
     # from inside the helper instead of reaching the assertion below — a
     # traceback where this file otherwise gives an explanation.
-    return _pyproject().get("project", {}).get("dependencies", []) or []
+    proj = _pyproject().get("project", {})
+    reqs = list(proj.get("dependencies", []) or [])
+    for extras in (proj.get("optional-dependencies", {}) or {}).values():
+        reqs.extend(extras)
+    return reqs
 
 
 def _fleet_pins() -> dict[str, list[tuple[str, str]]]:
