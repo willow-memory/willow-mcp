@@ -12,7 +12,10 @@ Supported:
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
 PDF_SUFFIX = ".pdf"
@@ -72,7 +75,7 @@ def _extract_pdf(path: Path) -> tuple[str, str]:
     except ImportError:
         pass
     except Exception:
-        pass
+        logger.debug("pdfplumber failed for %s", path, exc_info=True)
 
     # Fallback: pdf2image + tesseract (scanned PDFs)
     try:

@@ -33,6 +33,7 @@ import hashlib
 import json
 import math
 import os
+import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -88,7 +89,17 @@ def save_learned(model: str, store: dict[str, list[dict]]) -> None:
     p = _learned_path(model)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(store))
+        fd, tmp = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(store))
+            os.replace(tmp, p)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except OSError:
         pass
 
@@ -201,7 +212,17 @@ def build_adaptive_centroids(model: str = _embed.DEFAULT_EMBED_MODEL,
     if use_cache:
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(json.dumps(out))
+            fd, tmp = tempfile.mkstemp(dir=cache.parent, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(json.dumps(out))
+                os.replace(tmp, cache)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except OSError:
             pass
     return out
@@ -316,7 +337,17 @@ def save_discovered(model: str, store: dict[str, dict]) -> None:
     p = _discovered_path(model)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(store))
+        fd, tmp = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(store))
+            os.replace(tmp, p)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except OSError:
         pass
 

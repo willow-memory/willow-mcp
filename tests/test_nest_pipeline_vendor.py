@@ -26,14 +26,14 @@ NEST_DIR = pathlib.Path(__file__).resolve().parents[1] / "src/willow_mcp/nest"
 # and deliberately NOT pinned.)
 EXPECTED_SHA256 = {
     "db.py": "85f5146cfe0207427252250ef44e2e673d62cecf41338ab96547149ffe254076",
-    "embed.py": "e80f61c1a24f9b82a7c4a16c5be8bf89706f1a41b6fe91cd8530775e5157754f",
+    "embed.py": "25f15ee7b1d589c0a694636356a282c7c00cc086ec7d4526149ce5b2e39ec50a",
     "ingest.py": "bb244baf2b7d1500da494b1b98cc86b0591fe823caa7be53618db3d34ecf29fc",
     "llm.py": "628a3f58b11087b07ff9b5c096e3899c1ba468e6bc3849a71fddff03df738bfc",
     "secrets.py": "efd773441f05266c7f63512f6fe038e68ed838edc2b0f860dffa92b295958e12",
-    "selflearn.py": "9126c1aa3266c6d1d684b9da6fb34eb481049358f3479f40bfdca7f646725f09",
-    "taxonomy.py": "57a6593d122d3422a1938bacd75d7141ecc33206d05a6702ef200fe98c5bf623",
+    "selflearn.py": "bde962fa401816681572da1e74805a1789e42e402498bc4c87df7c8fec2657fd",
+    "taxonomy.py": "60d44d1c1d9a74dc23389feac7dce4600085ea408fb08ab528739559562d4f46",
     "classify.py": "7e81f75d98011aea824317e8fc977e16777fae1f6b7730b51bcfb93ab32748ca",
-    "ocr.py": "479dc5ed4cf5dad62e6eadcc92e6097fbd8b4e0f2f138c5ce61a37c332200254",
+    "ocr.py": "77d64d05beccb304614c63d6b03b9715883df189c4d58a4bc065968659aa2813",
 }
 
 
