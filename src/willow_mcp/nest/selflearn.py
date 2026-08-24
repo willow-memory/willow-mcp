@@ -88,9 +88,7 @@ def save_learned(model: str, store: dict[str, list[dict]]) -> None:
     p = _learned_path(model)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + f".tmp-{os.getpid()}")
-        tmp.write_text(json.dumps(store))
-        os.replace(tmp, p)
+        p.write_text(json.dumps(store))
     except OSError:
         pass
 
@@ -203,9 +201,7 @@ def build_adaptive_centroids(model: str = _embed.DEFAULT_EMBED_MODEL,
     if use_cache:
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cache.with_suffix(cache.suffix + f".tmp-{os.getpid()}")
-            tmp.write_text(json.dumps(out))
-            os.replace(tmp, cache)
+            cache.write_text(json.dumps(out))
         except OSError:
             pass
     return out
@@ -320,9 +316,7 @@ def save_discovered(model: str, store: dict[str, dict]) -> None:
     p = _discovered_path(model)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + f".tmp-{os.getpid()}")
-        tmp.write_text(json.dumps(store))
-        os.replace(tmp, p)
+        p.write_text(json.dumps(store))
     except OSError:
         pass
 

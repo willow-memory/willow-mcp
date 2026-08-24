@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import threading
 import urllib.error
 import urllib.request
 
@@ -31,23 +30,19 @@ _CAPS = (4000, 2000, 1000)
 _TIMEOUT = float(os.environ.get("NEST_EMBED_TIMEOUT", "60"))
 
 _installed: set[str] | None = None
-_installed_lock = threading.Lock()
 
 
 def installed_models() -> set[str]:
     global _installed
-    with _installed_lock:
-        if _installed is not None:
-            return _installed
+    if _installed is not None:
+        return _installed
     try:
         with urllib.request.urlopen(f"{DEFAULT_HOST}/api/tags", timeout=5) as resp:
             tags = json.loads(resp.read().decode("utf-8"))
-        result = {m.get("name", "") for m in tags.get("models", [])}
+        _installed = {m.get("name", "") for m in tags.get("models", [])}
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-        result = set()
-    with _installed_lock:
-        _installed = result
-    return result
+        _installed = set()
+    return _installed
 
 
 def available(model: str = DEFAULT_EMBED_MODEL) -> bool:

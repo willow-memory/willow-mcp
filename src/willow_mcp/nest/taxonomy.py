@@ -168,9 +168,7 @@ def build_centroids(model: str = _embed.DEFAULT_EMBED_MODEL,
     if use_cache:
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cache.with_suffix(cache.suffix + f".tmp-{os.getpid()}")
-            tmp.write_text(json.dumps(centroids))
-            os.replace(tmp, cache)
+            cache.write_text(json.dumps(centroids))
         except OSError:
             pass
     return centroids

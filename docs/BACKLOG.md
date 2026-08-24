@@ -22,10 +22,10 @@ code itself.
 | W-06 | gap | Done | gate / kart | `check_kart_task()` exception silently swallowed in `task_submit` |
 | W-07 | gap | Done | integrations | Jira stub has hardcoded placeholder `example.atlassian.net` URL |
 | W-08 | gap | Done | deploy | Dockerfile bakes in `WILLOW_APP_ID=glama-inspect` |
-| W-09 | debt | Done | error handling | 30+ `except Exception: pass` blocks with no logging |
-| W-10 | debt | Done | file I/O | Non-atomic writes in `nest/taxonomy.py`, `nest/selflearn.py`, `session_inject.py` |
+| W-09 | debt | Done | error handling | 30+ `except Exception: pass` blocks with no logging (nest/ocr.py deferred — vendored) |
+| W-10 | debt | Done | file I/O | Non-atomic writes in `session_inject.py` (nest/ files deferred — vendored from safe-app-store) |
 | W-11 | debt | Done | integrations | Mutable default dict `extra_headers: dict = {}` as class attribute on `BaseAdapter` |
-| W-12 | debt | Done | web_search | Global cache replacement race in `reset_search_cache()` |
+| W-12 | debt | Open | web_search | Global cache replacement race in `reset_search_cache()` and `nest/embed.py` (embed deferred — vendored) |
 | W-13 | debt | Done | types | `type: ignore[return-value]` in `bound_receipt.py:312` |
 | W-14 | debt | Done | integrations | Pinned `X-GitHub-Api-Version: 2022-11-28` will eventually deprecate |
 | W-15 | debt | Open | packaging | `nestor` is an unpublished git dependency -- 3 tools permanently unavailable on standard install |
