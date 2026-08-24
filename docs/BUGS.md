@@ -74,6 +74,13 @@ log carries a one-line entry and points there rather than duplicating.
 | B-11 | P2 | Fixed | schema confirm | `schema_confirm_mapping` confirmed on name-match alone (assertion, not evidence) — no rendered sample shown | PR #21 |
 | B-12 | P3 | Documented | serve / deploy | systemd `--user` serve unit doesn't inherit shell `WILLOW_PG_DB`/`WILLOW_STORE_ROOT`/`WILLOW_HOME` → serve reads `table_not_found` on data stdio sees | PR #18 |
 | B-13 | P3 | Fixed | tests | Rate-limit tests shared one `app_id`, exhausting the token bucket → cross-test failures | (in-tree; `_buckets` reset in fixtures) |
+| B-58 | P2 | Open | code_graph / indexer | `ast.walk` double-counts class methods — methods added once as `module.Class.method` (ClassDef branch) and again as `module.method` (FunctionDef branch); comment "Skip if inside a class" at line 147 checks nothing. `ON CONFLICT DO UPDATE` prevents crash but produces incorrect FQNs and inflated symbol counts | audit 2026-08-24 |
+| B-59 | P2 | Open | db / soil_heartbeat | `soil_heartbeat.py:112` uses `INSERT OR REPLACE INTO records` — the exact pattern `db.py:173` moved away from (deletes+re-inserts, resetting `deleted` to 0 and `created_at`). Inconsistent with the documented security fix | audit 2026-08-24 |
+| B-60 | P2 | Open | tool_oracle | `_store()` destructures `_nestor()` result without None check — raises `TypeError: cannot unpack non-iterable NoneType` when Nestor is unavailable. Callers guard, but `_store()` itself does not | audit 2026-08-24 |
+| B-61 | P2 | Open | oauth / serve | Google and Apple sign-in error handlers render raw `f"{exc}"` into HTML response (`oauth.py:589,646`). If exception contains internal details (stack traces, URLs), leaks sensitive info to browser | audit 2026-08-24 |
+| B-62 | P2 | Open | session_inject | `_MARKER` at `session_inject.py:14` is a predictable, world-readable `/tmp/willow-session-inject-marker.json`. Multi-user collision; another process can tamper to replay or suppress injections | audit 2026-08-24 |
+| B-63 | P2 | Open | federation | `_ServerConnection._ensure_started()` at `mcp_federation_client.py:330` checks `self._thread is not None` without a lock. Two concurrent callers can both start threads. `connect()`/`list_tools()`/`call_tool()` call it directly | audit 2026-08-24 |
+| B-64 | P3 | Open | code_graph / indexer | `_index_file()` uses `executemany()`/`execute()` for symbols/edges/indexed-files inserts but never calls `conn.commit()`. Data lost if caller does not commit and connection closes | audit 2026-08-24 |
 | B-08 | P2 | Stale | packaging | `requirements.txt` unpinned — never existed in current `pyproject.toml` layout | L-REQ-01 |
 | B-09 | P2 | Stale | gate | Silent fallback on missing SAP gate — `openclaw_sap_gate` gone in rewritten `gate.py` | L-AUTH-01 |
 
@@ -103,6 +110,63 @@ log carries a one-line entry and points there rather than duplicating.
 - **B-56 · P0** — **Local egress key exposure** on this host
   (`~/.config/willow-mcp/egress/private.pem` readable by MCP uid). **Fix:** #182
   custody (`harden-trust-root` / operator-owned key); not an MCP code path.
+
+- **B-58 · P2** — **Code graph indexer double-counts class methods.**
+  `ast.walk(tree)` traverses all nodes flat. Methods are added once from the
+  `ClassDef` branch (qualified as `module.Class.method`, kind `method`) and again
+  from the `FunctionDef` branch (qualified as `module.method`, kind `function`).
+  The comment at line 147 says "Skip if inside a class (already handled above)"
+  but nothing checks parent context — `ast.walk` does not track nesting. The
+  `ON CONFLICT(fqn) DO UPDATE` prevents a crash, but the module-level FQN entry
+  overwrites or coexists with the class-scoped one, producing incorrect graph
+  edges (a method appears callable at module level) and inflated symbol counts.
+  **Fix:** either track visited node ids, or switch from `ast.walk` to a
+  recursive visitor that skips `FunctionDef` nodes inside `ClassDef.body`.
+
+- **B-59 · P2** — **`soil_heartbeat.py` uses `INSERT OR REPLACE`.**
+  Line 112 uses `INSERT OR REPLACE INTO records`, the exact pattern `db.py:173`
+  explicitly documented as a security fix and moved away from. In SQLite,
+  `INSERT OR REPLACE` deletes the existing row and re-inserts, resetting `deleted`
+  back to 0 (un-deleting soft-deleted rows) and resetting `created_at`. The main
+  Store uses `INSERT ... ON CONFLICT ... DO UPDATE SET` instead. **Fix:** align
+  with `db.py`'s pattern.
+
+- **B-60 · P2** — **`tool_oracle._store()` crashes when Nestor unavailable.**
+  `_store()` calls `_nestor()` and destructures the result
+  (`_, _, _, cascade, SqliteStore = parts`) without checking if `parts` is None.
+  If Nestor is not installed, `_nestor()` returns None and this raises
+  `TypeError: cannot unpack non-iterable NoneType object`. Callers like `route()`
+  and `seal()` check `_nestor() is None` first, but `_store()` does not guard
+  itself. **Fix:** add a None guard at the top of `_store()`.
+
+- **B-61 · P2** — **OAuth error leaks raw exception into HTML.**
+  Both Google (`oauth.py:589`) and Apple (`oauth.py:646`) sign-in error handlers
+  render `f"<p>{exc}</p>"` directly into the HTML response. If the exception
+  contains internal details (stack traces, database errors, internal URLs), this
+  leaks sensitive information to the browser. **Fix:** return a generic error
+  message; log the actual exception server-side.
+
+- **B-62 · P2** — **Session inject marker in predictable shared `/tmp` path.**
+  `_MARKER = Path(tempfile.gettempdir()) / "willow-session-inject-marker.json"`
+  (`session_inject.py:14`) is a predictable, world-readable path. Multiple users
+  on the same system collide on this file, and another process can tamper with it
+  to replay or suppress session injections. **Fix:** include `WILLOW_HOME` or a
+  per-user/per-session component in the path.
+
+- **B-63 · P2** — **Race condition in federation client `_ensure_started()`.**
+  `_ServerConnection._ensure_started()` (`mcp_federation_client.py:330`) checks
+  `self._thread is not None` without holding a lock. Two concurrent callers can
+  both see None and both start a thread. The module-level `_registry_lock` is held
+  by `_get_connection()`, but `connect()`/`list_tools()`/`call_tool()` call
+  `_ensure_started()` directly without the lock. **Fix:** add an instance-level
+  lock to `_ensure_started()`.
+
+- **B-64 · P3** — **Missing `conn.commit()` in code graph indexer inserts.**
+  `_index_file()` (`code_graph/indexer.py:158-180`) uses `conn.executemany()` and
+  `conn.execute()` to insert symbols, edges, and indexed-file records but never
+  calls `conn.commit()`. If the caller does not commit explicitly and the
+  connection closes, all indexed data for that file is lost. **Fix:** commit at the
+  end of `_index_file()`, or document the caller contract.
 
 ## Fixed
 
