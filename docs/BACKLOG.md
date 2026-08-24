@@ -35,7 +35,7 @@ code itself.
 | W-19 | idea | Open | commitments | Wire Google Calendar sync transport (`commitments/calendar_source.py:116`) |
 | W-20 | idea | Done | server | Make hardcoded limits configurable via `WILLOW_*` env vars |
 | W-21 | idea | Done | tool_oracle | Rotate / truncate `pending.jsonl` (unbounded append-only file) |
-| W-22 | idea | Done | mem_ratify | Doctrine values env-configurable via `WILLOW_FRONTIER_MIN_WITNESSES` / `WILLOW_CANONICAL_MIN_WITNESSES` / `WILLOW_REQUIRE_STEPWISE_PROMOTION` |
+| W-22 | idea | Open | mem_ratify | Doctrine values env-configurable via `WILLOW_FRONTIER_MIN_WITNESSES` / `WILLOW_CANONICAL_MIN_WITNESSES` / `WILLOW_REQUIRE_STEPWISE_PROMOTION` |
 | W-23 | idea | Done | design | Specialist-registry TBD labels updated — 4/5 already implemented; only user-created extensions remain unimplemented |
 
 ---
@@ -244,17 +244,20 @@ into memory and reverses it. The file is append-only with no rotation. On a busy
 system this becomes a memory pressure point. Consider log rotation or a
 max-line read window.
 
-### W-22 · idea · Doctrine values now env-configurable
+### W-22 · idea · Doctrine values env-configurable (needs upstream-first)
 
-Three constants in `ratify.py` were hardcoded placeholders. Now configurable
-via env vars following the W-20 pattern, with the same conservative defaults:
+Three constants in `ratify.py` are hardcoded placeholders. Should be
+configurable via env vars following the W-20 pattern, with the same
+conservative defaults:
 
 - `WILLOW_FRONTIER_MIN_WITNESSES` (default `2`) — quorum for Contested → Frontier
 - `WILLOW_CANONICAL_MIN_WITNESSES` (default `2`) — quorum for Frontier → Canonical
 - `WILLOW_REQUIRE_STEPWISE_PROMOTION` (default `1`) — set `0`/`false` to allow tier skipping
 
-Enforcement remains off by default (`WILLOW_MEM_RATIFY_ENFORCE`). An operator
-can now tune the quorum sizes before turning enforcement on.
+**Blocked:** `ratify.py` is vendored from upstream Willow. The change must
+land in the upstream Willow repo first, then be re-vendored here with an
+updated pinned hash in `tests/test_mem_ratify.py`. Direct edits to the
+vendored copy break the `vendor-sync` CI gate.
 
 ### W-23 · idea · Specialist-registry TBD labels updated
 

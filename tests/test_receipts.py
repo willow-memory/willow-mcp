@@ -7,9 +7,6 @@ and transaction semantics are tested against the actual engine, not a fake.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
-from pathlib import Path
 
 import pytest
 
