@@ -109,7 +109,62 @@ class GCalSyncSource:
         self._calendar_id = calendar_id
         self._window_days = window_days
         self._credentials_path = credentials_path
-        self._list_events = list_events if list_events is not None else self._unwired_transport
+        if list_events is not None:
+            self._list_events = list_events
+        elif credentials_path is not None:
+            self._list_events = self._build_transport(credentials_path, calendar_id)
+        else:
+            self._list_events = self._unwired_transport
+
+    @staticmethod
+    def _build_transport(
+        credentials_path: str, calendar_id: str,
+    ) -> Callable[[datetime, datetime], list]:
+        import json
+
+        try:
+            from googleapiclient.discovery import build as build_service
+        except ImportError:
+            raise ImportError(
+                "GCalSyncSource transport needs google-api-python-client and google-auth. "
+                "Install: pip install 'willow-mcp[gcal]'"
+            ) from None
+
+        with open(credentials_path) as f:
+            cred_data = json.load(f)
+
+        _SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+
+        if cred_data.get("type") == "service_account":
+            from google.oauth2 import service_account
+
+            credentials = service_account.Credentials.from_service_account_file(
+                credentials_path, scopes=_SCOPES,
+            )
+        else:
+            from google.oauth2.credentials import Credentials
+
+            credentials = Credentials.from_authorized_user_file(
+                credentials_path, scopes=_SCOPES,
+            )
+
+        service = build_service("calendar", "v3", credentials=credentials)
+
+        def _transport(start: datetime, end: datetime) -> list:
+            result = (
+                service.events()
+                .list(
+                    calendarId=calendar_id,
+                    timeMin=start.isoformat(),
+                    timeMax=end.isoformat(),
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            return result.get("items", [])
+
+        return _transport
 
     @staticmethod
     def _unwired_transport(start: datetime, end: datetime) -> list:
