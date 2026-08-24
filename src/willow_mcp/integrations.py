@@ -51,11 +51,11 @@ from typing import Optional
 
 logger = logging.getLogger("willow_mcp.integrations")
 
-_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+_MAX_RESPONSE_BYTES = int(os.environ.get("WILLOW_INTEGRATION_MAX_RESPONSE_BYTES", str(2 * 1024 * 1024)))
 _MAX_BODY_BYTES = 512 * 1024
 _MAX_ATTEMPTS = 3
 _MAX_BACKOFF_SECONDS = 30
-_TIMEOUT_SECONDS = 30
+_TIMEOUT_SECONDS = int(os.environ.get("WILLOW_INTEGRATION_TIMEOUT", "30"))
 _RETRYABLE = {429, 500, 502, 503, 504}
 _METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import queue
 import threading
 import time
@@ -47,7 +48,7 @@ logger = logging.getLogger("willow_mcp.mcp_federation_client")
 #: How long a single stdio round trip (connect, list_tools, or one call_tool)
 #: may take before this side gives up on it. A hung child must not hang the
 #: calling tool forever.
-CALL_TIMEOUT_SECONDS = 30.0
+CALL_TIMEOUT_SECONDS = float(os.environ.get("WILLOW_FEDERATION_CALL_TIMEOUT", "30.0"))
 #: How long to wait for a freshly-started thread to publish its event loop.
 _LOOP_START_TIMEOUT_SECONDS = 5.0
 #: TCP connect budget for a remote peer — short, because an unreachable host

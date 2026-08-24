@@ -2,6 +2,7 @@
 
 import base64
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -15,6 +16,8 @@ import psycopg2
 import psycopg2.extras
 
 from . import postgres_lifecycle
+
+logger = logging.getLogger("willow_mcp.db")
 
 _pg_conn = None
 _pg_lock = threading.Lock()
@@ -98,14 +101,16 @@ def get_pg() -> Optional[psycopg2.extensions.connection]:
                 _pg_conn = _connect()
             _pg_conn.cursor().execute("SELECT 1")
             return _pg_conn
-        except Exception:
+        except Exception as exc:
+            logger.warning("Postgres connection failed: %s", exc)
             _pg_conn = None
             if postgres_lifecycle.ensure_enabled() and postgres_lifecycle.try_recover():
                 try:
                     _pg_conn = _connect()
                     _pg_conn.cursor().execute("SELECT 1")
                     return _pg_conn
-                except Exception:
+                except Exception as exc_retry:
+                    logger.warning("Postgres connection failed after recovery: %s", exc_retry)
                     _pg_conn = None
             return None
 

@@ -732,7 +732,7 @@ def _write_param(field_mapping: dict, value):
 
 # ── Sanitizer (Phase 4a) ─────────────────────────────────────────────────────
 
-_MAX_BLOB_BYTES = 512 * 1024   # record / context dicts
+_MAX_BLOB_BYTES = int(os.environ.get("WILLOW_MAX_BLOB_BYTES", str(512 * 1024)))
 _MAX_STR_BYTES = 64 * 1024     # content / task / query strings
 _MAX_TAGS = 32
 _MAX_TAG_LEN = 128
@@ -832,8 +832,8 @@ class _Bucket:
 
 _buckets: dict[str, _Bucket] = {}
 _buckets_lock = threading.Lock()
-_RATE = 60.0    # tokens per minute
-_BURST = 10.0   # bucket capacity
+_RATE = float(os.environ.get("WILLOW_RATE_LIMIT", "60.0"))
+_BURST = float(os.environ.get("WILLOW_RATE_BURST", "10.0"))
 
 
 def _check_rate(app_id: str) -> tuple[bool, int]:
