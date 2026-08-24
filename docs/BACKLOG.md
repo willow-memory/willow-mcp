@@ -15,10 +15,10 @@ code itself.
 | ID | Cat | Status | Component | One-line |
 |----|-----|--------|-----------|----------|
 | W-01 | gap | Open | plugin | 5 skill files on disk not registered in `plugin.json` |
-| W-02 | gap | Open | tests | 8 MCP tools with zero test coverage |
+| W-02 | gap | Done | tests | 8 MCP tools with zero test coverage |
 | W-03 | gap | Open | tests | 29 source modules with no corresponding test file |
-| W-04 | gap | Open | db | `get_pg()` silently returns None on Postgres connection failure -- no logging |
-| W-05 | gap | Open | config | `.mcp.json` sets `WILLOW_PG_DB=willow`; Grove requires `willow_20` |
+| W-04 | gap | Done | db | `get_pg()` silently returns None on Postgres connection failure -- no logging |
+| W-05 | gap | Done | config | `.mcp.json` sets `WILLOW_PG_DB=willow`; Grove requires `willow_20` |
 | W-06 | gap | Open | gate / kart | `check_kart_task()` exception silently swallowed in `task_submit` |
 | W-07 | gap | Open | integrations | Jira stub has hardcoded placeholder `example.atlassian.net` URL |
 | W-08 | gap | Open | deploy | Dockerfile bakes in `WILLOW_APP_ID=glama-inspect` |
@@ -33,7 +33,7 @@ code itself.
 | W-17 | debt | Open | packaging | Version falls back to `0.0.0+unknown` on fresh clone (no git tags) |
 | W-18 | idea | Open | voice | Wire the RealtimeSTT wake-gate (`voice/wake_gate.py:73`) |
 | W-19 | idea | Open | commitments | Wire Google Calendar sync transport (`commitments/calendar_source.py:116`) |
-| W-20 | idea | Open | server | Make hardcoded limits configurable via `WILLOW_*` env vars |
+| W-20 | idea | Done | server | Make hardcoded limits configurable via `WILLOW_*` env vars |
 | W-21 | idea | Open | tool_oracle | Rotate / truncate `pending.jsonl` (unbounded append-only file) |
 | W-22 | idea | Open | mem_ratify | Finalize placeholder doctrine values before enabling enforcement |
 | W-23 | idea | Open | design | Finish specialist-registry TBD sections (store_scope, permissions, extensions) |
