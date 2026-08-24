@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **W-18, W-19:** wire RealtimeSTTGate and GCalSyncSource transport ([967d201](https://github.com/willow-memory/willow-mcp/commit/967d201c5ab5c391a8d033d742cf7a0b4b2e07c5))
 * **W-18, W-19:** wire RealtimeSTTGate and GCalSyncSource transport ([f5a3ec2](https://github.com/willow-memory/willow-mcp/commit/f5a3ec25b5dff7d2b01aa1519340ed26da230638))
 
 ## [2.13.4](https://github.com/willow-memory/willow-mcp/compare/v2.13.3...v2.13.4) (2026-08-24)
