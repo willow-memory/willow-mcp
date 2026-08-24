@@ -31,8 +31,8 @@ code itself.
 | W-15 | debt | Done | packaging | `nestor-meaning` published on PyPI — optional extra `nestor` wired in pyproject.toml |
 | W-16 | debt | Done | docs | B-33 `Ref` column says `willow-mcp#TBD` -- issue number never recorded |
 | W-17 | debt | Done | packaging | Version falls back to `0.0.0+unknown` on fresh clone (no git tags) |
-| W-18 | idea | Open | voice | Wire the RealtimeSTT wake-gate (`voice/wake_gate.py:73`) |
-| W-19 | idea | Open | commitments | Wire Google Calendar sync transport (`commitments/calendar_source.py:116`) |
+| W-18 | idea | Done | voice | Wire the RealtimeSTT wake-gate (`voice/wake_gate.py:73`) |
+| W-19 | idea | Done | commitments | Wire Google Calendar sync transport (`commitments/calendar_source.py:116`) |
 | W-20 | idea | Done | server | Make hardcoded limits configurable via `WILLOW_*` env vars |
 | W-21 | idea | Done | tool_oracle | Rotate / truncate `pending.jsonl` (unbounded append-only file) |
 | W-22 | idea | Open | mem_ratify | Doctrine values env-configurable via `WILLOW_FRONTIER_MIN_WITNESSES` / `WILLOW_CANONICAL_MIN_WITNESSES` / `WILLOW_REQUIRE_STEPWISE_PROMOTION` |
@@ -224,12 +224,25 @@ clone means the version falls back to `0.0.0+unknown`, while `plugin.json` and
 but raises `NotImplementedError`. The design doc
 (`design/willow-voice-ingress-membrane.md`) is in place.
 
+**Done (2026-08-24).** Implemented `RealtimeSTTGate` using openwakeword
+(bundled with RealtimeSTT). Takes wake word names rather than model file
+paths; satisfies the same `WakeGate` protocol as `OpenWakeWordGate`.
+11 tests in `test_wake_gate.py` cover both gate adapters (score, reset,
+missing pcm, import error, protocol conformance, constructor args).
+
 ### W-19 · idea · Wire Google Calendar sync
 
 `GCalSyncSource` at `commitments/calendar_source.py:116` has a full skeleton
 but its transport raises `NotImplementedError` until an OAuth callable is
 injected. The commitment tools always use `StubCalendarSource`. Real calendar
 integration would enable commitment ingestion from actual calendar data.
+
+**Done (2026-08-24).** Wired `_build_transport()` using Google Calendar API v3
+via `google-api-python-client` + `google-auth`. Supports service account and
+OAuth user credentials (auto-detected from the JSON file). Constructor builds
+the transport when `credentials_path` is provided; the default (no args) still
+raises `NotImplementedError` (existing test preserved). Added `gcal` optional
+extra to `pyproject.toml`. 8 tests in `test_calendar_source_gcal_transport.py`.
 
 ### W-20 · idea · Make hardcoded limits configurable
 

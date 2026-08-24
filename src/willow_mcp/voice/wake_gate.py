@@ -63,13 +63,42 @@ class OpenWakeWordGate:
 
 
 class RealtimeSTTGate:
-    """Fallback path (KoljaB/RealtimeSTT) that collapses wake + VAD + faster-whisper behind
-    one dependency. If hand-assembling openWakeWord + Silero + faster-whisper drags,
-    implement this against the same WakeGate contract and swap it in — the controller does
-    not change. Not wired yet; raises so a premature swap fails loudly.
+    """Fallback WakeGate backed by RealtimeSTT's bundled openwakeword.
+
+    ``pip install RealtimeSTT`` brings openwakeword, Silero VAD, and faster-whisper
+    in one install. This gate uses the openwakeword scorer for the same frame-by-frame
+    WakeGate contract as OpenWakeWordGate; the controller does not change.
+
+    Constructor takes wake word NAMES (``("hey_willow",)``) that openwakeword resolves
+    to its bundled models, rather than explicit model file paths.
     """
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError(
-            "RealtimeSTT fallback not wired — see design/willow-voice-ingress-membrane.md"
-        )
+    def __init__(
+        self,
+        wake_words: Sequence[str] = ("hey_willow",),
+        *,
+        threshold: float = 0.5,
+        expected_frame_samples: int = 1280,
+    ):
+        try:
+            from openwakeword.model import Model
+        except ImportError:
+            raise ImportError(
+                "RealtimeSTTGate needs openwakeword (bundled with RealtimeSTT). "
+                "Install: pip install RealtimeSTT   (or: pip install openwakeword)"
+            ) from None
+        self._model = Model(wakeword_models=list(wake_words))
+        self.threshold = threshold
+        self.expected_frame_samples = expected_frame_samples
+
+    def score(self, frame: Frame) -> float:
+        import numpy as np
+
+        if frame.pcm is None:
+            raise ValueError("RealtimeSTTGate needs frame.pcm (raw int16 audio)")
+        samples = np.frombuffer(frame.pcm, dtype=np.int16)
+        preds = self._model.predict(samples)
+        return max(preds.values()) if preds else 0.0
+
+    def reset(self) -> None:
+        self._model.reset()

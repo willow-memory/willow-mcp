@@ -119,6 +119,10 @@ voice = [
     "sounddevice>=0.4,<1.0",
     "torch>=2.2,<3.0",
 ]
+gcal = [
+    "google-api-python-client>=2.0,<3.0",
+    "google-auth>=2.0,<3.0",
+]
 # The test bootstrap: `pip install -e ".[test]"` reproduces CI's test job from
 # ONE declared place instead of an imperative `pip install` line in tests.yml.
 # pyyaml + jsonschema are what makes this a real dependency group and not just
