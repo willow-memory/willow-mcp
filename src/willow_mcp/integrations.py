@@ -237,7 +237,7 @@ class GitHubAdapter(BaseAdapter):
     doc = "GitHub REST v3 — repos, PRs, issues, checks"
     env_vars = ("WILLOW_GITHUB_TOKEN", "GITHUB_TOKEN")
     extra_headers = {"Accept": "application/vnd.github+json",
-                     "X-GitHub-Api-Version": "2022-11-28"}
+                     "X-GitHub-Api-Version": os.environ.get("WILLOW_GITHUB_API_VERSION", "2022-11-28")}
 
 
 class HuggingFaceAdapter(BaseAdapter):

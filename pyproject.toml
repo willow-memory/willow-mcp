@@ -183,6 +183,10 @@ packages = ["willow-mcp", "jeles", "kartikeya"]
 # Tagging them is archaeology only — `skip-existing` in release.yml keeps the
 # resulting workflow runs from failing on versions PyPI already holds.
 source = "vcs"
+# When no git tags are reachable (fresh clone, shallow checkout without tags),
+# hatch-vcs falls back to this version instead of 0.0.0+unknown.  Keep it in
+# sync with .release-please-manifest.json — release-please bumps both.
+fallback-version = "2.13.1"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/willow_mcp"]

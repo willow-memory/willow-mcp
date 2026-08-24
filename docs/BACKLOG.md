@@ -25,12 +25,12 @@ code itself.
 | W-09 | debt | Open | error handling | 30+ `except Exception: pass` blocks with no logging |
 | W-10 | debt | Done | file I/O | Non-atomic writes in `nest/taxonomy.py`, `nest/selflearn.py`, `session_inject.py` |
 | W-11 | debt | Done | integrations | Mutable default dict `extra_headers: dict = {}` as class attribute on `BaseAdapter` |
-| W-12 | debt | Open | web_search | Global cache replacement race in `reset_search_cache()` |
+| W-12 | debt | Done | web_search | Global cache replacement race in `reset_search_cache()` |
 | W-13 | debt | Done | types | `type: ignore[return-value]` in `bound_receipt.py:312` |
-| W-14 | debt | Open | integrations | Pinned `X-GitHub-Api-Version: 2022-11-28` will eventually deprecate |
+| W-14 | debt | Done | integrations | Pinned `X-GitHub-Api-Version: 2022-11-28` will eventually deprecate |
 | W-15 | debt | Open | packaging | `nestor` is an unpublished git dependency -- 3 tools permanently unavailable on standard install |
 | W-16 | debt | Done | docs | B-33 `Ref` column says `willow-mcp#TBD` -- issue number never recorded |
-| W-17 | debt | Open | packaging | Version falls back to `0.0.0+unknown` on fresh clone (no git tags) |
+| W-17 | debt | Done | packaging | Version falls back to `0.0.0+unknown` on fresh clone (no git tags) |
 | W-18 | idea | Open | voice | Wire the RealtimeSTT wake-gate (`voice/wake_gate.py:73`) |
 | W-19 | idea | Open | commitments | Wire Google Calendar sync transport (`commitments/calendar_source.py:116`) |
 | W-20 | idea | Done | server | Make hardcoded limits configurable via `WILLOW_*` env vars |

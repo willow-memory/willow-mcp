@@ -1015,12 +1015,14 @@ class _TTLCache:
 
 
 _SEARCH_CACHE = _TTLCache(maxsize=_env_int("WILLOW_SEARCH_CACHE_SIZE", 256))
+_SEARCH_CACHE_LOCK = threading.Lock()
 
 
 def reset_search_cache() -> None:
     """Clear the query cache and re-read its size from env (test/operator reset)."""
     global _SEARCH_CACHE
-    _SEARCH_CACHE = _TTLCache(maxsize=_env_int("WILLOW_SEARCH_CACHE_SIZE", 256))
+    with _SEARCH_CACHE_LOCK:
+        _SEARCH_CACHE = _TTLCache(maxsize=_env_int("WILLOW_SEARCH_CACHE_SIZE", 256))
 
 
 def search_web(
@@ -1046,13 +1048,15 @@ def search_web(
     cfg = _cache_config()
     order = [p.name for p in providers] if providers is not None else _provider_order()
     use_cache = cache and cfg["enabled"]
+    with _SEARCH_CACHE_LOCK:
+        local_cache = _SEARCH_CACHE
     key = (
         _cache_key(query, max_results, trusted_only, include_handoffs, order)
         if use_cache
         else None
     )
     if key is not None:
-        cached = _SEARCH_CACHE.get(key)
+        cached = local_cache.get(key)
         if cached is not None:
             _log_search_event(query_hash=_query_hash(query), provider="cache",
                               status="ok", result_count=len(cached), latency_ms=0.0,
@@ -1090,5 +1094,5 @@ def search_web(
         ttl = cfg["ttl_news"] if _is_current_events(query) else cfg["ttl"]
         # Copies on the way in too — `result` is what this caller is about to
         # be handed, so storing those same objects would let them mutate it.
-        _SEARCH_CACHE.set(key, [dict(h) for h in result], ttl)
+        local_cache.set(key, [dict(h) for h in result], ttl)
     return result
