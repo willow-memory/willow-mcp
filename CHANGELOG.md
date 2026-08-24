@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.13.2](https://github.com/willow-memory/willow-mcp/compare/v2.13.1...v2.13.2) (2026-08-24)
+
+
+### Fixed
+
+* B-60, B-63 bugs + W-01, W-06, W-07, W-08 gaps ([b191771](https://github.com/willow-memory/willow-mcp/commit/b191771e32de3b2d4958e15a61ed1e381ac84cbb))
+* move logger definitions after all imports to satisfy ruff E402 ([e236400](https://github.com/willow-memory/willow-mcp/commit/e236400ebe9c35d19b18fd9544739050f41b2004))
+* **W-09:** add logger.debug to 21 silent except-Exception blocks ([cab50b5](https://github.com/willow-memory/willow-mcp/commit/cab50b53399f8265e9a506f64cdf22996fd95620))
+* W-10, W-11, W-13, W-16 debt items ([359ea16](https://github.com/willow-memory/willow-mcp/commit/359ea16772b9a9dffe505fc3c1ed3d06118da078))
+* W-12, W-14, W-17 debt items ([7a0b42a](https://github.com/willow-memory/willow-mcp/commit/7a0b42a49c42b88b5aa1d578a35792f1e2063210))
+* **W-21:** rotate pending.jsonl when it exceeds threshold ([cc877b4](https://github.com/willow-memory/willow-mcp/commit/cc877b4d777b82d6a2fbe59ef54cc9c5c0ecf5a6))
+
 ## [2.13.1](https://github.com/willow-memory/willow-mcp/compare/v2.13.0...v2.13.1) (2026-08-24)
 
 
