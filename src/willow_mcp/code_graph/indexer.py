@@ -89,6 +89,7 @@ def _index_file(
 
     symbols: list[tuple] = []
     edges: list[tuple] = []
+    class_method_ids: set[int] = set()
 
     # Module-level symbol
     symbols.append((
@@ -130,9 +131,10 @@ def _index_file(
                 except Exception:
                     pass
 
-            # Methods
+            # Methods — track their ids so the FunctionDef branch skips them
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    class_method_ids.add(id(item))
                     method_fqn = f"{class_fqn}.{item.name}"
                     mend = getattr(item, "end_lineno", item.lineno)
                     mbytes = sum(len(lines[i]) + 1
@@ -142,9 +144,10 @@ def _index_file(
                         rel_path, item.lineno, mend, _sig(item), mbytes,
                     ))
 
-        # Module-level functions
+        # Module-level functions (skip class methods already handled above)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # Skip if inside a class (already handled above)
+            if id(node) in class_method_ids:
+                continue
             func_fqn = f"{module_fqn}.{node.name}"
             fend = getattr(node, "end_lineno", node.lineno)
             fbytes = sum(len(lines[i]) + 1
@@ -178,6 +181,7 @@ def _index_file(
         (rel_path, "python", byte_size, len(lines), len(symbols),
          datetime.now(timezone.utc).isoformat()),
     )
+    conn.commit()
     return len(symbols)
 
 

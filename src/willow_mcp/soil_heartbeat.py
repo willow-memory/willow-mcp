@@ -109,9 +109,11 @@ def write_watchmen_heartbeat(
                 """
             )
             conn.execute(
-                "INSERT OR REPLACE INTO records "
+                "INSERT INTO records "
                 "(id, data, created_at, updated_at, deviation, action, deleted) "
-                "VALUES (?, ?, ?, ?, 0.0, 'work_quiet', 0)",
+                "VALUES (?, ?, ?, ?, 0.0, 'work_quiet', 0) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "data=excluded.data, updated_at=excluded.updated_at",
                 (watchmen_key, json.dumps(payload), now, now),
             )
             conn.commit()
