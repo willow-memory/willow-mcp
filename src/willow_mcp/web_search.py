@@ -1035,7 +1035,7 @@ def search_web(
     """
     General open web search for Willow.
 
-    trusted_only: filter to verified institutional domain suffixes.
+    trusted_only: heuristic filter on hostname suffix (not verification).
     include_handoffs: prepend map/search URLs for navigational queries.
     cache: serve/store via the in-process LRU+TTL cache (opt-out per call;
         WILLOW_SEARCH_CACHE=0 disables globally). Current-events queries get a
@@ -1070,10 +1070,9 @@ def search_web(
     raw = _search_providers(query, max_results, providers)
     if trusted_only:
         # The handoffs go through the same filter. They were exempt, so
-        # `trusted_only=True` returned google.com and duckduckgo.com — and the
-        # tool's own description promises "keep verified institutional domain
-        # suffixes only", with the handoffs mixed into one flat `results` list
-        # that gives a model no way to tell which is which.
+        # `trusted_only=True` returned google.com and duckduckgo.com — mixed
+        # into one flat `results` list that gives a model no way to tell
+        # filtered from unfiltered.
         hits = [h for h in hits if _trusted_host(h.get("hostname", ""))]
         raw = [h for h in raw if _trusted_host(h.get("hostname", ""))]
 
