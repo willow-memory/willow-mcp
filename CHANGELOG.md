@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.13.4](https://github.com/willow-memory/willow-mcp/compare/v2.13.3...v2.13.4) (2026-08-24)
+
+
+### Fixed
+
+* **W-09/W-10/W-12:** re-vendor nest/ from upstream safe-app-store#210 ([6d55d95](https://github.com/willow-memory/willow-mcp/commit/6d55d95010ed34cee95927a6e1142df602f9c94b))
+
 ## [2.13.3](https://github.com/willow-memory/willow-mcp/compare/v2.13.2...v2.13.3) (2026-08-24)
 
 
