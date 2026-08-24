@@ -36,11 +36,9 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* remaining 'verified' descriptions of trusted_only ([#288](https://github.com/willow-memory/willow-mcp/issues/288)) ([701cc02](https://github.com/willow-memory/willow-mcp/commit/701cc027e423acedd644f4c58663a38a3955771c))
-* stale docstrings and trusted_only heuristic labelling ([748de42](https://github.com/willow-memory/willow-mcp/commit/748de42f8cd5570ef3951903224383a906e901fd))
-* stale docstrings and trusted_only labelling ([#288](https://github.com/willow-memory/willow-mcp/issues/288)) ([df0f9b0](https://github.com/willow-memory/willow-mcp/commit/df0f9b0a7dbf1162ff0768c5c41185dcc7c22074))
-* update repo owner references after org transfer ([6809fce](https://github.com/willow-memory/willow-mcp/commit/6809fcee04478d2314a2b50c8199f40bbbf03a8a))
 * update repo owner references after org transfer ([c139acc](https://github.com/willow-memory/willow-mcp/commit/c139acc708f30ec71f398f712ceb7dc00c99a9b1))
+* remaining 'verified' descriptions of trusted_only (#288) ([701cc02](https://github.com/willow-memory/willow-mcp/commit/701cc027e423acedd644f4c58663a38a3955771c))
+* stale docstrings and trusted_only labelling (#288) ([df0f9b0](https://github.com/willow-memory/willow-mcp/commit/df0f9b0a7dbf1162ff0768c5c41185dcc7c22074))
 
 ## [2.13.0](https://github.com/rudi193-cmd/willow-mcp/compare/v2.12.0...v2.13.0) (2026-08-19)
 
