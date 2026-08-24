@@ -16,7 +16,7 @@ code itself.
 |----|-----|--------|-----------|----------|
 | W-01 | gap | Done | plugin | 5 skill files on disk not registered in `plugin.json` |
 | W-02 | gap | Done | tests | 8 MCP tools with zero test coverage |
-| W-03 | gap | Open | tests | 29 source modules with no corresponding test file |
+| W-03 | gap | Done | tests | 29 source modules with no corresponding test file |
 | W-04 | gap | Done | db | `get_pg()` silently returns None on Postgres connection failure -- no logging |
 | W-05 | gap | Done | config | `.mcp.json` sets `WILLOW_PG_DB=willow`; Grove requires `willow_20` |
 | W-06 | gap | Done | gate / kart | `check_kart_task()` exception silently swallowed in `task_submit` |
@@ -73,13 +73,35 @@ These MCP tools are not referenced in any test file:
 | `lineage_list` | `server.py:1318` |
 | `lineage_why` | `server.py:1302` |
 
-### W-03 · gap · 29 modules with no test file
+### W-03 · gap · Dedicated tests added for governance_ledger, receipts, handoff
 
 Most significant by line count: `dispatch.py` (787 lines), `db.py` (623),
 `governance_ledger.py` (334), `session_binder.py` (275), `receipts.py` (236),
 `worker.py` (219), `handoff.py` (179), `pgp.py` (159). Some are exercised
 indirectly through integration tests but lack dedicated unit tests for edge
 cases and error paths.
+
+**Done (2026-08-24).** Added 77 dedicated tests across three new files:
+
+- `test_governance_ledger.py` (30 tests) — `_decode`, `_payload`/`_payload_v2`
+  canonicalization, `entry_hash`/`entry_hash_v2` sensitivity and determinism,
+  `verify()` edge cases (empty chain, single row, content tamper, prev_hash
+  break, expected_head match/mismatch), `rechain()` anchor guards
+  (head_mismatch, untrusted, unreadable, unanchored, force bypass, marker
+  append).
+- `test_receipts.py` (26 tests) — `_entry_hash` pure function sensitivity,
+  chain integrity (record+verify, tamper detection, deleted row detection),
+  `on_record` observer, `tail()` ordering/scoping/limits, `since()` filtering,
+  `distinct_tools()`, migration backfill of legacy unchained rows.
+- `test_handoff.py` (21 tests) — `_utc_now` format, `_render_closeout`
+  rendering (basic, findings table, no narrative, date extraction, role
+  resolution, empty written_at), `handoff_write_v4` (success, wrong recipient,
+  dispatch error), `handoff_read` (success, not found, symlink refused, no
+  closeout), `verify_handoff` (verified, empty finding text, unresolved
+  checklist, unclean envelope, not complete, dispatch error).
+
+Remaining untested modules (dispatch, db, session_binder, worker, pgp) are
+primarily Postgres-dependent and would benefit from integration-test fixtures.
 
 ### W-04 · gap · Postgres connection failure is silent
 
