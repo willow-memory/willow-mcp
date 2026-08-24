@@ -1,7 +1,7 @@
 {
   "name": "willow-mcp",
   "description": "Willow sovereign agent platform — SQLite store, Postgres knowledge base, Kart task queue, plus the hooks and skills that keep them used correctly.",
-  "version": "2.13.0",
+  "version": "2.13.1",
   "hooks": {
     "SessionStart": [
       {

@@ -31,6 +31,15 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.13.1](https://github.com/willow-memory/willow-mcp/compare/v2.13.0...v2.13.1) (2026-08-24)
+
+
+### Fixed
+
+* update repo owner references after org transfer ([c139acc](https://github.com/willow-memory/willow-mcp/commit/c139acc708f30ec71f398f712ceb7dc00c99a9b1))
+* remaining 'verified' descriptions of trusted_only (#288) ([701cc02](https://github.com/willow-memory/willow-mcp/commit/701cc027e423acedd644f4c58663a38a3955771c))
+* stale docstrings and trusted_only labelling (#288) ([df0f9b0](https://github.com/willow-memory/willow-mcp/commit/df0f9b0a7dbf1162ff0768c5c41185dcc7c22074))
+
 ## [2.13.0](https://github.com/rudi193-cmd/willow-mcp/compare/v2.12.0...v2.13.0) (2026-08-19)
 
 
