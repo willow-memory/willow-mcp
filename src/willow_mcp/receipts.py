@@ -15,10 +15,11 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-logger = logging.getLogger("willow_mcp.receipts")
 from typing import Optional
 
 from . import paths
+
+logger = logging.getLogger("willow_mcp.receipts")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS receipts (

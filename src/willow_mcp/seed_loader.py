@@ -15,12 +15,13 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-logger = logging.getLogger("willow_mcp.seed_loader")
 from typing import Any
 
 from .paths import seeds_dir, store_root, willow_home
 from . import pgp
 from .db import Store
+
+logger = logging.getLogger("willow_mcp.seed_loader")
 
 SEED_FORMAT = "agent_seed_v1"
 _AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
