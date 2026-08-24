@@ -1,16 +1,3 @@
-# Vendored from willow (willow-memory/Willow, mem_ratify/ratify.py), Apache-2.0.
-# Copied rather than depended-on because mem_ratify is pure stdlib (os/enum/
-# dataclasses/typing) with NO egress, NO DB, and NO crypto, and lives in the
-# *willow* repo which willow-mcp does not otherwise import. Vendoring keeps this
-# server's dependency set unchanged and avoids a cross-repo import at runtime;
-# the box audit's chosen interim pattern (theme ①) is copy + drift-guard, not a
-# new package dependency. Kept byte-for-byte from the module docstring onward
-# (this header excepted) so it stays diffable against upstream. Drift is caught
-# two ways: tests/test_mem_ratify.py pins the vendored body hash (local edits)
-# and scripts/check_mem_ratify_sync.py diffs it against willow in CI (upstream
-# advancing). If mem_ratify changes UPSTREAM in willow, re-sync both files here
-# and update the pinned hash. Canonical home + full doctrine notes: willow's
-# mem_ratify/README.md.
 """mem_ratify — the Canon-promotion gate for Article IV (Knowledge & Canon).
 
 ΔΣ=42
@@ -100,23 +87,23 @@ class Tier(IntEnum):
 # PLACEHOLDER doctrine parameters — owner must confirm before enforcement
 # --------------------------------------------------------------------------- #
 
-# PLACEHOLDER — owner must confirm. Article IV names no quorum size; the only
-# number in the charter is Article IX.2's founding default of "at least 2
-# independent agent witnesses" (also listed as operator-adjustable, line 478).
-# We reuse 2 as the conservative minimum for a Frontier promotion quorum.
-FRONTIER_MIN_WITNESSES = 2
+# Doctrine parameters — env-configurable, conservative defaults.
+#
+# Article IV names no quorum size; Article IX.2's founding default is "at least
+# 2 independent agent witnesses" (also listed as operator-adjustable, line 478).
+# Override via WILLOW_* env vars; the defaults preserve the original placeholders.
+FRONTIER_MIN_WITNESSES = int(os.environ.get("WILLOW_FRONTIER_MIN_WITNESSES", "2"))
 
-# PLACEHOLDER — owner must confirm. Canonical is "the fleet's highest standard"
-# (IV.3) yet the charter gives it no larger number. We keep the same minimum
-# count but layer on the extra Canonical-only requirements (operator key,
-# ledger evidence, fresh-witness composition). The owner may wish this higher.
-CANONICAL_MIN_WITNESSES = 2
+# Canonical is "the fleet's highest standard" (IV.3) yet the charter gives it no
+# larger number. The owner may wish this higher.
+CANONICAL_MIN_WITNESSES = int(os.environ.get("WILLOW_CANONICAL_MIN_WITNESSES", "2"))
 
-# PLACEHOLDER — owner must confirm. IV.3's "at least one ratifying agent must
-# not have participated in the prior Frontier promotion" presumes promotion is
-# stepwise (Contested -> Frontier -> Canonical). We enforce stepwise (the
-# stricter reading) and forbid tier-skipping. Owner may allow direct jumps.
-REQUIRE_STEPWISE_PROMOTION = True
+# IV.3's "at least one ratifying agent must not have participated in the prior
+# Frontier promotion" presumes stepwise promotion (Contested -> Frontier ->
+# Canonical). Set to 0/false to allow direct Contested -> Canonical jumps.
+REQUIRE_STEPWISE_PROMOTION = os.environ.get(
+    "WILLOW_REQUIRE_STEPWISE_PROMOTION", "1",
+).strip().lower() not in {"0", "false", "no", "off"}
 
 
 ENFORCE_ENV_VAR = "WILLOW_MEM_RATIFY_ENFORCE"

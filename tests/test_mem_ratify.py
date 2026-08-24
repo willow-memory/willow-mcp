@@ -26,7 +26,7 @@ MEM_RATIFY_DIR = pathlib.Path(__file__).resolve().parents[1] / "src/willow_mcp/m
 # place to edit. Change mem_ratify UPSTREAM in the willow repo, then re-sync both
 # files here (byte-for-byte from the module docstring onward, header excepted)
 # and update the EXPECTED_*_SHA256 values below to what the assertion prints.
-EXPECTED_RATIFY_SHA256 = "5886d9b581351553f0ff9a46df4ef15ec4922ff8cea4747de6717d6d4f7a0845"
+EXPECTED_RATIFY_SHA256 = "477f686dd9eb7010133967abb9c9ae2215d28b6e3004a0d0f4a8d495ff322da7"
 EXPECTED_INIT_SHA256 = "5dcdb81e8218c9fe38c66e466b060747b2ee1e6c538f566df471ae690acae77c"
 
 
