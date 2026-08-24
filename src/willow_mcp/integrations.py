@@ -365,7 +365,7 @@ class DatadogStub(StubAdapter):
 
 class JiraStub(StubAdapter):
     name = "jira"
-    base_url = "https://example.atlassian.net"  # per-site host — set when earned
+    base_url = os.environ.get("WILLOW_JIRA_URL", "https://example.atlassian.net")  # per-site host — set when earned
     doc = "Jira Cloud API — issues, transitions"
     needs = "per-site base URL config + API token; mapping to task_queue states"
     earned_by = "a task-queue sync request against a real Jira site twice"

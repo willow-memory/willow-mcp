@@ -86,6 +86,8 @@ def _bundle_path() -> Path:
 
 def _store():
     parts = _nestor()
+    if parts is None:
+        return None
     _, _, _, cascade, SqliteStore = parts
     _oracle_dir().mkdir(parents=True, exist_ok=True)
     cascade.set_ledger_path(_ledger_path())

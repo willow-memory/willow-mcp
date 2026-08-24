@@ -2136,7 +2136,9 @@ def task_submit(
     try:
         from kartikeya import check_kart_task
         blocked = check_kart_task(task or "")
-    except Exception:
+    except Exception as exc:
+        import logging
+        logging.getLogger("willow_mcp.server").warning("check_kart_task failed: %s", exc)
         blocked = None
     if blocked:
         return blocked

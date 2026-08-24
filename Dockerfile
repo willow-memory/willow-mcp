@@ -30,6 +30,7 @@ USER willow
 # Glama only needs the server to start and respond to introspection.
 # SAP auth is disabled when no PGP fingerprint is set.
 # Postgres is optional — server degrades gracefully without it.
-ENV WILLOW_APP_ID=glama-inspect
+ARG WILLOW_APP_ID=glama-inspect
+ENV WILLOW_APP_ID=${WILLOW_APP_ID}
 
 CMD ["python", "-m", "willow_mcp"]

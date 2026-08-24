@@ -14,14 +14,14 @@ code itself.
 
 | ID | Cat | Status | Component | One-line |
 |----|-----|--------|-----------|----------|
-| W-01 | gap | Open | plugin | 5 skill files on disk not registered in `plugin.json` |
+| W-01 | gap | Done | plugin | 5 skill files on disk not registered in `plugin.json` |
 | W-02 | gap | Done | tests | 8 MCP tools with zero test coverage |
 | W-03 | gap | Open | tests | 29 source modules with no corresponding test file |
 | W-04 | gap | Done | db | `get_pg()` silently returns None on Postgres connection failure -- no logging |
 | W-05 | gap | Done | config | `.mcp.json` sets `WILLOW_PG_DB=willow`; Grove requires `willow_20` |
-| W-06 | gap | Open | gate / kart | `check_kart_task()` exception silently swallowed in `task_submit` |
-| W-07 | gap | Open | integrations | Jira stub has hardcoded placeholder `example.atlassian.net` URL |
-| W-08 | gap | Open | deploy | Dockerfile bakes in `WILLOW_APP_ID=glama-inspect` |
+| W-06 | gap | Done | gate / kart | `check_kart_task()` exception silently swallowed in `task_submit` |
+| W-07 | gap | Done | integrations | Jira stub has hardcoded placeholder `example.atlassian.net` URL |
+| W-08 | gap | Done | deploy | Dockerfile bakes in `WILLOW_APP_ID=glama-inspect` |
 | W-09 | debt | Open | error handling | 30+ `except Exception: pass` blocks with no logging |
 | W-10 | debt | Open | file I/O | Non-atomic writes in `nest/taxonomy.py`, `nest/selflearn.py`, `session_inject.py` |
 | W-11 | debt | Open | integrations | Mutable default dict `extra_headers: dict = {}` as class attribute on `BaseAdapter` |

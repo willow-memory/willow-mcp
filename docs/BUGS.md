@@ -76,10 +76,10 @@ log carries a one-line entry and points there rather than duplicating.
 | B-13 | P3 | Fixed | tests | Rate-limit tests shared one `app_id`, exhausting the token bucket → cross-test failures | (in-tree; `_buckets` reset in fixtures) |
 | B-58 | P2 | Fixed | code_graph / indexer | `ast.walk` double-counts class methods — methods added once as `module.Class.method` (ClassDef branch) and again as `module.method` (FunctionDef branch); comment "Skip if inside a class" at line 147 checks nothing. `ON CONFLICT DO UPDATE` prevents crash but produces incorrect FQNs and inflated symbol counts | audit 2026-08-24; branch `claude/hanuman-bugfix-b58-b59-b64` |
 | B-59 | P2 | Fixed | db / soil_heartbeat | `soil_heartbeat.py:112` uses `INSERT OR REPLACE INTO records` — the exact pattern `db.py:173` moved away from (deletes+re-inserts, resetting `deleted` to 0 and `created_at`). Inconsistent with the documented security fix | audit 2026-08-24; branch `claude/hanuman-bugfix-b58-b59-b64` |
-| B-60 | P2 | Open | tool_oracle | `_store()` destructures `_nestor()` result without None check — raises `TypeError: cannot unpack non-iterable NoneType` when Nestor is unavailable. Callers guard, but `_store()` itself does not | audit 2026-08-24 |
+| B-60 | P2 | Fixed | tool_oracle | `_store()` destructures `_nestor()` result without None check — raises `TypeError: cannot unpack non-iterable NoneType` when Nestor is unavailable. Callers guard, but `_store()` itself does not | audit 2026-08-24; fixed 2026-08-24 |
 | B-61 | P2 | Fixed | oauth / serve | Google and Apple sign-in error handlers render raw `f"{exc}"` into HTML response (`oauth.py:589,646`). If exception contains internal details (stack traces, URLs), leaks sensitive info to browser | audit 2026-08-24; branch `claude/loki-security-b61-b62` |
 | B-62 | P2 | Fixed | session_inject | `_MARKER` at `session_inject.py:14` is a predictable, world-readable `/tmp/willow-session-inject-marker.json`. Multi-user collision; another process can tamper to replay or suppress injections | audit 2026-08-24; branch `claude/loki-security-b61-b62` |
-| B-63 | P2 | Open | federation | `_ServerConnection._ensure_started()` at `mcp_federation_client.py:330` checks `self._thread is not None` without a lock. Two concurrent callers can both start threads. `connect()`/`list_tools()`/`call_tool()` call it directly | audit 2026-08-24 |
+| B-63 | P2 | Fixed | federation | `_ServerConnection._ensure_started()` at `mcp_federation_client.py:330` checks `self._thread is not None` without a lock. Two concurrent callers can both start threads. `connect()`/`list_tools()`/`call_tool()` call it directly | audit 2026-08-24; fixed 2026-08-24 |
 | B-64 | P3 | Fixed | code_graph / indexer | `_index_file()` uses `executemany()`/`execute()` for symbols/edges/indexed-files inserts but never calls `conn.commit()`. Data lost if caller does not commit and connection closes | audit 2026-08-24; branch `claude/hanuman-bugfix-b58-b59-b64` |
 | B-08 | P2 | Stale | packaging | `requirements.txt` unpinned — never existed in current `pyproject.toml` layout | L-REQ-01 |
 | B-09 | P2 | Stale | gate | Silent fallback on missing SAP gate — `openclaw_sap_gate` gone in rewritten `gate.py` | L-AUTH-01 |
@@ -111,23 +111,17 @@ log carries a one-line entry and points there rather than duplicating.
   (`~/.config/willow-mcp/egress/private.pem` readable by MCP uid). **Fix:** #182
   custody (`harden-trust-root` / operator-owned key); not an MCP code path.
 
-- **B-60 · P2** — **`tool_oracle._store()` crashes when Nestor unavailable.**
-  `_store()` calls `_nestor()` and destructures the result
-  (`_, _, _, cascade, SqliteStore = parts`) without checking if `parts` is None.
-  If Nestor is not installed, `_nestor()` returns None and this raises
-  `TypeError: cannot unpack non-iterable NoneType object`. Callers like `route()`
-  and `seal()` check `_nestor() is None` first, but `_store()` does not guard
-  itself. **Fix:** add a None guard at the top of `_store()`.
-
-- **B-63 · P2** — **Race condition in federation client `_ensure_started()`.**
-  `_ServerConnection._ensure_started()` (`mcp_federation_client.py:330`) checks
-  `self._thread is not None` without holding a lock. Two concurrent callers can
-  both see None and both start a thread. The module-level `_registry_lock` is held
-  by `_get_connection()`, but `connect()`/`list_tools()`/`call_tool()` call
-  `_ensure_started()` directly without the lock. **Fix:** add an instance-level
-  lock to `_ensure_started()`.
-
 ## Fixed
+
+- **B-60 · P2 (2026-08-24)** — **`tool_oracle._store()` crashed when Nestor
+  unavailable.** `_store()` destructured `_nestor()` result without None check.
+  Fixed: added None guard at top of `_store()`, returning None when Nestor is not
+  installed instead of raising `TypeError`.
+
+- **B-63 · P2 (2026-08-24)** — **Race condition in federation client
+  `_ensure_started()`.** Two concurrent callers could both see
+  `self._thread is None` and both start threads. Fixed: added instance-level
+  `self._start_lock` wrapping the entire `_ensure_started()` body.
 
 - **B-58 · P2 (2026-08-24)** — **Code graph indexer double-counted class
   methods.** `ast.walk` traverses flat; methods appeared both as
