@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import time
 from pathlib import Path
 
+logger = logging.getLogger("willow_mcp.session_inject")
 _DEDUP_TTL_SEC = 300
 # tempfile.gettempdir(), not a hardcoded "/tmp" literal: honors TMPDIR/TEMP
 # overrides and keeps this portable off Linux, where /tmp is not a given.
@@ -80,7 +82,7 @@ def record_injection(session_id: str, fingerprint: str, *, lite: bool) -> None:
         )
         os.replace(tmp, _MARKER)
     except Exception:
-        pass
+        logger.debug("marker write failed", exc_info=True)
 
 
 def minimal_continuation_block(agent: str, postgres: str, next_bite: str = "") -> list[str]:

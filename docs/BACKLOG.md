@@ -22,7 +22,7 @@ code itself.
 | W-06 | gap | Done | gate / kart | `check_kart_task()` exception silently swallowed in `task_submit` |
 | W-07 | gap | Done | integrations | Jira stub has hardcoded placeholder `example.atlassian.net` URL |
 | W-08 | gap | Done | deploy | Dockerfile bakes in `WILLOW_APP_ID=glama-inspect` |
-| W-09 | debt | Open | error handling | 30+ `except Exception: pass` blocks with no logging |
+| W-09 | debt | Done | error handling | 30+ `except Exception: pass` blocks with no logging |
 | W-10 | debt | Done | file I/O | Non-atomic writes in `nest/taxonomy.py`, `nest/selflearn.py`, `session_inject.py` |
 | W-11 | debt | Done | integrations | Mutable default dict `extra_headers: dict = {}` as class attribute on `BaseAdapter` |
 | W-12 | debt | Done | web_search | Global cache replacement race in `reset_search_cache()` |

@@ -92,7 +92,9 @@ class GroveOAuthProvider:
             try:
                 return json.loads(self._token_path.read_text())
             except Exception:
-                pass
+                import logging
+                logging.getLogger("willow_mcp.oauth").debug(
+                    "corrupt token store at %s, resetting", self._token_path, exc_info=True)
         return {"clients": {}, "access_tokens": {}, "refresh_tokens": {}}
 
     def _save_state(self) -> None:

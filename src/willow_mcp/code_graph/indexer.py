@@ -60,7 +60,7 @@ def _sig(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
             try:
                 args[idx] += f" = {ast.unparse(default)}"
             except Exception:
-                pass
+                logger.debug("ast.unparse failed for default arg %d", idx, exc_info=True)
     if node.args.vararg:
         args.append(f"*{node.args.vararg.arg}")
     if node.args.kwarg:
@@ -128,7 +128,7 @@ def _index_file(
                     if not any(base_name.startswith(s) for s in _SKIP_TARGETS):
                         edges.append((class_fqn, base_name, "inherit"))
                 except Exception:
-                    pass
+                    logger.debug("ast.unparse failed for base of %s", class_fqn, exc_info=True)
 
             # Methods
             for item in node.body:

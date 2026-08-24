@@ -116,5 +116,5 @@ def announce(app_id: str, tool: str, outcome: str, trust_level: Optional[int],
         _sink({"app_id": app_id, "tool": tool, "outcome": outcome,
                "trust_level": trust_level, "volume": vol, "message": message})
     except Exception:
-        pass
+        logger.debug("announce sink failed for tool=%s", tool, exc_info=True)
     return vol

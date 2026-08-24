@@ -9,10 +9,13 @@ See docs/design/agent-seed.md.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger("willow_mcp.seed_loader")
 from typing import Any
 
 from .paths import seeds_dir, store_root, willow_home
@@ -211,6 +214,7 @@ def seed_corpus_corrections() -> int:
             )
             seeded += 1
         except Exception:
+            logger.debug("seed store_put failed for %s", record_id, exc_info=True)
             continue
     return seeded
 

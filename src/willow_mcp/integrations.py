@@ -111,7 +111,7 @@ class BaseAdapter:
             if default_vault().has(vault_key(self.name)):
                 return "vault"
         except Exception:
-            pass
+            logger.debug("vault check failed for %s", self.name, exc_info=True)
         return None
 
     # ── transport ────────────────────────────────────────────────────────────
@@ -196,7 +196,7 @@ class BaseAdapter:
                 try:
                     detail = e.read(500).decode("utf-8", errors="ignore")
                 except Exception:
-                    pass
+                    logger.debug("error body read failed", exc_info=True)
                 if e.code in _RETRYABLE and attempt + 1 < _MAX_ATTEMPTS:
                     time.sleep(_retry_delay(e.headers.get("Retry-After"), attempt))
                     continue

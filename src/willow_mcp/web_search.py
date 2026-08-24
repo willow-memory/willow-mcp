@@ -240,7 +240,7 @@ def _unwrap_ddg(href: str) -> str:
             if qs.get("uddg"):
                 return unquote(qs["uddg"][0])
         except Exception:
-            pass
+            log.debug("uddg extraction failed for %s", href, exc_info=True)
     return href
 
 
