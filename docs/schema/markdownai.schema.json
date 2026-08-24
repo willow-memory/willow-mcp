@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/rudi193-cmd/willow-mcp/docs/schema/markdownai.schema.json",
+  "$id": "https://github.com/willow-memory/willow-mcp/docs/schema/markdownai.schema.json",
   "title": "MarkdownAI (mai) document frontmatter",
   "description": "Schema for the optional YAML frontmatter of a @markdownai v1.0 document. The frontmatter block, when present, MUST precede the `@markdownai v1.0` header (see docs/markdownai-schema.md). Field sets are grounded in the willow-mcp templates: skills (skills/*.md), ASSIGNMENT and CLOSEOUT (docs/templates/, bundle/templates/). The body grammar (directives) is specified in prose in docs/markdownai-schema.md, not here.",
   "type": "object",

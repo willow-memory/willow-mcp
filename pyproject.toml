@@ -108,7 +108,7 @@ web = [
 # published to PyPI. Plain `pip install willow-mcp` stands up the server
 # without it (the oracle verbs report status='unavailable'); to enable
 # routing, install the engine directly alongside:
-#   pip install "nestor @ git+https://github.com/rudi193-cmd/Nestor@master"
+#   pip install "nestor @ git+https://github.com/Die-Namic-Systems/Nestor@master"
 # Once Nestor is on PyPI, restore:  nestor = ["nestor>=<first-published-tag>"]
 # Sentry telemetry for the Bug Smash observability experiment. Opt-in only:
 # inert unless WILLOW_SENTRY_DSN is set at runtime (see observability.py).
@@ -152,10 +152,10 @@ willow-mcp-compile-persona = "willow_mcp.persona_compile:main"
 willow-mcp-integrations = "willow_mcp.integrations:main"
 
 [project.urls]
-Homepage = "https://github.com/rudi193-cmd/willow-mcp"
-Repository = "https://github.com/rudi193-cmd/willow-mcp"
-Issues = "https://github.com/rudi193-cmd/willow-mcp/issues"
-Changelog = "https://github.com/rudi193-cmd/willow-mcp/blob/master/CHANGELOG.md"
+Homepage = "https://github.com/willow-memory/willow-mcp"
+Repository = "https://github.com/willow-memory/willow-mcp"
+Issues = "https://github.com/willow-memory/willow-mcp/issues"
+Changelog = "https://github.com/willow-memory/willow-mcp/blob/master/CHANGELOG.md"
 
 [tool.willow.fleet]
 # The packages this operator releases, and therefore the ones whose bump policy

@@ -256,7 +256,7 @@ This inverts the **sudo invariant** (FRANK `90e52ab7`): *the model may REQUEST e
 4. **The residual is reported, never implied away.** `diagnostic_summary.checks.net_lease.self_writable` lists exactly which authorizing keys the running process could forge. `WILLOW_MCP_STRICT_TRUST_ROOT=1` turns that into a refusal (`trust_root_denied`).
 5. **The PreToolUse hook blocks the crossing** — `grant-net`, a write under `_net_leases/`, or an edit adding `task_net` to a manifest. A hook is a guardrail in the agent's own harness, not a control; it makes the boundary visible where it would be crossed.
 
-**Not closed.** On a single-uid host the agent can still write the lease. It must now forge a *third* artifact, with a clock, under audit — but the operating system is not stopping it. **Strict mode is off by default**, because enabling it before uid separation exists would deny egress on every current install. The genuine fix is ownership: `chown` `mcp_apps/` and `mcp_apps/_net_leases/` to a uid the agent's process does not run as, then set `WILLOW_MCP_STRICT_TRUST_ROOT=1`. That is a deployment step this repo can support and check but cannot perform. Tracked as B-32 in `docs/BUGS.md`, and as [issue #231](https://github.com/rudi193-cmd/willow-mcp/issues/231) (dedicated low-privilege agent uid) and [#232](https://github.com/rudi193-cmd/willow-mcp/issues/232) (store `.db` OS-level permission enforcement, which depends on it). The concrete "which uid runs what, in what order" runbook for actually performing that deployment step — including raw OS-level probes that prove the denial rather than inferring it from the diagnostic alone — is [`docs/deploy/dedicated-uid-deployment.md`](docs/deploy/dedicated-uid-deployment.md).
+**Not closed.** On a single-uid host the agent can still write the lease. It must now forge a *third* artifact, with a clock, under audit — but the operating system is not stopping it. **Strict mode is off by default**, because enabling it before uid separation exists would deny egress on every current install. The genuine fix is ownership: `chown` `mcp_apps/` and `mcp_apps/_net_leases/` to a uid the agent's process does not run as, then set `WILLOW_MCP_STRICT_TRUST_ROOT=1`. That is a deployment step this repo can support and check but cannot perform. Tracked as B-32 in `docs/BUGS.md`, and as [issue #231](https://github.com/willow-memory/willow-mcp/issues/231) (dedicated low-privilege agent uid) and [#232](https://github.com/willow-memory/willow-mcp/issues/232) (store `.db` OS-level permission enforcement, which depends on it). The concrete "which uid runs what, in what order" runbook for actually performing that deployment step — including raw OS-level probes that prove the denial rather than inferring it from the diagnostic alone — is [`docs/deploy/dedicated-uid-deployment.md`](docs/deploy/dedicated-uid-deployment.md).
 
 ---
 
@@ -383,7 +383,7 @@ submit and creates no queue row.
 of which *are* caught). This finding shares its remediation with L-DOS-02
 directly above — and L-DOS-02's own "DONE" already names both patterns
 (`find / -delete` / raw-device write) as part of that fix. This entry was left
-marked OPEN when that landed and [issue #233](https://github.com/rudi193-cmd/willow-mcp/issues/233)
+marked OPEN when that landed and [issue #233](https://github.com/willow-memory/willow-mcp/issues/233)
 was later filed against the stale wording, not a live gap.
 
 Re-verified live 2026-08-01 against both `kartikeya` HEAD and the installed

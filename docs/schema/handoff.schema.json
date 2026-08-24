@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/rudi193-cmd/willow-mcp/docs/schema/handoff.schema.json",
+  "$id": "https://github.com/willow-memory/willow-mcp/docs/schema/handoff.schema.json",
   "title": "handoff.json (handoff_v1)",
   "description": "The structured record written by the handoff_write_v4 MCP tool at $WILLOW_HOME/dispatch/{dispatch_id}/handoff.json. closeout.md is RENDERED from this record (see handoff.py _render_closeout); this JSON is the source of truth. Grounded in src/willow_mcp/handoff.py.",
   "type": "object",

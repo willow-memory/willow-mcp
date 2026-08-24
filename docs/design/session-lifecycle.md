@@ -10,7 +10,7 @@ description: "Draft 0.3 (2026-07-09, unratified) — session lifecycle design fo
 
 *Draft 0.3 — 2026-07-09 — unratified.*
 
-**Product:** [willow-mcp](https://github.com/rudi193-cmd/willow-mcp) — agent-neutral MCP server (SOIL + Postgres KB + Kart).  
+**Product:** [willow-mcp](https://github.com/willow-memory/willow-mcp) — agent-neutral MCP server (SOIL + Postgres KB + Kart).  
 **Not in scope:** willow-2.0 fylgja hooks (`session_start.py`, persona picker, boot-done flags, Grove daemons). Those are fleet-internal; this design is what **any MCP client** gets from willow-mcp alone.
 
 **North star:** [`WILLOW Complete System`](../../../Desktop/Nest/WILLOW%20Complete%20System.txt) (operator packet, July 2026) — zero-cost, packet-is-boot, orchestrator loop.

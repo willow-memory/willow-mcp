@@ -47,7 +47,7 @@ def main(argv: list) -> int:
         return 0
     sys.stdout.write(
         "::error title=vendor drift::src/willow_mcp/friction_floor.py has drifted "
-        "from rudi193-cmd/willow-gate. Re-sync it (procedure in "
+        "from willow-memory/willow-gate. Re-sync it (procedure in "
         "tests/test_stance_friction.py) and update the pinned hash there.\n")
     sys.stdout.writelines(difflib.unified_diff(
         theirs.splitlines(True), mine.splitlines(True),

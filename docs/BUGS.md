@@ -555,7 +555,7 @@ log carries a one-line entry and points there rather than duplicating.
   clean `pip install` left every task `pending` forever (it only ran because an
   out-of-repo, often stale, willow-2.0 Kart was present). **Fixed** by extracting
   the mature willow-2.0 Kart as a standalone, host-agnostic package — **`kartikeya`**
-  (github.com/rudi193-cmd/kartikeya, **published to PyPI as 0.0.1**) — with the
+  (github.com/willow-memory/kartikeya, **published to PyPI as 0.0.1**) — with the
   sandbox/worker/execute core decoupled from all fleet imports behind a
   `TaskQueue` backend seam (bundled SQLite reference impl + Postgres). willow-mcp
   now: depends on `kartikeya` (hard dep, `>=0.0.1,<0.1.0`); ships

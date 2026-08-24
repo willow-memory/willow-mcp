@@ -64,7 +64,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 log = logging.getLogger("willow_mcp.web_fetch")
 
-_USER_AGENT = "Mozilla/5.0 (compatible; Willow-mcp/2.0; +https://github.com/rudi193-cmd/willow-mcp)"
+_USER_AGENT = "Mozilla/5.0 (compatible; Willow-mcp/2.0; +https://github.com/willow-memory/willow-mcp)"
 _DEFAULT_MAX_BYTES = 512_000
 _DEFAULT_MAX_CHARS = 80_000
 #: requests defaults to 30. A fetch tool does not need a chain that long, and

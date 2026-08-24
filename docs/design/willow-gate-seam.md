@@ -9,7 +9,7 @@ description: "Maps how willow-gate's agent-side HMAC binder composes with willow
 # willow-gate ↔ willow-mcp: the seam
 
 Status: **proposal / mapping only** (no code yet). This pins how
-[`willow-gate`](https://github.com/rudi193-cmd/willow-gate) composes with
+[`willow-gate`](https://github.com/willow-memory/willow-gate) composes with
 willow-mcp's existing authorization stack *before* any of the invasive wiring is
 written, so we can prototype one slice at a time without guessing the shape.
 
