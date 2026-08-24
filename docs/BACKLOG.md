@@ -28,15 +28,15 @@ code itself.
 | W-12 | debt | Done | web_search | Global cache replacement race in `reset_search_cache()` and `nest/embed.py` |
 | W-13 | debt | Done | types | `type: ignore[return-value]` in `bound_receipt.py:312` |
 | W-14 | debt | Done | integrations | Pinned `X-GitHub-Api-Version: 2022-11-28` will eventually deprecate |
-| W-15 | debt | Open | packaging | `nestor` is an unpublished git dependency -- 3 tools permanently unavailable on standard install |
+| W-15 | debt | Open | packaging | `nestor-meaning` unpublished on PyPI — 3 tool-oracle verbs unavailable on standard install (graceful degradation works) |
 | W-16 | debt | Done | docs | B-33 `Ref` column says `willow-mcp#TBD` -- issue number never recorded |
 | W-17 | debt | Done | packaging | Version falls back to `0.0.0+unknown` on fresh clone (no git tags) |
 | W-18 | idea | Open | voice | Wire the RealtimeSTT wake-gate (`voice/wake_gate.py:73`) |
 | W-19 | idea | Open | commitments | Wire Google Calendar sync transport (`commitments/calendar_source.py:116`) |
 | W-20 | idea | Done | server | Make hardcoded limits configurable via `WILLOW_*` env vars |
 | W-21 | idea | Done | tool_oracle | Rotate / truncate `pending.jsonl` (unbounded append-only file) |
-| W-22 | idea | Open | mem_ratify | Finalize placeholder doctrine values before enabling enforcement |
-| W-23 | idea | Open | design | Finish specialist-registry TBD sections (store_scope, permissions, extensions) |
+| W-22 | idea | Done | mem_ratify | Doctrine values env-configurable via `WILLOW_FRONTIER_MIN_WITNESSES` / `WILLOW_CANONICAL_MIN_WITNESSES` / `WILLOW_REQUIRE_STEPWISE_PROMOTION` |
+| W-23 | idea | Done | design | Specialist-registry TBD labels updated — 4/5 already implemented; only user-created extensions remain unimplemented |
 
 ---
 
@@ -165,11 +165,17 @@ the old cache while another replaces it is a race. Same pattern in
 `GitHubAdapter` at `integrations.py:240` pins `X-GitHub-Api-Version: 2022-11-28`.
 Should be tracked for periodic update or made configurable.
 
-### W-15 · debt · Nestor unpublished dependency
+### W-15 · debt · Nestor unpublished on PyPI
 
-`pyproject.toml:102-112` references `nestor` as a git dependency unavailable on
-PyPI. `nestor_tool_route/seal/pending` gracefully return `status='unavailable'`,
-but these 3 tools are non-functional on any standard install.
+The Nestor repo (`Die-Namic-Systems/Nestor`) is already packaged as
+`nestor-meaning` (pyproject.toml `name`, hatch-vcs versioning, sdist/wheel
+build targets, `[publish]` extra with twine). The import name is `nestor`.
+Graceful degradation works — oracle verbs return `status='unavailable'`.
+
+**Resolution path:** tag a release in the Nestor repo, publish to PyPI as
+`nestor-meaning`, then restore the optional extra in willow-mcp's
+pyproject.toml: `nestor = ["nestor-meaning>=<version>"]`. The pyproject.toml
+comment already documents this with the correct package name.
 
 ### W-16 · debt · B-33 missing issue number
 
@@ -217,17 +223,27 @@ into memory and reverses it. The file is append-only with no rotation. On a busy
 system this becomes a memory pressure point. Consider log rotation or a
 max-line read window.
 
-### W-22 · idea · Finalize mem_ratify placeholders
+### W-22 · idea · Doctrine values now env-configurable
 
-Three values marked "PLACEHOLDER -- owner must confirm" in `ratify.py`:
-`FRONTIER_MIN_WITNESSES` (line 107), `CANONICAL_MIN_WITNESSES` (line 113),
-`REQUIRE_STEPWISE_PROMOTION` (line 119). Must be operator-configured before
-enforcement is enabled.
+Three constants in `ratify.py` were hardcoded placeholders. Now configurable
+via env vars following the W-20 pattern, with the same conservative defaults:
 
-### W-23 · idea · Finish specialist-registry TBDs
+- `WILLOW_FRONTIER_MIN_WITNESSES` (default `2`) — quorum for Contested → Frontier
+- `WILLOW_CANONICAL_MIN_WITNESSES` (default `2`) — quorum for Frontier → Canonical
+- `WILLOW_REQUIRE_STEPWISE_PROMOTION` (default `1`) — set `0`/`false` to allow tier skipping
 
-`docs/design/specialist-registry.md` has six TBD items: `store_scope` (line 50),
-`permissions`/`deny_tools` per-role schema (lines 160-161), orchestrator role
-(line 186), and "User-created extensions" section (line 238).
-`session-lifecycle.md` also marks the registry as draft with "permissions TBD"
-(line 363).
+Enforcement remains off by default (`WILLOW_MEM_RATIFY_ENFORCE`). An operator
+can now tune the quorum sizes before turning enforcement on.
+
+### W-23 · idea · Specialist-registry TBD labels updated
+
+Four of five TBD items in `specialist-registry.md` were already implemented in
+code and the labels were stale:
+
+- `store_scope`: implemented in `gate.store_scope()` / `collection_permitted()` (B-24/B-25)
+- `permissions`/`deny_tools` per-role: ratified in `permissions-matrix.md`, enforced in `gate.permitted()`
+- Orchestrator role: ~40-tool `orchestrator` group in `gate.py`, `dispatch_write` split (B-51)
+- `session-lifecycle.md` S-R1: marked done, S3 unblocked
+
+Only "User-created extensions" (§10) remains genuinely unimplemented — no
+`user_specialists.json` loader or persona overlay exists in the codebase.

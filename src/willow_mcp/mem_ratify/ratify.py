@@ -97,26 +97,25 @@ class Tier(IntEnum):
 
 
 # --------------------------------------------------------------------------- #
-# PLACEHOLDER doctrine parameters — owner must confirm before enforcement
+# Doctrine parameters — env-configurable, with conservative defaults.
 # --------------------------------------------------------------------------- #
 
-# PLACEHOLDER — owner must confirm. Article IV names no quorum size; the only
-# number in the charter is Article IX.2's founding default of "at least 2
-# independent agent witnesses" (also listed as operator-adjustable, line 478).
-# We reuse 2 as the conservative minimum for a Frontier promotion quorum.
-FRONTIER_MIN_WITNESSES = 2
+# Article IV names no quorum size; Article IX.2's founding default is "at least
+# 2 independent agent witnesses" (also listed as operator-adjustable, line 478).
+FRONTIER_MIN_WITNESSES = int(os.environ.get("WILLOW_FRONTIER_MIN_WITNESSES", "2"))
 
-# PLACEHOLDER — owner must confirm. Canonical is "the fleet's highest standard"
-# (IV.3) yet the charter gives it no larger number. We keep the same minimum
-# count but layer on the extra Canonical-only requirements (operator key,
-# ledger evidence, fresh-witness composition). The owner may wish this higher.
-CANONICAL_MIN_WITNESSES = 2
+# Canonical is "the fleet's highest standard" (IV.3). Same minimum count as
+# Frontier but layered with extra requirements (operator key, ledger evidence,
+# fresh-witness composition). Operators may wish this higher.
+CANONICAL_MIN_WITNESSES = int(os.environ.get("WILLOW_CANONICAL_MIN_WITNESSES", "2"))
 
-# PLACEHOLDER — owner must confirm. IV.3's "at least one ratifying agent must
-# not have participated in the prior Frontier promotion" presumes promotion is
-# stepwise (Contested -> Frontier -> Canonical). We enforce stepwise (the
-# stricter reading) and forbid tier-skipping. Owner may allow direct jumps.
-REQUIRE_STEPWISE_PROMOTION = True
+# IV.3's "at least one ratifying agent must not have participated in the prior
+# Frontier promotion" presumes stepwise promotion (Contested -> Frontier ->
+# Canonical). We enforce stepwise by default; set to "0" or "false" to allow
+# direct tier jumps.
+REQUIRE_STEPWISE_PROMOTION = os.environ.get(
+    "WILLOW_REQUIRE_STEPWISE_PROMOTION", "1",
+).lower() not in ("0", "false", "no")
 
 
 ENFORCE_ENV_VAR = "WILLOW_MEM_RATIFY_ENFORCE"

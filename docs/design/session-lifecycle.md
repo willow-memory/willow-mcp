@@ -360,8 +360,8 @@ Same operator may run both; designs must not require fylgja for willow-mcp to wo
 | S0 | willow-mcp | Templates + `SESSION_FLOW.md`, `AGENTS.md`, `ORIENT.md` from Nest packet |
 | S1 | willow-mcp | `dispatch/` directory I/O + `dispatch_send` / `dispatch_read` | **done** |
 | S2 | willow-mcp | `sessions/` file + `dispatch_accept` / `session_read` | **done** |
-| S-R1 | `specialist-registry.md` + JSON schema | **draft** — permissions TBD |
-| S3 | `roles.py` envelope enforcement | blocked on permissions decision |
+| S-R1 | `specialist-registry.md` + JSON schema | **done** — permissions ratified in `permissions-matrix.md`, enforced in `gate.py` |
+| S3 | `roles.py` envelope enforcement | unblocked — permissions ratified; `roles.py` reads `allow_tools`/`deny_tools` from registry |
 | S4 | willow-mcp | `handoff_write_v4`, `handoff_read`, `verify_handoff` | **done** |
 | S5 | willow-mcp | `agent_clear`, status machine | **done** |
 | S6 | willow-mcp | DAG in SOIL + `dag_next` |

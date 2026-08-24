@@ -101,15 +101,13 @@ web = [
 ]
 # Nestor verified-match engine backs the natural-language tool oracle
 # (willow_mcp.tool_oracle / nestor_tool_route — docs/design/nestor-tool-route.md).
-# It is an unpublished git dependency, and PyPI refuses ANY package whose
-# metadata carries a direct URL dependency ("400 Can't have direct
-# dependency") — a `nestor = ["nestor @ git+..."]` extra here blocked the
-# v2.8.0/v2.9.0/v2.9.1 uploads outright, so the extra is gone until Nestor is
-# published to PyPI. Plain `pip install willow-mcp` stands up the server
-# without it (the oracle verbs report status='unavailable'); to enable
-# routing, install the engine directly alongside:
-#   pip install "nestor @ git+https://github.com/Die-Namic-Systems/Nestor@master"
-# Once Nestor is on PyPI, restore:  nestor = ["nestor>=<first-published-tag>"]
+# PyPI package name: nestor-meaning (import name: nestor).
+# Currently unpublished — PyPI refuses direct-URL git dependencies, so the
+# extra is gone until nestor-meaning is published. Plain `pip install willow-mcp`
+# stands up the server without it (oracle verbs report status='unavailable');
+# to enable routing, install alongside:
+#   pip install "nestor-meaning @ git+https://github.com/Die-Namic-Systems/Nestor@master"
+# Once published:  nestor = ["nestor-meaning>=<first-published-tag>"]
 # Sentry telemetry for the Bug Smash observability experiment. Opt-in only:
 # inert unless WILLOW_SENTRY_DSN is set at runtime (see observability.py).
 observability = ["sentry-sdk>=2.0,<3.0"]
