@@ -36,9 +36,9 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **ci:** remove unused imports, revert vendored ratify.py ([6ef59b6](https://github.com/willow-memory/willow-mcp/commit/6ef59b637fb8816d9506156a595f397a0883af16))
-* **ci:** revert vendored nest/ files to match upstream safe-app-store ([db040a7](https://github.com/willow-memory/willow-mcp/commit/db040a7f6ba7bddf7d00cb906a2f1863bbf984b0))
 * **ci:** update pinned nest/ hashes to match reverted upstream copies ([db8e2c7](https://github.com/willow-memory/willow-mcp/commit/db8e2c761d8740c3c2455a4458aae5321e07e62c))
+* **ci:** revert vendored nest/ files to match upstream safe-app-store ([db040a7](https://github.com/willow-memory/willow-mcp/commit/db040a7f6ba7bddf7d00cb906a2f1863bbf984b0))
+* **ci:** remove unused imports, revert vendored ratify.py ([6ef59b6](https://github.com/willow-memory/willow-mcp/commit/6ef59b637fb8816d9506156a595f397a0883af16))
 * **W-15:** wire nestor optional extra — nestor-meaning is published on PyPI ([62b9b41](https://github.com/willow-memory/willow-mcp/commit/62b9b4144a8310601899d10665e928db5ef9a4ef))
 
 ## [2.13.2](https://github.com/willow-memory/willow-mcp/compare/v2.13.1...v2.13.2) (2026-08-24)
