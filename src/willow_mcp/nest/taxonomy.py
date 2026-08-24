@@ -23,7 +23,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tempfile
 from pathlib import Path
 
 try:  # works both as a package (apps.nest_seed) and as a plain script dir
@@ -169,17 +168,7 @@ def build_centroids(model: str = _embed.DEFAULT_EMBED_MODEL,
     if use_cache:
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=cache.parent, suffix=".tmp")
-            try:
-                with os.fdopen(fd, "w") as f:
-                    f.write(json.dumps(centroids))
-                os.replace(tmp, cache)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+            cache.write_text(json.dumps(centroids))
         except OSError:
             pass
     return centroids
