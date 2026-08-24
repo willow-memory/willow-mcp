@@ -3169,8 +3169,8 @@ def handoff_read(app_id: str, dispatch_id: str) -> dict:
 def verify_handoff(app_id: str, dispatch_id: str) -> dict:
     """Orchestrator-side check of a completed dispatch's handoff: confirms the
     closeout exists and its declarations hold — checklist resolved, envelope
-    clean, findings present. Run this before agent_clear releases the
-    specialist for its next packet. Read-only."""
+    clean, findings present. Sets status to 'verified'. Run this before
+    agent_clear releases the specialist for its next packet."""
     return handoff_stack.verify_handoff(dispatch_id)
 
 
@@ -5228,7 +5228,10 @@ def willow_web_search(
     snippet, source, and hostname per result. Use for current events, tech news,
     and queries that need the live open web.
 
-    `trusted_only`: keep verified institutional domain suffixes only.
+    `trusted_only`: heuristic filter — keep results whose hostname matches a
+    hand-curated suffix list of institutional domains. Cannot distinguish a real
+    institution from a lookalike and does not verify the source. Prefer
+    `willow_institutional_search` for citations that need backing.
     `include_handoffs`: prepend OpenStreetMap/Google Maps links for navigational
     queries. Requires web_net + consent.internet + a live egress lease."""
     from . import web_egress, web_search

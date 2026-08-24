@@ -188,3 +188,66 @@ def test_read_group_tools_with_write_annotations_are_acknowledged():
         "explicitly acknowledged (add to the allowlist if intentional). "
         "Unacknowledged:\n  " + "\n  ".join(unacknowledged)
     )
+
+
+def _extract_tool_docstrings(filepath: Path) -> dict[str, str]:
+    """Parse {tool_name: docstring} from source, without import."""
+    if not filepath.exists():
+        return {}
+    src = filepath.read_text(encoding="utf-8")
+    lines = src.splitlines()
+    tools: dict[str, str] = {}
+    for i, line in enumerate(lines):
+        m = re.search(r"@mcp\.tool\(annotations=([\w_]+)\)", line.strip())
+        if m:
+            for j in range(i + 1, min(i + 5, len(lines))):
+                dm = re.match(r"\s*(?:async\s+)?def\s+(\w+)\s*\(", lines[j])
+                if dm:
+                    name = dm.group(1)
+                    doc_lines = []
+                    in_doc = False
+                    for k in range(j + 1, min(j + 30, len(lines))):
+                        stripped = lines[k].strip()
+                        if not in_doc:
+                            if stripped.startswith('"""') or stripped.startswith("'''"):
+                                quote = stripped[:3]
+                                if stripped.endswith(quote) and len(stripped) > 6:
+                                    doc_lines.append(stripped[3:-3])
+                                    break
+                                in_doc = True
+                                doc_lines.append(stripped[3:])
+                            else:
+                                break
+                        else:
+                            if quote in stripped:
+                                doc_lines.append(stripped[:stripped.index(quote)])
+                                break
+                            doc_lines.append(stripped)
+                    tools[name] = "\n".join(doc_lines)
+                    break
+    return tools
+
+
+def test_write_annotated_tools_do_not_claim_read_only():
+    """A tool annotated as WRITE/WRITE_IDEM/DESTRUCTIVE must not have a
+    terminal 'Read-only.' claim in its docstring — that contradicts what the
+    annotation declares to the client.  'Read-only reconcile:' or similar
+    qualified uses are fine; only a standalone sentence-final claim is flagged.
+
+    Catches the verify_handoff class of bug: annotation updated, docstring
+    not."""
+    stale: list[str] = []
+    for fp in (_SERVER, _GROVE_TOOLS, _MAI_TOOLS):
+        annos = _extract_tool_annotations(fp)
+        docs = _extract_tool_docstrings(fp)
+        for tool, anno in annos.items():
+            if anno not in _WRITE_ANNO_NAMES:
+                continue
+            doc = docs.get(tool, "")
+            if re.search(r'Read-only\.\s*$', doc, re.MULTILINE):
+                stale.append(f"{tool}: annotated {anno} but docstring claims 'Read-only.'")
+    assert not stale, (
+        "Write-annotated tools must not have a terminal 'Read-only.' claim in "
+        "their docstring (update the docstring to reflect what the tool actually "
+        "writes). Stale claims:\n  " + "\n  ".join(stale)
+    )

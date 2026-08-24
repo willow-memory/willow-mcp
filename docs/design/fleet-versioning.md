@@ -193,9 +193,10 @@ trusted_only: Annotated[bool, Field(default=False, deprecated=True,
 ```
 
 **And for a safety parameter, accept-and-ignore is forbidden outright.**
-`trusted_only` means "keep verified institutional domain suffixes only" — a
-caller passing it is asking to be *restricted*. Silently ignoring it returns raw
-web results to a model that believes they were vetted. This repo shipped that
+`trusted_only` means "keep results whose hostname matches a hand-curated
+institutional suffix list" — a caller passing it is asking to be *restricted*.
+Silently ignoring it returns raw web results to a model that believes they were
+filtered. This repo shipped that
 exact bug and fixed it one release ago; `web_search.py` carries the note that
 the handoffs were exempt from the filter, so `trusted_only=True` returned
 `google.com`. A deprecation lane that re-creates it deliberately, for a whole
