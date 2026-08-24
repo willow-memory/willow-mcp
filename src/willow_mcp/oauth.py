@@ -24,6 +24,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import secrets
 import time
@@ -45,6 +46,8 @@ from .vault import Vault
 
 if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
+
+logger = logging.getLogger("willow_mcp.oauth")
 
 _ACCESS_TTL  = 30 * 86400
 _CODE_TTL    = 300
@@ -586,8 +589,9 @@ class WillowOAuthProvider(GroveOAuthProvider):
                 email, sub = await asyncio.to_thread(
                     _google_verify_id_token, tokens["id_token"], client_id,
                 )
-            except Exception as exc:
-                return HTMLResponse(f"<h2>Google sign-in failed.</h2><p>{exc}</p>", status_code=400)
+            except Exception:
+                logger.exception("Google sign-in token exchange/verification failed")
+                return HTMLResponse("<h2>Google sign-in failed.</h2><p>Please try again.</p>", status_code=400)
 
             propose_binding("google", sub, email)
             client, params = entry
@@ -643,8 +647,9 @@ class WillowOAuthProvider(GroveOAuthProvider):
                 email, sub = await asyncio.to_thread(
                     _apple_verify_id_token, id_token, apple_client_id,
                 )
-            except Exception as exc:
-                return HTMLResponse(f"<h2>Apple sign-in failed.</h2><p>{exc}</p>", status_code=400)
+            except Exception:
+                logger.exception("Apple sign-in token verification failed")
+                return HTMLResponse("<h2>Apple sign-in failed.</h2><p>Please try again.</p>", status_code=400)
 
             propose_binding("apple", sub, email)
             client, params = entry

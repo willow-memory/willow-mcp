@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import tempfile
+import os
 import time
 from pathlib import Path
 
 _DEDUP_TTL_SEC = 300
-# tempfile.gettempdir(), not a hardcoded "/tmp" literal: honors TMPDIR/TEMP
-# overrides and keeps this portable off Linux, where /tmp is not a given.
-_MARKER = Path(tempfile.gettempdir()) / "willow-session-inject-marker.json"
+
+
+def _marker_path() -> Path:
+    home = Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
+    d = home / "run"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "session-inject-marker.json"
 
 MAX_CORRECTIONS = 4
 MAX_PREFERENCES = 3
@@ -47,9 +51,10 @@ def should_skip_duplicate(session_id: str, fingerprint: str) -> bool:
     if not session_id:
         return False
     try:
-        if not _MARKER.is_file():
+        marker = _marker_path()
+        if not marker.is_file():
             return False
-        data = json.loads(_MARKER.read_text(encoding="utf-8"))
+        data = json.loads(marker.read_text(encoding="utf-8"))
         if data.get("session_id") != session_id:
             return False
         if data.get("fingerprint") != fingerprint:
@@ -64,7 +69,7 @@ def record_injection(session_id: str, fingerprint: str, *, lite: bool) -> None:
     if not session_id:
         return
     try:
-        _MARKER.write_text(
+        _marker_path().write_text(
             json.dumps(
                 {
                     "session_id": session_id,
