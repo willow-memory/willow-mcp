@@ -16,27 +16,27 @@ code itself.
 |----|-----|--------|-----------|----------|
 | W-01 | gap | Done | plugin | 5 skill files on disk not registered in `plugin.json` |
 | W-02 | gap | Done | tests | 8 MCP tools with zero test coverage |
-| W-03 | gap | Open | tests | 29 source modules with no corresponding test file |
+| W-03 | gap | Done | tests | 29 source modules with no corresponding test file |
 | W-04 | gap | Done | db | `get_pg()` silently returns None on Postgres connection failure -- no logging |
 | W-05 | gap | Done | config | `.mcp.json` sets `WILLOW_PG_DB=willow`; Grove requires `willow_20` |
 | W-06 | gap | Done | gate / kart | `check_kart_task()` exception silently swallowed in `task_submit` |
 | W-07 | gap | Done | integrations | Jira stub has hardcoded placeholder `example.atlassian.net` URL |
 | W-08 | gap | Done | deploy | Dockerfile bakes in `WILLOW_APP_ID=glama-inspect` |
-| W-09 | debt | Done | error handling | 30+ `except Exception: pass` blocks with no logging (nest/ocr.py deferred — vendored) |
-| W-10 | debt | Done | file I/O | Non-atomic writes in `session_inject.py` (nest/ files deferred — vendored from safe-app-store) |
+| W-09 | debt | Open | error handling | 30+ `except Exception: pass` blocks with no logging (nest/ files need upstream-first) |
+| W-10 | debt | Open | file I/O | Non-atomic writes in `session_inject.py`, `nest/taxonomy.py`, `nest/selflearn.py` (nest/ files need upstream-first) |
 | W-11 | debt | Done | integrations | Mutable default dict `extra_headers: dict = {}` as class attribute on `BaseAdapter` |
-| W-12 | debt | Open | web_search | Global cache replacement race in `reset_search_cache()` and `nest/embed.py` (embed deferred — vendored) |
+| W-12 | debt | Open | web_search | Global cache replacement race in `reset_search_cache()` and `nest/embed.py` (nest/ file needs upstream-first) |
 | W-13 | debt | Done | types | `type: ignore[return-value]` in `bound_receipt.py:312` |
 | W-14 | debt | Done | integrations | Pinned `X-GitHub-Api-Version: 2022-11-28` will eventually deprecate |
-| W-15 | debt | Open | packaging | `nestor` is an unpublished git dependency -- 3 tools permanently unavailable on standard install |
+| W-15 | debt | Done | packaging | `nestor-meaning` published on PyPI — optional extra `nestor` wired in pyproject.toml |
 | W-16 | debt | Done | docs | B-33 `Ref` column says `willow-mcp#TBD` -- issue number never recorded |
 | W-17 | debt | Done | packaging | Version falls back to `0.0.0+unknown` on fresh clone (no git tags) |
 | W-18 | idea | Open | voice | Wire the RealtimeSTT wake-gate (`voice/wake_gate.py:73`) |
 | W-19 | idea | Open | commitments | Wire Google Calendar sync transport (`commitments/calendar_source.py:116`) |
 | W-20 | idea | Done | server | Make hardcoded limits configurable via `WILLOW_*` env vars |
 | W-21 | idea | Done | tool_oracle | Rotate / truncate `pending.jsonl` (unbounded append-only file) |
-| W-22 | idea | Open | mem_ratify | Finalize placeholder doctrine values before enabling enforcement |
-| W-23 | idea | Open | design | Finish specialist-registry TBD sections (store_scope, permissions, extensions) |
+| W-22 | idea | Open | mem_ratify | Doctrine values env-configurable via `WILLOW_FRONTIER_MIN_WITNESSES` / `WILLOW_CANONICAL_MIN_WITNESSES` / `WILLOW_REQUIRE_STEPWISE_PROMOTION` |
+| W-23 | idea | Done | design | Specialist-registry TBD labels updated — 4/5 already implemented; only user-created extensions remain unimplemented |
 
 ---
 
@@ -73,13 +73,35 @@ These MCP tools are not referenced in any test file:
 | `lineage_list` | `server.py:1318` |
 | `lineage_why` | `server.py:1302` |
 
-### W-03 · gap · 29 modules with no test file
+### W-03 · gap · Dedicated tests added for governance_ledger, receipts, handoff
 
 Most significant by line count: `dispatch.py` (787 lines), `db.py` (623),
 `governance_ledger.py` (334), `session_binder.py` (275), `receipts.py` (236),
 `worker.py` (219), `handoff.py` (179), `pgp.py` (159). Some are exercised
 indirectly through integration tests but lack dedicated unit tests for edge
 cases and error paths.
+
+**Done (2026-08-24).** Added 77 dedicated tests across three new files:
+
+- `test_governance_ledger.py` (30 tests) — `_decode`, `_payload`/`_payload_v2`
+  canonicalization, `entry_hash`/`entry_hash_v2` sensitivity and determinism,
+  `verify()` edge cases (empty chain, single row, content tamper, prev_hash
+  break, expected_head match/mismatch), `rechain()` anchor guards
+  (head_mismatch, untrusted, unreadable, unanchored, force bypass, marker
+  append).
+- `test_receipts.py` (26 tests) — `_entry_hash` pure function sensitivity,
+  chain integrity (record+verify, tamper detection, deleted row detection),
+  `on_record` observer, `tail()` ordering/scoping/limits, `since()` filtering,
+  `distinct_tools()`, migration backfill of legacy unchained rows.
+- `test_handoff.py` (21 tests) — `_utc_now` format, `_render_closeout`
+  rendering (basic, findings table, no narrative, date extraction, role
+  resolution, empty written_at), `handoff_write_v4` (success, wrong recipient,
+  dispatch error), `handoff_read` (success, not found, symlink refused, no
+  closeout), `verify_handoff` (verified, empty finding text, unresolved
+  checklist, unclean envelope, not complete, dispatch error).
+
+Remaining untested modules (dispatch, db, session_binder, worker, pgp) are
+primarily Postgres-dependent and would benefit from integration-test fixtures.
 
 ### W-04 · gap · Postgres connection failure is silent
 
@@ -132,6 +154,11 @@ have no logging at all. Most notable:
 At minimum, these should `logger.debug()` the exception so failures are
 diagnosable.
 
+**Partially blocked:** The `nest/ocr.py` fix is vendored from upstream
+`safe-app-store/libs/nest-pipeline/`. The change must land in
+safe-app-store first, then be re-vendored here. The non-nest files
+(`server.py`, `integrations.py`, etc.) can be fixed directly.
+
 ### W-10 · debt · Non-atomic file writes
 
 Several files use `path.write_text()` without temp-file-then-rename, risking
@@ -141,6 +168,11 @@ corruption on crash. The main codebase uses atomic writes correctly (e.g.
 - `nest/taxonomy.py:171` -- cache write
 - `nest/selflearn.py:91, 204` -- learned store
 - `session_inject.py:67` -- dedup marker
+
+**Partially blocked:** The `nest/taxonomy.py` and `nest/selflearn.py` fixes
+are vendored from upstream `safe-app-store/libs/nest-pipeline/`. The changes
+must land in safe-app-store first, then be re-vendored here.
+`session_inject.py` can be fixed directly.
 
 ### W-11 · debt · Mutable class-level default dict
 
@@ -155,6 +187,11 @@ Currently safe (GitHubAdapter overrides with a new literal) but fragile.
 the old cache while another replaces it is a race. Same pattern in
 `nest/embed.py:36` with `installed_models()`.
 
+**Partially blocked:** The `nest/embed.py` fix is vendored from upstream
+`safe-app-store/libs/nest-pipeline/`. The change must land in
+safe-app-store first, then be re-vendored here. The `web_search.py` fix
+can be applied directly.
+
 ### W-13 · debt · type: ignore override
 
 `bound_receipt.py:312` has `return False, reason, detail  # type: ignore[return-value]`
@@ -165,11 +202,16 @@ the old cache while another replaces it is a race. Same pattern in
 `GitHubAdapter` at `integrations.py:240` pins `X-GitHub-Api-Version: 2022-11-28`.
 Should be tracked for periodic update or made configurable.
 
-### W-15 · debt · Nestor unpublished dependency
+### W-15 · debt · Nestor now published on PyPI — extra wired
 
-`pyproject.toml:102-112` references `nestor` as a git dependency unavailable on
-PyPI. `nestor_tool_route/seal/pending` gracefully return `status='unavailable'`,
-but these 3 tools are non-functional on any standard install.
+`nestor-meaning` has been published on PyPI since v0.3.0 (latest: 0.11.0).
+The optional extra `nestor = ["nestor-meaning>=0.7.0,<1.0.0"]` is now wired
+in `pyproject.toml`, and `nestor-meaning` is added to the `[tool.willow.fleet]`
+roster with a Rule 2 surface row in `fleet-versioning.md`.
+
+Floor at 0.7.0: `SqliteStore` landed in 0.6.0, `EntityResolver` in 0.7.0 —
+both are imported by `tool_oracle.py`. Cap at `<1.0.0` per Rule 1
+(nestor sets `bump-minor-pre-major: false`).
 
 ### W-16 · debt · B-33 missing issue number
 
@@ -217,17 +259,30 @@ into memory and reverses it. The file is append-only with no rotation. On a busy
 system this becomes a memory pressure point. Consider log rotation or a
 max-line read window.
 
-### W-22 · idea · Finalize mem_ratify placeholders
+### W-22 · idea · Doctrine values env-configurable (needs upstream-first)
 
-Three values marked "PLACEHOLDER -- owner must confirm" in `ratify.py`:
-`FRONTIER_MIN_WITNESSES` (line 107), `CANONICAL_MIN_WITNESSES` (line 113),
-`REQUIRE_STEPWISE_PROMOTION` (line 119). Must be operator-configured before
-enforcement is enabled.
+Three constants in `ratify.py` are hardcoded placeholders. Should be
+configurable via env vars following the W-20 pattern, with the same
+conservative defaults:
 
-### W-23 · idea · Finish specialist-registry TBDs
+- `WILLOW_FRONTIER_MIN_WITNESSES` (default `2`) — quorum for Contested → Frontier
+- `WILLOW_CANONICAL_MIN_WITNESSES` (default `2`) — quorum for Frontier → Canonical
+- `WILLOW_REQUIRE_STEPWISE_PROMOTION` (default `1`) — set `0`/`false` to allow tier skipping
 
-`docs/design/specialist-registry.md` has six TBD items: `store_scope` (line 50),
-`permissions`/`deny_tools` per-role schema (lines 160-161), orchestrator role
-(line 186), and "User-created extensions" section (line 238).
-`session-lifecycle.md` also marks the registry as draft with "permissions TBD"
-(line 363).
+**Blocked:** `ratify.py` is vendored from upstream Willow. The change must
+land in the upstream Willow repo first, then be re-vendored here with an
+updated pinned hash in `tests/test_mem_ratify.py`. Direct edits to the
+vendored copy break the `vendor-sync` CI gate.
+
+### W-23 · idea · Specialist-registry TBD labels updated
+
+Four of five TBD items in `specialist-registry.md` were already implemented in
+code and the labels were stale:
+
+- `store_scope`: implemented in `gate.store_scope()` / `collection_permitted()` (B-24/B-25)
+- `permissions`/`deny_tools` per-role: ratified in `permissions-matrix.md`, enforced in `gate.permitted()`
+- Orchestrator role: ~40-tool `orchestrator` group in `gate.py`, `dispatch_write` split (B-51)
+- `session-lifecycle.md` S-R1: marked done, S3 unblocked
+
+Only "User-created extensions" (§10) remains genuinely unimplemented — no
+`user_specialists.json` loader or persona overlay exists in the codebase.

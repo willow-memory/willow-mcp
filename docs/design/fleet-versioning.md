@@ -81,6 +81,7 @@ For those, the correct instruments are upstream and in CI, not in the range:
   |---|---|---|---|
   | jeles 0.5.1 | **1.0.0** | 0.6.0 | 0.5.2 |
   | kartikeya 0.0.9 | **1.0.0** | 0.1.0 | 0.0.10 |
+  | nestor-meaning 0.7.0 | **1.0.0** | 0.8.0 | 0.7.1 |
 
   The price is the property both configs previously prized: reaching 1.0 was a
   decision someone makes rather than one a commit message makes. You cannot
@@ -108,6 +109,7 @@ callers hold — different for all three.
 | **willow-mcp** | the MCP tool contract — tool names, parameter names and meanings, documented return keys; the seven `[project.scripts]` console entry points; **and the fact that `willow_mcp` is importable and `python -m willow_mcp` runs** | the Python API — module layout, function signatures, anything under `willow_mcp.*` beyond the package importing |
 | **jeles** | the importable Python API (`jeles.institutional`, `jeles.sources`, `jeles.corpus`, `jeles.willow_mcp_client`, the shared hit key set), `corpus_server`'s tool contract, **and the host-card schema** (`jeles/cards/*.json` — the `host`/`roles`/`publisher`/`custody`/`jurisdiction`/`status`/`notes` fields and the enum values `roles` and `custody` admit) | internals prefixed `_`, including `_egress`; the `observed` field the schema never shipped |
 | **kartikeya** | the `kartikeya`/`kart` CLI and the task-queue schema on disk and in Postgres | the worker internals |
+| **nestor-meaning** | the importable Python API (`nestor.answer`, `nestor.cascade`, `nestor.portable`, `nestor.entity.EntityResolver`, `nestor.sqlite_store.SqliteStore`), the `nestor` CLI | internals prefixed `_`; the dogfood store schema |
 
 The importability clause in willow-mcp's row is not decoration. Two fleet
 packages import it: `jeles/willow_mcp_client.py` probes `import willow_mcp` and

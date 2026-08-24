@@ -47,7 +47,7 @@ Today this is scattered across `roles.py`, `agent_roster.json`, `persona_envelop
 | **Persona file** | `persona_path` | Persona | Path to voice `.md` (relative to bundle or `$WILLOW_HOME/personas/`). |
 | **Persona preload** | `persona_bundle` | — | Copy into wheel bundle on publish. |
 | **Entry mode** | `entry_mode` | — | Default `dispatch`; `human` allowed for freeform resume. |
-| **Store scope** | `store_scope` | — | SOIL collection prefixes. **⚠️ TBD.** |
+| **Store scope** | `store_scope` | — | SOIL collection prefixes. Implemented: `gate.store_scope()` / `collection_permitted()` — exact names or `prefix*` wildcards, fail-closed (B-24/B-25). |
 | **Namespace** | `namespace` | — | SOIL/KB write lane prefix, e.g. `hanuman/`. |
 | **Mandate** | `job` | — | One-line job description for assignments. |
 | **Not** | `not_job` | — | Anti-patterns / out-of-scope defaults. |
@@ -157,8 +157,8 @@ CREATE TABLE IF NOT EXISTS specialists (
   display_name     TEXT NOT NULL,
   role             TEXT NOT NULL,
   roles            JSONB NOT NULL DEFAULT '[]',
-  permissions      JSONB NOT NULL DEFAULT '[]',   -- TBD per role
-  deny_tools       JSONB NOT NULL DEFAULT '[]',   -- TBD per role
+  permissions      JSONB NOT NULL DEFAULT '[]',   -- per-role values ratified in permissions-matrix.md
+  deny_tools       JSONB NOT NULL DEFAULT '[]',   -- per-role overlay; enforced in gate.permitted()
   persona_path     TEXT NOT NULL,
   persona_bundle   BOOLEAN NOT NULL DEFAULT true,
   entry_mode       TEXT NOT NULL DEFAULT 'dispatch',
@@ -183,7 +183,7 @@ Seed from bundle JSON on `willow-mcp-init` or migration. Bitemporal versioning o
 
 | Function | Name | Seat | Entry | Picker | Permissions |
 |----------|------|------|-------|--------|-------------|
-| ORCHESTRATE | `willow` | orchestrator | `human_orchestrator` | Charter hook only | **TBD** — `orchestrator` group sketch; not ratified |
+| ORCHESTRATE | `willow` | orchestrator | `human_orchestrator` | Charter hook only | Ratified — `orchestrator` group in `gate.py` (~40 tools); `dispatch_write` excludes `verify_handoff`/`agent_clear` (B-51). |
 
 Stored separately: `config/orchestrator.json` or top-level flag `human_only: true` on willow manifest — not mixed into specialist picker lists.
 
