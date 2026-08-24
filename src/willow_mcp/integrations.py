@@ -83,7 +83,7 @@ class BaseAdapter:
     auth_header: str = "Authorization"
     auth_prefix: str = "Bearer "
     credential_required: bool = False
-    extra_headers: dict = {}
+    extra_headers: Optional[dict] = None
 
     # ── credentials ──────────────────────────────────────────────────────────
 
@@ -120,7 +120,7 @@ class BaseAdapter:
         headers = {
             "Accept": "application/json",
             "User-Agent": "willow-mcp-integrations",
-            **self.extra_headers,
+            **(self.extra_headers or {}),
         }
         if cred:
             headers[self.auth_header] = f"{self.auth_prefix}{cred}"

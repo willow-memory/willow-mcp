@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -64,7 +65,9 @@ def record_injection(session_id: str, fingerprint: str, *, lite: bool) -> None:
     if not session_id:
         return
     try:
-        _MARKER.write_text(
+        _MARKER.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _MARKER.with_suffix(_MARKER.suffix + f".tmp-{os.getpid()}")
+        tmp.write_text(
             json.dumps(
                 {
                     "session_id": session_id,
@@ -75,6 +78,7 @@ def record_injection(session_id: str, fingerprint: str, *, lite: bool) -> None:
             ),
             encoding="utf-8",
         )
+        os.replace(tmp, _MARKER)
     except Exception:
         pass
 
