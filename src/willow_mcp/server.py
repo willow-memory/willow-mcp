@@ -113,7 +113,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 112 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 113 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -3202,6 +3202,26 @@ def session_read(app_id: str, session_id: str) -> dict:
     mode, bound dispatch, project/workspace — as written by session_enter.
     Returns {error: not_found} for an unknown session. Read-only."""
     return dispatch_stack.session_read(app_id, session_id)
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("sessions_read_unverifiable")
+def sessions_read_unverifiable() -> dict:
+    """PR4 of the identity-in-session plan: enumerate orchestrator sessions
+    whose attestation sidecar exists but no longer verifies. The browsable
+    trust-view an operator needs after a keyring compromise, a key rotation
+    that invalidated prior sigs, or a tampered sidecar — without this, the
+    operator learns about invalidated sessions one denial-per-write at a
+    time.
+
+    Returns {"unverifiable": [{session_id, verifier, format, reason}, ...]}.
+    A session with a sidecar that verifies is NOT listed. A session with no
+    sidecar at all is NOT listed either (that is unattested, not
+    unverifiable). Read-only — does not touch the attribution cache or the
+    ledger."""
+    from . import human_session
+
+    return {"unverifiable": human_session.list_unverifiable_sessions()}
 
 
 @mcp.tool(annotations=_ANNO_WRITE_IDEM)

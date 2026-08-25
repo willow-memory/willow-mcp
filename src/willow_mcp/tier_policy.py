@@ -49,6 +49,7 @@ TOOL_CLASS: dict[str, str] = {
     "gap_list": READ,
     "dispatch_read": READ, "dispatch_list": READ, "handoff_read": READ,
     "session_read": READ, "session_enter": READ,
+    "sessions_read_unverifiable": READ,
     "specialist_list": READ, "specialist_get": READ,
     "exposure_config_get": READ, "exposure_slice": READ,
     "fleet_status": READ, "fleet_health": READ, "frank_read": READ,

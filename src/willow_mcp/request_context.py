@@ -6,7 +6,7 @@ and `server._read_call_credential()` read the signing client's out-of-band
 purpose, `Context` is injected into tool functions as a parameter, and the only
 ContextVar left in the SDK is `auth_context_var` for OAuth.
 
-That injection does not reach us. `_guarded` wraps 112 tools and the credential
+That injection does not reach us. `_guarded` wraps 113 tools and the credential
 check lives in the wrapper, not in any tool body — so "declare `ctx: Context`"
 would mean editing 109 signatures to thread a value none of them use, and
 rewriting the wrapper's `sig.bind` machinery around a parameter that must be

@@ -224,7 +224,14 @@ def test_orchestrator_write_denial_refuses_missing_sig_file(ring_with_rita, monk
 
 def test_orchestrator_write_denial_refuses_after_compromise(ring_with_rita, monkeypatch):
     """A signed v2 sidecar loses its trust when the verifier is revoked
-    as compromised — mirrors session_signing.session_is_valid's shape."""
+    as compromised — mirrors session_signing.session_is_valid's shape.
+
+    PR4 note: the in-process attribution cache is dropped explicitly here
+    to model the operator's post-revocation restart. Cross-process
+    revocation is by design invisible to a running server (Nestor's keyring
+    docstring names the same restart-on-revocation discipline); the cache
+    clear stands in for the restart that a real deployment would perform.
+    """
     monkeypatch.setenv("WILLOW_HUMAN_ORCHESTRATOR", "1")
     _enter_and_sign(ring_with_rita, "s-comp", "rita")
 
@@ -240,6 +247,7 @@ def test_orchestrator_write_denial_refuses_after_compromise(ring_with_rita, monk
     )
     ring_with_rita.revoke("rita", reason="stolen", compromised=True)
     ring_with_rita.save()
+    human_session.clear_attribution_cache()  # simulate operator restart
 
     denial = human_session.orchestrator_write_denial(
         app_id="willow",

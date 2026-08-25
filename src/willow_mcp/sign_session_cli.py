@@ -200,17 +200,46 @@ def cmd_sign_session(args: argparse.Namespace) -> int:
         print(f"Error: could not write attestation: {exc}", file=sys.stderr)
         return EXIT_FAIL
 
+    # PR4: append to the attribution ledger. This runs AFTER the sidecar +
+    # sig writes so a mid-flight failure never leaves a ledger entry for an
+    # attestation that isn't on disk. The reverse case (sidecar written but
+    # ledger append fails) is a much smaller anomaly — the sidecar is still
+    # valid, we just missed recording it — and we report it as a warning
+    # rather than rolling back, since rolling back the sidecar would break
+    # the operator's next orchestrator write.
+    from . import attribution_ledger
+
+    ledger_warning = ""
+    try:
+        new_head = attribution_ledger.append(
+            session_id=session_id,
+            verifier=verifier,
+            attested_at=attested_at,
+            sig_digest=attribution_ledger.sig_digest_hex(sig_hex),
+        )
+    except OSError as exc:
+        ledger_warning = (
+            f"\n  WARNING: attribution ledger append failed ({exc}); "
+            "the sidecar is on disk and the write path will accept it, but "
+            "there is no audit-trail entry for this attestation."
+        )
+        new_head = None
+
     key_kind = entry.kind
+    ledger_line = (
+        f"\n  ledger head {new_head[:16]}…" if new_head else ""
+    )
     print(
         f"Attested (v2, {key_kind}): {attest_file}\n"
         f"  verifier    {verifier}\n"
         f"  attested_at {attested_at}\n"
-        f"  sig         {sig_file}\n"
+        f"  sig         {sig_file}"
+        f"{ledger_line}\n"
         "\n"
         f"orchestrator_write_denial verifies this against {verifier}'s key in "
         "the keyring. Ordinary session writes (session_handoff_write, "
         "dispatch_accept, agent_clear, ...) do not invalidate it — the "
-        "signed payload is identity-only."
+        "signed payload is identity-only." + ledger_warning
     )
     return EXIT_OK
 
