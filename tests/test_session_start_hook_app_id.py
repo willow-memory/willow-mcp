@@ -5,8 +5,6 @@ where WILLOW_APP_ID was unset. This test file pins the new refusal.
 """
 from __future__ import annotations
 
-import pytest
-
 from willow_mcp import session_start_hook
 
 
