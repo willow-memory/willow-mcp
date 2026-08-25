@@ -113,7 +113,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 113 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 118 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -2970,6 +2970,14 @@ def _enveloped_verb_gate(
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     if not matches:
+        # PR6 (envelope-accrual): ENOGRANTS. Currently the gate is
+        # permissive here (returns None → call proceeds unmetered) —
+        # behavior preserved. But an attributed orchestrator session
+        # that hits this path is a good signal the operator would want
+        # to ratify an envelope covering this shape, so it becomes a
+        # queue entry. Silent best-effort; gate's real return is
+        # unchanged.
+        _auto_propose_on_gate_miss(app_id, verb, call_args, session)
         return None
     if len(matches) > 1:
         return {
@@ -2996,11 +3004,118 @@ def _enveloped_verb_gate(
         return {"error": f"envelope_gate_failed: {exc}"}
     if result.get("ok"):
         return None
+    # PR6: envelope existed but the check failed (bounds mismatch, quota
+    # exhausted, expiry). Auto-propose captures the ACTUAL call_args so
+    # the operator can widen bounds or bump quota with one ratify click
+    # rather than diffing errno.reason.fields[] against the current
+    # envelope by hand.
+    _auto_propose_on_gate_miss(app_id, verb, call_args, session)
     return {
         "error": result.get("errno", "EAMBIG"),
         "reason": result.get("reason"),
         "citation_id": result.get("citation_id"),
     }
+
+
+# PR6: dedup for auto-propose. A single call site can hit the gate many
+# times per session (dispatch loops, retry paths); we don't want the queue
+# to fill with 20 identical proposals for one shape. Track (session, verb,
+# bounds_digest) tuples in-process — cleared on process restart, same
+# discipline the attribution cache follows.
+_auto_propose_seen: set[tuple[str, str, str]] = set()
+_auto_propose_seen_lock = None
+
+
+def _auto_propose_lock():
+    global _auto_propose_seen_lock
+    if _auto_propose_seen_lock is None:
+        import threading
+        _auto_propose_seen_lock = threading.Lock()
+    return _auto_propose_seen_lock
+
+
+def clear_auto_propose_cache(session: str = "") -> None:
+    """Drop cached (session, verb, bounds_digest) tuples. Empty session
+    clears the whole cache (test-fixture / operator-restart use); a specific
+    session drops just that session's memoized shapes."""
+    with _auto_propose_lock():
+        if not session:
+            _auto_propose_seen.clear()
+            return
+        stale = [key for key in _auto_propose_seen if key[0] == session]
+        for key in stale:
+            _auto_propose_seen.discard(key)
+
+
+def _auto_propose_on_gate_miss(
+    app_id: str, verb: str, call_args: dict, session: str
+) -> None:
+    """PR6 back-channel: turn a gate refusal into a queue entry.
+
+    Silent best-effort. Never blocks or alters the gate's return path — the
+    caller still receives the original success/refusal signal. Fires only
+    when the current session is an attributed orchestrator session (per
+    PR1-4 identity) whose record carries a verifier; skips otherwise so
+    unattributed / specialist-owned processes cannot spam the queue.
+
+    Dedup by (session, verb, bounds_digest) tuple: repeat calls with the
+    same shape produce one proposal, not N.
+
+    Specialist-side auto-propose (a specialist's OWN process auto-proposing
+    from ITS ENOGRANTS, attributed via the dispatch packet's from_app) is
+    deferred to a follow-up: it needs the dispatch packet meta.json to
+    carry the orchestrator's verifier, which is a schema extension in a
+    separate PR.
+    """
+    from . import envelope_authoring as _ea
+    from . import human_session as _hs
+    from . import keyring as _keyring
+
+    if not _keyring.enabled():
+        return
+    if not session or not _hs.is_session_attributed(session):
+        return
+    # Read the session record — must have a verifier bound (PR2 discipline).
+    # dispatch_stack.session_read expects (app_id, session_id).
+    record = dispatch_stack.session_read(app_id, session)
+    verifier = (record or {}).get("verifier", "")
+    if not verifier:
+        return
+
+    # Dedup: same (session, verb, bounds) → one proposal, not N.
+    try:
+        digest = _ea._bounds_digest(dict(call_args or {}))
+    except Exception:
+        return
+    key = (session, verb, digest)
+    with _auto_propose_lock():
+        if key in _auto_propose_seen:
+            return
+        _auto_propose_seen.add(key)
+
+    pg = get_pg()
+    ledger = None
+    if pg is not None:
+        try:
+            from .governance_ledger import GovernanceLedger
+            ledger = GovernanceLedger(pg)
+        except Exception:
+            ledger = None
+    try:
+        _ea.propose(
+            verb=verb, grantee=app_id, bounds=dict(call_args or {}),
+            reason=f"auto-proposed from gate miss on session {session}",
+            verifier=verifier, session_id=session,
+            proposer_app_id=app_id, ledger=ledger,
+        )
+    except _ea.EnvelopeAuthoringError:
+        # Silent — auto-propose failing must never mask the gate's real
+        # return signal. UnknownVerbError from an off-registry verb, an
+        # UnattributedSessionError from a cache race, an InvalidBounds
+        # from a caller supplying non-schema keys — all fall through.
+        # The operator can still see the specialist's original errno on
+        # the tool response; nothing was silently swallowed there.
+        pass
 
 
 # Project used for the FRANK citation a verb-level gate writes on the caller's
@@ -3326,6 +3441,28 @@ def session_enter(
     snap = read_stack_snapshot(app_id)
     if snap:
         result["orientation"]["stack_snapshot"] = snap
+
+    # PR6 (envelope-accrual): surface the operator's pending-proposal count
+    # at seat entry so an attributed orchestrator sees "N proposals waiting
+    # for ratification" as part of orient, not mid-dispatch when the queue
+    # has silently grown. Only surfaced for orchestrator sessions — a
+    # specialist's orient block doesn't include the operator queue.
+    from .human_session import is_orchestrator_app
+    if is_orchestrator_app(app_id):
+        try:
+            from . import envelope_authoring as _ea
+            pending = _ea.list_pending(oldest_first=True, limit=1000)
+            result["orientation"]["envelope_proposals_pending"] = {
+                "count": len(pending),
+                "oldest_id": pending[0]["id"] if pending else None,
+                "oldest_at": pending[0].get("proposed_at") if pending else None,
+            }
+        except Exception:
+            # A missing registry / trusted_read failure is not a reason to
+            # refuse session_enter — the queue count is orient sugar, the
+            # registry itself is checked by the auto-propose path with
+            # its own error handling.
+            pass
     return result
 
 
@@ -3635,6 +3772,177 @@ def envelope_apply(
         )
     except Exception as exc:
         return {"error": f"envelope_apply_failed: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# Envelope authoring (PR5 of the envelope-accrual plan).
+#
+# envelope_apply above is the READ side of the envelope contract — check a
+# grant, cite it, run the act. These five tools are the WRITE side that was
+# missing: an agent proposes into pre-approved.json#proposals[], an operator
+# ratifies (moves to active[]) or rejects (records the "no" with reopen_when),
+# and both surfaces are readable. Every authoring act appends a FRANK ledger
+# event alongside the existing envelope_citation events.
+#
+# All five gate on the CURRENT ORCHESTRATOR SESSION (per PR1-4 attribution):
+# propose/ratify/reject require an entered orchestrator session whose verifier
+# passes the keyring check. Specialists cannot MCP-call these directly; the
+# auto-propose path from _enveloped_verb_gate (PR6) is how a specialist's
+# gate miss lands in the queue attributed to the orchestrator that
+# dispatched it. See docs/design/envelope-accrual.md.
+# ---------------------------------------------------------------------------
+
+
+def _envelope_authoring_session() -> tuple[str, str] | dict:
+    """(verifier, session_id) for the current orchestrator session, or a
+    structured refusal dict when no attributed session is in force.
+
+    Every envelope authoring MCP tool routes through this. The pattern
+    matches human_session.orchestrator_write_denial's discipline: refuse at
+    the boundary, name the missing piece, point at the fix."""
+    from . import human_session as _hs
+    session_id = _current_orchestrator_session()
+    if not session_id:
+        return {"error": "orchestrator_session_required",
+                "message": "envelope authoring requires an entered orchestrator "
+                "session (call session_enter(app_id='willow', session_id=...) "
+                "first)."}
+    record = dispatch_stack.session_read("willow", session_id)
+    verifier = (record or {}).get("verifier", "")
+    if not verifier:
+        return {"error": "unattributed_session",
+                "message": (
+                    f"session {session_id!r} has no verifier on record — "
+                    "envelope authoring is attribution-gated. Sign the "
+                    f"session with `willow-mcp sign-session {session_id} "
+                    "--verifier NAME` from an operator terminal (PR3), then "
+                    "call session_enter again with the seal_sig."
+                )}
+    if not _hs.is_session_attributed(session_id):
+        return {"error": "unattributed_session",
+                "message": (
+                    f"session {session_id!r} carries verifier {verifier!r} "
+                    "on record but is not in the process's attribution "
+                    "cache. This can mean the sig was invalidated "
+                    "(compromised key, tampered sidecar) or the process was "
+                    "restarted after a revocation. Call an orchestrator "
+                    "write once (e.g. dispatch_list) to refresh the cache, "
+                    "or check `sessions_read_unverifiable`."
+                )}
+    return verifier, session_id
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_propose")
+def envelope_propose(
+    verb: str,
+    grantee: str,
+    bounds: dict,
+    reason: str,
+    expires_at: str = "",
+    max_count: int | None = None,
+) -> dict:
+    """Draft an envelope into pre-approved.json#proposals[]. No force until
+    the operator ratifies. Attribution-gated: refuses when the current
+    orchestrator session isn't keyring-attributed (PR1-4). Writes an
+    envelope_proposed event to the FRANK ledger."""
+    ctx = _envelope_authoring_session()
+    if isinstance(ctx, dict):
+        return ctx
+    verifier, session_id = ctx
+    from . import envelope_authoring as _ea
+    pg = get_pg()
+    ledger = None
+    if pg is not None:
+        from .governance_ledger import GovernanceLedger
+        ledger = GovernanceLedger(pg)
+    try:
+        row = _ea.propose(
+            verb=verb, grantee=grantee, bounds=bounds, reason=reason,
+            verifier=verifier, session_id=session_id,
+            expires_at=expires_at or None, max_count=max_count,
+            ledger=ledger, proposer_app_id="willow",
+        )
+    except _ea.EnvelopeAuthoringError as exc:
+        return {"error": type(exc).__name__, "message": str(exc)}
+    return {"ok": True, "proposal": row}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_ratify")
+def envelope_ratify(proposal_id: str) -> dict:
+    """Move a proposal from proposals[] to active[]. Operator-only; requires
+    the current orchestrator session's verifier to pass the keyring check.
+    Writes envelope_ratified to the FRANK ledger. issued_by is stamped as
+    'root' (invariant preserved from pre-PR5)."""
+    ctx = _envelope_authoring_session()
+    if isinstance(ctx, dict):
+        return ctx
+    verifier, _ = ctx
+    from . import envelope_authoring as _ea
+    pg = get_pg()
+    ledger = None
+    if pg is not None:
+        from .governance_ledger import GovernanceLedger
+        ledger = GovernanceLedger(pg)
+    try:
+        row = _ea.ratify(proposal_id, verifier=verifier, ledger=ledger)
+    except _ea.EnvelopeAuthoringError as exc:
+        return {"error": type(exc).__name__, "message": str(exc)}
+    return {"ok": True, "envelope": row}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_reject")
+def envelope_reject(
+    proposal_id: str, reason: str, reopen_when: str = ""
+) -> dict:
+    """Record a "no" on a proposal. Same operator-attribution gate as
+    envelope_ratify. reopen_when distinguishes NEVER (empty) from NOT YET
+    (non-empty), mirroring nestor.memory.reject_match's shape."""
+    ctx = _envelope_authoring_session()
+    if isinstance(ctx, dict):
+        return ctx
+    verifier, _ = ctx
+    from . import envelope_authoring as _ea
+    pg = get_pg()
+    ledger = None
+    if pg is not None:
+        from .governance_ledger import GovernanceLedger
+        ledger = GovernanceLedger(pg)
+    try:
+        row = _ea.reject(
+            proposal_id, reason=reason, verifier=verifier,
+            reopen_when=reopen_when, ledger=ledger,
+        )
+    except _ea.EnvelopeAuthoringError as exc:
+        return {"error": type(exc).__name__, "message": str(exc)}
+    return {"ok": True, "rejection": row}
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("envelope_list")
+def envelope_list(grantee: str = "", verb: str = "") -> dict:
+    """List currently ACTIVE envelopes, optionally filtered by grantee
+    and/or verb. Read-only."""
+    from . import envelope_authoring as _ea
+    rows = _ea.list_active(grantee=grantee or None, verb=verb or None)
+    return {"active": rows, "count": len(rows)}
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("envelope_pending_read")
+def envelope_pending_read(
+    oldest_first: bool = True, limit: int = 50
+) -> dict:
+    """List envelope PROPOSALS awaiting operator ratification. Oldest first
+    by default so the queue is drained in FIFO order. Read-only.
+
+    This is the operator's queue view for the accrual loop — see
+    docs/design/envelope-accrual.md."""
+    from . import envelope_authoring as _ea
+    rows = _ea.list_pending(oldest_first=oldest_first, limit=limit)
+    return {"pending": rows, "count": len(rows)}
 
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -7164,6 +7472,11 @@ def _main():
     from . import sign_session_cli as _sign_session_cli
     _sign_session_cli.register(subparsers)
 
+    # PR5: envelope authoring — operator surface for
+    # ratify/reject/list/pending. See src/willow_mcp/cli_envelope.py.
+    from . import cli_envelope as _cli_envelope
+    _cli_envelope.register(subparsers)
+
     frank_anchor_p = subparsers.add_parser(
         "frank-anchor",
         help="Show or write the FRANK governance chain's externally-held head "
@@ -7476,6 +7789,9 @@ def _main():
     if args.command == "sign-session":
         from . import sign_session_cli as _sign_session_cli
         sys.exit(_sign_session_cli.cmd_sign_session(args))
+    if args.command == "envelope":
+        from . import cli_envelope as _cli_envelope
+        sys.exit(_cli_envelope.cmd_envelope(args))
     if args.command == "frank-anchor":
         _cmd_frank_anchor(args)
         return

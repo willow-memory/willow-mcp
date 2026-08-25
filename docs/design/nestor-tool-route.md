@@ -24,7 +24,7 @@ natural-language phrasings humans have sanctioned for each.
 
 ## The gap
 
-willow-mcp exposes 145 tools. An agent (or a human at a prompt) that knows
+willow-mcp exposes 150 tools. An agent (or a human at a prompt) that knows
 *what it wants* — "show me what breaks if I touch this file" — still has to know
 that the verb is `code_graph_impact`. Fuzzy self-discovery today is either the
 model guessing from tool names, or a keyword grep. Both fail the willow way:

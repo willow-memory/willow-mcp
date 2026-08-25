@@ -50,6 +50,8 @@ TOOL_CLASS: dict[str, str] = {
     "dispatch_read": READ, "dispatch_list": READ, "handoff_read": READ,
     "session_read": READ, "session_enter": READ,
     "sessions_read_unverifiable": READ,
+    "envelope_list": READ, "envelope_pending_read": READ,
+    "envelope_propose": WRITE, "envelope_ratify": WRITE, "envelope_reject": WRITE,
     "specialist_list": READ, "specialist_get": READ,
     "exposure_config_get": READ, "exposure_slice": READ,
     "fleet_status": READ, "fleet_health": READ, "frank_read": READ,
