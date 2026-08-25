@@ -7089,6 +7089,13 @@ def _main():
         "session_id", help="session_id passed to session_enter(app_id='willow', ...)"
     )
 
+    # Per-verifier keyring (identity-in-session plan, PR1). Opt-in via
+    # WILLOW_KEYRING. When unset, this subcommand still parses but reports
+    # that the keyring is not configured. See src/willow_mcp/keyring.py and
+    # src/willow_mcp/cli_keys.py for the primitive and the subcommand.
+    from . import cli_keys as _cli_keys
+    _cli_keys.register(subparsers)
+
     frank_anchor_p = subparsers.add_parser(
         "frank-anchor",
         help="Show or write the FRANK governance chain's externally-held head "
@@ -7394,6 +7401,10 @@ def _main():
     if args.command == "attest-session":
         _cmd_attest_session(args)
         return
+    if args.command == "keys":
+        # cli_keys.cmd_keys returns an exit code; propagate it.
+        from . import cli_keys as _cli_keys
+        sys.exit(_cli_keys.cmd_keys(args))
     if args.command == "frank-anchor":
         _cmd_frank_anchor(args)
         return
