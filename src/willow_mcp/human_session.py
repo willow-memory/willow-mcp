@@ -43,6 +43,94 @@ ORCHESTRATOR_WRITE_TOOLS = frozenset({
     "envelope_apply",
 })
 
+# PR3: sidecar format tokens. v1 = original attest-session payload (PGP
+# detached-signed by WILLOW_PGP_FINGERPRINT, no verifier field). v2 = keyring
+# path (client-signed via willow-mcp sign-session, ed25519 hex sig, adds a
+# verifier field naming the operator). Both continue to verify during
+# migration — legacy_key pattern from Nestor §5.8.
+_ATTEST_FORMAT_V1 = "orchestrator_session_attestation_v1"
+_ATTEST_FORMAT_V2 = "orchestrator_session_attestation_v2"
+
+
+def _sidecar_is_v2(attest_path) -> bool:
+    """True if the sidecar at `attest_path` declares itself v2. Any parse
+    failure or missing format falls through to False (treat as v1 legacy)."""
+    import json
+
+    try:
+        payload = json.loads(attest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return payload.get("format") == _ATTEST_FORMAT_V2
+
+
+def _verify_v2_sidecar_via_keyring(attest_path, sig_path, session_id: str):
+    """Verify a v2 sidecar under the keyring. Returns:
+
+    * ``None`` if the sidecar is v1 (fall through to legacy PGP path) OR if
+      the sidecar is v2 and its signature verifies (allow the write).
+    * A denial string if the sidecar IS v2 but the payload is malformed, the
+      signature is missing, the signature does not verify against the named
+      verifier's key in the keyring, or the payload names a different
+      identity than claimed.
+
+    The signal design mirrors ``session_signing.session_is_valid``: the
+    validator returns bool, the enforcer here returns the operator-facing
+    denial message.
+    """
+    import json
+
+    from . import session_signing
+
+    try:
+        payload = json.loads(attest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return (
+            f"orchestrator_session_attestation_invalid: session {session_id!r} "
+            f"attestation sidecar is unreadable ({exc}) — re-run "
+            f"`willow-mcp sign-session {session_id} --verifier NAME` from the "
+            "operator terminal."
+        )
+    if payload.get("format") != _ATTEST_FORMAT_V2:
+        return None  # v1 sidecar; caller falls through to PGP legacy path
+
+    try:
+        sig_hex = sig_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return (
+            f"orchestrator_session_attestation_invalid: session {session_id!r} "
+            f"attestation signature sidecar is unreadable ({exc})."
+        )
+
+    verifier = payload.get("verifier", "")
+    attested_at = payload.get("attested_at", "")
+    if payload.get("app_id") != ORCHESTRATOR_APP_ID or payload.get("session_id") != session_id:
+        return (
+            f"orchestrator_session_attestation_invalid: session {session_id!r} "
+            "attestation sidecar signs a different identity than claimed — "
+            "the signed payload names another app_id or session_id, so its "
+            "signature is not evidence about this session."
+        )
+    if not verifier or not attested_at or not sig_hex:
+        return (
+            f"orchestrator_session_attestation_invalid: session {session_id!r} "
+            "v2 attestation is missing one of verifier/attested_at/signature; "
+            f"re-run `willow-mcp sign-session {session_id} --verifier NAME`."
+        )
+    if not session_signing.session_is_valid(
+        ORCHESTRATOR_APP_ID, session_id, verifier, attested_at, sig_hex
+    ):
+        return (
+            f"orchestrator_session_attestation_invalid: session {session_id!r} "
+            f"was v2-attested by {verifier!r} but the signature does not "
+            "verify against that verifier's key in the keyring (rotated key, "
+            "compromised key, tampered sidecar, or the operator signed under a "
+            "different keyring). Re-run "
+            f"`willow-mcp sign-session {session_id} --verifier {verifier}` from "
+            "the operator terminal."
+        )
+    return None  # verified — allow the write
+
 
 def is_orchestrator_app(app_id: str) -> bool:
     return (app_id or "").strip().lower() == ORCHESTRATOR_APP_ID
@@ -142,13 +230,16 @@ def orchestrator_write_denial(
             "env). Agents cannot run Willow."
         )
 
-    # P2 (#186): once PGP is enabled, env attestation alone is no longer enough —
-    # the current session must also carry a valid signature over its stable
-    # identity. No-op (interim env-only) until WILLOW_PGP_FINGERPRINT is set,
-    # same opt-in gate as manifest signing (#183).
+    # P2 (#186): once PGP is enabled, env attestation alone is no longer
+    # enough — the current session must also carry a valid signature over
+    # its stable identity. No-op (interim env-only) until either
+    # WILLOW_PGP_FINGERPRINT (legacy) or WILLOW_KEYRING (PR3 keyring path)
+    # is set.
+    from . import keyring as keyring_mod
     from . import pgp
 
-    if not pgp.pgp_enabled():
+    keyring_on = keyring_mod.enabled()
+    if not pgp.pgp_enabled() and not keyring_on:
         return None
 
     from .paths import session_attestation_path, session_path
@@ -158,7 +249,9 @@ def orchestrator_write_denial(
             "orchestrator_session_attestation_missing: no active orchestrator "
             "session on record for this process — call "
             "session_enter(app_id='willow', session_id=...) first, then "
-            "`willow-mcp attest-session <session_id>` from the operator terminal."
+            "`willow-mcp attest-session <session_id>` (legacy PGP) or "
+            "`willow-mcp sign-session <session_id> --verifier NAME` (keyring, PR3) "
+            "from the operator terminal."
         )
 
     # Live session file must still exist (proof session_enter's binding is on
@@ -171,7 +264,9 @@ def orchestrator_write_denial(
             f"orchestrator_session_attestation_missing: session {session_id!r} "
             "has no live session file on disk — call "
             "session_enter(app_id='willow', session_id=...) first, then "
-            f"`willow-mcp attest-session {session_id}` from the operator terminal."
+            f"`willow-mcp attest-session {session_id}` (legacy PGP) or "
+            f"`willow-mcp sign-session {session_id} --verifier NAME` (keyring) "
+            "from the operator terminal."
         )
 
     # #313: verify against the dedicated attest-session sidecar
@@ -183,6 +278,24 @@ def orchestrator_write_denial(
     # tuple attest-session signed and is never touched by those writes.
     attest_path = session_attestation_path(ORCHESTRATOR_APP_ID, session_id)
     sig_path = attest_path.parent / f"{attest_path.name}.sig"
+
+    # PR3: if a v2 sidecar exists and the keyring is enabled, verify through
+    # the keyring path (client-signed ed25519 or hmac). v2 sidecars carry a
+    # `verifier` field naming the operator; the sig lives in a separate
+    # .sig file as raw hex (not a PGP detached sig). Fall back to the PGP
+    # legacy path (v1 sidecar) when either the sidecar is v1 or the keyring
+    # is disabled.
+    if keyring_on and attest_path.is_file() and sig_path.is_file():
+        v2_denial = _verify_v2_sidecar_via_keyring(
+            attest_path, sig_path, session_id
+        )
+        if v2_denial is not None:
+            return v2_denial
+        # v2_denial is None either because verification succeeded (allow the
+        # write) or because the sidecar is v1 (fall through to PGP legacy).
+        if _sidecar_is_v2(attest_path):
+            return None
+
     if not attest_path.is_file() or not sig_path.is_file():
         # Distinguish "never attested" from "attested, but the signature no
         # longer verifies" in the top-level reason (#313) -- the operator
@@ -192,10 +305,29 @@ def orchestrator_write_denial(
         # Token rename from orchestrator_session_attestation_required (#186):
         # parsers that still match the old needle should look for
         # orchestrator_session_attestation_missing / _invalid instead.
+        remedy = (
+            f"`willow-mcp sign-session {session_id} --verifier NAME`"
+            if keyring_on
+            else f"`willow-mcp attest-session {session_id}`"
+        )
         return (
             f"orchestrator_session_attestation_missing: session {session_id!r} "
-            "has never been PGP-attested (no attestation record on file) — run "
-            f"`willow-mcp attest-session {session_id}` from the operator terminal."
+            f"has never been attested (no attestation record on file) — run "
+            f"{remedy} from the operator terminal."
+        )
+    # PR3: reaching here means either the keyring is off (legacy PGP path)
+    # or the sidecar is v1 (predates keyring adoption). Both need the PGP
+    # verifier; if PGP is not enabled and we still reach here, that means
+    # the operator has a keyring but a v1 sidecar and no PGP fingerprint —
+    # ask them to re-attest under the keyring path so the sidecar rolls to
+    # v2.
+    if not pgp.pgp_enabled():
+        return (
+            f"orchestrator_session_attestation_invalid: session {session_id!r} "
+            "has a v1 (PGP) attestation sidecar but WILLOW_PGP_FINGERPRINT is "
+            "not set, so it cannot be verified. The keyring is on — re-attest "
+            f"under it with `willow-mcp sign-session {session_id} --verifier "
+            "NAME` from the operator terminal to roll the sidecar to v2."
         )
     ok, detail = pgp.verify_detached(attest_path)
     if not ok:
