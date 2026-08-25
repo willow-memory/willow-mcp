@@ -14,17 +14,14 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from willow_mcp import (
     envelope_authoring as ea,
-    envelopes as _envelopes,
     human_session,
     keyring as keyring_mod,
-    paths,
 )
 
 
