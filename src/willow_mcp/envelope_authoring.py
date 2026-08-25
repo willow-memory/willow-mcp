@@ -260,6 +260,26 @@ def propose(
             f"generated id {proposal_id!r} already exists — retry"
         )
 
+    # PR7: precedent recall. If the caller didn't supply precedent_ids
+    # explicitly, ask envelope_shapes for the top matches against
+    # currently-active envelopes for this (verb, grantee, bounds) shape.
+    # An import-guarded call — if envelope_shapes ever needs an optional
+    # dep this module doesn't want to pull in, propose still works.
+    resolved_precedents: list[str]
+    if precedent_ids is None:
+        try:
+            from . import envelope_shapes as _es
+            resolved_precedents = _es.top_precedent_ids(
+                verb, grantee, bounds
+            )
+        except Exception:
+            # Precedent recall failing must never block propose — the
+            # operator can still ratify from scratch. Log to no-op and
+            # move on.
+            resolved_precedents = []
+    else:
+        resolved_precedents = list(precedent_ids)
+
     row = {
         "id": proposal_id,
         "verb_id": verb_id,
@@ -282,7 +302,7 @@ def propose(
             "orchestrator_session_id": orchestrator_session_id or session_id,
             "proposer_app_id": proposer_app_id,
         },
-        "precedent_ids": list(precedent_ids or []),
+        "precedent_ids": resolved_precedents,
     }
     proposals.append(row)
     registry["proposals"] = proposals
