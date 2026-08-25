@@ -41,6 +41,14 @@ ORCHESTRATOR_WRITE_TOOLS = frozenset({
     "agent_clear",
     "frank_append",
     "envelope_apply",
+    # PR5 (envelope-accrual): the operator's authoring writes gate under
+    # the same shape. propose is gated too — the MCP-tool path is
+    # orchestrator-only; a specialist's session proposes via the
+    # auto-propose path (PR6) which runs from inside _enveloped_verb_gate
+    # itself, not through the tool.
+    "envelope_propose",
+    "envelope_ratify",
+    "envelope_reject",
 })
 
 # PR3: sidecar format tokens. v1 = original attest-session payload (PGP

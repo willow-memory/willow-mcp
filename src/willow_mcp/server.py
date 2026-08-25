@@ -113,7 +113,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 113 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 118 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -3635,6 +3635,177 @@ def envelope_apply(
         )
     except Exception as exc:
         return {"error": f"envelope_apply_failed: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# Envelope authoring (PR5 of the envelope-accrual plan).
+#
+# envelope_apply above is the READ side of the envelope contract — check a
+# grant, cite it, run the act. These five tools are the WRITE side that was
+# missing: an agent proposes into pre-approved.json#proposals[], an operator
+# ratifies (moves to active[]) or rejects (records the "no" with reopen_when),
+# and both surfaces are readable. Every authoring act appends a FRANK ledger
+# event alongside the existing envelope_citation events.
+#
+# All five gate on the CURRENT ORCHESTRATOR SESSION (per PR1-4 attribution):
+# propose/ratify/reject require an entered orchestrator session whose verifier
+# passes the keyring check. Specialists cannot MCP-call these directly; the
+# auto-propose path from _enveloped_verb_gate (PR6) is how a specialist's
+# gate miss lands in the queue attributed to the orchestrator that
+# dispatched it. See docs/design/envelope-accrual.md.
+# ---------------------------------------------------------------------------
+
+
+def _envelope_authoring_session() -> tuple[str, str] | dict:
+    """(verifier, session_id) for the current orchestrator session, or a
+    structured refusal dict when no attributed session is in force.
+
+    Every envelope authoring MCP tool routes through this. The pattern
+    matches human_session.orchestrator_write_denial's discipline: refuse at
+    the boundary, name the missing piece, point at the fix."""
+    from . import human_session as _hs
+    session_id = _current_orchestrator_session()
+    if not session_id:
+        return {"error": "orchestrator_session_required",
+                "message": "envelope authoring requires an entered orchestrator "
+                "session (call session_enter(app_id='willow', session_id=...) "
+                "first)."}
+    record = dispatch_stack.session_read("willow", session_id)
+    verifier = (record or {}).get("verifier", "")
+    if not verifier:
+        return {"error": "unattributed_session",
+                "message": (
+                    f"session {session_id!r} has no verifier on record — "
+                    "envelope authoring is attribution-gated. Sign the "
+                    f"session with `willow-mcp sign-session {session_id} "
+                    "--verifier NAME` from an operator terminal (PR3), then "
+                    "call session_enter again with the seal_sig."
+                )}
+    if not _hs.is_session_attributed(session_id):
+        return {"error": "unattributed_session",
+                "message": (
+                    f"session {session_id!r} carries verifier {verifier!r} "
+                    "on record but is not in the process's attribution "
+                    "cache. This can mean the sig was invalidated "
+                    "(compromised key, tampered sidecar) or the process was "
+                    "restarted after a revocation. Call an orchestrator "
+                    "write once (e.g. dispatch_list) to refresh the cache, "
+                    "or check `sessions_read_unverifiable`."
+                )}
+    return verifier, session_id
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_propose")
+def envelope_propose(
+    verb: str,
+    grantee: str,
+    bounds: dict,
+    reason: str,
+    expires_at: str = "",
+    max_count: int | None = None,
+) -> dict:
+    """Draft an envelope into pre-approved.json#proposals[]. No force until
+    the operator ratifies. Attribution-gated: refuses when the current
+    orchestrator session isn't keyring-attributed (PR1-4). Writes an
+    envelope_proposed event to the FRANK ledger."""
+    ctx = _envelope_authoring_session()
+    if isinstance(ctx, dict):
+        return ctx
+    verifier, session_id = ctx
+    from . import envelope_authoring as _ea
+    pg = get_pg()
+    ledger = None
+    if pg is not None:
+        from .governance_ledger import GovernanceLedger
+        ledger = GovernanceLedger(pg)
+    try:
+        row = _ea.propose(
+            verb=verb, grantee=grantee, bounds=bounds, reason=reason,
+            verifier=verifier, session_id=session_id,
+            expires_at=expires_at or None, max_count=max_count,
+            ledger=ledger, proposer_app_id="willow",
+        )
+    except _ea.EnvelopeAuthoringError as exc:
+        return {"error": type(exc).__name__, "message": str(exc)}
+    return {"ok": True, "proposal": row}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_ratify")
+def envelope_ratify(proposal_id: str) -> dict:
+    """Move a proposal from proposals[] to active[]. Operator-only; requires
+    the current orchestrator session's verifier to pass the keyring check.
+    Writes envelope_ratified to the FRANK ledger. issued_by is stamped as
+    'root' (invariant preserved from pre-PR5)."""
+    ctx = _envelope_authoring_session()
+    if isinstance(ctx, dict):
+        return ctx
+    verifier, _ = ctx
+    from . import envelope_authoring as _ea
+    pg = get_pg()
+    ledger = None
+    if pg is not None:
+        from .governance_ledger import GovernanceLedger
+        ledger = GovernanceLedger(pg)
+    try:
+        row = _ea.ratify(proposal_id, verifier=verifier, ledger=ledger)
+    except _ea.EnvelopeAuthoringError as exc:
+        return {"error": type(exc).__name__, "message": str(exc)}
+    return {"ok": True, "envelope": row}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_reject")
+def envelope_reject(
+    proposal_id: str, reason: str, reopen_when: str = ""
+) -> dict:
+    """Record a "no" on a proposal. Same operator-attribution gate as
+    envelope_ratify. reopen_when distinguishes NEVER (empty) from NOT YET
+    (non-empty), mirroring nestor.memory.reject_match's shape."""
+    ctx = _envelope_authoring_session()
+    if isinstance(ctx, dict):
+        return ctx
+    verifier, _ = ctx
+    from . import envelope_authoring as _ea
+    pg = get_pg()
+    ledger = None
+    if pg is not None:
+        from .governance_ledger import GovernanceLedger
+        ledger = GovernanceLedger(pg)
+    try:
+        row = _ea.reject(
+            proposal_id, reason=reason, verifier=verifier,
+            reopen_when=reopen_when, ledger=ledger,
+        )
+    except _ea.EnvelopeAuthoringError as exc:
+        return {"error": type(exc).__name__, "message": str(exc)}
+    return {"ok": True, "rejection": row}
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("envelope_list")
+def envelope_list(grantee: str = "", verb: str = "") -> dict:
+    """List currently ACTIVE envelopes, optionally filtered by grantee
+    and/or verb. Read-only."""
+    from . import envelope_authoring as _ea
+    rows = _ea.list_active(grantee=grantee or None, verb=verb or None)
+    return {"active": rows, "count": len(rows)}
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("envelope_pending_read")
+def envelope_pending_read(
+    oldest_first: bool = True, limit: int = 50
+) -> dict:
+    """List envelope PROPOSALS awaiting operator ratification. Oldest first
+    by default so the queue is drained in FIFO order. Read-only.
+
+    This is the operator's queue view for the accrual loop — see
+    docs/design/envelope-accrual.md."""
+    from . import envelope_authoring as _ea
+    rows = _ea.list_pending(oldest_first=oldest_first, limit=limit)
+    return {"pending": rows, "count": len(rows)}
 
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -7164,6 +7335,11 @@ def _main():
     from . import sign_session_cli as _sign_session_cli
     _sign_session_cli.register(subparsers)
 
+    # PR5: envelope authoring — operator surface for
+    # ratify/reject/list/pending. See src/willow_mcp/cli_envelope.py.
+    from . import cli_envelope as _cli_envelope
+    _cli_envelope.register(subparsers)
+
     frank_anchor_p = subparsers.add_parser(
         "frank-anchor",
         help="Show or write the FRANK governance chain's externally-held head "
@@ -7476,6 +7652,9 @@ def _main():
     if args.command == "sign-session":
         from . import sign_session_cli as _sign_session_cli
         sys.exit(_sign_session_cli.cmd_sign_session(args))
+    if args.command == "envelope":
+        from . import cli_envelope as _cli_envelope
+        sys.exit(_cli_envelope.cmd_envelope(args))
     if args.command == "frank-anchor":
         _cmd_frank_anchor(args)
         return
