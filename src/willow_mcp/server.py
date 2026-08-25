@@ -113,7 +113,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 112 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 113 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -3204,6 +3204,26 @@ def session_read(app_id: str, session_id: str) -> dict:
     return dispatch_stack.session_read(app_id, session_id)
 
 
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("sessions_read_unverifiable")
+def sessions_read_unverifiable() -> dict:
+    """PR4 of the identity-in-session plan: enumerate orchestrator sessions
+    whose attestation sidecar exists but no longer verifies. The browsable
+    trust-view an operator needs after a keyring compromise, a key rotation
+    that invalidated prior sigs, or a tampered sidecar — without this, the
+    operator learns about invalidated sessions one denial-per-write at a
+    time.
+
+    Returns {"unverifiable": [{session_id, verifier, format, reason}, ...]}.
+    A session with a sidecar that verifies is NOT listed. A session with no
+    sidecar at all is NOT listed either (that is unattested, not
+    unverifiable). Read-only — does not touch the attribution cache or the
+    ledger."""
+    from . import human_session
+
+    return {"unverifiable": human_session.list_unverifiable_sessions()}
+
+
 @mcp.tool(annotations=_ANNO_WRITE_IDEM)
 @_guarded("session_enter")
 def session_enter(
@@ -6156,7 +6176,25 @@ def _cmd_attest_session(args) -> None:
     human_session.orchestrator_write_denial verifies this sidecar's signature
     before dispatch_send/verify_handoff/agent_clear/frank_append/envelope_apply
     run as app_id=willow, whenever WILLOW_PGP_FINGERPRINT is set."""
+    from . import keyring as _keyring
     from . import pgp
+
+    # PR3 deprecation notice: when the keyring is on, attest-session's
+    # server-side pinentry burden is no longer the recommended path. Point
+    # the operator at sign-session (client-side signing off the server
+    # process) but continue with the PGP flow for backward compat — a
+    # deployment migrating away from PGP might have both configured during
+    # cutover, and refusing here would break their existing scripts.
+    if _keyring.enabled():
+        print(
+            "Note: WILLOW_KEYRING is set. `willow-mcp attest-session` is the "
+            "legacy PGP-fingerprint path; the recommended flow under the "
+            "keyring is `willow-mcp sign-session <session_id> --verifier "
+            "NAME`, which signs client-side so no signing key reaches this "
+            "process. This command still writes a v1 sidecar for backward "
+            "compatibility.",
+            file=sys.stderr,
+        )
 
     if os.environ.get("WILLOW_IN_KART", "").strip() or not sys.stdin.isatty():
         print(
@@ -7120,6 +7158,12 @@ def _main():
     from . import cli_keys as _cli_keys
     _cli_keys.register(subparsers)
 
+    # PR3: client-side session signer. Replaces the server-side pinentry
+    # burden of attest-session for keyring-enabled deployments. See
+    # src/willow_mcp/sign_session_cli.py.
+    from . import sign_session_cli as _sign_session_cli
+    _sign_session_cli.register(subparsers)
+
     frank_anchor_p = subparsers.add_parser(
         "frank-anchor",
         help="Show or write the FRANK governance chain's externally-held head "
@@ -7429,6 +7473,9 @@ def _main():
         # cli_keys.cmd_keys returns an exit code; propagate it.
         from . import cli_keys as _cli_keys
         sys.exit(_cli_keys.cmd_keys(args))
+    if args.command == "sign-session":
+        from . import sign_session_cli as _sign_session_cli
+        sys.exit(_sign_session_cli.cmd_sign_session(args))
     if args.command == "frank-anchor":
         _cmd_frank_anchor(args)
         return

@@ -30,7 +30,26 @@ def handle(payload: dict) -> dict:
     session_id = str(
         payload.get("session_id") or payload.get("conversation_id") or uuid.uuid4()
     )
-    app_id = os.environ.get("WILLOW_APP_ID", "willow")
+    # PR4 of the identity-in-session plan: refuse to enter with an inferred
+    # identity. The prior default silently assigned app_id="willow"
+    # (orchestrator seat) to any workspace without WILLOW_APP_ID set — the
+    # exact anti-pattern nestor.memory._same_verifier codified ("empty is
+    # unknown, not a person"). Every existing willow orchestrator workspace
+    # must set WILLOW_APP_ID=willow explicitly next to the
+    # WILLOW_HUMAN_ORCHESTRATOR flag it already carries; specialist
+    # workspaces must set their own app_id or refuse at boot.
+    app_id = os.environ.get("WILLOW_APP_ID", "").strip()
+    if not app_id:
+        message = (
+            "WILLOW_APP_ID is not set on this MCP server env. Willow no longer "
+            "defaults to 'willow' — an unset value used to silently claim the "
+            "orchestrator seat. Set WILLOW_APP_ID=willow (orchestrator "
+            "workspace) or WILLOW_APP_ID=<specialist_id> (specialist workspace) "
+            "in your MCP config next to WILLOW_HUMAN_ORCHESTRATOR. See "
+            "docs/design/human-orchestrator.md wiring checklist item 2."
+        )
+        logging.getLogger("willow_mcp.session_start_hook").error(message)
+        return {"additional_context": f"WILLOW session_enter FAILED — {message}"}
     result = session_enter(
         app_id=app_id,
         session_id=session_id,

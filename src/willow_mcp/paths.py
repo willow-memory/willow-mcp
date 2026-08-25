@@ -154,6 +154,14 @@ def session_path(app_id: str, session_id: str) -> Path:
     return sessions_dir() / f"{app_id}-{safe_sid}.json"
 
 
+def attribution_ledger_path() -> Path:
+    """PR4 of the identity-in-session plan: append-only hash chain of session
+    attestations. One file per willow-mcp instance, at a fixed name under
+    sessions_dir() so a caller does not have to know an app_id or session_id
+    to check the tip. See src/willow_mcp/attribution_ledger.py."""
+    return sessions_dir() / "attribution_ledger.jsonl"
+
+
 def session_attestation_path(app_id: str, session_id: str) -> Path:
     """Path to the immutable identity attestation for an orchestrator session
     (#313). `session_path()` holds mutable operational state (status,
