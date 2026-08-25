@@ -113,7 +113,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 118 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 119 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -3025,6 +3025,25 @@ def _enveloped_verb_gate(
 _auto_propose_seen: set[tuple[str, str, str]] = set()
 _auto_propose_seen_lock = None
 
+# Follow-on to PR6, filed against Nestor's dogfood prior:
+#   "A ledger line that will not parse is a state that cannot happen.
+#    What does the code do when it happens? It ignored it. entries()
+#    walked past and returned a shorter chain in silence. Fixed with
+#    a second walk — ledger.unreadable() — rather than a condition
+#    inside the first."
+#
+# Same shape here. The auto-propose write path is deliberately silent
+# so an EnvelopeAuthoringError doesn't mask the specialist's real errno
+# (that reasoning stays right). But silence on the WRITE path shouldn't
+# mean the discards leave no residue anywhere: an operator whose queue
+# says "3 pending" needs to know if it should have said "5 pending, 2
+# lost." The two-walk pattern: propose() writes what succeeds,
+# _auto_propose_discards accumulates what got swallowed. The orient
+# block surfaces the count so the operator sees the residue at seat-open,
+# not weeks later when a shape they thought was queued turns out not to
+# be.
+_auto_propose_discards: list[dict] = []
+
 
 def _auto_propose_lock():
     global _auto_propose_seen_lock
@@ -3035,16 +3054,37 @@ def _auto_propose_lock():
 
 
 def clear_auto_propose_cache(session: str = "") -> None:
-    """Drop cached (session, verb, bounds_digest) tuples. Empty session
-    clears the whole cache (test-fixture / operator-restart use); a specific
-    session drops just that session's memoized shapes."""
+    """Drop cached dedup tuples AND discard residue. Empty session clears
+    the whole cache and all discards (test-fixture / operator-restart use);
+    a specific session drops just that session's memoized shapes and
+    swallowed proposals."""
     with _auto_propose_lock():
         if not session:
             _auto_propose_seen.clear()
+            _auto_propose_discards.clear()
             return
         stale = [key for key in _auto_propose_seen if key[0] == session]
         for key in stale:
             _auto_propose_seen.discard(key)
+        _auto_propose_discards[:] = [
+            d for d in _auto_propose_discards if d.get("session_id") != session
+        ]
+
+
+def list_auto_propose_discards(session: str = "") -> list[dict]:
+    """Read the swallowed-auto-propose residue accumulated in this process.
+
+    Second walk of the two-walk pattern the Nestor dogfood prior names:
+    the write path (propose) yields what succeeded; this yields what got
+    discarded. Non-empty means at least one gate miss failed to land in
+    the queue — the operator's pending count is a floor, not the true
+    count. Empty ``session`` returns all discards; a specific session_id
+    filters. Read-only; does not touch the cache."""
+    with _auto_propose_lock():
+        if not session:
+            return list(_auto_propose_discards)
+        return [d for d in _auto_propose_discards
+                if d.get("session_id") == session]
 
 
 def _auto_propose_on_gate_miss(
@@ -3108,14 +3148,30 @@ def _auto_propose_on_gate_miss(
             verifier=verifier, session_id=session,
             proposer_app_id=app_id, ledger=ledger,
         )
-    except _ea.EnvelopeAuthoringError:
-        # Silent — auto-propose failing must never mask the gate's real
-        # return signal. UnknownVerbError from an off-registry verb, an
-        # UnattributedSessionError from a cache race, an InvalidBounds
-        # from a caller supplying non-schema keys — all fall through.
-        # The operator can still see the specialist's original errno on
-        # the tool response; nothing was silently swallowed there.
-        pass
+    except _ea.EnvelopeAuthoringError as exc:
+        # Silent on the WRITE path — auto-propose failing must never mask
+        # the gate's real return signal. UnknownVerbError, UnattributedSessionError,
+        # InvalidBoundsSignatureError — all fall through here so the
+        # specialist still sees its original errno.
+        #
+        # BUT the discard is not silent overall. Record it in the residue
+        # walk so the orient block can surface "3 pending, 2 discarded"
+        # at the operator's next seat-open. Nestor's dogfood prior on
+        # ledger.unreadable() is the shape: a discard leaves no residue to
+        # count is the failure; a companion walk fixes it.
+        from datetime import datetime, timezone
+        with _auto_propose_lock():
+            _auto_propose_discards.append({
+                "session_id": session,
+                "verifier": verifier,
+                "app_id": app_id,
+                "verb": verb,
+                "bounds": dict(call_args or {}),
+                "error_class": type(exc).__name__,
+                "error_message": str(exc)[:400],
+                "at": datetime.now(timezone.utc)
+                    .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            })
 
 
 # Project used for the FRANK citation a verb-level gate writes on the caller's
@@ -3447,6 +3503,12 @@ def session_enter(
     # for ratification" as part of orient, not mid-dispatch when the queue
     # has silently grown. Only surfaced for orchestrator sessions — a
     # specialist's orient block doesn't include the operator queue.
+    #
+    # Follow-on: surface the auto-propose discard residue too. Nestor
+    # prior (dogfood: ledger.unreadable): a discard leaves no residue to
+    # count is the failure. Non-zero discards mean the pending count is a
+    # floor, not the true count — the operator needs to know that at
+    # seat-open, not weeks later.
     from .human_session import is_orchestrator_app
     if is_orchestrator_app(app_id):
         try:
@@ -3463,7 +3525,35 @@ def session_enter(
             # registry itself is checked by the auto-propose path with
             # its own error handling.
             pass
+        discards = list_auto_propose_discards()
+        result["orientation"]["envelope_auto_propose_discards"] = {
+            "count": len(discards),
+            "latest_error_class": (
+                discards[-1]["error_class"] if discards else None
+            ),
+        }
     return result
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("envelope_read_discards")
+def envelope_read_discards(session_id: str = "") -> dict:
+    """Read the auto-propose discard residue for the current process.
+
+    PR6 auto-propose (envelope-accrual) is silent on failure — it swallows
+    EnvelopeAuthoringError so the specialist's real errno isn't masked.
+    But silence on the write path shouldn't mean the discards leave no
+    residue. This tool is the second walk (mirroring Nestor's
+    ledger.unreadable() pattern): what got proposed AND what got
+    swallowed, so the operator can see whether the pending queue is
+    the full picture or a floor.
+
+    Empty ``session_id`` returns all discards this process has seen; a
+    specific session_id filters. Discards are cleared on process
+    restart (same discipline as the attribution and dedup caches);
+    ``clear_auto_propose_cache()`` also clears them per-session or
+    globally."""
+    return {"discards": list_auto_propose_discards(session=session_id or "")}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
