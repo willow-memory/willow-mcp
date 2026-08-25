@@ -67,10 +67,20 @@ def handle(payload: dict) -> dict:
     # own uid's behalf, and only if the operator explicitly opted in.
     #
     # Opt-in: WILLOW_OPERATOR_VERIFIER unset → no auto-sign, existing
-    # behavior. When set, the hook still succeeds even if auto-sign
-    # fails (unknown/compromised verifier, keyring not enabled, missing
-    # private half) — it just doesn't produce a sig, and session_enter
-    # falls through to the unattested downgrade path (existing).
+    # behavior. When set:
+    # * keyring disabled → note, session enters unattributed (soft
+    #   degrade — the operator's config is inconsistent, but continuing
+    #   without attribution mirrors the existing WILLOW_KEYRING-off
+    #   behavior; loud enough via the note).
+    # * verifier unknown OR compromised → REFUSE. This is the reliable
+    #   check case: verifying_entry returns None for both, and the
+    #   Nestor prior ("warn when the check can't be reliable; refuse
+    #   when it can") applies. A compromised key that continues under
+    #   graceful degrade is exactly the fail-quiet-and-compound pattern
+    #   this session called out.
+    # * signing fails otherwise → note, degrade. The signer's exception
+    #   surface isn't reliable enough to distinguish
+    #   compromised-mid-sign from transient failure.
     verifier_arg = os.environ.get("WILLOW_OPERATOR_VERIFIER", "").strip()
     seal_sig = ""
     attested_at = ""
@@ -86,12 +96,27 @@ def handle(payload: dict) -> dict:
                     "session will not be auto-signed."
                 )
             elif _keyring.get_keyring().verifying_entry(verifier_arg) is None:
-                auto_sign_note = (
-                    f"WILLOW_OPERATOR_VERIFIER={verifier_arg!r} is unknown to "
-                    "the keyring or compromised; session will not be "
-                    "auto-signed. Run `willow-mcp keys add "
-                    f"{verifier_arg}` or check keyring status."
+                # Reliable check (unknown OR compromised) → refuse loudly,
+                # do not enter the session. Nestor's dogfood prior: the
+                # check is reliable, so the answer is refuse, not warn.
+                # Compromised keys that continue unattributed are the
+                # exact fail-quiet pattern the fail-loud-not-break
+                # posture forbids.
+                message = (
+                    f"WILLOW_OPERATOR_VERIFIER={verifier_arg!r} is unknown "
+                    "to the keyring or has been revoked as compromised. "
+                    "Session did NOT enter. Run `willow-mcp keys status "
+                    f"{verifier_arg}` to check; add or rotate the key "
+                    f"(`willow-mcp keys add {verifier_arg}` or "
+                    f"`willow-mcp keys add {verifier_arg} --rotate`) and "
+                    "reopen the session."
                 )
+                logging.getLogger(
+                    "willow_mcp.session_start_hook"
+                ).error(message)
+                return {"additional_context": (
+                    f"WILLOW session_enter REFUSED — {message}"
+                )}
             else:
                 attested_at = (
                     datetime.now(timezone.utc)
@@ -165,8 +190,24 @@ def handle(payload: dict) -> dict:
         from . import human_session as _human_session
         _human_session._remember_attributed(session_id)
     boot_lines = build_boot_lines(app_id, session_id, source, result)
+    # Hoist auto_sign_note into the boot_context prose so the LLM inside
+    # the client sees the attribution status as part of orient, not
+    # buried in a JSON field the client renderer may or may not surface.
+    # Nestor prior on matcher-mismatch: "the report field matters as
+    # much as the warning — an HTTP caller reading JSON never sees a
+    # warning at all." The note is now visible in the LLM's context
+    # regardless of client-side rendering.
+    if auto_sign_note:
+        boot_lines.append("")
+        boot_lines.append(f"[attribution] {auto_sign_note}")
     result["boot_context"] = "\n".join(boot_lines)
-    return {"additional_context": json.dumps(result, sort_keys=True)}
+    # Also hoist to the top-level returned dict so a client that renders
+    # top-level keys (rather than parsing additional_context JSON) shows
+    # it prominently. Belt-and-braces alongside the boot_context line.
+    outer = {"additional_context": json.dumps(result, sort_keys=True)}
+    if auto_sign_note:
+        outer["auto_sign"] = auto_sign_note
+    return outer
 
 
 def main() -> None:

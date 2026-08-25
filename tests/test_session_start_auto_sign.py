@@ -55,6 +55,16 @@ def ring_with_rita(tmp_path):
 
 
 def _run(session_id, monkeypatch, *, app_id="willow", operator_verifier=None):
+    """Returns the parsed additional_context dict. Raises the raw string
+    onto a `_raw` key for the refusal path (which returns plain-text
+    additional_context, not JSON)."""
+    return _run_full(session_id, monkeypatch, app_id=app_id,
+                     operator_verifier=operator_verifier)[0]
+
+
+def _run_full(session_id, monkeypatch, *, app_id="willow", operator_verifier=None):
+    """Returns (parsed_ctx, outer_result_dict). Some tests need the outer
+    dict to assert on top-level hoisted keys like `auto_sign`."""
     monkeypatch.setenv("WILLOW_APP_ID", app_id)
     if operator_verifier is None:
         monkeypatch.delenv("WILLOW_OPERATOR_VERIFIER", raising=False)
@@ -62,8 +72,12 @@ def _run(session_id, monkeypatch, *, app_id="willow", operator_verifier=None):
         monkeypatch.setenv("WILLOW_OPERATOR_VERIFIER", operator_verifier)
     payload = {"session_id": session_id}
     result = session_start_hook.handle(payload)
-    ctx = json.loads(result["additional_context"])
-    return ctx
+    ctx_raw = result["additional_context"]
+    try:
+        ctx = json.loads(ctx_raw)
+    except (ValueError, TypeError):
+        ctx = {"_raw": ctx_raw}
+    return ctx, result
 
 
 # --- opt-in gate ---------------------------------------------------------
@@ -205,28 +219,69 @@ def test_auto_sign_downgrades_when_keyring_disabled(monkeypatch):
     assert record.get("verifier", "") == ""
 
 
-def test_auto_sign_downgrades_when_verifier_unknown(ring_with_rita, monkeypatch):
-    """Env var names an unknown verifier → hook succeeds, note explains,
-    session unattributed. Points at `willow-mcp keys add` in the message."""
+def test_unknown_verifier_refuses_session_enter(ring_with_rita, monkeypatch):
+    """Env var names an unknown verifier → REFUSE, do not enter the session.
+
+    Design change from PR8-A: the keyring's verifying_entry check IS
+    reliable (returns None for both unknown and compromised). Nestor's
+    matcher-mismatch prior says "warn when the check can't be reliable,
+    refuse when it can." An unknown verifier that continues unattributed
+    is exactly the fail-quiet compound the fail-loud-not-break posture
+    forbids.
+    """
     ctx = _run("s-unknown", monkeypatch, operator_verifier="mallory")
-    assert "unknown to the keyring" in ctx["auto_sign_note"]
-    assert "willow-mcp keys add mallory" in ctx["auto_sign_note"]
+    assert "_raw" in ctx, "refusal returns plain-text additional_context"
+    assert "REFUSED" in ctx["_raw"]
+    assert "unknown to the keyring or has been revoked as compromised" in ctx["_raw"]
+    assert "willow-mcp keys add mallory" in ctx["_raw"]
+    # Session did NOT enter — no record on disk
     record = dispatch.session_read("willow", "s-unknown")
-    assert record.get("verifier", "") == ""
+    assert record.get("error") == "not_found"
 
 
-def test_auto_sign_downgrades_when_verifier_compromised(
+def test_compromised_verifier_refuses_session_enter(
     ring_with_rita, monkeypatch
 ):
-    """A compromised verifier is untrusted — same code path as unknown
-    (both return None from verifying_entry)."""
+    """Same code path as unknown (both return None from verifying_entry),
+    and same fail-loud discipline. Compromised keys that continue under
+    graceful degrade are the exact 'fail quiet and compound' pattern the
+    session's audit against Nestor priors called out."""
     ring_with_rita.revoke("rudi", compromised=True)
     ring_with_rita.save()
 
     ctx = _run("s-comp", monkeypatch, operator_verifier="rudi")
-    assert "unknown to the keyring or compromised" in ctx["auto_sign_note"]
+    assert "_raw" in ctx
+    assert "REFUSED" in ctx["_raw"]
+    assert "unknown to the keyring or has been revoked as compromised" in ctx["_raw"]
+    assert "--rotate" in ctx["_raw"]
+    # Session did NOT enter
     record = dispatch.session_read("willow", "s-comp")
-    assert record.get("verifier", "") == ""
+    assert record.get("error") == "not_found"
+
+
+def test_hoisted_auto_sign_note_appears_in_boot_context_and_top_level(
+    ring_with_rita, monkeypatch
+):
+    """Nestor prior on matcher mismatch: 'an HTTP caller reading JSON
+    never sees a warning at all.' The auto_sign_note must land somewhere
+    the operator actually sees — both hoisted to the outer result dict
+    (client-renderer accessible) AND in the boot_context prose (LLM in
+    the client sees it as part of orient)."""
+    ctx, outer = _run_full(
+        "s-hoist", monkeypatch, operator_verifier="rudi",
+    )
+    # Outer dict carries the note as a top-level field
+    assert outer.get("auto_sign"), (
+        "auto_sign_note must be hoisted to the outer result dict so a "
+        "client that renders top-level keys shows it prominently"
+    )
+    assert "auto-signed by rudi" in outer["auto_sign"]
+    # Boot context prose includes it too
+    assert "[attribution]" in ctx.get("boot_context", ""), (
+        "auto_sign_note must be rendered into boot_context so the LLM "
+        "inside the client sees it as part of orient — a first-class "
+        "field the client renderer may skip is not enough"
+    )
 
 
 def test_auto_sign_off_for_specialist_workspaces(ring_with_rita, monkeypatch):
