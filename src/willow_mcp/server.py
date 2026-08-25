@@ -2970,6 +2970,14 @@ def _enveloped_verb_gate(
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     if not matches:
+        # PR6 (envelope-accrual): ENOGRANTS. Currently the gate is
+        # permissive here (returns None → call proceeds unmetered) —
+        # behavior preserved. But an attributed orchestrator session
+        # that hits this path is a good signal the operator would want
+        # to ratify an envelope covering this shape, so it becomes a
+        # queue entry. Silent best-effort; gate's real return is
+        # unchanged.
+        _auto_propose_on_gate_miss(app_id, verb, call_args, session)
         return None
     if len(matches) > 1:
         return {
@@ -2996,11 +3004,118 @@ def _enveloped_verb_gate(
         return {"error": f"envelope_gate_failed: {exc}"}
     if result.get("ok"):
         return None
+    # PR6: envelope existed but the check failed (bounds mismatch, quota
+    # exhausted, expiry). Auto-propose captures the ACTUAL call_args so
+    # the operator can widen bounds or bump quota with one ratify click
+    # rather than diffing errno.reason.fields[] against the current
+    # envelope by hand.
+    _auto_propose_on_gate_miss(app_id, verb, call_args, session)
     return {
         "error": result.get("errno", "EAMBIG"),
         "reason": result.get("reason"),
         "citation_id": result.get("citation_id"),
     }
+
+
+# PR6: dedup for auto-propose. A single call site can hit the gate many
+# times per session (dispatch loops, retry paths); we don't want the queue
+# to fill with 20 identical proposals for one shape. Track (session, verb,
+# bounds_digest) tuples in-process — cleared on process restart, same
+# discipline the attribution cache follows.
+_auto_propose_seen: set[tuple[str, str, str]] = set()
+_auto_propose_seen_lock = None
+
+
+def _auto_propose_lock():
+    global _auto_propose_seen_lock
+    if _auto_propose_seen_lock is None:
+        import threading
+        _auto_propose_seen_lock = threading.Lock()
+    return _auto_propose_seen_lock
+
+
+def clear_auto_propose_cache(session: str = "") -> None:
+    """Drop cached (session, verb, bounds_digest) tuples. Empty session
+    clears the whole cache (test-fixture / operator-restart use); a specific
+    session drops just that session's memoized shapes."""
+    with _auto_propose_lock():
+        if not session:
+            _auto_propose_seen.clear()
+            return
+        stale = [key for key in _auto_propose_seen if key[0] == session]
+        for key in stale:
+            _auto_propose_seen.discard(key)
+
+
+def _auto_propose_on_gate_miss(
+    app_id: str, verb: str, call_args: dict, session: str
+) -> None:
+    """PR6 back-channel: turn a gate refusal into a queue entry.
+
+    Silent best-effort. Never blocks or alters the gate's return path — the
+    caller still receives the original success/refusal signal. Fires only
+    when the current session is an attributed orchestrator session (per
+    PR1-4 identity) whose record carries a verifier; skips otherwise so
+    unattributed / specialist-owned processes cannot spam the queue.
+
+    Dedup by (session, verb, bounds_digest) tuple: repeat calls with the
+    same shape produce one proposal, not N.
+
+    Specialist-side auto-propose (a specialist's OWN process auto-proposing
+    from ITS ENOGRANTS, attributed via the dispatch packet's from_app) is
+    deferred to a follow-up: it needs the dispatch packet meta.json to
+    carry the orchestrator's verifier, which is a schema extension in a
+    separate PR.
+    """
+    from . import envelope_authoring as _ea
+    from . import human_session as _hs
+    from . import keyring as _keyring
+
+    if not _keyring.enabled():
+        return
+    if not session or not _hs.is_session_attributed(session):
+        return
+    # Read the session record — must have a verifier bound (PR2 discipline).
+    # dispatch_stack.session_read expects (app_id, session_id).
+    record = dispatch_stack.session_read(app_id, session)
+    verifier = (record or {}).get("verifier", "")
+    if not verifier:
+        return
+
+    # Dedup: same (session, verb, bounds) → one proposal, not N.
+    try:
+        digest = _ea._bounds_digest(dict(call_args or {}))
+    except Exception:
+        return
+    key = (session, verb, digest)
+    with _auto_propose_lock():
+        if key in _auto_propose_seen:
+            return
+        _auto_propose_seen.add(key)
+
+    pg = get_pg()
+    ledger = None
+    if pg is not None:
+        try:
+            from .governance_ledger import GovernanceLedger
+            ledger = GovernanceLedger(pg)
+        except Exception:
+            ledger = None
+    try:
+        _ea.propose(
+            verb=verb, grantee=app_id, bounds=dict(call_args or {}),
+            reason=f"auto-proposed from gate miss on session {session}",
+            verifier=verifier, session_id=session,
+            proposer_app_id=app_id, ledger=ledger,
+        )
+    except _ea.EnvelopeAuthoringError:
+        # Silent — auto-propose failing must never mask the gate's real
+        # return signal. UnknownVerbError from an off-registry verb, an
+        # UnattributedSessionError from a cache race, an InvalidBounds
+        # from a caller supplying non-schema keys — all fall through.
+        # The operator can still see the specialist's original errno on
+        # the tool response; nothing was silently swallowed there.
+        pass
 
 
 # Project used for the FRANK citation a verb-level gate writes on the caller's
@@ -3326,6 +3441,28 @@ def session_enter(
     snap = read_stack_snapshot(app_id)
     if snap:
         result["orientation"]["stack_snapshot"] = snap
+
+    # PR6 (envelope-accrual): surface the operator's pending-proposal count
+    # at seat entry so an attributed orchestrator sees "N proposals waiting
+    # for ratification" as part of orient, not mid-dispatch when the queue
+    # has silently grown. Only surfaced for orchestrator sessions — a
+    # specialist's orient block doesn't include the operator queue.
+    from .human_session import is_orchestrator_app
+    if is_orchestrator_app(app_id):
+        try:
+            from . import envelope_authoring as _ea
+            pending = _ea.list_pending(oldest_first=True, limit=1000)
+            result["orientation"]["envelope_proposals_pending"] = {
+                "count": len(pending),
+                "oldest_id": pending[0]["id"] if pending else None,
+                "oldest_at": pending[0].get("proposed_at") if pending else None,
+            }
+        except Exception:
+            # A missing registry / trusted_read failure is not a reason to
+            # refuse session_enter — the queue count is orient sugar, the
+            # registry itself is checked by the auto-propose path with
+            # its own error handling.
+            pass
     return result
 
 
