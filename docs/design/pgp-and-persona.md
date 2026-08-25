@@ -8,7 +8,8 @@ description: "Locked decisions (draft 1.0, 2026-07-09) on PGP as willow-mcp's so
 
 # PGP + persona (LOCKED decisions)
 
-*Status: **LOCKED** draft 1.0 — 2026-07-09*  
+*Status: **LOCKED** draft 1.0 — 2026-07-09*
+*Reconciled with shipped code — 2026-08-25 · design intent unchanged; §1 header table and §1 write gate table now name the sidecar directly (previously buried in §5 P2 slice note), and the gated-tool count and 5th check are aligned with `human_session.py`. See end-of-doc reconciliation note.*
 *Companion: `human-orchestrator.md` · `product-layout.md` · `session-lifecycle.md`*
 
 ---
@@ -40,7 +41,7 @@ Same operator key signs:
 | Artifact | Path |
 |----------|------|
 | App manifest | `mcp_apps/{app_id}/manifest.json` + `.sig` |
-| Human session attestation | `sessions/willow-{session_id}.json` (canonical blob + `.sig`) |
+| Human session attestation | `sessions/willow-{session_id}.attest.json` + `.sig` — dedicated sidecar carrying only the stable `{app_id, session_id}` tuple (`paths.session_attestation_path`). **Not** the live `sessions/willow-{session_id}.json` record, which `session_bind` rewrites on every state change. See §5 P2 for the sidecar rationale. |
 | Dispatch packet (phase P3) | `dispatch/{id}/meta.json` + `.sig` |
 | Optional persona roster changes | `config/persona_roster.json` + `.sig` |
 | Agent seed (ratified) | `$WILLOW_HOME/seeds/{agent_id}.json` + `.sig` — see `agent-seed.md` |
@@ -53,14 +54,15 @@ port `dev_bypass` / `_DEV_SAFE_ROOT`.
 
 ### Orchestrator write gate (layered)
 
-`dispatch_send`, `verify_handoff`, `agent_clear` require **all**:
+The gated tools are enumerated in `human_session.py::ORCHESTRATOR_WRITE_TOOLS` — currently `dispatch_send`, `dispatch_accept`, `handoff_write_v4`, `verify_handoff`, `agent_clear`, `frank_append`, `envelope_apply` (three originals plus four added 2026-07-31 after the packet `96F54DA7` red-team showed direct calls bypassing `session_enter`'s guard). Each requires **all** of:
 
 1. `app_id=willow`
 2. `WILLOW_HUMAN_ORCHESTRATOR=1` on MCP host (charter seat config)
-3. Valid PGP attestation on `sessions/willow-{session_id}.json` (when PGP enabled)
-4. Manifest `.sig` verifies (when PGP enabled)
+3. **Live `sessions/willow-{session_id}.json` on disk** — proof `session_enter` still binds this id. Added at #313 so deleting the live session file after attest cannot leave the gate armed against a session no longer live.
+4. Valid PGP detached signature on the **sidecar** `sessions/willow-{session_id}.attest.json` — NOT on the live session record (see the header table row above and §5 P2 for why the sidecar exists). When PGP enabled.
+5. Manifest `.sig` verifies. When PGP enabled.
 
-Env-only was interim until P2 landed (issue #186); checks 1-2 are still required underneath, PGP session attestation (3) layers on top of them once `WILLOW_PGP_FINGERPRINT` is set. Manifest `.sig` (4) already enforces uniformly via `gate._load_manifest` (#183).
+Env-only was interim until P2 landed (issue #186); checks 1-2 are still required underneath, and 3-4 layer on top once `WILLOW_PGP_FINGERPRINT` is set. Manifest `.sig` (5) already enforces uniformly via `gate._load_manifest` (#183). Denial-reason tokens: `orchestrator_session_attestation_missing` (never attested / no live session file / no sidecar) vs `orchestrator_session_attestation_invalid` (sidecar present but signature no longer verifies) — see Upgrade note under §5.
 
 ### Signing stays host-side
 
@@ -210,6 +212,17 @@ After deploying the sidecar change:
 ---
 
 *Operator decisions locked 2026-07-09: no dev bypass in product; one fingerprint; charter picker only; project roster + user extensions (details §3 open).*
+
+---
+
+## Reconciliation note (2026-08-25)
+
+The design decisions in this doc — one fingerprint, no dev bypass, sidecar rather than live-record signing, host-side signing only — are unchanged. What was reconciled with shipped code so a reader top-to-bottom no longer sees the old shape first and has to reach §5 P2 for the correction:
+
+- **§1 header table row for "Human session attestation"** now names `sessions/willow-{session_id}.attest.json` + `.sig` directly and cites the reason. Previously the header table said `sessions/willow-{session_id}.json`; only the P2 slice note (still below) explained the change.
+- **§1 Orchestrator write gate table** now enumerates all seven gated tools (was three), adds check 3 (live session file on disk, added at #313), renames check 4 to name the sidecar rather than the live record, and lists the two denial-reason tokens. The doc previously mismatched `human-orchestrator.md` on tool count and mismatched itself on which file gets signed.
+- **§5 P2 slice notes remain the source of truth for history** — they explain WHY the sidecar exists and why the gate hardened at #313. The §1 tables now agree with them at first read.
+- Companion doc `human-orchestrator.md` reconciled in the same pass — its §Orchestrator write tools section, wiring checklist, and code map now match `human_session.py`.
 
 @phase constraints
 ## Constraints

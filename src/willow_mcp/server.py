@@ -3212,6 +3212,9 @@ def session_enter(
     dispatch_id: str = "",
     project: str = "",
     workspace: str = "",
+    verifier: str = "",
+    attested_at: str = "",
+    seal_sig: str = "",
 ) -> dict:
     """FIRST CALL of any session. Registers the app/session pair, resolves the
     entry mode (human seat vs dispatched specialist — pass `dispatch_id` when
@@ -3219,14 +3222,35 @@ def session_enter(
     info, ORIENT.md presence, standing records (stack, portfolio, milestones,
     commitments, governance flags), the latest project handoff, collection
     aliases, and FRANK ledger presence. Close the session later with
-    session_handoff_write (human path) or handoff_write_v4 (dispatch path)."""
-    result = dispatch_stack.session_enter(
-        app_id,
-        session_id,
-        dispatch_id,
-        project=project,
-        workspace=workspace,
-    )
+    session_handoff_write (human path) or handoff_write_v4 (dispatch path).
+
+    Identity-in-session PR2: `verifier`, `attested_at`, and `seal_sig` are
+    optional and route through the willow orchestrator branch. When the
+    per-verifier keyring (`WILLOW_KEYRING`) is enabled and all three are
+    supplied, the signature is verified over the frozen wire message BEFORE
+    any session record is written; an invalid signature returns a structured
+    error rather than a raw exception. When the keyring is not enabled the
+    three parameters are ignored and pre-PR2 behavior stands verbatim."""
+    from . import session_signing as _session_signing
+
+    try:
+        result = dispatch_stack.session_enter(
+            app_id,
+            session_id,
+            dispatch_id,
+            project=project,
+            workspace=workspace,
+            verifier=verifier,
+            attested_at=attested_at,
+            seal_sig=seal_sig,
+        )
+    except _session_signing.InvalidSessionSignatureError as exc:
+        return {
+            "app_id": app_id,
+            "session_id": session_id,
+            "error": "invalid_session_signature",
+            "message": str(exc),
+        }
     if result.get("error"):
         return result
 
@@ -7089,6 +7113,13 @@ def _main():
         "session_id", help="session_id passed to session_enter(app_id='willow', ...)"
     )
 
+    # Per-verifier keyring (identity-in-session plan, PR1). Opt-in via
+    # WILLOW_KEYRING. When unset, this subcommand still parses but reports
+    # that the keyring is not configured. See src/willow_mcp/keyring.py and
+    # src/willow_mcp/cli_keys.py for the primitive and the subcommand.
+    from . import cli_keys as _cli_keys
+    _cli_keys.register(subparsers)
+
     frank_anchor_p = subparsers.add_parser(
         "frank-anchor",
         help="Show or write the FRANK governance chain's externally-held head "
@@ -7394,6 +7425,10 @@ def _main():
     if args.command == "attest-session":
         _cmd_attest_session(args)
         return
+    if args.command == "keys":
+        # cli_keys.cmd_keys returns an exit code; propagate it.
+        from . import cli_keys as _cli_keys
+        sys.exit(_cli_keys.cmd_keys(args))
     if args.command == "frank-anchor":
         _cmd_frank_anchor(args)
         return

@@ -545,16 +545,32 @@ def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict
     return dispatch_read(dispatch_id)
 
 
-def session_bind(app_id: str, session_id: str, dispatch_id: str, status: str) -> dict:
+def session_bind(
+    app_id: str,
+    session_id: str,
+    dispatch_id: str,
+    status: str,
+    verifier: str = "",
+) -> dict:
+    """Write the thin session-state file. When ``verifier`` is non-empty, it
+    is preserved across subsequent binds (a later ``status`` change never
+    overwrites a bound verifier with empty); when empty, whatever was on
+    disk stays. Identity-in-session PR2: the session record now names the
+    operator who attested it. See ``docs/design/identity-in-session.md`` when
+    it lands (PR4)."""
     sessions_dir().mkdir(parents=True, exist_ok=True)
+    path = session_path(app_id, session_id)
+    prior = _read_json(path)
+    prior_verifier = (prior or {}).get("verifier", "")
     data = {
         "app_id": app_id,
         "session_id": session_id,
         "status": status,
         "dispatch_id": dispatch_id,
+        "verifier": verifier or prior_verifier,
         "updated_at": _utc_now(),
     }
-    _write_json(session_path(app_id, session_id), data)
+    _write_json(path, data)
     return data
 
 
@@ -571,16 +587,85 @@ def _pending_for_app(app_id: str) -> dict | None:
     return dispatches[0] if dispatches else None
 
 
+def _resolve_session_sig(
+    app_id: str,
+    session_id: str,
+    verifier: str,
+    attested_at: str,
+    seal_sig: str,
+) -> None:
+    """PR2 of the identity-in-session plan: refuse before session_bind writes.
+
+    Short-circuits when the keyring is not enabled (legacy PGP-fingerprint
+    path continues untouched). When the keyring IS enabled:
+
+    * ``verifier`` and ``seal_sig`` both empty → downgrade to unattested;
+      matches ``by_human_attested``'s existing downgrade-not-denial policy.
+    * one supplied without the other → refuse; a signature without a
+      named verifier is a claim about nobody, and a verifier claim without a
+      signature is an attribution attempt that must not silently succeed.
+    * both supplied but the sig does not verify → refuse. Mirrors
+      ``nestor/memory.py::_resolve_seal_sig``: refusal comes BEFORE any
+      write, and the store never sees an unverified attempt.
+
+    Raises :class:`session_signing.InvalidSessionSignatureError` in the
+    refusal paths.
+    """
+    from . import session_signing
+
+    if not session_signing.signing_enabled():
+        return  # keyring not enabled → legacy path
+    if not verifier and not seal_sig:
+        return  # no attempt → downgrade to unattested (session_bind writes verifier="")
+    if not verifier:
+        raise session_signing.InvalidSessionSignatureError(
+            "seal_sig supplied without verifier — a signature must name the "
+            "operator it attests for"
+        )
+    if not seal_sig:
+        raise session_signing.InvalidSessionSignatureError(
+            f"verifier {verifier!r} supplied without seal_sig — a signature "
+            "over the frozen wire message is required when the keyring is "
+            "enabled"
+        )
+    if not attested_at:
+        raise session_signing.InvalidSessionSignatureError(
+            "attested_at is empty — the timestamp is part of the signed "
+            "payload and must be supplied by the client-side signer"
+        )
+    if not session_signing.session_is_valid(
+        app_id, session_id, verifier, attested_at, seal_sig
+    ):
+        raise session_signing.InvalidSessionSignatureError(
+            f"session attestation for {verifier!r} does not verify — the "
+            "signature does not match the frozen wire bytes for this "
+            "verifier's key on this instance"
+        )
+
+
 def session_enter(
     app_id: str,
     session_id: str,
     dispatch_id: str = "",
     project: str = "",
     workspace: str = "",
+    verifier: str = "",
+    attested_at: str = "",
+    seal_sig: str = "",
 ) -> dict:
     """Resolve session entry mode: human prompt vs dispatch id path.
 
-    Orchestrator (willow) is human-only — never dispatch entry. See human-orchestrator.md.
+    Orchestrator (willow) is human-only — never dispatch entry. See
+    human-orchestrator.md.
+
+    Identity-in-session PR2: three new optional parameters route through the
+    willow branch. ``verifier`` names the operator attesting; ``attested_at``
+    is the RFC3339 timestamp in the signed payload; ``seal_sig`` is the
+    hex-encoded signature over the frozen wire message the client-side
+    signer produced. When the keyring is not enabled all three are ignored,
+    preserving the pre-PR2 behavior verbatim. Specialist sessions ignore
+    the params too — attribution-to-specialist propagation is a separate
+    concern, out of scope for PR2.
     """
     project_info = project_context(project, workspace)
     if project_info.get("error"):
@@ -600,7 +685,18 @@ def session_enter(
                     "Agents cannot run the orchestrator seat."
                 ),
             }
-        session_bind(app_id, session_id, "", "idle")
+        # Refuse before session_bind writes anything. When the keyring is not
+        # enabled this is a no-op and the legacy behavior stands.
+        _resolve_session_sig(app_id, session_id, verifier, attested_at, seal_sig)
+        # The verifier field means SOMEONE ATTESTED this session with proof.
+        # When the keyring is disabled there is no proof mechanism, so a
+        # verifier claim is metadata without backing — never written. This
+        # preserves the invariant: a non-empty verifier on the session record
+        # is always the name of someone whose signature verified at some
+        # point (past-tense; a later revocation may retire the trust).
+        from . import session_signing as _session_signing
+        stored_verifier = verifier if _session_signing.signing_enabled() else ""
+        session_bind(app_id, session_id, "", "idle", verifier=stored_verifier)
         return {
             "entry_mode": "human_orchestrator",
             "app_id": app_id,
