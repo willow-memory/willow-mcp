@@ -3213,14 +3213,31 @@ def dispatch_send(
     # checked against name the same task_class dispatch.py will actually
     # record as `role` on the packet — not a value the gate invented.
     resolved_role = (role or to_app).lower()
+    orch_session = _current_orchestrator_session()
     gate_err = _enveloped_verb_gate(
         app_id,
         "dispatch",
         {"to_agents": to_app, "task_class": resolved_role},
         project=_VERB_CITATION_PROJECT,
+        session=orch_session,
     )
     if gate_err:
         return gate_err
+    # Envelope-accrual PR9: propagate the operator's identity onto the
+    # dispatch packet so the specialist can inherit attribution. The
+    # session record for the currently-entered orchestrator carries the
+    # verifier PR2/PR3 bound on session_enter; look it up here and pass
+    # it through to _meta_new. Silent when the orchestrator's session is
+    # unattested (verifier=""), which is the same "no orchestrator to
+    # attribute to" case that already skips auto-propose today.
+    from_verifier = ""
+    from_session = ""
+    if orch_session:
+        rec = dispatch_stack.session_read(app_id, orch_session)
+        if not rec.get("error"):
+            from_verifier = str(rec.get("verifier") or "").strip()
+            if from_verifier:
+                from_session = orch_session
     return dispatch_stack.dispatch_send(
         from_app=app_id,
         to_app=to_app,
@@ -3231,6 +3248,8 @@ def dispatch_send(
         phase=phase,
         priority=priority,
         context_refs=context_refs,
+        from_verifier=from_verifier,
+        from_session=from_session,
     )
 
 

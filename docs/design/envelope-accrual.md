@@ -67,6 +67,16 @@ Attribution gate: auto-propose fires only when the current session is a keyring-
 
 **Deferred**: specialist-side auto-propose (a specialist's OWN process auto-proposing from its own gate misses, attributed via the dispatch packet's `from_app`). Needs `dispatch_send` to carry the orchestrator's verifier in the signed meta.json — a schema extension not in scope for PR6.
 
+### PR9 — dispatch carries operator attribution (Kart-boundary silence, part A)
+
+The PR6 deferral above. `dispatch_send` now writes `from_verifier` and `from_session` into the signed meta.json (both empty when the orchestrator's own session is unattributed — the no-attribution-to-carry case). On `dispatch_accept` and on `session_enter`'s specialist re-entry branch, the packet's `from_verifier` is lifted onto the specialist's session record (via `session_bind(..., verifier=...)`) and the specialist session is added to the in-process `_attributed_sessions` cache.
+
+The net effect: a specialist that inherits an orchestrator's attribution through the dispatch packet can now trip `_auto_propose_on_gate_miss` from its own process. The resulting queue entry's `proposed_by.verifier` names the ORIGINATING operator, not the specialist that generated the miss — the operator's queue view stays a queue of humans, not of proxying processes. `session_bind`'s existing verifier-preservation contract means no downstream lifecycle transition clobbers the inheritance, and the HMAC signature on meta.json (`dispatch_signing.sign_meta`) covers both new fields so a hand-planted packet cannot forge an operator attribution.
+
+An unattributed dispatch packet (`from_verifier=""`) does NOT attribute the specialist — the silence is preserved rather than laundered.
+
+**Still deferred (Kart-boundary silence, part B)**: a specialist running INSIDE Kart (bwrap-sandboxed shell task, no MCP client at all) still has no path back to the queue. Part A closes the silence for every specialist that runs as its own MCP client, which is the majority in practice today. Part B needs a design decision on the drop-off mechanism (filesystem queue Kart CAN write to? harvester on the host side?) before it's tractable — its own thread.
+
 ### PR7 — shape similarity + precedent recall (future)
 
 `envelope_shapes.similar_precedents(verb, grantee, bounds)` reads active envelopes + FRANK `envelope_ratified` history, scores each precedent by verb match + grantee overlap + per-field bounds similarity (fnmatch equivalence classes for glob bounds, prefix overlap for path-shaped bounds). `envelope_propose` calls this before writing; the resulting proposal row carries `precedent_ids: [...]` and `pre_filled_bounds: {...}`. The operator's ratify UX shows "similar to envelopes X, Y ratified on D1, D2 — confirm precedents or override."
@@ -96,7 +106,7 @@ The operator's answering cost per session collapses from "N raw authoring acts" 
 
 ## What this design does NOT do
 
-- **Kart-boundary propagation.** Specialists running inside Kart cannot call `envelope_propose` (sandbox denies). PR6's specialist-side auto-propose is deferred for the same reason: no `envelope_propose` from Kart, no dispatch-packet extension to attribute the orchestrator inside Kart, no way to reach the FRANK ledger from Kart.
+- **Kart-inside-bwrap propagation.** PR9 closes the specialist-as-MCP-client case (dispatch packet carries operator attribution; specialist inherits it on accept). A specialist running INSIDE Kart's bwrap sandbox has no MCP client at all — no way to call `envelope_propose`, no filesystem drop-off queue today. Closing that pocket needs a drop-off mechanism decided separately.
 - **Cross-instance envelope sync.** Single-instance only. Multi-box operators today have separate registries per box.
 - **Portable envelopes across fleet repos.** safe-app-store and homestead each have their own registries; unifying them is out of scope.
 - **Auto-ratification.** Every yes still passes through a human. Precedent recall pre-fills; the click remains.
