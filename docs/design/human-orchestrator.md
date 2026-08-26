@@ -68,8 +68,11 @@ These require **human host attestation** in stdio mode. The canonical list lives
 - `agent_clear`
 - `frank_append`
 - `envelope_apply`
+- `envelope_propose` (PR5)
+- `envelope_ratify` (PR5)
+- `envelope_reject` (PR5)
 
-The three original tools plus four added defensively after a red-team on 2026-07-31 (packet `96F54DA7`) demonstrated a specialist calling `dispatch_accept` / `handoff_write_v4` directly, bypassing `session_enter`'s willow-branch guard. See the comment above `ORCHESTRATOR_WRITE_TOOLS` in `human_session.py` for the trace.
+Ten tools: the three originals, plus four added defensively after a red-team on 2026-07-31 (packet `96F54DA7`) demonstrated a specialist calling `dispatch_accept` / `handoff_write_v4` directly, bypassing `session_enter`'s willow-branch guard; plus three more added in the envelope-accrual PR5 so authoring the operator's yes/no is also keyring-gated (a specialist's OWN gate misses take the separate auto-propose path from inside `_enveloped_verb_gate`, which does NOT require the orchestrator attestation gate — it runs when the calling session is a keyring-attributed orchestrator session, PR6). See the comment above `ORCHESTRATOR_WRITE_TOOLS` in `human_session.py` for the trace.
 
 **Stdio:** `WILLOW_HUMAN_ORCHESTRATOR=1` on the MCP server process environment — set **only** in the orchestrator workspace MCP config. Specialist project configs must omit it. This is a **required** layer, not an interim one — see below.
 
@@ -134,7 +137,7 @@ Read tools (`dispatch_list`, `dispatch_read`) remain available to any manifest t
 
 The design intent statements in this doc (the Rule, the Why, the injection-hygiene rules, the persona voice-only overlay) are unchanged. What was reconciled with shipped code:
 
-- **Gated write tools: 3 → 7.** Three tools were listed here; the code has gated seven since 2026-07-31 (`dispatch_accept`, `handoff_write_v4`, `frank_append`, `envelope_apply` added after the packet `96F54DA7` red-team). `ORCHESTRATOR_WRITE_TOOLS` in `human_session.py` is the source of truth.
+- **Gated write tools: 3 → 7 → 10.** Three originally listed; seven after the packet `96F54DA7` red-team (2026-07-31); ten as of the envelope-accrual PR5 (`envelope_propose`/`ratify`/`reject` added so authoring the operator's yes/no also requires keyring attestation). `ORCHESTRATOR_WRITE_TOOLS` in `human_session.py` remains the source of truth.
 - **PGP was "planned"; it shipped.** `pgp-and-persona.md` P2 shipped 2026-08-01 and hardened at #313 (2026-08-10). The write gate now layers env attestation + live-session-file check + sidecar PGP attestation + manifest `.sig`. Env attestation is a required underneath, not interim.
 - **A fifth check exists:** the live `sessions/willow-{session_id}.json` on disk. Added at #313 so deleting the session file after attesting cannot leave the gate armed against a session no longer live.
 - **The sidecar file is not the live session record.** `sessions/willow-{session_id}.attest.json` is what `attest-session` signs; `sessions/willow-{session_id}.json` is rewritten by every `session_bind` call. Any doc claim about signing "the session file" needs to read as "the attest sidecar."

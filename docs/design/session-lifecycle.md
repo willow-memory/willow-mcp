@@ -71,12 +71,15 @@ session_enter("willow", dispatch_id=…)        →  REJECTED (orchestrator_huma
 
 **Orchestrator write tools** — the canonical list lives in `human_session.py::ORCHESTRATOR_WRITE_TOOLS`
 (currently `dispatch_send`, `dispatch_accept`, `handoff_write_v4`, `verify_handoff`, `agent_clear`,
-`frank_append`, `envelope_apply`; three originals plus four added after the 2026-07-31 red-team on
-packet `96F54DA7`). Each requires `WILLOW_HUMAN_ORCHESTRATOR=1` on the MCP host env (stdio) or OAuth
-binding to willow (serve); when `WILLOW_PGP_FINGERPRINT` is set, a further layered gate applies
-(live session file on disk + valid PGP sig on the `sessions/willow-{id}.attest.json` sidecar +
-verified manifest `.sig`). See [`human-orchestrator.md`](human-orchestrator.md) §Orchestrator write
-tools and [`pgp-and-persona.md`](pgp-and-persona.md) §1 for the full layered gate and denial tokens.
+`frank_append`, `envelope_apply`, `envelope_propose`, `envelope_ratify`, `envelope_reject`;
+ten tools — three originals plus four added after the 2026-07-31 red-team on packet `96F54DA7`,
+plus three added in the envelope-accrual PR5 so authoring the operator's yes/no is also
+keyring-attested). Each requires `WILLOW_HUMAN_ORCHESTRATOR=1` on the MCP host env (stdio) or
+OAuth binding to willow (serve); when a keyring / PGP identity substrate is configured, a further
+layered gate applies (live session file on disk + valid ed25519 sig on the keyring path or
+PGP sig on the sidecar `sessions/willow-{id}.attest.json` + verified manifest `.sig`). See
+[`human-orchestrator.md`](human-orchestrator.md) §Orchestrator write tools and
+[`pgp-and-persona.md`](pgp-and-persona.md) §1 for the full layered gate and denial tokens.
 Agents cannot invoke these as willow.
 
 **Resolver:** `session_enter(app_id, session_id, dispatch_id="")` — see `dispatch.py`.

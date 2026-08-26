@@ -21,7 +21,7 @@ Companion: `specialist-registry.md` · `human-orchestrator.md` · `gate.py`
 1. **Allow** — manifest `permissions` expands via `PERMISSION_GROUPS` in `gate.py` (groups and literal tool names).
 2. **Deny** — manifest `deny_tools` is an overlay that wins over allows (defense in depth).
 3. **Scope** — manifest `store_scope` confines SOIL collections (`prefix*` wildcards).
-4. **Orchestrator writes** — `dispatch_send`, `dispatch_accept`, `handoff_write_v4`, `verify_handoff`, `agent_clear`, `frank_append`, `envelope_apply` for `app_id=willow` additionally require `WILLOW_HUMAN_ORCHESTRATOR=1` (stdio) or OAuth binding (serve). (See `ORCHESTRATOR_WRITE_TOOLS` in `human_session.py`.)
+4. **Orchestrator writes** — `dispatch_send`, `dispatch_accept`, `handoff_write_v4`, `verify_handoff`, `agent_clear`, `frank_append`, `envelope_apply`, plus (envelope-accrual PR5) `envelope_propose`, `envelope_ratify`, `envelope_reject` — for `app_id=willow` additionally require `WILLOW_HUMAN_ORCHESTRATOR=1` (stdio) or OAuth binding (serve). (See `ORCHESTRATOR_WRITE_TOOLS` in `human_session.py` — 10 tools.)
 5. **Egress** — `task_net` is never implied by `task_queue` or `full_access`; must be explicit on the manifest line.
 6. **Grove is read-universal, write-deliberate.** `grove_read` is safe for every seat, including pure-read ones (`skirnir`, `vishwakarma`); `grove_write` is granted only to seats that need to post as themselves. Posting as a *different* identity is a further, separate capability — `grove_relay` — never implied by `grove_write` or `full_access`, and not granted to any seed seat: an operator grants it to a bridge/relay seat when one exists.
 
