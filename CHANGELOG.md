@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **project-wiring:** compile project hook manifests ([5841eec](https://github.com/willow-memory/willow-mcp/commit/5841eec0a35235d4556514c7ea05f8ef6bd66828))
 * **project-wiring:** compile project hook manifests ([efbad88](https://github.com/willow-memory/willow-mcp/commit/efbad88b865f9a6e43e03ab78be9ab13dff3a909))
 
 ## [2.16.0](https://github.com/willow-memory/willow-mcp/compare/v2.15.0...v2.16.0) (2026-08-26)
