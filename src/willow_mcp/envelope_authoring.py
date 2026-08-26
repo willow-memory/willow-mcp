@@ -432,6 +432,16 @@ def reject(
     surfaces rejections should show non-empty ``reopen_when`` as a condition
     to re-check, not a closed door.
 
+    PR11 (envelope-accrual, archived state): the rejected row does not
+    vanish — it moves to the registry's ``archived[]`` list with
+    ``status="rejected"``, its bounds intact, and the ``reason`` /
+    ``reopen_when`` / ``verifier`` fields preserved. This is what lets
+    :func:`envelope_shapes.similar_precedents` count "the operator's
+    no with a reopen condition" as a precedent alongside their yeses —
+    the same signal Nestor's ``reject_match`` surfaces. Registry growth
+    is a real long-run cost; compaction is left for a later PR when
+    the archived list actually gets large enough to matter.
+
     Returns ``{proposal_id, verifier, rejected_at, reason, reopen_when}`` and
     appends ``envelope_rejected`` to the FRANK ledger when one is available.
     """
@@ -452,7 +462,21 @@ def reject(
     proposals = [row for row in proposals if row.get("id") != proposal_id]
 
     rejected_at = _now_iso()
+    # PR11: archive the rejected row instead of dropping. Bounds + polarity
+    # + reopen_when carry into the precedent walk. The operator's decision
+    # (yes AND no) is what accrues, not just the ratified subset.
+    archived = list(registry.get("archived") or [])
+    archived.append({
+        **{k: v for k, v in proposal.items() if not k.startswith("_")},
+        "status": "rejected",
+        "archived_at": rejected_at,
+        "rejected_at": rejected_at,
+        "reject_reason": reason,
+        "reopen_when": reopen_when,
+        "rejected_by": verifier,
+    })
     registry["proposals"] = proposals
+    registry["archived"] = archived
     _atomic_write(_envelopes.registry_path(), registry)
 
     ledger_record_id = None
@@ -503,6 +527,32 @@ def list_active(
     return list(rows)
 
 
+def list_archived(
+    *,
+    grantee: Optional[str] = None,
+    verb: Optional[str] = None,
+    status: Optional[str] = None,
+) -> list[dict]:
+    """Envelope rows the operator has archived — today, rejected
+    proposals moved by :func:`reject` (PR11). Filterable by grantee,
+    verb, and status. Read-only.
+
+    Bounds and reopen_when carry through so a caller can score archived
+    rows as precedents (see :func:`envelope_shapes.similar_precedents`
+    with ``include_archived=True``). The ``status`` filter is opt-in —
+    absent, all archived rows come back regardless of why they were
+    archived (rejected today; superseded / revoked in future PRs)."""
+    registry = _load_registry()
+    rows = list(registry.get("archived") or [])
+    if grantee is not None:
+        rows = [row for row in rows if _grantee_matches(row.get("grantee"), grantee)]
+    if verb is not None:
+        rows = [row for row in rows if row.get("verb") == verb]
+    if status is not None:
+        rows = [row for row in rows if row.get("status") == status]
+    return rows
+
+
 def list_pending(
     *,
     oldest_first: bool = True,
@@ -532,10 +582,16 @@ def list_pending(
     if not include_precedents:
         return rows
     # Build one lookup so N pending × M precedents is O(N+M+A) rather than
-    # O(N × M × A). Active is small in practice; still worth the loop.
+    # O(N × M × A). Active + archived are small in practice; still worth
+    # the loop. Active wins ties (an id present in both — shouldn't happen,
+    # but active is the current state, so it's the truth if it does).
     active_by_id = {
         row.get("id"): row for row in (registry.get("active") or [])
         if row.get("id")
+    }
+    archived_by_id = {
+        row.get("id"): row for row in (registry.get("archived") or [])
+        if row.get("id") and row.get("id") not in active_by_id
     }
     enriched = []
     for row in rows:
@@ -544,7 +600,18 @@ def list_pending(
         for pid in row.get("precedent_ids") or []:
             hit = active_by_id.get(pid)
             if hit is not None:
-                expanded.append(hit)
+                expanded.append({**hit, "precedent_status": "active"})
+                continue
+            hit = archived_by_id.get(pid)
+            if hit is not None:
+                # PR11: an archived precedent — most often the operator's
+                # "no with reopen_when" from a prior session. Same shape,
+                # different polarity. The `precedent_status` field is
+                # what tells the ratify surface how to render it.
+                expanded.append({
+                    **hit,
+                    "precedent_status": hit.get("status") or "archived",
+                })
         row["precedents_expanded"] = expanded
         enriched.append(row)
     return enriched

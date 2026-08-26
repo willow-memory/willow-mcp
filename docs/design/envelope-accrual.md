@@ -77,6 +77,23 @@ An unattributed dispatch packet (`from_verifier=""`) does NOT attribute the spec
 
 **Still deferred (Kart-boundary silence, part B)**: a specialist running INSIDE Kart (bwrap-sandboxed shell task, no MCP client at all) still has no path back to the queue. Part A closes the silence for every specialist that runs as its own MCP client, which is the majority in practice today. Part B needs a design decision on the drop-off mechanism (filesystem queue Kart CAN write to? harvester on the host side?) before it's tractable — its own thread.
 
+### PR10 — precedents expanded inline on pending read
+
+`envelope_pending_read` now returns each row with `precedents_expanded`: the full envelope objects behind every id in `precedent_ids` that still resolves. Turns the ratify UX into one glance ("confirm precedents X, Y or override") instead of a two-hop dance through `envelope_list`. Precedent ids that no longer resolve silently drop from the expansion; `precedent_ids` itself stays intact as tamper evidence. Opt-out with `include_precedents=false`.
+
+### PR11 — rejected proposals accrue as precedents (registry `archived[]`)
+
+The operator's *decisions* accrue, not just the ratified subset. Same discipline as Nestor's `reject_match`: a "no with a reopen_when" is a precedent about the shape, not a lesser signal.
+
+- Registry gains an `archived[]` list alongside `active[]` and `proposals[]`. `reject()` moves the rejected row into `archived[]` with `status="rejected"`, `archived_at`, `reject_reason`, `reopen_when`, `rejected_by`, and the bounds intact. Old behavior — deleting the row — was throwing away the operator's most useful signal about future proposals.
+- New read: `envelope_authoring.list_archived(grantee=, verb=, status=)`. Filterable, read-only.
+- `envelope_shapes.similar_precedents` gains `include_archived=True` (default). Walks both `active[]` and `archived[]`; each result carries `precedent_status` (`"active"` or `"rejected"`) and — for a rejected precedent — the `reopen_when` condition. Score is polarity-blind; the surface renders the polarity.
+- `top_precedent_ids` and `list_pending`'s inline precedent expansion (PR10) both extend to include archived rows with the same status decoration.
+
+The natural sequel — "when `ratify` supersedes an existing active envelope for the same (verb, grantee), move the superseded one into `archived[]`" — is a separate design decision (whether ratify should supersede at all is itself unresolved) and out of scope here. Registry growth is a real long-run concern; compaction is left for when the archived list gets large enough to matter.
+
+Historical precedents from the FRANK ledger itself remain out of scope: `envelope_ratified` events store `bounds_digest`, not full bounds, so the ledger walk can identify prior envelope_ids but not score them. That would need either a wire change (bounds inline in the event) or a separate bounds-history store, neither of which are tractable here.
+
 ### PR7 — shape similarity + precedent recall (future)
 
 `envelope_shapes.similar_precedents(verb, grantee, bounds)` reads active envelopes + FRANK `envelope_ratified` history, scores each precedent by verb match + grantee overlap + per-field bounds similarity (fnmatch equivalence classes for glob bounds, prefix overlap for path-shaped bounds). `envelope_propose` calls this before writing; the resulting proposal row carries `precedent_ids: [...]` and `pre_filled_bounds: {...}`. The operator's ratify UX shows "similar to envelopes X, Y ratified on D1, D2 — confirm precedents or override."

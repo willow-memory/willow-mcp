@@ -368,3 +368,165 @@ def test_propose_precedent_ids_empty_when_no_active_envelopes(
         reason="first", verifier="rita", session_id="s-orch-shapes",
     )
     assert p["precedent_ids"] == []
+
+
+# --- PR11: archived precedents (the operator's rejections count too) ------
+
+
+def _archived(id_, verb, grantee, bounds, *, status="rejected", reopen_when=""):
+    return {
+        "id": id_,
+        "verb": verb,
+        "grantee": grantee,
+        "bounds": bounds,
+        "status": status,
+        "archived_at": "2026-08-20T00:00:00Z",
+        "rejected_at": "2026-08-20T00:00:00Z",
+        "reject_reason": "test",
+        "reopen_when": reopen_when,
+        "rejected_by": "rita",
+    }
+
+
+def test_archived_precedent_included_by_default():
+    """A rejected envelope IS a precedent — Nestor's reject_match discipline
+    says a 'no with a reopen_when' is a precedent about the shape, not
+    a lesser signal."""
+    got = es.similar_precedents(
+        "demo_paths", "hanuman",
+        {"path_pattern": "docs/**", "max_bytes": 1024},
+        active_envelopes=[],
+        archived_envelopes=[_archived(
+            "env-rejected", "demo_paths", "hanuman",
+            {"path_pattern": "docs/**", "max_bytes": 1024},
+            reopen_when="after audit",
+        )],
+    )
+    assert len(got) == 1
+    assert got[0]["envelope_id"] == "env-rejected"
+    assert got[0]["precedent_status"] == "rejected"
+    assert got[0]["reopen_when"] == "after audit"
+
+
+def test_archived_precedent_scores_same_as_active():
+    """Score is polarity-blind; the precedent_status field is what tells
+    the surface how to render."""
+    active = [_envelope("env-active", "demo_paths", "hanuman",
+                        {"path_pattern": "docs/**", "max_bytes": 1024})]
+    archived = [_archived(
+        "env-arch", "demo_paths", "hanuman",
+        {"path_pattern": "docs/**", "max_bytes": 1024},
+    )]
+    got = es.similar_precedents(
+        "demo_paths", "hanuman",
+        {"path_pattern": "docs/**", "max_bytes": 1024},
+        active_envelopes=active,
+        archived_envelopes=archived,
+    )
+    scores = {p["envelope_id"]: p["score"] for p in got}
+    assert scores["env-active"] == scores["env-arch"] == 1.0
+    statuses = {p["envelope_id"]: p["precedent_status"] for p in got}
+    assert statuses == {"env-active": "active", "env-arch": "rejected"}
+
+
+def test_include_archived_false_reverts_to_pr7_behavior():
+    """PR7 shape recall was active-only. Callers who don't want the
+    polarity in their result set opt out with include_archived=False."""
+    got = es.similar_precedents(
+        "demo_paths", "hanuman",
+        {"path_pattern": "docs/**", "max_bytes": 1024},
+        active_envelopes=[],
+        archived_envelopes=[_archived(
+            "env-arch", "demo_paths", "hanuman",
+            {"path_pattern": "docs/**", "max_bytes": 1024},
+        )],
+        include_archived=False,
+    )
+    assert got == []
+
+
+def test_active_precedent_carries_status_active():
+    """Every result now has precedent_status. Active rows get 'active'."""
+    got = es.similar_precedents(
+        "demo_paths", "hanuman",
+        {"path_pattern": "docs/**", "max_bytes": 1024},
+        active_envelopes=[_envelope(
+            "env-a", "demo_paths", "hanuman",
+            {"path_pattern": "docs/**", "max_bytes": 1024},
+        )],
+        archived_envelopes=[],
+    )
+    assert got[0]["precedent_status"] == "active"
+    # No reopen_when on an active precedent
+    assert "reopen_when" not in got[0]
+
+
+def test_top_precedent_ids_includes_archived_by_default(
+    ring_with_rita, registry_with_paths_verb,
+):
+    """End-to-end: reject a proposal, propose again with a similar shape,
+    top_precedent_ids finds the archived one."""
+    p_prior = ea.propose(
+        verb="demo_paths", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 1024},
+        reason="prior", verifier="rita", session_id="s-orch-shapes",
+    )
+    ea.reject(
+        p_prior["id"], reason="too broad",
+        reopen_when="after audit", verifier="rita",
+    )
+    ids = es.top_precedent_ids(
+        "demo_paths", "hanuman",
+        {"path_pattern": "docs/**", "max_bytes": 2048},
+    )
+    assert p_prior["id"] in ids
+
+
+def test_top_precedent_ids_include_archived_false_skips(
+    ring_with_rita, registry_with_paths_verb,
+):
+    p_prior = ea.propose(
+        verb="demo_paths", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 1024},
+        reason="prior", verifier="rita", session_id="s-orch-shapes",
+    )
+    ea.reject(p_prior["id"], reason="r", verifier="rita")
+    ids = es.top_precedent_ids(
+        "demo_paths", "hanuman",
+        {"path_pattern": "docs/**", "max_bytes": 2048},
+        include_archived=False,
+    )
+    assert p_prior["id"] not in ids
+
+
+def test_propose_carries_archived_precedents_end_to_end(
+    ring_with_rita, registry_with_paths_verb,
+):
+    """The full path: reject a shape, propose a similar one, the new
+    proposal's precedent_ids includes the rejected one, and list_pending's
+    expansion resolves it with precedent_status='rejected'."""
+    p_prior = ea.propose(
+        verb="demo_paths", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 1024},
+        reason="prior", verifier="rita", session_id="s-orch-shapes",
+    )
+    ea.reject(
+        p_prior["id"], reason="too broad",
+        reopen_when="after audit", verifier="rita",
+    )
+    p_new = ea.propose(
+        verb="demo_paths", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 2048},
+        reason="wider", verifier="rita", session_id="s-orch-shapes",
+    )
+    assert p_prior["id"] in p_new["precedent_ids"]
+
+    pending = ea.list_pending()
+    match = next(r for r in pending if r["id"] == p_new["id"])
+    exp = match["precedents_expanded"]
+    assert any(
+        e["id"] == p_prior["id"]
+        and e["precedent_status"] == "rejected"
+        and e["reopen_when"] == "after audit"
+        for e in exp
+    )
