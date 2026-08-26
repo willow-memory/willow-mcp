@@ -198,8 +198,21 @@ def dispatch_send(
     priority: str = "normal",
     context_refs: Optional[list[str]] = None,
     dispatch_id: str = "",
+    from_verifier: str = "",
+    from_session: str = "",
 ) -> dict:
-    """Create dispatch/{id}/ with meta, assignment, and status pending."""
+    """Create dispatch/{id}/ with meta, assignment, and status pending.
+
+    ``from_verifier`` and ``from_session`` name the human operator whose
+    orchestrator session generated this dispatch (envelope-accrual PR9,
+    Kart-boundary silence follow-up). They travel inside the signed
+    meta.json so the specialist can carry the orchestrator's attribution
+    forward — when the specialist hits ENOGRANTS on a verb, the
+    auto-propose queue entry can be attributed back to the operator, not
+    dropped as unattributed. Both empty (legacy call site, unattributed
+    orchestrator, or specialist-to-specialist chain) keeps the pre-PR9
+    behavior: no attribution rides the packet, the specialist's own gate
+    misses stay silent."""
     if not (assignment_md or "").strip():
         return {"error": "assignment_required"}
     did = (dispatch_id or new_dispatch_id()).upper()
@@ -237,6 +250,17 @@ def dispatch_send(
         "summary": (summary or "").strip() or _first_line(assignment_md),
         "created_at": _utc_now(),
         "status": "pending",
+        # Envelope-accrual PR9: the operator's identity rides the packet so
+        # the specialist can attribute its own auto-proposed envelopes back
+        # to the human who dispatched it. Empty when the orchestrator's own
+        # session is unattributed, or on a specialist-to-specialist chain
+        # where no operator is directly upstream (also empty on legacy
+        # in-repo callers that don't pass these). Covered by the HMAC
+        # signature below like every other field — tampering with either
+        # field invalidates the packet, so a hand-planted meta.json can't
+        # forge an operator attribution.
+        "from_verifier": (from_verifier or "").strip(),
+        "from_session": (from_session or "").strip(),
     }
     # B-52/#241: sign every field above (HMAC-SHA256, runtime-held key --
     # dispatch_signing.py) so dispatch_read/dispatch_list can tell a packet
@@ -530,7 +554,16 @@ def dispatch_set_status(dispatch_id: str, status: str, **extra: Any) -> dict:
 
 
 def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict:
-    """Specialist takes packet: pending → working."""
+    """Specialist takes packet: pending → working.
+
+    When the packet carries ``from_verifier`` (envelope-accrual PR9),
+    that operator identity is bound onto the specialist's session record
+    and added to the in-process attribution cache. That's what lets the
+    specialist's own auto-propose from ``_enveloped_verb_gate`` succeed —
+    ``envelope_authoring.propose`` requires an attributed session, and
+    the specialist has no keyring identity of its own; the orchestrator's
+    identity travels through the dispatch packet to serve as the
+    proposer of record."""
     pkt = dispatch_read(dispatch_id)
     if pkt.get("error"):
         return pkt
@@ -541,7 +574,19 @@ def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict
         return {"error": "invalid_transition", "from": cur, "to": "working"}
     dispatch_set_status(dispatch_id, "working")
     if session_id:
-        session_bind(app_id, session_id, dispatch_id, "working")
+        from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
+        session_bind(
+            app_id, session_id, dispatch_id, "working",
+            verifier=from_verifier,
+        )
+        if from_verifier:
+            # Adds this specialist session to the attribution cache so its
+            # own gate misses (via _auto_propose_on_gate_miss) succeed
+            # rather than short-circuiting on is_session_attributed=False.
+            # Lazy import: human_session pulls keyring, and dispatch.py
+            # is imported early enough that a top-level import loops.
+            from . import human_session as _hs
+            _hs._remember_attributed(session_id)
     return dispatch_read(dispatch_id)
 
 
@@ -769,7 +814,18 @@ def session_enter(
     if cur == "pending":
         pkt = dispatch_accept(did, app_id, session_id)
     elif session_id:
-        session_bind(app_id, session_id, did, cur)
+        # Re-entry into an already-accepted packet (specialist reconnecting
+        # or continuing after a hop). Same envelope-accrual PR9 discipline
+        # as dispatch_accept: lift the packet's operator attribution onto
+        # the session and into the attribution cache. session_bind's
+        # verifier-preservation contract means an already-set verifier is
+        # not clobbered when the packet carries none; a specialist without
+        # a session record yet gets seeded here.
+        from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
+        session_bind(app_id, session_id, did, cur, verifier=from_verifier)
+        if from_verifier:
+            from . import human_session as _hs
+            _hs._remember_attributed(session_id)
 
     closeout = closeout_from_meta(pkt.get("meta", {}))
     return {
