@@ -135,6 +135,35 @@ The real control is ownership: put the lease root and manifest under a uid the
 agent does not run as, then set `WILLOW_MCP_STRICT_TRUST_ROOT=1` so egress is
 refused whenever the process reading the keys could also have written them.
 
+### Earn-first tools — a lease for building, not for running
+
+Some tools are `EARN-FIRST` — real capabilities the fleet does not build
+ahead of a consumer. The consumer is the operator, asking, on the record.
+This uses the same lease shape as the egress lease above, one subject over:
+
+| Key | Question it answers | Where it lives | Who turns it |
+|---|---|---|---|
+| **build lease** | *This tool, until when?* | `mcp_apps/_build_leases/<tool>.json` | operator, `willow-mcp grant-build`, expires |
+
+- Same 3h ceiling (FRANK `cc553729`), same fail-closed reader, same
+  local-only mint boundary as `grant-net`. No MCP tool can reach it.
+- `--reason` is where the operator's on-record agreement lives. The CLI
+  flags a grant that landed without one — the rule this lease opens is
+  *"the operator asks AND agrees to what building this opens,"* and an
+  empty reason has nowhere for the agreement to live.
+- `willow-mcp earn-check` reads the roster + leases on disk and prints
+  `ready` / `waiting` / `dry` per family. `willow-mcp gates` folds the
+  same rows into its panel under **Earn-first build leases**.
+- **An agent may propose the build; it may never authorize its own.** The
+  PreToolUse hook refuses `Bash: willow-mcp grant-build …` and direct
+  writes into `_build_leases/`, the same class as the `grant-net`
+  self-grant refusal.
+
+The roster and the doctrine it enforces live in
+`docs/design/slice-backlog.md` under **Earn-first**. Integration stubs
+stay on a different rule (`earn_mode: two-cite`, see
+`docs/design/integrations.md §6`) — different subject, different check.
+
 ## 3. The database model — the same shape as the network model, one key shorter
 
 Local Postgres access is opt-in too, gated the same way egress is (B2), just
