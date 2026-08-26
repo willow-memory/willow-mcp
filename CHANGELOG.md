@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.16.0](https://github.com/willow-memory/willow-mcp/compare/v2.15.0...v2.16.0) (2026-08-26)
+
+
+### Added
+
+* **mem_ratify:** WitnessCollector + witness-supply seam on _mem_ratify_gate ([460c480](https://github.com/willow-memory/willow-mcp/commit/460c48039cc77a68c1ee13106c34aa18c2d384c2))
+* **mem_ratify:** WitnessCollector + witness-supply seam on _mem_ratify_gate ([f620fe6](https://github.com/willow-memory/willow-mcp/commit/f620fe664389b2448848a9aa950e68faf5f93dc0))
+
 ## [2.15.0](https://github.com/willow-memory/willow-mcp/compare/v2.14.0...v2.15.0) (2026-08-26)
 
 
