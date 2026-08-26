@@ -310,6 +310,102 @@ def test_reject_removes_proposal_from_queue(ring_with_rita, fresh_registry):
     assert on_disk["active"] == []
 
 
+# --- PR11: rejected proposals move to archived[] with bounds intact -------
+
+
+def test_reject_moves_to_archived_with_bounds_and_reopen_when(
+    ring_with_rita, fresh_registry,
+):
+    """PR11: the whole point. Rejected rows survive in archived[] with
+    the fields shape-scoring needs (bounds, verb, grantee, reopen_when,
+    reject_reason, rejected_by, status)."""
+    registry_path, _ = fresh_registry
+    proposal = ea.propose(
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 4096},
+        reason="draft", verifier="rita", session_id="s-orch",
+    )
+    ea.reject(
+        proposal["id"], reason="too broad",
+        reopen_when="hanuman gets audited by loki",
+        verifier="rita",
+    )
+    on_disk = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert len(on_disk["archived"]) == 1
+    arch = on_disk["archived"][0]
+    assert arch["id"] == proposal["id"]
+    assert arch["verb"] == "demo_verb"
+    assert arch["grantee"] == "hanuman"
+    assert arch["bounds"] == {"path_pattern": "docs/**", "max_bytes": 4096}
+    assert arch["status"] == "rejected"
+    assert arch["reject_reason"] == "too broad"
+    assert arch["reopen_when"] == "hanuman gets audited by loki"
+    assert arch["rejected_by"] == "rita"
+    assert arch["archived_at"].endswith("Z")
+    assert arch["rejected_at"] == arch["archived_at"]
+
+
+def test_list_archived_reads_the_archive(ring_with_rita, fresh_registry):
+    for i in range(3):
+        p = ea.propose(
+            verb="demo_verb", grantee="hanuman",
+            bounds={"path_pattern": f"p{i}", "max_bytes": 1}, reason="t",
+            verifier="rita", session_id="s-orch",
+        )
+        ea.reject(p["id"], reason=f"r{i}", verifier="rita")
+    rows = ea.list_archived()
+    assert len(rows) == 3
+    assert {r["status"] for r in rows} == {"rejected"}
+
+
+def test_list_archived_filters_by_grantee_verb_status(
+    ring_with_rita, fresh_registry,
+):
+    p1 = ea.propose(verb="demo_verb", grantee="hanuman",
+                    bounds={"path_pattern": "a", "max_bytes": 1},
+                    reason="t", verifier="rita", session_id="s-orch")
+    p2 = ea.propose(verb="demo_no_bounds", grantee="loki", bounds={},
+                    reason="t2", verifier="rita", session_id="s-orch")
+    ea.reject(p1["id"], reason="r", verifier="rita")
+    ea.reject(p2["id"], reason="r", verifier="rita")
+
+    assert len(ea.list_archived(grantee="hanuman")) == 1
+    assert len(ea.list_archived(verb="demo_no_bounds")) == 1
+    assert len(ea.list_archived(status="rejected")) == 2
+    assert ea.list_archived(status="superseded") == []
+
+
+def test_list_pending_precedent_expansion_includes_archived(
+    ring_with_rita, fresh_registry,
+):
+    """PR11 + PR10 interop: an archived precedent id resolves in the
+    expansion, decorated with precedent_status='rejected' so the ratify
+    surface shows the polarity."""
+    # First: a proposal, then reject it — becomes archived
+    p_prior = ea.propose(
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 1024},
+        reason="prior", verifier="rita", session_id="s-orch",
+    )
+    ea.reject(
+        p_prior["id"], reason="too broad",
+        reopen_when="see audit", verifier="rita",
+    )
+    # Now: a new proposal that references the archived id
+    ea.propose(
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 2048},
+        reason="widen", verifier="rita", session_id="s-orch",
+        precedent_ids=[p_prior["id"]],
+    )
+    row = ea.list_pending()[0]
+    assert len(row["precedents_expanded"]) == 1
+    exp = row["precedents_expanded"][0]
+    assert exp["id"] == p_prior["id"]
+    assert exp["precedent_status"] == "rejected"
+    assert exp["reopen_when"] == "see audit"
+
+
 # --- list_active + list_pending -------------------------------------------
 
 

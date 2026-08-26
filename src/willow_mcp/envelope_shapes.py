@@ -25,11 +25,20 @@ shape" is discrete (path prefix, quota tier, timeout budget). Semantic
 similarity would be over-engineered for the domain and would introduce a
 dependency this module doesn't need.
 
-Precedents come from ``envelope_authoring.list_active`` for PR7 — the
-currently-in-force envelopes. A follow-on could extend this to walk the
-FRANK ``envelope_ratified`` event stream so ratified-then-superseded shapes
-also count as precedent; that requires a Postgres connection this module
-does not want to hold and is left for a later PR.
+Precedents come from BOTH ``envelope_authoring.list_active`` (currently
+in force) AND ``envelope_authoring.list_archived`` (PR11: today, the
+operator's rejected proposals with reopen_when). Score is
+polarity-blind — a rejected match scores the same as a ratified one;
+the ``precedent_status`` field on each result tells the surface how to
+render it. This mirrors Nestor's ``reject_match``: a "no with a
+reopen_when" is a precedent about the shape, not a lesser signal.
+
+Historical precedents from the FRANK ledger itself remain out of
+scope — ``envelope_ratified`` events store ``bounds_digest``, not
+bounds, so the ledger walk can identify prior envelope_ids but not
+score them. That would need either a wire change (bounds inline in
+the event) or a separate bounds-history store, neither of which are
+tractable here.
 
 The output shape is stable:
     [
@@ -128,47 +137,73 @@ def similar_precedents(
     bounds: dict,
     *,
     active_envelopes: Optional[Iterable[dict]] = None,
+    archived_envelopes: Optional[Iterable[dict]] = None,
+    include_archived: bool = True,
     min_score: float = 0.0,
 ) -> list[dict]:
-    """Rank active envelopes as precedents for a proposed (verb, grantee,
-    bounds) shape.
+    """Rank active + archived envelopes as precedents for a proposed
+    (verb, grantee, bounds) shape.
 
     Only envelopes matching both ``verb`` (exactly) and ``grantee`` (via
     :func:`envelope_authoring._grantee_matches`) are considered. Bounds
     similarity is computed per-field via :func:`_field_similarity` and the
     overall score is the mean.
 
-    Returns a list of ``{envelope_id, score, matching_bounds, differing_bounds,
-    precedent_bounds}`` dicts, sorted descending by score. Optionally
-    filtered by ``min_score`` — the caller may want to hide near-zero
-    matches from the operator ratify surface.
+    Returns a list of ``{envelope_id, score, precedent_status,
+    matching_bounds, differing_bounds, precedent_bounds}`` dicts, sorted
+    descending by score. ``precedent_status`` is ``"active"`` for a
+    currently-active envelope; for an archived row (PR11) it reflects the
+    stored status (today: ``"rejected"``). A rejected precedent also
+    carries ``reopen_when`` in the result so the ratify surface can show
+    "you already said no to this shape; condition to reopen: X."
 
-    ``active_envelopes`` accepts a caller-supplied iterable (test injection)
-    and defaults to :func:`envelope_authoring.list_active` filtered by
-    ``verb``. The verb filter is applied twice — once by ``list_active`` for
-    speed, once here for defense — cheap and lets a test pass in
-    unfiltered rows.
+    Score is polarity-blind — a rejected match scores the same as a
+    ratified one; the ``precedent_status`` field tells the surface how
+    to render it. This mirrors Nestor's ``reject_match``: a "no with a
+    reopen_when" is a precedent about the shape, not a lesser signal.
+
+    Optionally filtered by ``min_score``. ``include_archived=False``
+    reverts to PR7-era behavior (active only).
+
+    ``active_envelopes`` / ``archived_envelopes`` accept caller-supplied
+    iterables for test injection; the defaults come from
+    :func:`envelope_authoring.list_active` / :func:`.list_archived`,
+    verb-filtered for speed. Verb filter re-applied here as defense so
+    an unfiltered iterable still gets narrowed.
     """
+    # Default-fetch pairs: if the caller injected active_envelopes but
+    # didn't touch archived_envelopes, we treat archived as empty rather
+    # than reaching for the registry (a test that pins verb-mismatch on
+    # an in-memory list shouldn't need a registry on disk). Callers who
+    # want the auto-fetch on both leave both as None.
+    caller_supplied_active = active_envelopes is not None
     if active_envelopes is None:
         active_envelopes = _ea.list_active(verb=verb)
+    if not include_archived:
+        archived_envelopes = ()
+    elif archived_envelopes is None and not caller_supplied_active:
+        # Best-effort: an unreadable registry (missing, unowned, hand-
+        # deleted) shouldn't turn precedent recall into a crash. Same
+        # discipline the propose() call site already uses when wrapping
+        # top_precedent_ids in a try/except.
+        try:
+            archived_envelopes = _ea.list_archived(verb=verb)
+        except Exception:
+            archived_envelopes = ()
+    elif archived_envelopes is None:
+        archived_envelopes = ()
 
-    out: list[dict] = []
-    for row in active_envelopes:
+    def _score_row(row: dict, status_default: str) -> Optional[dict]:
         if row.get("verb") != verb:
-            continue
+            return None
         if not _ea._grantee_matches(row.get("grantee"), grantee):
-            continue
+            return None
         prec_bounds = row.get("bounds") or {}
         if not isinstance(prec_bounds, dict) or not bounds:
-            continue
+            return None
         matching: list[str] = []
         differing: list[str] = []
         scores: list[float] = []
-        # Union of keys so a precedent with EXTRA fields still scores
-        # (extras contribute 0 for missing-in-proposal, which is right —
-        # a precedent that granted MORE than this proposal asks for is
-        # still relevant, and the operator sees the extras in
-        # precedent_bounds).
         all_keys = set(bounds) | set(prec_bounds)
         for key in all_keys:
             if key in bounds and key in prec_bounds:
@@ -181,17 +216,33 @@ def similar_precedents(
             else:
                 differing.append(key)
         if not scores:
-            continue
+            return None
         score = sum(scores) / len(scores)
         if score < min_score:
-            continue
-        out.append({
+            return None
+        out = {
             "envelope_id": row.get("id"),
             "score": round(score, 4),
+            "precedent_status": row.get("status") or status_default,
             "matching_bounds": sorted(matching),
             "differing_bounds": sorted(differing),
             "precedent_bounds": prec_bounds,
-        })
+        }
+        # PR11: preserve the reopen-condition on a rejected precedent so
+        # the operator surface can name it.
+        if row.get("status") == "rejected":
+            out["reopen_when"] = row.get("reopen_when") or ""
+        return out
+
+    out: list[dict] = []
+    for row in active_envelopes:
+        scored = _score_row(row, "active")
+        if scored is not None:
+            out.append(scored)
+    for row in archived_envelopes or ():
+        scored = _score_row(row, "archived")
+        if scored is not None:
+            out.append(scored)
     out.sort(key=lambda p: p["score"], reverse=True)
     return out
 
@@ -203,10 +254,20 @@ def top_precedent_ids(
     *,
     limit: int = 5,
     min_score: float = 0.1,
+    include_archived: bool = True,
 ) -> list[str]:
     """Convenience: just the top-N envelope ids for embedding on a
     proposal row's ``precedent_ids`` field. Filters below ``min_score`` by
     default (0.1 keeps out near-zero matches that would just be noise on
-    the operator ratify surface)."""
-    ranked = similar_precedents(verb, grantee, bounds, min_score=min_score)
+    the operator ratify surface).
+
+    PR11: ``include_archived`` defaults True so the ids include the
+    operator's prior "no with reopen_when" alongside active envelopes.
+    :func:`envelope_authoring.list_pending` (PR10 expansion) resolves
+    each id back to the full row with its ``precedent_status`` so the
+    surface can render active vs rejected differently."""
+    ranked = similar_precedents(
+        verb, grantee, bounds,
+        min_score=min_score, include_archived=include_archived,
+    )
     return [p["envelope_id"] for p in ranked[:limit] if p["envelope_id"]]
