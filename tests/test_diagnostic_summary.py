@@ -401,6 +401,53 @@ def test_diag_envelope_registry_warns_when_absent(monkeypatch, tmp_path):
     assert out["present"] is False
 
 
+# ── build_leases check — informational only, never gates verdict ────────────
+
+def test_diagnostic_summary_includes_build_leases_check(tmp_path, monkeypatch):
+    """The earn-first surface has to appear alongside net_lease in the
+    self-check — same posture as net_lease's own reporting, so `diagnostic_summary`
+    stays the one place that reads all of them together."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(tmp_path / "mcp_apps"))
+    fn = getattr(server.diagnostic_summary, "fn", server.diagnostic_summary)
+    rep = fn(app_id="")
+    assert "build_leases" in rep["checks"]
+    bl = rep["checks"]["build_leases"]
+    assert "roster_size" in bl and bl["roster_size"] > 0
+    assert "roster_dry" in bl and "extras" in bl and "tally" in bl
+    assert bl["max_ttl_seconds"] == 3 * 60 * 60  # same 3h ceiling as net_lease
+
+
+def test_build_leases_check_never_enters_problems(tmp_path, monkeypatch):
+    """B-18: a check that is empty/dry on every existing install must never
+    become a new `warn`/`error` in `problems`, or every install's resting
+    state degrades on this PR alone. build_leases is deliberately excluded
+    from _derive_problems."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(tmp_path / "mcp_apps"))
+    fn = getattr(server.diagnostic_summary, "fn", server.diagnostic_summary)
+    rep = fn(app_id="")
+    checks = {p.get("check") for p in rep["problems"]}
+    assert "build_leases" not in checks
+
+
+def test_build_leases_check_reflects_a_live_lease(tmp_path, monkeypatch):
+    """Grant one lease, confirm it surfaces in the diag output with the
+    right issuer, tally, and roster-dry list shrinking by one."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(tmp_path / "mcp_apps"))
+    from willow_mcp import build_lease
+    build_lease.grant("workflow", 1800, issuer="operator", reason="ship it")
+
+    fn = getattr(server.diagnostic_summary, "fn", server.diagnostic_summary)
+    rep = fn(app_id="")
+    bl = rep["checks"]["build_leases"]
+    assert bl["tally"]["active"] == 1
+    assert "workflow" not in bl["roster_dry"]
+    assert any(row["tool"] == "workflow" and row["status"] == "active"
+               for row in bl["leases"])
+
+
 def test_diagnostic_summary_is_registered_and_the_probe_helper_is_not():
     """Guard against decorator displacement (regression from #332's own fix):
     _diag_envelope_registry is a PRIVATE helper, not an MCP tool, and

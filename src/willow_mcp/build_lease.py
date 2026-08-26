@@ -247,3 +247,30 @@ def list_leases() -> list[dict]:
     if not root.is_dir():
         return []
     return [read_lease(path.stem) for path in sorted(root.glob("*.json"))]
+
+
+#: Earn-first roster — the tool families whose entry into the codebase is
+#: gated by a build lease. Kept here (module-level, not a JSON file) so it
+#: moves in the same commit as the doctrine, and so a family cannot be
+#: silently added to the gated set without a diff a reviewer sees. A lease
+#: on a family name authorizes any tool under that family (`workflow_run`,
+#: `workflow_step`, ...).
+#:
+#: Mirrors `docs/design/slice-backlog.md` "Earn-first" and the operator-
+#: promoted-from-LEAVE rows (2026-07-21). `gcal` and `time-travel` are
+#: deliberately excluded — gcal is auth-flow-blocked (has an operator ask
+#: already), time-travel is an idea, not a capability with a caller.
+#:
+#: Imported by `server._cmd_earn_check` and by `gates_panel._build_lease_rows`
+#: so both surfaces read the same source of truth.
+EARN_FIRST_ROSTER: tuple[tuple[str, str], ...] = (
+    ("workflow", "multi-phase engine on the existing Kart task_* queue"),
+    ("intake", "KB-tier routing (blocked upstream on jeles/binder/opus targets)"),
+    ("dag", "SOIL DAG — dag_next / dag_status, route dispatch by function"),
+    ("tension_scan", "scan KB frontier / contested atoms for semantic tensions"),
+    ("source_trail_verify", "extract claims and check each against a source trail"),
+    ("infer", "local + provider-routed inference (7b / chat / imagine / speak)"),
+    ("dream", "AutoDream synthesis pipeline (check / run / schedule)"),
+    ("wce", "weekly-witness ritual (check / schedule)"),
+    ("voice_keyterms", "STT keyterms for voice-input accuracy"),
+)

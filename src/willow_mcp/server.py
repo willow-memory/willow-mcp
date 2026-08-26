@@ -4650,6 +4650,46 @@ def _diag_net_lease(app_id: str) -> dict:
     }
 
 
+def _diag_build_leases() -> dict:
+    """Earn-first build leases — what building is currently authorized, by
+    whom, and until when.
+
+    Deliberately informational (never folded into `_derive_problems` / the
+    verdict): an install with no active build lease is not degraded, an
+    expired lease is not wrong, and a malformed one is the reader's own
+    report — same B-18 rule the net-lease residual reporting follows. The
+    self-writable residual is not re-reported per family here — `net_lease`
+    already measured `mcp_apps/` writability at the root, and both lease
+    subtrees inherit it. A single note points at that check instead.
+    """
+    from . import build_lease
+
+    leases = build_lease.list_leases()
+    roster_names = {fam for fam, _ in build_lease.EARN_FIRST_ROSTER}
+    on_disk = {row["tool"] for row in leases}
+    tallies = {"active": 0, "expired": 0, "malformed": 0, "mismatch": 0, "none": 0}
+    for row in leases:
+        tallies[row["status"]] = tallies.get(row["status"], 0) + 1
+
+    return {
+        "lease_root": str(build_lease._leases_root()),
+        "max_ttl_seconds": build_lease.MAX_TTL_SECONDS,
+        "roster_size": len(roster_names),
+        "roster_dry": sorted(roster_names - on_disk),
+        "extras": sorted(on_disk - roster_names),
+        "leases": leases,
+        "tally": tallies,
+        # `net_lease.self_writable` already reports the shared mcp_apps root;
+        # duplicating it here would suggest a distinct membrane.
+        "self_writable_note": "shared root with net_lease — see net_lease.self_writable",
+        # A sub-check that reports N active leases and calls itself "ok" is
+        # honest here: there is nothing about a build lease's mere existence
+        # that is a problem (its point is authorization). "status" stays "ok"
+        # unconditionally so the verdict is unmoved.
+        "status": "ok",
+    }
+
+
 def _diag_uid_separation(app_id: str) -> dict:
     """B-32/#231, made legible: whose *account* actually owns the trust root,
     named next to whose account is asking.
@@ -5327,6 +5367,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
     worker = _diag_worker(eff)
     consent = _diag_consent()
     net_lease = _diag_net_lease(eff)
+    build_leases = _diag_build_leases()
     severance = _diag_severance(store, postgres, net_lease)
     uid_separation = _diag_uid_separation(eff)
     store_db_perms = _diag_store_db_perms(eff)
@@ -5345,6 +5386,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
         "checks": {"store": store, "postgres": postgres, "rings": rings,
                    "schema": schema, "manifest": manifest, "identity_bindings": bindings,
                    "worker": worker, "consent": consent, "net_lease": net_lease,
+                   "build_leases": build_leases,
                    "severance": severance, "uid_separation": uid_separation,
                    "store_db_perms": store_db_perms,
                    "envelope_registry": envelope_registry, "env": env},
@@ -7290,30 +7332,6 @@ def _cmd_build_status(args) -> None:
         print(line)
 
 
-#: Earn-first roster — the tools whose entry into the codebase is gated by a
-#: build lease. Kept here (not in a separate roster file) so it moves in the
-#: same commit as the doctrine, and so a tool is not silently added to the
-#: gated set without a diff a reviewer sees. Grouped by family; a lease on a
-#: family name authorizes any tool under that family (`workflow_run`,
-#: `workflow_step`, ...).
-#:
-#: Mirrors the `slice-backlog.md` "Earn-first" section and the operator-
-#: promoted-from-LEAVE rows (2026-07-21). `gcal` and `time-travel` are
-#: deliberately excluded — gcal is auth-flow-blocked (has an operator ask
-#: already), time-travel is an idea, not a capability with a caller.
-_EARN_FIRST_ROSTER: tuple[tuple[str, str], ...] = (
-    ("workflow", "multi-phase engine on the existing Kart task_* queue"),
-    ("intake", "KB-tier routing (blocked upstream on jeles/binder/opus targets)"),
-    ("dag", "SOIL DAG — dag_next / dag_status, route dispatch by function"),
-    ("tension_scan", "scan KB frontier / contested atoms for semantic tensions"),
-    ("source_trail_verify", "extract claims and check each against a source trail"),
-    ("infer", "local + provider-routed inference (7b / chat / imagine / speak)"),
-    ("dream", "AutoDream synthesis pipeline (check / run / schedule)"),
-    ("wce", "weekly-witness ritual (check / schedule)"),
-    ("voice_keyterms", "STT keyterms for voice-input accuracy"),
-)
-
-
 def _cmd_earn_check(args) -> None:
     """`willow-mcp earn-check` — cross-reference the earn-first roster with
     build leases on disk.
@@ -7331,7 +7349,7 @@ def _cmd_earn_check(args) -> None:
 
     on_disk = {row["tool"]: row for row in build_lease.list_leases()}
     rows: list[dict] = []
-    for family, blurb in _EARN_FIRST_ROSTER:
+    for family, blurb in build_lease.EARN_FIRST_ROSTER:
         lease_row = on_disk.get(family)
         if lease_row is None:
             state = "dry"
@@ -7361,7 +7379,7 @@ def _cmd_earn_check(args) -> None:
     # the canonical list of gated tools, but an operator may grant on a
     # freshly-named family before it lands in the doc. Surface it so nothing
     # is invisible.
-    extras = sorted(set(on_disk) - {fam for fam, _ in _EARN_FIRST_ROSTER})
+    extras = sorted(set(on_disk) - {fam for fam, _ in build_lease.EARN_FIRST_ROSTER})
 
     if args.json:
         print(json.dumps({"roster": rows, "extras": [

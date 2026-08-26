@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from willow_mcp import consent, gates_panel, lease, manifest_admin
+from willow_mcp import build_lease, consent, gates_panel, lease, manifest_admin
 from willow_mcp.gate import (
     INTEGRATION_NET_PERMISSION,
     NET_PERMISSION,
@@ -256,8 +256,67 @@ def test_group_by_category_skips_empty_categories_and_follows_order(apps_root):
     grouped = gates_panel.group_by_category(rows)
     keys = [key for key, _, _ in grouped]
     assert keys == sorted(keys, key=lambda k: [c for c, _ in gates_panel.CATEGORY_ORDER].index(k))
-    assert set(keys) <= {"egress", "system", "identity", "permissions"}
+    assert set(keys) <= {"egress", "build", "system", "identity", "permissions"}
     assert all(group for _, _, group in grouped)  # no empty buckets
+
+
+# ── build leases ─────────────────────────────────────────────────────────────
+
+def test_collect_emits_a_row_per_earn_first_family(apps_root):
+    """Every family in the roster gets a row, dry or leased."""
+    rows = gates_panel.collect()
+    family_row_ids = {r.id for r in rows if r.id.startswith("build.")}
+    expected = {f"build.{fam}" for fam, _ in build_lease.EARN_FIRST_ROSTER}
+    assert expected.issubset(family_row_ids)
+
+
+def test_dry_family_row_is_off_with_grant_build_action(apps_root):
+    row = _row(gates_panel.collect(), "build.workflow")
+    assert row.state == "off"
+    assert row.timer_shape == "lease"
+    assert row.action_cli and "grant-build workflow" in row.action_cli
+    assert row.category == "build"
+
+
+def test_active_build_lease_flips_the_row_to_on_with_a_timer(apps_root):
+    build_lease.grant("workflow", 1800, issuer="operator",
+                      reason="ship the multi-phase engine")
+    row = _row(gates_panel.collect(), "build.workflow")
+    assert row.state == "on"
+    assert row.timer_shape == "lease"
+    assert row.remaining_seconds is not None and row.remaining_seconds <= 1800
+    assert row.expires_at
+    assert row.action_cli == "willow-mcp revoke-build workflow"
+    assert "operator" in row.detail
+    assert "multi-phase" in row.detail
+
+
+def test_build_lease_outside_the_roster_is_still_surfaced(apps_root):
+    """Silent invisibility is what a status readout must not do — a lease
+    granted on a family not yet in the doc still appears."""
+    build_lease.grant("brand-new-family", 600, issuer="op",
+                      reason="one-off")
+    row = _row(gates_panel.collect(), "build.brand-new-family")
+    assert row.state == "on"
+    assert "not in EARN_FIRST_ROSTER" in row.detail
+
+
+def test_state_label_build_active(apps_root):
+    row = gates_panel.GateRow(id="build.workflow", label="build lease",
+                              scope="workflow", state="on", detail="")
+    assert row.state_label == "ACTIVE"
+
+
+def test_state_label_build_off(apps_root):
+    row = gates_panel.GateRow(id="build.workflow", label="build lease",
+                              scope="workflow", state="off", detail="")
+    assert row.state_label == "NONE"
+
+
+def test_render_tui_carries_the_build_heading(apps_root):
+    out = gates_panel.render_tui(gates_panel.collect(), color=False)
+    assert "Earn-first build leases" in out
+    assert "build lease" in out
 
 
 # ── state_label — what "on"/"off" means, in words ───────────────────────────
