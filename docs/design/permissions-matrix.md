@@ -79,11 +79,22 @@ None of the six seats above hold `grove_relay` — every write posts as the spec
 
 | Field | Value |
 |-------|-------|
-| permissions | orchestrator, commitment_read, store_read, knowledge_read, lineage_read, gap_write, grove_read, grove_write |
+| permissions | orchestrator, commitment_read, commitment_write, store_read, store_write, knowledge_read, knowledge_write, lineage_read, gap_write, grove_read, grove_write, envelope_read, envelope_write, envelope_read_discards, task_queue, human_loop_read, human_loop_write, nest_read, nest_write, code_graph_read, friction_read, federation_read, federation_call, mcp_federation |
 | deny_tools | — |
 | store_scope | willow_*, projects_* |
 | human_only | true |
 | entry_mode | human_orchestrator |
+
+**PR12 (2026-08-26): enabled-operator alignment.** The prior ratified set (`orchestrator, commitment_read, store_read, knowledge_read, lineage_read, gap_write, grove_read, grove_write`) modeled Willow as a **narrow proxy** ("assign → review evidence → clear"). In practice the operator was already doing operator-scope writes and routing around the manifest to do them; the envelope-accrual PRs (5–11) shipped an authoring surface Willow's own manifest didn't grant, which the code called a mechanism and the operator called broken. This ratified set aligns permissions with the seat's actual job — envelope authoring, knowledge ingest, store writes, task submits, nest promotes, commitment ledger, human-loop queue, code-graph reads, friction reads, federation reads + calls (plus `mcp_federation` own-line capability so the federated-MCP gate can actually reach downstream servers).
+
+**What still stays off:**
+- `integration_call` (outside services — Slack/Linear/etc.), `willow_web_search/fetch` (open web) and their capability lines (`integration_net`, `web_net`) — each is its own operator decision, not implied by an "enabled operator" posture.
+- `schema_confirm_mapping`, `frank_append`, `envelope_apply` beyond what the `orchestrator` group already grants — admin/verify surfaces stay behind their existing group boundaries.
+- The `orchestrator` shared permission group itself is unchanged — B-36 / `bundle/skills/gaps.md` remain in effect: apps other than willow that hold `orchestrator` are not silently widened. The widening lives on willow's OWN permissions list, not in the shared group.
+
+**What still requires human attestation** on top of the manifest grant: `envelope_propose`/`ratify`/`reject`, `dispatch_send`/`accept`, `handoff_write_v4`, `verify_handoff`, `agent_clear`, `frank_append`, `envelope_apply` (see `human_session.ORCHESTRATOR_WRITE_TOOLS`). The manifest lets the seat attempt them; the attestation gate is the second signature.
+
+**What still requires runtime consent** on top of the manifest grant: `consent.federation` (federated MCP), `consent.cloud_llm` (Nest cloud egress). The manifest lets the seat reach the tool; the consent gate is what actually completes a call.
 
 The orchestrator posts to Grove as itself (`grove_write`), same as every other seat — it does **not** hold `grove_relay`. Relaying on a specialist's behalf is a distinct, operator-granted capability reserved for a future bridge seat, not implied by the orchestrator role.
 

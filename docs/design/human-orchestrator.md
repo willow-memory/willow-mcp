@@ -34,7 +34,9 @@ Without this boundary:
 3. Auto-pick pending packet could bind an agent session to orchestrator work.
 4. The orchestrator becomes a **privilege escalation target** — whoever speaks as willow dispatches the fleet.
 
-The orchestrator is not a faster worker. It is the **human's proxy** for separation of duties: assign → review evidence → clear.
+The orchestrator is the **seat the human sits in** — not a proxy that only assigns. It runs its own writes on operator-scope work (envelope authoring, knowledge ingest, store puts, task submits, nest promotes, commitment ledger, human-loop queue, federated MCP calls) so that the human at the terminal isn't forced to dispatch a specialist for every routine act. Separation of duties still holds on the dispatch/handoff/clear axis (`dispatch_send`/`handoff_write_v4`/`verify_handoff`/`agent_clear` remain the orchestrator's specialist-oversight tools, gated by human attestation), and on capability escalation (envelope ratification still requires the operator's keyring-verified signature — an agent can propose, only a human can confirm).
+
+The "human's proxy for separation of duties" framing was aspirational; in practice the operator was already doing operator-scope writes and had to work around the manifest to do them. PR12 aligns the permission set with the seat's actual job. See `docs/design/permissions-matrix.md` §4 for the full ratified permission list.
 
 ---
 

@@ -21,6 +21,76 @@ def test_load_registry_from_bundle():
     assert "knowledge_read" in orch_perms
 
 
+def test_orchestrator_seat_carries_pr12_enabled_operator_grants():
+    """PR12 enabled-operator alignment: pin the ratified set that closes the
+    envelope-accrual mechanism-vs-manifest gap and formalizes the operator's
+    write surface. Any accidental deletion of an entry here demotes Willow
+    back to a narrow proxy that can't reach mechanisms the code ships."""
+    data = reg.load_registry(prefer_home=False)
+    orch_perms = set(data["orchestrator_seat"]["permissions"])
+
+    # Envelope authoring — the bug PR12 primarily closes (mechanism shipped
+    # in PRs 5-11, manifest never granted).
+    assert {"envelope_read", "envelope_write",
+            "envelope_read_discards"} <= orch_perms
+
+    # Operator-scope writes the seat plausibly does directly.
+    assert {"knowledge_write", "store_write", "task_queue",
+            "commitment_write", "nest_read", "nest_write",
+            "human_loop_read", "human_loop_write",
+            "code_graph_read", "friction_read"} <= orch_perms
+
+    # Federated MCP — driving downstream servers with the gate in between.
+    # Needs BOTH federation_call (tool group) AND mcp_federation
+    # (own-line capability that gates fork/exec at server uid) OR the
+    # runtime call is denied by the federation gate. The manifest carries
+    # both so the operator can actually use the tool.
+    assert {"federation_read", "federation_call",
+            "mcp_federation"} <= orch_perms
+
+    # What still stays off — pins the deliberate exclusions.
+    assert "integration_call" not in orch_perms
+    assert "web_net" not in orch_perms
+    assert "integration_net" not in orch_perms
+    assert "full_access" not in orch_perms
+    assert "schema_admin" not in orch_perms
+
+
+def test_orchestrator_manifest_grants_envelope_tools_after_pr12(home):
+    """End-to-end: the ratified permissions actually reach the gate for
+    envelope tools. Before PR12 these would return False even though the
+    tools existed and the code called them."""
+    from willow_mcp.gate import permitted
+    hi.ensure_home_layout()
+    reg.compile_manifests(reg.load_registry(), only_missing=False)
+    for tool in ("envelope_propose", "envelope_ratify", "envelope_reject",
+                 "envelope_list", "envelope_pending_read",
+                 "envelope_read_discards",
+                 "knowledge_ingest", "store_put", "task_submit",
+                 "commitment_ingest", "human_required_enqueue",
+                 "nest_promote", "federation_call"):
+        assert permitted("willow", tool), (
+            f"PR12: willow manifest must permit {tool}"
+        )
+
+
+def test_orchestrator_manifest_still_denies_deliberately_off_tools(home):
+    """Guardrail: PR12 widened the set but did NOT include integration_call,
+    web egress, or schema admin. If any of these become True, we crossed a
+    line the design explicitly held."""
+    from willow_mcp.gate import permitted
+    hi.ensure_home_layout()
+    reg.compile_manifests(reg.load_registry(), only_missing=False)
+    for tool in ("integration_call",
+                 "willow_web_search", "willow_web_fetch",
+                 "willow_institutional_search",
+                 "schema_confirm_mapping"):
+        assert not permitted("willow", tool), (
+            f"PR12: willow manifest must NOT permit {tool} — "
+            "this is a documented anti-widening"
+        )
+
+
 def test_orchestrator_manifest_supports_session_start_tools(home):
     """session-start open ritual needs tools outside the orchestrator group alone."""
     from willow_mcp.gate import permitted
