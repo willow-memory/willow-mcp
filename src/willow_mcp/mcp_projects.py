@@ -14,6 +14,7 @@ from .paths import store_root, willow_home
 from .project_wiring import (
     expand_home,
     normalize_wiring,
+    render_cursor_hooks,
     render_project_claude_settings,
     resolve_willow_mcp_python,
 )
@@ -195,10 +196,16 @@ def _willow_mcp_server_block(
     }
 
 
-def _static_server_block(name: str, extra_env: dict[str, Any] | None = None) -> dict[str, Any]:
+def _static_server_block(
+    name: str,
+    extra_env: dict[str, Any] | None = None,
+    args_override: list[str] | None = None,
+) -> dict[str, Any]:
     if name not in _STATIC_SERVERS:
         raise ValueError(f"unknown static server {name!r}")
     block = json.loads(json.dumps(_STATIC_SERVERS[name]))
+    if args_override is not None:
+        block["args"] = list(args_override)
     if extra_env:
         env = block.setdefault("env", {})
         if isinstance(env, dict):
@@ -206,6 +213,42 @@ def _static_server_block(name: str, extra_env: dict[str, Any] | None = None) -> 
                 if isinstance(val, str):
                     env[key] = expand_home(val)
     return block
+
+
+def _validated_server_args(
+    project_id: str,
+    entry: dict[str, Any],
+    servers: list[Any],
+) -> dict[str, list[str]]:
+    raw = entry.get("server_args")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise TypeError(f"project {project_id!r}: server_args must be an object")
+    selected = {name for name in servers if isinstance(name, str)}
+    validated: dict[str, list[str]] = {}
+    for name, args in raw.items():
+        if not isinstance(name, str) or name not in _STATIC_SERVERS:
+            raise ValueError(
+                f"project {project_id!r}: server_args only supports static servers; "
+                f"got {name!r}"
+            )
+        if (
+            not isinstance(args, list)
+            or not args
+            or any(not isinstance(arg, str) or not arg.strip() for arg in args)
+        ):
+            raise TypeError(
+                f"project {project_id!r}: server_args[{name!r}] "
+                "must be a non-empty list of non-empty strings"
+            )
+        if name not in selected:
+            raise ValueError(
+                f"project {project_id!r}: server_args configured for unselected "
+                f"server {name!r}"
+            )
+        validated[name] = list(args)
+    return validated
 
 
 def render_project_mcp(
@@ -223,6 +266,7 @@ def render_project_mcp(
         willow_env.setdefault("WILLOW_PROJECT_ROOT", raw_path)
     willow_env.setdefault("WILLOW_HANDOFF_PROJECT", project_id)
     server_env = entry.get("server_env") if isinstance(entry.get("server_env"), dict) else {}
+    server_args = _validated_server_args(project_id, entry, servers)
 
     mcp_servers: dict[str, Any] = {}
     for name in servers:
@@ -238,7 +282,11 @@ def render_project_mcp(
             )
         elif name in _STATIC_SERVERS:
             overrides = server_env.get(name) if isinstance(server_env.get(name), dict) else {}
-            mcp_servers[name] = _static_server_block(name, overrides)
+            mcp_servers[name] = _static_server_block(
+                name,
+                overrides,
+                server_args.get(name),
+            )
         else:
             raise ValueError(f"project {project_id!r}: unknown server {name!r}")
 
@@ -325,21 +373,37 @@ def audit_project(
     wiring = normalize_wiring(entry)
     if "claude" in ides and wiring.get("claude_settings") == "project":
         settings = paths["claude_settings"]
-        expected_settings = render_project_claude_settings(entry)
-        if not settings.is_file():
-            issues.append(f"{project_id}: missing claude settings → {settings}")
-        else:
-            try:
-                on_disk = json.loads(settings.read_text(encoding="utf-8"))
-            except Exception as e:
-                issues.append(f"{project_id}: unreadable claude settings: {e}")
+        try:
+            expected_settings = render_project_claude_settings(
+                entry, project_id=project_id
+            )
+        except (TypeError, ValueError):
+            # audit_project_wiring reports the precise manifest/client error
+            # below. An audit is a report, not an exception path.
+            expected_settings = None
+        if expected_settings is not None:
+            if not settings.is_file():
+                issues.append(f"{project_id}: missing claude settings → {settings}")
             else:
-                for key in ("permissions", "enableAllProjectMcpServers", "enabledMcpjsonServers", "hooks", "env"):
-                    if on_disk.get(key) != expected_settings.get(key):
-                        issues.append(
-                            f"{project_id}: claude settings drift ({key}) → {settings}"
-                        )
-                        break
+                try:
+                    on_disk = json.loads(settings.read_text(encoding="utf-8"))
+                except Exception as e:
+                    issues.append(f"{project_id}: unreadable claude settings: {e}")
+                else:
+                    keys = (
+                        "permissions",
+                        "enableAllProjectMcpServers",
+                        "enabledMcpjsonServers",
+                        "hooks",
+                        "env",
+                    )
+                    for key in keys:
+                        if on_disk.get(key) != expected_settings.get(key):
+                            issues.append(
+                                f"{project_id}: claude settings drift ({key}) "
+                                f"→ {settings}"
+                            )
+                            break
 
     issues.extend(audit_project_wiring(project_id, entry))
 
@@ -361,6 +425,18 @@ def sync_project(
     payload = render_project_mcp(project_id, entry)
     paths = project_paths(project_id, entry)
     ides = entry.get("ides") or []
+    wiring = normalize_wiring(entry)
+
+    # Validate all project-owned hook inputs before any MCP or hook config is
+    # replaced. In particular, an unsupported client mapping must not produce
+    # a half-updated project.
+    if "cursor" in ides and wiring.get("hooks"):
+        render_cursor_hooks(entry, project_id=project_id)
+    claude_settings = (
+        render_project_claude_settings(entry, project_id=project_id)
+        if "claude" in ides and wiring.get("claude_settings") == "project"
+        else None
+    )
 
     for label, path in (
         ("canonical", paths["canonical"]),
@@ -371,11 +447,11 @@ def sync_project(
             continue
         _write_json(path, payload, dry_run=dry_run)
 
-    wiring = normalize_wiring(entry)
     if "claude" in ides and wiring.get("claude_settings") == "project":
+        assert claude_settings is not None
         _write_json(
             paths["claude_settings"],
-            render_project_claude_settings(entry),
+            claude_settings,
             dry_run=dry_run,
         )
 

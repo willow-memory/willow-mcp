@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from willow_mcp.mcp_projects import (
     audit_all,
     audit_project,
@@ -107,6 +109,55 @@ def test_render_project_mcp_with_env_overrides(tmp_path, monkeypatch):
     assert payload["mcpServers"]["willow-mcp"]["env"]["WILLOW_STORE_ROOT"] == str(
         custom_store.resolve()
     )
+
+
+def test_nestor_project_can_override_only_its_static_server_args(tmp_path):
+    draft_args = [
+        "serve",
+        "--engine",
+        "ollama",
+        "--ollama-model",
+        "willow-lane4-3b:latest",
+    ]
+    nestor_entry = {
+        "path": str(tmp_path / "nestor"),
+        "agent": "nestor",
+        "servers": ["nestor"],
+        "server_args": {"nestor": draft_args},
+    }
+    other_entry = {
+        "path": str(tmp_path / "other"),
+        "agent": "willow",
+        "servers": ["nestor"],
+    }
+
+    nestor = render_project_mcp("nestor", nestor_entry)
+    other = render_project_mcp("other", other_entry)
+
+    assert nestor["mcpServers"]["nestor"]["args"] == draft_args
+    assert other["mcpServers"]["nestor"]["args"] == ["serve", "--read-only"]
+
+
+@pytest.mark.parametrize(
+    ("server_args", "message"),
+    [
+        ({"nestor": "serve"}, "non-empty list"),
+        ({"nestor": ["serve", ""]}, "non-empty list"),
+        ({"nestor": []}, "non-empty list"),
+        ({"unknown": ["serve"]}, "only supports static servers"),
+        ({"nestor": ["serve"]}, "unselected server"),
+    ],
+)
+def test_server_args_refuses_invalid_or_dead_overrides(tmp_path, server_args, message):
+    entry = {
+        "path": str(tmp_path / "project"),
+        "agent": "willow",
+        "servers": ["codebase-memory-mcp"],
+        "server_args": server_args,
+    }
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        render_project_mcp("project", entry)
 
 
 def test_render_project_mcp_ignores_charter_local_store(tmp_path, monkeypatch):
