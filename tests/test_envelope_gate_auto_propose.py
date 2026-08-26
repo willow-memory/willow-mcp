@@ -453,6 +453,10 @@ def test_envelope_read_discards_tool_reads_residue(
     """The MCP READ tool returns the same list list_auto_propose_discards
     exposes internally, wrapped in {'discards': [...]}."""
     _willow_manifest(tmp_path, monkeypatch)
+    # In CI WILLOW_APP_ID is unset at module-import time so _DEFAULT_APP_ID
+    # falls to ''. The guarded tool has no app_id parameter, so the guard
+    # falls back to _DEFAULT_APP_ID. Give it a valid one for this call.
+    monkeypatch.setattr(server, "_DEFAULT_APP_ID", "willow")
     sid = "s-read-discards-tool"
     dispatch.session_bind("willow", sid, "", "idle", verifier="rita")
     human_session._remember_attributed(sid)
