@@ -54,7 +54,7 @@ import uuid
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from mcp.server.mcpserver import MCPServer
 from psycopg2.extras import Json
@@ -199,37 +199,51 @@ def _enforce_mem_ratify() -> bool:
         "1", "true", "yes", "on")
 
 
-def _mem_ratify_gate(app_id: str, domain: str, source: str) -> Optional[dict]:
+def _mem_ratify_gate(
+    app_id: str,
+    domain: str,
+    source: str,
+    *,
+    witnesses: "Iterable[object] | None" = None,
+) -> Optional[dict]:
     """B8: consult the Article IV Canon-promotion gate for a shared-KB write.
 
     Returns None to allow (gate not enforced, or the decision does not block),
     or an error dict to refuse. A no-op unless `WILLOW_MCP_ENFORCE_MEM_RATIFY`
     is set — the default path never calls this.
 
-    A bare knowledge write carries no witness/quorum/Operator-Key metadata today
-    (that plumbing is mem_ratify/README.md follow-up 1-3), so it is modeled as
-    what it actually is: an attempt to seat an unratified proposal (Contested)
-    straight into shared Canon (Canonical) with an empty quorum. `ratify()`
-    fail-closes on that, and `Decision.is_blocking()` folds in mem_ratify's own
-    `WILLOW_MEM_RATIFY_ENFORCE` knob so a denial blocks only when the operator
-    has turned BOTH knobs on; otherwise it is a logged advisory that changes
-    nothing. The Decision (reasons/flags/placeholders) is surfaced to the caller
-    for the audit trail."""
+    ``witnesses`` (mem_ratify/README.md follow-up 1-3, now landed as
+    ``mem_ratify.collect``): an optional iterable of ``Witness`` instances or
+    ``{agent_id, base_model, independence_evidence?}`` dicts, deduped by
+    ``agent_id`` and with the proposer refused (§0.2). Default ``None`` /
+    ``()`` preserves today's behavior exactly — a bare write with no quorum
+    that ratify fail-closes on — so existing callers see no change.
+
+    A bare knowledge write with no witnesses is modeled as what it actually
+    is: an attempt to seat an unratified proposal (Contested) straight into
+    shared Canon (Canonical) with an empty quorum. `ratify()` fail-closes on
+    that, and `Decision.is_blocking()` folds in mem_ratify's own
+    `WILLOW_MEM_RATIFY_ENFORCE` knob so a denial blocks only when the
+    operator has turned BOTH knobs on; otherwise it is a logged advisory that
+    changes nothing. The Decision (reasons/flags/placeholders) is surfaced to
+    the caller for the audit trail."""
     # Lazy, local import (kb_ingest-style): mem_ratify is pure stdlib so this is
     # always importable, but importing only inside the enforced branch keeps
     # import-time behavior and the default path provably untouched.
     import logging
 
     from . import mem_ratify
+    from .mem_ratify.collect import coerce_witnesses
 
     log = logging.getLogger("willow_mcp.server")
 
+    witness_tuple = coerce_witnesses(witnesses, proposer_id=app_id)
     request = mem_ratify.RatifyRequest.build(
         claim_id=f"knowledge_ingest:{app_id}:{domain or 'general'}",
         current_tier=mem_ratify.Tier.CONTESTED,
         target_tier=mem_ratify.Tier.CANONICAL,
         proposer_id=app_id,
-        witnesses=(),
+        witnesses=witness_tuple,
     )
     decision = mem_ratify.ratify(request)
     detail = {
@@ -1519,6 +1533,8 @@ def _knowledge_ingest_core(
     domain: str = "general",
     source: str = "",
     tags: Optional[list] = None,
+    *,
+    witnesses: "Iterable[object] | None" = None,
 ) -> dict:
     """The actual knowledge-base write, shared by knowledge_ingest and
     gap_promote. Deliberately ungated (no @_guarded, no receipt of its
@@ -1535,7 +1551,7 @@ def _knowledge_ingest_core(
     # B8: Article IV Canon-promotion gate. OFF by default — when the enforce flag
     # is unset this call is skipped entirely and the write below is unchanged.
     if _enforce_mem_ratify():
-        denied = _mem_ratify_gate(app_id, domain, source)
+        denied = _mem_ratify_gate(app_id, domain, source, witnesses=witnesses)
         if denied:
             return denied
 
