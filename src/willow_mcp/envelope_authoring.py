@@ -503,17 +503,51 @@ def list_active(
     return list(rows)
 
 
-def list_pending(*, oldest_first: bool = True, limit: int = 50) -> list[dict]:
+def list_pending(
+    *,
+    oldest_first: bool = True,
+    limit: int = 50,
+    include_precedents: bool = True,
+) -> list[dict]:
     """Proposals awaiting ratification. Operator's queue view.
 
     Sorted by ``proposed_at`` (oldest first by default so the operator sees
     the longest-waiting proposals at the top). Bounded by ``limit`` — the
     queue can grow; a paginated read is safer than an unbounded one.
+
+    When ``include_precedents`` is True (the default; PR10), each row gets
+    a ``precedents_expanded`` field: for every id in ``precedent_ids``
+    that still resolves to a currently-active envelope, the full envelope
+    row is inlined so the operator can see WHAT they'd be reaffirming
+    without a second lookup. IDs that no longer resolve (envelope was
+    revoked, registry was edited by hand) are silently dropped from the
+    expansion — the id itself stays in ``precedent_ids`` as tamper
+    evidence but the operator's ratify surface reflects only what's
+    actually still on record. Empty list on a row with no precedents.
     """
     registry = _load_registry()
     rows = list(registry.get("proposals") or [])
     rows.sort(key=lambda r: r.get("proposed_at") or "", reverse=not oldest_first)
-    return rows[: max(0, int(limit))]
+    rows = rows[: max(0, int(limit))]
+    if not include_precedents:
+        return rows
+    # Build one lookup so N pending × M precedents is O(N+M+A) rather than
+    # O(N × M × A). Active is small in practice; still worth the loop.
+    active_by_id = {
+        row.get("id"): row for row in (registry.get("active") or [])
+        if row.get("id")
+    }
+    enriched = []
+    for row in rows:
+        row = dict(row)
+        expanded = []
+        for pid in row.get("precedent_ids") or []:
+            hit = active_by_id.get(pid)
+            if hit is not None:
+                expanded.append(hit)
+        row["precedents_expanded"] = expanded
+        enriched.append(row)
+    return enriched
 
 
 # ---------------------------------------------------------------------------

@@ -375,6 +375,117 @@ def test_list_pending_respects_limit(ring_with_rita, fresh_registry):
     assert len(ea.list_pending(limit=100)) == 5
 
 
+# --- PR10: precedents expanded inline in list_pending ---------------------
+
+
+def _seed_active_envelope(registry_path, *, envelope_id, verb, grantee, bounds):
+    """Plant an entry in the registry's active[] list without going through
+    envelope_ratify — the pending precedent expansion is a pure read
+    against active[], so we don't need the FRANK path for this test."""
+    doc = json.loads(registry_path.read_text(encoding="utf-8"))
+    doc.setdefault("active", []).append({
+        "id": envelope_id,
+        "verb": verb,
+        "grantee": grantee,
+        "bounds": bounds,
+        "issued_by": "root",
+        "issued_at": "2026-08-01T00:00:00Z",
+    })
+    registry_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    os.chmod(str(registry_path), 0o600)
+
+
+def test_list_pending_expands_precedents_by_default(ring_with_rita, fresh_registry):
+    """PR10: a pending row's precedent_ids resolve to the full active
+    envelope rows inline so the ratify UX is one glance."""
+    registry_path, _ = fresh_registry
+    _seed_active_envelope(
+        registry_path, envelope_id="ENV-PRIOR-1",
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 1024},
+    )
+    # Propose with an explicit precedent_ids so we don't depend on
+    # shape-scoring finding it (that's tested in test_envelope_shapes.py).
+    prop = ea.propose(
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 2048},
+        reason="widen the quota", verifier="rita", session_id="s-orch",
+        precedent_ids=["ENV-PRIOR-1"],
+    )
+    assert prop["precedent_ids"] == ["ENV-PRIOR-1"]
+
+    pending = ea.list_pending()
+    assert len(pending) == 1
+    row = pending[0]
+    assert row["precedent_ids"] == ["ENV-PRIOR-1"]
+    exp = row["precedents_expanded"]
+    assert len(exp) == 1
+    assert exp[0]["id"] == "ENV-PRIOR-1"
+    assert exp[0]["bounds"]["max_bytes"] == 1024
+
+
+def test_list_pending_drops_unresolvable_precedent_from_expansion(
+    ring_with_rita, fresh_registry,
+):
+    """A precedent_id that no longer resolves to active[] silently drops
+    from the expansion. precedent_ids itself stays intact — the operator
+    sees "one glance" info, the id list preserves the paper trail."""
+    ea.propose(
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 2048},
+        reason="widen the quota", verifier="rita", session_id="s-orch",
+        precedent_ids=["ENV-REVOKED"],
+    )
+    row = ea.list_pending()[0]
+    assert row["precedent_ids"] == ["ENV-REVOKED"]
+    assert row["precedents_expanded"] == []
+
+
+def test_list_pending_include_precedents_false_skips_expansion(
+    ring_with_rita, fresh_registry,
+):
+    """The low-level caller who just wants the raw rows can opt out. The
+    key must NOT be present when opted out — a caller keying off
+    presence-of-precedents_expanded must see a real absence, not a
+    misleading empty list."""
+    registry_path, _ = fresh_registry
+    _seed_active_envelope(
+        registry_path, envelope_id="ENV-P",
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 1024},
+    )
+    ea.propose(
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 2048},
+        reason="widen", verifier="rita", session_id="s-orch",
+        precedent_ids=["ENV-P"],
+    )
+    row = ea.list_pending(include_precedents=False)[0]
+    assert "precedents_expanded" not in row
+    assert row["precedent_ids"] == ["ENV-P"]
+
+
+def test_list_pending_expands_multiple_precedents(
+    ring_with_rita, fresh_registry,
+):
+    registry_path, _ = fresh_registry
+    for eid in ("ENV-A", "ENV-B", "ENV-C"):
+        _seed_active_envelope(
+            registry_path, envelope_id=eid,
+            verb="demo_verb", grantee="hanuman",
+            bounds={"path_pattern": f"pat-{eid}", "max_bytes": 1},
+        )
+    ea.propose(
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "pat-new", "max_bytes": 1},
+        reason="wider", verifier="rita", session_id="s-orch",
+        precedent_ids=["ENV-A", "ENV-B", "ENV-C"],
+    )
+    row = ea.list_pending()[0]
+    assert [e["id"] for e in row["precedents_expanded"]] == \
+        ["ENV-A", "ENV-B", "ENV-C"]
+
+
 # --- bounds_digest (frozen wire piece for FRANK events) --------------------
 
 

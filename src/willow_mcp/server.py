@@ -4042,15 +4042,28 @@ def envelope_list(grantee: str = "", verb: str = "") -> dict:
 @mcp.tool(annotations=_ANNO_READ)
 @_guarded("envelope_pending_read")
 def envelope_pending_read(
-    oldest_first: bool = True, limit: int = 50
+    oldest_first: bool = True, limit: int = 50,
+    include_precedents: bool = True,
 ) -> dict:
     """List envelope PROPOSALS awaiting operator ratification. Oldest first
     by default so the queue is drained in FIFO order. Read-only.
 
     This is the operator's queue view for the accrual loop — see
-    docs/design/envelope-accrual.md."""
+    docs/design/envelope-accrual.md.
+
+    When ``include_precedents`` is True (default, PR10), each row's
+    ``precedent_ids`` are expanded into a ``precedents_expanded`` list
+    of the full currently-active envelope rows they name. That's what
+    turns a ratify into one glance ("confirm precedents X, Y or
+    override") rather than a two-hop dance through ``envelope_list``.
+    Precedent IDs that no longer resolve to an active envelope are
+    silently dropped from the expansion (revoked / hand-edited registry);
+    ``precedent_ids`` itself stays intact as tamper evidence."""
     from . import envelope_authoring as _ea
-    rows = _ea.list_pending(oldest_first=oldest_first, limit=limit)
+    rows = _ea.list_pending(
+        oldest_first=oldest_first, limit=limit,
+        include_precedents=include_precedents,
+    )
     return {"pending": rows, "count": len(rows)}
 
 
