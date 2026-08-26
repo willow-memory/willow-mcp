@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* build-status --json for machine readers ([6ca2b06](https://github.com/willow-memory/willow-mcp/commit/6ca2b06e94838bb55092add1fb6b7417b53985a7))
 * build-status --json for machine readers ([29a5265](https://github.com/willow-memory/willow-mcp/commit/29a52657aa9a7cda492bb79d3f85d5ec9cc0134a))
 
 ## [2.14.0](https://github.com/willow-memory/willow-mcp/compare/v2.13.4...v2.14.0) (2026-08-24)
