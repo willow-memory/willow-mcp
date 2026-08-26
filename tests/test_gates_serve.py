@@ -50,7 +50,12 @@ def test_state_defaults_to_server_app_id_when_no_query_param(client):
     assert res.status_code == 200
     rows = res.json()
     scopes = {r["scope"] for r in rows}
-    assert scopes == {"global", "testapp"}
+    # {"global", "testapp"} are the app-vs-global axis this test locks in;
+    # build-lease rows add a third axis (scope=<tool family>, one per earn-
+    # first roster entry), which is legitimate distinct state and not the
+    # subject of this test. Subset, not equality — matches the sibling
+    # test's shape below.
+    assert {"global", "testapp"} <= scopes
 
 
 def test_state_query_param_overrides_default(client, home):

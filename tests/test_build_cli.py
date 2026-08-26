@@ -10,7 +10,6 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 
 def _run(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
