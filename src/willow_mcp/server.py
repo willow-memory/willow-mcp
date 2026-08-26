@@ -7306,13 +7306,17 @@ def _cmd_revoke_build(args) -> None:
 
 def _cmd_build_status(args) -> None:
     """`willow-mcp build-status` — what earn-first builds are currently
-    authorized, and by whom."""
+    authorized, and by whom. `--json` matches the read-only status
+    convention `net-status` / `earn-check` / `gates --json` already use."""
     from . import build_lease
 
     leases = (
         [build_lease.read_lease(args.tool)] if args.tool
         else build_lease.list_leases()
     )
+    if args.json:
+        print(json.dumps({"leases": leases}, indent=2))
+        return
     if not leases:
         print(
             "No build leases on disk. Every earn-first tool is dry — "
@@ -7945,6 +7949,8 @@ def _main():
         "build-status",
         help="Show build leases for earn-first tools")
     build_status_p.add_argument("tool", nargs="?", default="")
+    build_status_p.add_argument("--json", action="store_true",
+                                help="machine-readable output")
 
     earn_check_p = subparsers.add_parser(
         "earn-check",
