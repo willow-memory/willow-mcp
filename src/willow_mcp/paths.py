@@ -384,6 +384,10 @@ def net_leases_dir() -> Path:
     return mcp_apps_root() / "_net_leases"
 
 
+def build_leases_dir() -> Path:
+    return mcp_apps_root() / "_build_leases"
+
+
 def bundle_dir() -> Path:
     """Shipped seeds inside the installed package."""
     return Path(__file__).resolve().parent / "bundle"

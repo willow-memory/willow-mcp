@@ -69,18 +69,35 @@ tick it and note the mechanism — a stale tracker is its own small drift.
 Per `gap-inventory.md §3/§6` — real capabilities, all `full`-only and/or untested
 in willow-2.0. Order is rough tractability.
 
+**Earn mode.** These rows are gated by `earn_mode: user-lease` — a tool leaves
+earn-first when the operator has an active build lease for it, issued via
+`willow-mcp grant-build <tool> --ttl 30m --reason "..."`. The lease has the
+same 3h ceiling as `grant-net` (FRANK `cc553729`); when it expires the row
+falls back to earn-first. `willow-mcp earn-check` reads the whole roster and
+prints `ready` / `waiting` / `dry` per family so this stops being a
+case-by-case argument. Rows without an explicit `earn_mode` inherit
+`user-lease` from this section header. (Integration stubs in `integrations.py`
+stay on `earn_mode: two-cite` — the ledger-count rule; different subject,
+different rule.)
+
 - [ ] **`workflow_*`** (5) — multi-phase engine; rides the existing Kart `task_*`
-  queue, so the most tractable of this tier.
+  queue, so the most tractable of this tier. `earn_mode: user-lease`.
 - [ ] **`willow_web_search` Brave provider** — the seam ships (`web_search.py`
   `BraveSearchProvider`, `_IMPLEMENTED = False`); implement the real call +
   `BRAVE_API_KEY` path behind the `web_net` egress gate when a consumer needs a
-  second provider. DDG is the working default today.
+  second provider. DDG is the working default today. **See also issue #288** —
+  the alternative on the same question is dropping `web_search.py` entirely in
+  favour of jeles; pick one, not both. `earn_mode: user-lease`.
 - [ ] **Calendar gcal OAuth transport** — the calendar source + tests exist;
   the live gcal transport is a home-box OAuth step, deferred (`server.py:3829`).
+  **`earn_mode: auth-flow-blocked`** — the operator ask exists (commitment
+  ingestion); what's missing is the OAuth flow, not the earn condition. Not
+  gated by the build-lease rule.
 - [ ] **G-1 / S6 — SOIL DAG + `dag_next` / `dag_status`** — route dispatch by
   `function` → default `agent_id`, and walk a multi-step plan. Design exists
   (S6), tools absent (verified). Earn-first: no consumer today — the orchestrator
   dispatches explicitly. Build when a multi-step orchestration flow needs it.
+  `earn_mode: user-lease`.
 
 ### Security / gate follow-ups (red-team 2026-07-31 → `docs/BUGS.md`)
 
@@ -122,21 +139,26 @@ in willow-2.0. Order is rough tractability.
   `dispatch_read`; `dispatch_accept`/`handoff_write_v4` inherit it for free.
 - [ ] **B-56** — Host egress key custody (#182) on operator workstations.
 - [ ] **`intake_*`** (4) — KB-tier routing; needs jeles/binder/opus targets first.
+  `earn_mode: user-lease` (also upstream-blocked on jeles/binder/opus arriving).
 - [ ] **`skill_*`, `index_*` / `cmb_*`, `cbm_*`, `mem_binder_*` / `mem_ratify_*`**
   — registries and extra KB sub-stores mirroring existing store patterns.
+  `earn_mode: user-lease`.
 - [ ] **SOIL edges + `pg_edge_*`** (5) — graph edges over the store willow-mcp
-  already owns.
+  already owns. `earn_mode: user-lease`.
 - [ ] **Maintenance / analytics readers** — `ledger_repair`, `handoff_search` /
   `handoff_rebuild`, `routing_log_read`, `session_query` / `session_review`.
-  Cheap, low priority.
+  Cheap, low priority. `earn_mode: user-lease`.
 - [ ] **6 integration stubs to earn** — `gmail`, `slack`, `notion`,
   `google-drive`, `datadog`, `jira`; each declared with what earns it
-  (`integrations.py`).
+  (`integrations.py`). `earn_mode: two-cite` — different rule, different subject
+  (see `integrations.py` `needs:` / `earned_by:` and the "twice" checklist in
+  `docs/design/integrations.md §6`).
 
 ### Promoted from LEAVE (operator call, 2026-07-21 — fresh willow-2.0 diff @ `6e82a38`)
 
 Operator elected to keep these on the radar rather than treat them as non-goals.
 Still earn-first (build when a consumer needs it), but no longer written off.
+All `earn_mode: user-lease` — same rule as the rest of the earn-first tier.
 
 - [ ] **`tension_scan`** — scans the KB's frontier/contested atoms for semantic
   tensions or redundancies (contradictions between atoms). Strongest standalone

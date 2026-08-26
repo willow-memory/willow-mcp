@@ -248,7 +248,7 @@ def list_app_ids() -> list[str]:
     root = _apps_root()
     if not root.is_dir():
         return []
-    skip = {"_net_leases", "_identity_bindings"}
+    skip = {"_net_leases", "_identity_bindings", "_build_leases"}
     return sorted(p.name for p in root.iterdir() if p.is_dir() and p.name not in skip)
 
 
