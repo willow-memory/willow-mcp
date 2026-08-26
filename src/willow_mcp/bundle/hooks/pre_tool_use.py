@@ -546,16 +546,16 @@ def check_task_submit(tool_input: dict) -> Optional[str]:
 # The egress keys, as they appear on disk. Minting either is the escalation the
 # sudo invariant forbids: request and confirm are separate authorities, and the
 # agent holds only the first.
-_LEASE_DIR_RE = re.compile(r"mcp_apps/_net_leases\b")
+_LEASE_DIR_RE = re.compile(r"mcp_apps/(?:_net_leases|_build_leases)\b")
 # The identity keystore ($WILLOW_HOME/gate/): per-agent HMAC secrets + the trust
 # registry. Minting/rotating an identity or a trust ceiling by writing these is
 # the same operator-only authority as minting a lease — an agent may request
 # standing, never write its own secret (D2). Reading is not blocked.
 _KEYSTORE_RE = re.compile(r"gate/(?:secrets\b|registry\.json)")
 _GRANT_CMD_RE = re.compile(
-    r"\bwillow-mcp\s+(?:grant-net|dev-net|sign-net-task|register-agent|revoke-agent|rotate-agent|consent\s+(?:set|reconcile)|roster\s+sync)\b"
-    r"|\bwillow_mcp\s+(?:grant-net|dev-net|sign-net-task|register-agent|revoke-agent|rotate-agent)\b"
-    r"|\b(?:lease\.grant|sign_envelope|agent_registry\.(?:register_agent|revoke))\s*\("
+    r"\bwillow-mcp\s+(?:grant-net|dev-net|grant-build|sign-net-task|register-agent|revoke-agent|rotate-agent|consent\s+(?:set|reconcile)|roster\s+sync)\b"
+    r"|\bwillow_mcp\s+(?:grant-net|dev-net|grant-build|sign-net-task|register-agent|revoke-agent|rotate-agent)\b"
+    r"|\b(?:lease\.grant|build_lease\.grant|sign_envelope|agent_registry\.(?:register_agent|revoke))\s*\("
     r"|\bconsent_admin\.(?:write_consent|set_key|reconcile)\s*\("
     r"|\bfleet_roster\.sync\s*\("
 )
