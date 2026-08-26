@@ -42,7 +42,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from . import consent, gates_html, lease, paths
+from . import build_lease, consent, gates_html, lease, paths
 from .gate import (
     INTEGRATION_NET_PERMISSION,
     MCP_FEDERATION_PERMISSION,
@@ -210,6 +210,8 @@ def _category(row_id: str, label: str) -> str:
         return "identity"
     if row_id.startswith("consent.") or row_id.startswith("lease."):
         return "egress"
+    if row_id.startswith("build."):
+        return "build"
     if row_id.startswith("perm."):
         if label in (NET_PERMISSION, INTEGRATION_NET_PERMISSION, WEB_NET_PERMISSION,
                      MCP_FEDERATION_PERMISSION):
@@ -225,6 +227,7 @@ _STATE_LABELS: dict[str, dict[str, str]] = {
     "perm.": {"on": "GRANTED", "off": "NOT GRANTED"},
     "consent.": {"on": "ALLOWED", "off": "BLOCKED"},
     "lease.": {"on": "ACTIVE", "off": "NONE"},
+    "build.": {"on": "ACTIVE", "off": "NONE"},
     "binding.": {"on": "CONFIRMED", "off": "PENDING"},
     "worker": {"on": "RUNNING", "warn": "STALLED", "off": "STOPPED"},
     "strict_trust_root": {"on": "ENABLED", "off": "DISABLED"},
@@ -248,7 +251,7 @@ def list_app_ids() -> list[str]:
     root = _apps_root()
     if not root.is_dir():
         return []
-    skip = {"_net_leases", "_identity_bindings"}
+    skip = {"_net_leases", "_identity_bindings", "_build_leases"}
     return sorted(p.name for p in root.iterdir() if p.is_dir() and p.name not in skip)
 
 
@@ -422,10 +425,68 @@ def _binding_rows() -> list[GateRow]:
     return rows
 
 
+def _build_lease_rows() -> list[GateRow]:
+    """One row per earn-first tool family, plus any lease outside the roster.
+
+    Same shape as `_app_rows`'s lease row — a "lease" timer_shape with a real
+    deadline when active, an `action_cli` pointing at `grant-build` when not.
+    A lease held on a family not in `EARN_FIRST_ROSTER` is still surfaced;
+    silent invisibility is what a status readout must not do.
+    """
+    rows: list[GateRow] = []
+    on_disk = {row["tool"]: row for row in build_lease.list_leases()}
+    seen: set[str] = set()
+
+    def _row(family: str, blurb: str) -> GateRow:
+        lst = on_disk.get(family)
+        if lst is None:
+            return GateRow(
+                id=f"build.{family}", label="build lease", scope=family,
+                friendly=f"Build {family}", state="off",
+                detail=f"{blurb} — no lease on disk (family is 'dry')",
+                timer_shape="lease",
+                action_cli=f'willow-mcp grant-build {family} --ttl 30m --reason "..."',
+            )
+        status = lst["status"]
+        if status == "active":
+            return GateRow(
+                id=f"build.{family}", label="build lease", scope=family,
+                friendly=f"Build {family}", state="on",
+                detail=f"{blurb} — issuer={lst.get('issuer')} "
+                       f"reason={lst.get('reason') or '(none)'}",
+                remaining_seconds=lst["remaining_seconds"],
+                expires_at=lst["expires_at"], timer_shape="lease",
+                action_cli=f"willow-mcp revoke-build {family}",
+            )
+        detail = {
+            "expired": f"{blurb} — expired",
+            "malformed": f"{blurb} — {lst.get('error', 'malformed')}",
+            "mismatch": f"{blurb} — {lst.get('error', 'tool name mismatch')}",
+        }.get(status, f"{blurb} — {status}")
+        return GateRow(
+            id=f"build.{family}", label="build lease", scope=family,
+            friendly=f"Build {family}", state="off",
+            detail=detail, timer_shape="lease",
+            action_cli=f'willow-mcp grant-build {family} --ttl 30m --reason "..."',
+        )
+
+    for family, blurb in build_lease.EARN_FIRST_ROSTER:
+        rows.append(_row(family, blurb))
+        seen.add(family)
+
+    # Anything the operator granted on a family not yet in the roster still
+    # appears — the earn-check CLI treats these as "extras" for the same
+    # reason.
+    for extra in sorted(set(on_disk) - seen):
+        rows.append(_row(extra, "(not in EARN_FIRST_ROSTER — one-off grant)"))
+
+    return rows
+
+
 def collect(app_id: str = "") -> list[GateRow]:
     """Every gate row. Pass `app_id` to scope the per-app rows to one app;
     omit it to show every app under `mcp_apps/`."""
-    rows = _global_rows() + _binding_rows()
+    rows = _global_rows() + _binding_rows() + _build_lease_rows()
     for a in ([app_id] if app_id else list_app_ids()):
         rows.extend(_app_rows(a))
     return rows
@@ -442,6 +503,7 @@ _ANSI = {"on": "\033[97;42m", "off": "\033[97;41m", "warn": "\033[30;43m", "rese
 #: else). Both renderers (TUI, HTML) iterate this instead of a flat list.
 CATEGORY_ORDER: list[tuple[str, str]] = [
     ("egress", "Egress & network"),
+    ("build", "Earn-first build leases"),
     ("system", "System"),
     ("identity", "Identity"),
     ("permissions", "Permissions"),

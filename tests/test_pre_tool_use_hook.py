@@ -579,6 +579,41 @@ def test_main_blocks_a_task_submit_that_smuggles_grant_net():
     assert json.loads(stdout)["decision"] == "block"
 
 
+def test_main_blocks_a_bash_grant_build():
+    """grant-build is the same self-grant class as grant-net: the operator
+    asks and agrees, the agent never authorizes its own build."""
+    code, stdout = _run_hook({
+        "tool_name": "Bash",
+        "tool_input": {"command": "willow-mcp grant-build workflow --ttl 30m --reason ..."},
+        "session_id": "s1",
+    })
+    assert code == 0
+    decision = json.loads(stdout)
+    assert decision["decision"] == "block"
+
+
+def test_check_task_submit_self_grant_blocks_grant_build_in_task_text():
+    reason = pre_tool_use.check_task_submit_self_grant(
+        {"task": "willow-mcp grant-build workflow --ttl 30m --reason ..."})
+    assert reason is not None
+
+
+def test_check_task_submit_self_grant_allows_build_status_and_earn_check():
+    """Reading gate state is not escalation. build-status and earn-check both
+    read only; blocking them would be a false positive."""
+    for task in ("willow-mcp build-status", "willow-mcp earn-check --json"):
+        assert pre_tool_use.check_task_submit_self_grant({"task": task}) is None
+
+
+def test_lease_dir_re_covers_build_leases_dir():
+    """A write into _build_leases/ is the same mint path a write into
+    _net_leases/ is; the direct-write guard must refuse both."""
+    assert pre_tool_use._LEASE_DIR_RE.search(
+        "cat > $WILLOW_HOME/mcp_apps/_build_leases/workflow.json")
+    assert pre_tool_use._LEASE_DIR_RE.search(
+        "echo {} > mcp_apps/_net_leases/willow.json")
+
+
 def test_main_still_warns_on_directive_when_not_self_granting():
     """The block must not swallow the softer B-21 warning for ordinary tasks."""
     code, stdout = _run_hook({

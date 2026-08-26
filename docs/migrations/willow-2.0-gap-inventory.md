@@ -91,6 +91,11 @@ Code-verified equivalences (docstrings/tables match):
 - 🟢 **PORT** — genuine gap, was core/standard tier, self-contained.
 - 🟡 **EARN-FIRST** — real capability but `full`-only and/or untested in 2.0; port
   only when a concrete willow-mcp consumer needs it (the "surface is earned" rule).
+  Consumer = the operator, asking, on the record. Enforced by `earn_mode:
+  user-lease` — `willow-mcp grant-build <tool> --ttl 30m --reason "..."`
+  (3h ceiling, same as `grant-net`); `willow-mcp earn-check` reads the whole
+  roster. See `docs/design/slice-backlog.md` "Earn-first" section for the rule
+  the seal opens.
 - 🔴 **LEAVE** — heavy external deps or vestigial; don't bring into a clean product
   without a strong reason.
 

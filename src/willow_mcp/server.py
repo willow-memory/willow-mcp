@@ -4650,6 +4650,46 @@ def _diag_net_lease(app_id: str) -> dict:
     }
 
 
+def _diag_build_leases() -> dict:
+    """Earn-first build leases — what building is currently authorized, by
+    whom, and until when.
+
+    Deliberately informational (never folded into `_derive_problems` / the
+    verdict): an install with no active build lease is not degraded, an
+    expired lease is not wrong, and a malformed one is the reader's own
+    report — same B-18 rule the net-lease residual reporting follows. The
+    self-writable residual is not re-reported per family here — `net_lease`
+    already measured `mcp_apps/` writability at the root, and both lease
+    subtrees inherit it. A single note points at that check instead.
+    """
+    from . import build_lease
+
+    leases = build_lease.list_leases()
+    roster_names = {fam for fam, _ in build_lease.EARN_FIRST_ROSTER}
+    on_disk = {row["tool"] for row in leases}
+    tallies = {"active": 0, "expired": 0, "malformed": 0, "mismatch": 0, "none": 0}
+    for row in leases:
+        tallies[row["status"]] = tallies.get(row["status"], 0) + 1
+
+    return {
+        "lease_root": str(build_lease._leases_root()),
+        "max_ttl_seconds": build_lease.MAX_TTL_SECONDS,
+        "roster_size": len(roster_names),
+        "roster_dry": sorted(roster_names - on_disk),
+        "extras": sorted(on_disk - roster_names),
+        "leases": leases,
+        "tally": tallies,
+        # `net_lease.self_writable` already reports the shared mcp_apps root;
+        # duplicating it here would suggest a distinct membrane.
+        "self_writable_note": "shared root with net_lease — see net_lease.self_writable",
+        # A sub-check that reports N active leases and calls itself "ok" is
+        # honest here: there is nothing about a build lease's mere existence
+        # that is a problem (its point is authorization). "status" stays "ok"
+        # unconditionally so the verdict is unmoved.
+        "status": "ok",
+    }
+
+
 def _diag_uid_separation(app_id: str) -> dict:
     """B-32/#231, made legible: whose *account* actually owns the trust root,
     named next to whose account is asking.
@@ -5327,6 +5367,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
     worker = _diag_worker(eff)
     consent = _diag_consent()
     net_lease = _diag_net_lease(eff)
+    build_leases = _diag_build_leases()
     severance = _diag_severance(store, postgres, net_lease)
     uid_separation = _diag_uid_separation(eff)
     store_db_perms = _diag_store_db_perms(eff)
@@ -5345,6 +5386,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
         "checks": {"store": store, "postgres": postgres, "rings": rings,
                    "schema": schema, "manifest": manifest, "identity_bindings": bindings,
                    "worker": worker, "consent": consent, "net_lease": net_lease,
+                   "build_leases": build_leases,
                    "severance": severance, "uid_separation": uid_separation,
                    "store_db_perms": store_db_perms,
                    "envelope_registry": envelope_registry, "env": env},
@@ -7209,6 +7251,166 @@ def _cmd_dev_net(args) -> None:
     print(json.dumps(status, indent=2))
 
 
+def _cmd_grant_build(args) -> None:
+    """`willow-mcp grant-build` — issue a time-boxed build lease for an
+    earn-first tool.
+
+    Local/stdio-only by design, exactly like `grant-net`: no MCP tool can
+    reach this, so an agent can request a build and never authorize it to
+    itself. The lease expires on its own; the ceiling is 3h (FRANK
+    `cc553729`, the same ceiling `grant-net` uses).
+
+    The reason field is what makes this a real gate. The rule the seal opens
+    is 'the user asks AND agrees to what the ask opens' — `--reason` is
+    where that agreement is written on the record.
+    """
+    from . import build_lease
+
+    try:
+        ttl = build_lease.parse_ttl(args.ttl)
+        record = build_lease.grant(
+            args.tool, ttl, issuer=args.issuer, reason=args.reason or "",
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    print(
+        f"Build lease issued for tool={record['tool']!r} by {record['issuer']!r}\n"
+        f"  expires: {record['expires_at']} (ttl {record['ttl_seconds']}s)\n"
+        f"  reason:  {record['reason'] or '(none given)'}"
+    )
+    if not record["reason"]:
+        print(
+            "\n  NOTE: no --reason was given. The rule this lease opens is that "
+            "the operator asks AND agrees to what the ask opens; the reason is "
+            "where that agreement lives on the record. Re-grant with --reason "
+            "when convenient.",
+            file=sys.stderr,
+        )
+
+
+def _cmd_revoke_build(args) -> None:
+    """`willow-mcp revoke-build` — end a build lease before it expires."""
+    from . import build_lease
+
+    try:
+        had = build_lease.revoke(args.tool)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    print(
+        f"Build lease for tool={args.tool!r} "
+        f"{'revoked' if had else 'was not present'}."
+    )
+
+
+def _cmd_build_status(args) -> None:
+    """`willow-mcp build-status` — what earn-first builds are currently
+    authorized, and by whom."""
+    from . import build_lease
+
+    leases = (
+        [build_lease.read_lease(args.tool)] if args.tool
+        else build_lease.list_leases()
+    )
+    if not leases:
+        print(
+            "No build leases on disk. Every earn-first tool is dry — "
+            "an operator ask (`willow-mcp grant-build <tool> --ttl 30m "
+            "--reason ...`) is what earns any of them."
+        )
+        return
+    for st in leases:
+        line = f"{st['tool']:<28} {st['status']}"
+        if st["status"] == "active":
+            line += (
+                f"  expires in {st['remaining_seconds']}s "
+                f"(issuer: {st.get('issuer')})"
+            )
+        elif st.get("error"):
+            line += f"  — {st['error']}"
+        print(line)
+
+
+def _cmd_earn_check(args) -> None:
+    """`willow-mcp earn-check` — cross-reference the earn-first roster with
+    build leases on disk.
+
+    Emits `{ready, waiting, dry}` per row. `ready` = an active lease exists.
+    `waiting` = a lease existed and expired (needs a fresh ask). `dry` = no
+    lease has ever been issued for this family.
+
+    Reads only; issues nothing. The whole point is to make the case-by-case
+    re-litigation of 'should we build X now?' a lookup instead of an
+    argument — either the operator asked (there is a lease) or they haven't
+    (there is not).
+    """
+    from . import build_lease
+
+    on_disk = {row["tool"]: row for row in build_lease.list_leases()}
+    rows: list[dict] = []
+    for family, blurb in build_lease.EARN_FIRST_ROSTER:
+        lease_row = on_disk.get(family)
+        if lease_row is None:
+            state = "dry"
+            expires_at = None
+            remaining_seconds = None
+            issuer = None
+        elif lease_row["status"] == "active":
+            state = "ready"
+            expires_at = lease_row["expires_at"]
+            remaining_seconds = lease_row["remaining_seconds"]
+            issuer = lease_row.get("issuer")
+        else:
+            state = "waiting"
+            expires_at = lease_row["expires_at"]
+            remaining_seconds = lease_row["remaining_seconds"]
+            issuer = lease_row.get("issuer")
+        rows.append({
+            "family": family,
+            "state": state,
+            "expires_at": expires_at,
+            "remaining_seconds": remaining_seconds,
+            "issuer": issuer,
+            "blurb": blurb,
+        })
+
+    # A build lease outside the roster is not itself a bug — the roster is
+    # the canonical list of gated tools, but an operator may grant on a
+    # freshly-named family before it lands in the doc. Surface it so nothing
+    # is invisible.
+    extras = sorted(set(on_disk) - {fam for fam, _ in build_lease.EARN_FIRST_ROSTER})
+
+    if args.json:
+        print(json.dumps({"roster": rows, "extras": [
+            {"family": t, **on_disk[t]} for t in extras
+        ]}, indent=2))
+        return
+
+    tally = {"ready": 0, "waiting": 0, "dry": 0}
+    for r in rows:
+        tally[r["state"]] += 1
+    print(
+        f"earn-first roster: {len(rows)} families "
+        f"— ready:{tally['ready']}  waiting:{tally['waiting']}  dry:{tally['dry']}"
+    )
+    print()
+    for r in rows:
+        marker = {"ready": "●", "waiting": "◐", "dry": "○"}[r["state"]]
+        head = f"  {marker} {r['family']:<22} {r['state']}"
+        if r["state"] == "ready":
+            head += f"  (expires in {r['remaining_seconds']}s, by {r['issuer']})"
+        elif r["state"] == "waiting":
+            head += f"  (last lease expired at {r['expires_at']})"
+        print(head)
+        print(f"      {r['blurb']}")
+    if extras:
+        print("\n  leases outside the roster (grant on a family not yet in docs):")
+        for t in extras:
+            row = on_disk[t]
+            print(f"    - {t}  {row['status']}  (issuer: {row.get('issuer')})")
+
+
 def _cmd_gates(args) -> None:
     """`willow-mcp gates` — every authorization gate as one on/off panel.
 
@@ -7721,6 +7923,37 @@ def _main():
     dev_net_p.add_argument("--force", action="store_true",
                             help="proceed even though WILLOW_MCP_STRICT_TRUST_ROOT is set")
 
+    grant_build_p = subparsers.add_parser(
+        "grant-build",
+        help="Issue a time-boxed build lease for an earn-first tool "
+             "(local-only — never an MCP tool)",
+    )
+    grant_build_p.add_argument("tool",
+                               help="tool name (family stem is fine, e.g. workflow, intake)")
+    grant_build_p.add_argument("--ttl", default="30m",
+                               help="lease lifetime: 900s / 30m / 2h (ceiling 3h)")
+    grant_build_p.add_argument("--reason", default="",
+                               help="what building this opens — recorded on the lease")
+    grant_build_p.add_argument("--issuer", default=os.environ.get("USER", "operator"),
+                               help="who is authorizing the build (default $USER)")
+
+    revoke_build_p = subparsers.add_parser(
+        "revoke-build", help="End a build lease before it expires")
+    revoke_build_p.add_argument("tool")
+
+    build_status_p = subparsers.add_parser(
+        "build-status",
+        help="Show build leases for earn-first tools")
+    build_status_p.add_argument("tool", nargs="?", default="")
+
+    earn_check_p = subparsers.add_parser(
+        "earn-check",
+        help="Cross-reference the earn-first roster with build leases on disk "
+             "— replaces case-by-case re-litigation with a status readout",
+    )
+    earn_check_p.add_argument("--json", action="store_true",
+                              help="machine-readable output")
+
     harden_p = subparsers.add_parser(
         "harden-trust-root",
         help="Separate egress confirm authority from the agent (B-32): chown trust roots + strict mode",
@@ -7952,6 +8185,18 @@ def _main():
         return
     if args.command == "dev-net":
         _cmd_dev_net(args)
+        return
+    if args.command == "grant-build":
+        _cmd_grant_build(args)
+        return
+    if args.command == "revoke-build":
+        _cmd_revoke_build(args)
+        return
+    if args.command == "build-status":
+        _cmd_build_status(args)
+        return
+    if args.command == "earn-check":
+        _cmd_earn_check(args)
         return
     if args.command == "harden-trust-root":
         _cmd_harden_trust_root(args)

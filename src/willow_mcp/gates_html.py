@@ -159,6 +159,7 @@ SHARED_CSS = """
 _CATEGORY_ORDER_JS = """
 const CATEGORY_ORDER = [
   ["egress", "Egress & network"],
+  ["build", "Earn-first build leases"],
   ["system", "System"],
   ["identity", "Identity"],
   ["permissions", "Permissions"],
