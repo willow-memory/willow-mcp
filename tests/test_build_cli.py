@@ -111,6 +111,45 @@ def test_build_status_empty_message(tmp_path, monkeypatch):
     assert "grant-build" in out.stdout  # tells the user how to earn one
 
 
+def test_build_status_json_matches_read_only_convention(tmp_path, monkeypatch):
+    """`--json` mirrors the convention `net-status` / `earn-check` /
+    `gates --json` already use — machine output for status readers."""
+    _home(tmp_path, monkeypatch)
+    _run("grant-build", "workflow", "--ttl", "30m", "--issuer", "sean",
+         "--reason", "ship it")
+
+    out = _run("build-status", "--json")
+    assert out.returncode == 0, out.stderr
+    payload = json.loads(out.stdout)
+    assert "leases" in payload
+    active = [r for r in payload["leases"] if r["status"] == "active"]
+    assert len(active) == 1
+    assert active[0]["tool"] == "workflow"
+    assert active[0]["issuer"] == "sean"
+
+
+def test_build_status_json_empty_is_still_valid_json(tmp_path, monkeypatch):
+    """Zero leases must emit `{"leases": []}`, not the human message —
+    a caller parsing the stream cannot handle a prose fallback."""
+    _home(tmp_path, monkeypatch)
+    out = _run("build-status", "--json")
+    assert out.returncode == 0, out.stderr
+    payload = json.loads(out.stdout)
+    assert payload == {"leases": []}
+
+
+def test_build_status_json_scoped_to_one_tool(tmp_path, monkeypatch):
+    """The positional `tool` arg still narrows the machine output."""
+    _home(tmp_path, monkeypatch)
+    _run("grant-build", "workflow", "--ttl", "30m", "--issuer", "sean")
+    _run("grant-build", "intake", "--ttl", "30m", "--issuer", "sean")
+
+    out = _run("build-status", "workflow", "--json")
+    assert out.returncode == 0, out.stderr
+    payload = json.loads(out.stdout)
+    assert {row["tool"] for row in payload["leases"]} == {"workflow"}
+
+
 # ── earn-check: the status readout that replaces re-litigation ───────────────
 
 def test_earn_check_reports_dry_when_nothing_is_leased(tmp_path, monkeypatch):
