@@ -38,7 +38,7 @@ Same shape Nestor uses for translation-memory pairs, applied to a different subj
 
 Each version of Nestor's covenant *removed* something (`docs/covenant-lineage.md`): a confidence number, a redundant tier, an auto-ratification path. Every removal made the primitive smaller. The envelope-accrual work follows the same discipline — no auto-ratification, no unbounded generalization, no shape that would silently widen without a click.
 
-## The three PRs
+## The shipping PRs (PR5 through PR12)
 
 ### PR5 — foundation (merged into this branch as `afdd675` + `4e85494`)
 
@@ -48,7 +48,7 @@ Five new MCP tools + a CLI + the `envelope_authoring` module:
 - `envelope_ratify(proposal_id)` — WRITE, orchestrator + keyring. Moves proposal → active with `issued_by="root"`.
 - `envelope_reject(proposal_id, reason, reopen_when)` — WRITE, same operator gate. NEVER vs NOT YET.
 - `envelope_list(grantee, verb)` — READ.
-- `envelope_pending_read(oldest_first, limit)` — READ. Operator queue view.
+- `envelope_pending_read(oldest_first, limit, include_precedents)` — READ. Operator queue view. `include_precedents` (PR10) expands `precedent_ids` inline to the full active/archived envelope rows.
 - CLI: `willow-mcp envelope {list,pending,ratify,reject}`. No CLI `propose` — propose is orchestrator-attributed and lives on the MCP tool surface.
 
 Each authoring act writes a FRANK event when Postgres is available; deployments without PG get the on-disk record but no ledger entry (same graceful-degradation pattern `envelope_apply` already uses).
@@ -63,7 +63,7 @@ The back-channel from `_enveloped_verb_gate` to `proposals[]`:
 
 Attribution gate: auto-propose fires only when the current session is a keyring-attributed orchestrator session with a verifier on record. Unattributed / specialist-owned processes cannot cause a proposal to appear.
 
-`session_enter`'s orientation block gains `envelope_proposals_pending: {count, oldest_id, oldest_at}` for orchestrator sessions. The operator sees "N proposals waiting" at seat-open, not mid-dispatch after the queue has silently grown.
+`session_enter`'s orientation block gains `envelope_proposals_pending: {count, oldest_id, oldest_at}` for orchestrator sessions. The operator sees "N proposals waiting" at seat-open, not mid-dispatch after the queue has silently grown. PR8-Commit-B extended the block with `envelope_auto_propose_discards: {count, latest_error_class}` — the residue walk for proposals that hit `EnvelopeAuthoringError` inside `_auto_propose_on_gate_miss` and got swallowed; the count surfaces at seat-open so silence-on-write doesn't mean silence-overall.
 
 **Deferred**: specialist-side auto-propose (a specialist's OWN process auto-proposing from its own gate misses, attributed via the dispatch packet's `from_app`). Needs `dispatch_send` to carry the orchestrator's verifier in the signed meta.json — a schema extension not in scope for PR6.
 
@@ -94,11 +94,42 @@ The natural sequel — "when `ratify` supersedes an existing active envelope for
 
 Historical precedents from the FRANK ledger itself remain out of scope: `envelope_ratified` events store `bounds_digest`, not full bounds, so the ledger walk can identify prior envelope_ids but not score them. That would need either a wire change (bounds inline in the event) or a separate bounds-history store, neither of which are tractable here.
 
-### PR7 — shape similarity + precedent recall (future)
+### PR7 — shape similarity + precedent recall
 
-`envelope_shapes.similar_precedents(verb, grantee, bounds)` reads active envelopes + FRANK `envelope_ratified` history, scores each precedent by verb match + grantee overlap + per-field bounds similarity (fnmatch equivalence classes for glob bounds, prefix overlap for path-shaped bounds). `envelope_propose` calls this before writing; the resulting proposal row carries `precedent_ids: [...]` and `pre_filled_bounds: {...}`. The operator's ratify UX shows "similar to envelopes X, Y ratified on D1, D2 — confirm precedents or override."
+`envelope_shapes.similar_precedents(verb, grantee, bounds)` reads active envelopes, scores each precedent by verb match + grantee overlap + per-field bounds similarity (fnmatch equivalence classes for glob bounds, prefix overlap for path-shaped bounds, ratio decay for numerics). `envelope_propose` calls this before writing; the resulting proposal row carries `precedent_ids: [...]`. The operator's ratify UX (via PR10's `precedents_expanded` field) shows "similar to envelopes X, Y ratified on D1, D2 — confirm precedents or override."
 
-This is the piece that makes the accrual actually reduce authoring cost. PR5 + PR6 make the loop *possible*; PR7 makes it *cheap*.
+This is the piece that makes the accrual actually reduce authoring cost. PR5 + PR6 make the loop *possible*; PR7 makes it *cheap*. Extended by PR11 to include archived (rejected-with-reopen_when) precedents in the shape walk.
+
+### PR8 — auto-sign session at SessionStart (kill the sign-session papercut)
+
+Before PR8, every session needed a second-terminal `willow-mcp sign-session --verifier NAME` invocation before any envelope authoring could work; otherwise `envelope_propose`/`ratify`/`reject` refused with `UnattributedSessionError`. PR8 auto-signs at seat-open when the operator has set `WILLOW_OPERATOR_VERIFIER=NAME` in the MCP env:
+
+- SessionStart hook reads the verifier's Ed25519 private half from `$WILLOW_KEYRING`.
+- Writes the `_v2` sidecar + `.sig` atomically at `paths.session_attestation_path(...)` — same shape `sign_session_cli` produces, so `orchestrator_write_denial`'s sidecar-verify path (PR3) finds them on the next orchestrator write.
+- Warms the attribution cache post-`session_enter` so the operator's very first `envelope_propose` doesn't refuse.
+- Preserves the PR3 "server never signs on the client-supplied path" invariant — this is not a client-supplied path; the server signs on its own uid's behalf, only when the operator explicitly opted in via env.
+
+**Commit A** (2026-08-26, silence audit): compromised or unknown verifier now REFUSES `session_enter` outright instead of downgrading to unattested. `verifying_entry` returns None reliably for both cases; the Nestor prior ("refuse when the check can be reliable") applies. `auto_sign_note` also hoisted from a JSON blob key into the top-level result and the `boot_context` prose so the LLM in the client sees attribution status regardless of client rendering.
+
+**Commit B** (2026-08-26, silence audit): `_auto_propose_on_gate_miss` still swallows `EnvelopeAuthoringError` on the WRITE path (must never mask the specialist's real errno), but the discard is no longer silent overall. New `_auto_propose_discards` list captures verb/grantee/bounds/error_class/timestamp; new READ MCP tool `envelope_read_discards`; new `envelope_auto_propose_discards.{count, latest_error_class}` on the orchestrator's `session_enter` orient block. Nestor `ledger.entries() + ledger.unreadable()` two-walk pattern.
+
+**Commit B also fixed a permission-groups gap**: PR5-7 shipped `envelope_*` tools as `@_guarded` MCP tools but never added them to any `PERMISSION_GROUPS` entry in `gate.py` — every call returned `gate denied` silently. Three new groups (`envelope_read`, `envelope_write`, `envelope_read_discards`); all six tools folded into `full_access`. `envelope_write` joined the seat-guard write-capable list.
+
+### PR12 — enabled-operator alignment (Willow's manifest catches up)
+
+Even after Commit B added envelope tools to `full_access`, Willow's default manifest (`bundle/config/specialists.json:148-157`) never held `full_access` — it held a narrow set (`orchestrator, commitment_read, store_read, knowledge_read, lineage_read, gap_write, grove_read, grove_write`) that modeled Willow as a "narrow proxy" (assign → review → clear). The envelope-accrual authoring surface was unreachable from a stock Willow seat.
+
+PR12 widened Willow's OWN permissions list (NOT the shared `orchestrator` group) to add:
+
+- `envelope_read`, `envelope_write`, `envelope_read_discards` — the whole authoring loop becomes reachable
+- `knowledge_write`, `store_write`, `task_queue`, `commitment_write`, `nest_read`, `nest_write`, `code_graph_read`, `friction_read`, `human_loop_read`, `human_loop_write` — operator-scope writes that were routed around the manifest before
+- `federation_read`, `federation_call`, `mcp_federation` — driving downstream MCP servers with the existing federated-MCP gate in between
+
+Stayed off: `integration_call` and `web_net`/`integration_net` (Slack/Linear/open-web — each a separate operator decision); `schema_confirm_mapping`; `full_access` (targeted grant, not blanket). The shared `orchestrator` permission group in `gate.py` is unchanged — apps other than Willow that hold it are not silently widened.
+
+`docs/design/human-orchestrator.md` intent line reframed from "the human's proxy for separation of duties" to "the seat the human sits in" (separation of duties preserved on the dispatch/handoff/clear axis and on capability escalation via envelope ratification). See `docs/design/permissions-matrix.md` §4 for the full ratified permission list.
+
+**Without PR12, the whole envelope-accrual loop was a mechanism no operator could actually reach.** PR12 is where the loop pays its rent end-to-end from Day 1.
 
 ## Constraints inherited (do NOT re-solve)
 
@@ -111,7 +142,7 @@ This is the piece that makes the accrual actually reduce authoring cost. PR5 + P
 
 ## Where the accrual loop closes
 
-Once PR5 + PR6 + PR7 land:
+Once PR5-PR12 land (all merged 2026-08-25/26):
 
 1. Operator opens the willow orchestrator seat. Orient shows "3 proposals waiting" from prior sessions.
 2. Operator dispatches Hanuman. Hanuman's call to `dispatch_send` (verb-level-enforced) hits the gate. An envelope exists for `dispatch_send/hanuman` with bounds `{"file_pattern": "src/**"}` but this call wants `{"file_pattern": "docs/**"}`. Gate refuses; auto-propose writes a queue entry with the new bounds.

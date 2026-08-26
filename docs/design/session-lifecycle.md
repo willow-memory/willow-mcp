@@ -34,9 +34,9 @@ description: "Draft 0.3 (2026-07-09, unratified) — session lifecycle design fo
 | **Constitution** | `~/github/willow` | `CONSTITUTION.md`, `ORIENT.md` — law; willow-mcp **enforces**, does not author. `envelopes/` **no longer lives here** — the registry moved to `$WILLOW_HOME/constitutional/` (below), because a live registry is operator-instance data, not something a charter repo should carry in git. |
 | **Fleet muscle** | `willow-2.0` | Optional upstream; same tool names when wired, but not required for this design |
 
-willow-mcp ships with: `store_*`, `knowledge_*`, `task_*`, `agent_route`, `agent_dispatch_result`, `fleet_*`, `context_*`, `receipts_tail`, `diagnostic_summary`.
+willow-mcp today ships **121 MCP tools** across store, knowledge, task queue, dispatch, handoff, session, orchestrator write set, envelope authoring, Grove, FRANK, integrations, Nest, commitments, code-graph, human-loop, federated MCP, and diagnostics. The list changes with every PR; grep `@mcp.tool` in `src/willow_mcp/server.py` for the current inventory, or `README.md` for the count claim (kept in sync by `tests/test_counts_in_prose.py`).
 
-**To add (this design):** `dispatch_send`, `dispatch_list`, `dispatch_read`, `handoff_write_v4`, `handoff_read`, `verify_handoff`, `agent_clear`, `dag_*` (or SOIL-backed equivalents).
+**Historically added by this design (all shipped 2026-07 through 2026-08):** `dispatch_send`, `dispatch_list`, `dispatch_read`, `dispatch_accept`, `handoff_write_v4`, `handoff_read`, `verify_handoff`, `agent_clear`, `session_enter`, `session_bind`. DAG tools (`dag_*`) are still open — see §11.
 
 ---
 
@@ -71,12 +71,15 @@ session_enter("willow", dispatch_id=…)        →  REJECTED (orchestrator_huma
 
 **Orchestrator write tools** — the canonical list lives in `human_session.py::ORCHESTRATOR_WRITE_TOOLS`
 (currently `dispatch_send`, `dispatch_accept`, `handoff_write_v4`, `verify_handoff`, `agent_clear`,
-`frank_append`, `envelope_apply`; three originals plus four added after the 2026-07-31 red-team on
-packet `96F54DA7`). Each requires `WILLOW_HUMAN_ORCHESTRATOR=1` on the MCP host env (stdio) or OAuth
-binding to willow (serve); when `WILLOW_PGP_FINGERPRINT` is set, a further layered gate applies
-(live session file on disk + valid PGP sig on the `sessions/willow-{id}.attest.json` sidecar +
-verified manifest `.sig`). See [`human-orchestrator.md`](human-orchestrator.md) §Orchestrator write
-tools and [`pgp-and-persona.md`](pgp-and-persona.md) §1 for the full layered gate and denial tokens.
+`frank_append`, `envelope_apply`, `envelope_propose`, `envelope_ratify`, `envelope_reject`;
+ten tools — three originals plus four added after the 2026-07-31 red-team on packet `96F54DA7`,
+plus three added in the envelope-accrual PR5 so authoring the operator's yes/no is also
+keyring-attested). Each requires `WILLOW_HUMAN_ORCHESTRATOR=1` on the MCP host env (stdio) or
+OAuth binding to willow (serve); when a keyring / PGP identity substrate is configured, a further
+layered gate applies (live session file on disk + valid ed25519 sig on the keyring path or
+PGP sig on the sidecar `sessions/willow-{id}.attest.json` + verified manifest `.sig`). See
+[`human-orchestrator.md`](human-orchestrator.md) §Orchestrator write tools and
+[`pgp-and-persona.md`](pgp-and-persona.md) §1 for the full layered gate and denial tokens.
 Agents cannot invoke these as willow.
 
 **Resolver:** `session_enter(app_id, session_id, dispatch_id="")` — see `dispatch.py`.
@@ -350,7 +353,7 @@ text; they're the operator's own instance data, so they don't belong in a
 | willow-2.0 | willow-mcp |
 |------------|------------|
 | fylgja hooks, persona picker, boot flags | None — packet is boot |
-| 100+ MCP tools, Grove, FRANK, dreams | ~21 tools, grows via this design |
+| 100+ MCP tools, Grove, FRANK, dreams | **121 MCP tools** (2026-08-26) — full Grove/FRANK/nest/commitment/code-graph/human-loop/envelope-authoring/federation surfaces; count kept in sync by `tests/test_counts_in_prose.py` |
 | Session-scoped named agents as daemons | Any client + manifest `app_id` |
 | Optional host when `WILLOW_STORE_ROOT` points at fleet | Default standalone install |
 

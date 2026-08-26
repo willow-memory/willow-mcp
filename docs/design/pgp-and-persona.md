@@ -54,7 +54,7 @@ port `dev_bypass` / `_DEV_SAFE_ROOT`.
 
 ### Orchestrator write gate (layered)
 
-The gated tools are enumerated in `human_session.py::ORCHESTRATOR_WRITE_TOOLS` — currently `dispatch_send`, `dispatch_accept`, `handoff_write_v4`, `verify_handoff`, `agent_clear`, `frank_append`, `envelope_apply` (three originals plus four added 2026-07-31 after the packet `96F54DA7` red-team showed direct calls bypassing `session_enter`'s guard). Each requires **all** of:
+The gated tools are enumerated in `human_session.py::ORCHESTRATOR_WRITE_TOOLS` — currently `dispatch_send`, `dispatch_accept`, `handoff_write_v4`, `verify_handoff`, `agent_clear`, `frank_append`, `envelope_apply`, `envelope_propose`, `envelope_ratify`, `envelope_reject` (ten tools — three originals plus four added 2026-07-31 after the packet `96F54DA7` red-team showed direct calls bypassing `session_enter`'s guard; plus three added in the envelope-accrual PR5 so authoring the operator's yes/no also requires keyring attestation). Each requires **all** of:
 
 1. `app_id=willow`
 2. `WILLOW_HUMAN_ORCHESTRATOR=1` on MCP host (charter seat config)
@@ -68,6 +68,25 @@ Env-only was interim until P2 landed (issue #186); checks 1-2 are still required
 
 `willow-mcp sign-manifest`, `willow-mcp attest-session` — operator terminal only.
 Kart bwrap cannot reach gpg-agent (fleet lesson). Agents **request**; operator **signs**.
+
+### Keyring path (PR1-PR8, 2026-08-25) — the new primary identity substrate
+
+**PGP is no longer the only path.** The identity-in-session line (PRs #372-#376) ported the Nestor §5.8 per-verifier keyring into willow-mcp as `src/willow_mcp/keyring.py`, added client-side ed25519 signing via `sign_session` (`src/willow_mcp/session_signing.py`), and made the orchestrator write gate verify against BOTH paths — a v2 keyring sidecar OR a v1 PGP sidecar. New deployments should prefer the keyring path; PGP remains as legacy_key for migration and stays fully supported.
+
+| Path | Signing tool | Identity substrate | Sidecar format |
+|------|--------------|--------------------|----------------|
+| **Keyring (PR1-PR8, preferred)** | `willow-mcp sign-session <session_id> --verifier NAME` or automatic on SessionStart when `WILLOW_OPERATOR_VERIFIER=NAME` is set (PR8) | `src/willow_mcp/keyring.py` (Ed25519 per-verifier) | `orchestrator_session_attestation_v2` — `{format, app_id, session_id, verifier, attested_at}` + hex ed25519 sig |
+| **PGP (legacy)** | `willow-mcp attest-session <session_id>` | System `gpg` + `WILLOW_PGP_FINGERPRINT` | `orchestrator_session_attestation_v1` — `{format, app_id, session_id, attested_at}` + detached ASCII sig |
+
+Both paths use the same layered gate above (checks 1-5) and the same denial tokens (`_missing` / `_invalid`). `orchestrator_write_denial` (`human_session.py`) resolves which sidecar shape to verify by reading the sidecar's `format` field.
+
+**Compromised verifier discipline (PR8 Commit A):** the SessionStart auto-sign path REFUSES to open a session when `WILLOW_OPERATOR_VERIFIER` names a key that is unknown to the keyring OR has been revoked as compromised. `verifying_entry` returns None for both cases; the Nestor prior ("warn when the check can't be reliable; refuse when it can") applies. A compromised key that continued under graceful degrade would be exactly the fail-quiet-and-compound pattern the fleet forbids.
+
+**Attribution cache (PR4):** `human_session._attributed_sessions` is a process-local set — the first orchestrator write per session pays the sidecar verify, subsequent writes are O(1). Cache-by-path: revocation across processes requires operator restart (mirrors `nestor.keyring`'s policy). `sessions_read_unverifiable` MCP tool (PR4) enumerates sessions whose sidecar exists but no longer verifies — the browsable trust-view after a rotation.
+
+**Attribution rides dispatch (PR9):** `dispatch_send` writes `from_verifier` + `from_session` into the signed meta.json; `dispatch_accept` and `session_enter`'s specialist branch lift those fields onto the specialist's session record and into the attribution cache. A specialist inherits the operator's attribution through the dispatch packet, so its own gate misses can auto-propose envelopes attributed to the ORIGINATING operator — the queue view stays a queue of humans, not proxying processes.
+
+The whole envelope-accrual loop (PR5-PR12) presumes an attributed session. Both paths above satisfy that presumption; a session with neither is unattributed and cannot auto-propose or ratify.
 
 ---
 
