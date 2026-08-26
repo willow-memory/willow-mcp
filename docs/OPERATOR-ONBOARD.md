@@ -131,3 +131,99 @@ willow-mcp sign-manifest hanuman
 Interactive operator terminal only (same as `sign-net-task`/`sign-db-task` —
 `gpg-agent` is unreachable inside Kart). Re-run after any manifest edit; a
 changed manifest with a stale signature is denied too.
+
+## Keyring identity + envelope-accrual (PR1-PR12, 2026-08-25/26)
+
+The identity-in-session + envelope-accrual thread shipped a per-verifier
+ed25519 keyring as the primary operator identity substrate (PGP stays as
+legacy_key). What the operator does day-to-day:
+
+### One-time keyring setup
+
+```bash
+willow-mcp keys add rita         # your operator handle (any name; matches WILLOW_OPERATOR_VERIFIER below)
+willow-mcp keys status rita      # confirm the key is active
+```
+
+Then set the env in the MCP config so every SessionStart auto-signs:
+
+```jsonc
+// .cursor/mcp.json  (willow orchestrator seat)
+{
+  "willow": {
+    "env": {
+      "WILLOW_APP_ID": "willow",
+      "WILLOW_HUMAN_ORCHESTRATOR": "1",
+      "WILLOW_KEYRING": "on",
+      "WILLOW_OPERATOR_VERIFIER": "rita"
+    }
+  }
+}
+```
+
+With `WILLOW_OPERATOR_VERIFIER` set, the SessionStart hook (PR8) auto-signs
+each new session: it writes the `_v2` sidecar + `.sig`, warms the
+attribution cache, and prints an `auto_sign_note` into the boot context.
+Your first `envelope_propose`/`ratify`/`reject` works without a second
+terminal.
+
+An **unknown or compromised verifier REFUSES `session_enter` outright**
+(PR8 Commit A): a compromised key that continued unattested is exactly
+the fail-quiet pattern the fleet forbids. Rotate with
+`willow-mcp keys add rita --rotate` and reopen the session.
+
+### The envelope-accrual loop in one flow
+
+```bash
+# 1. Open a session (auto-signed if WILLOW_OPERATOR_VERIFIER is set)
+#    Otherwise: willow-mcp sign-session <session_id> --verifier rita
+
+# 2. See the queue at seat-open (envelope_pending_read is on the orient block)
+#    N proposals waiting: shown by session_enter's orientation block.
+
+# 3. Do work. When a specialist hits an envelope wall, a proposal appears
+#    in your queue automatically (auto-propose from _enveloped_verb_gate,
+#    PR6, attributed to you via the dispatch packet, PR9).
+
+# 4. Ratify from your operator terminal:
+willow-mcp envelope pending             # list open proposals with precedents inline (PR10)
+willow-mcp envelope ratify <proposal_id>
+#    OR reject with a reopen condition:
+willow-mcp envelope reject <proposal_id> --reason "too broad" --reopen-when "after loki audit"
+
+# 5. Rejections accrue as precedents too (PR11), so the next similar
+#    proposal shows you already said no with a reopen condition — the
+#    ratify UX renders it as "you said no on 2026-08-10 because ...;
+#    reopen when ..." rather than a blank slate.
+```
+
+### Diagnostics
+
+```bash
+willow-mcp envelope list                          # ratified envelopes
+willow-mcp envelope pending                       # proposal queue (with precedents inline)
+# via MCP tool: envelope_read_discards            # residue walk: proposals swallowed on error (PR8B)
+willow-mcp sessions --unverifiable                # sessions whose sidecar exists but no longer verifies (PR4)
+```
+
+### Multi-machine attribution (unchanged)
+
+The auto-sign path (`WILLOW_OPERATOR_VERIFIER`) is same-uid only. Cross-box
+operators keep using `willow-mcp sign-session <session_id> --verifier rita`
+manually — the CLI signs client-side against the operator's own key and
+uploads only the sig + sidecar to the server.
+
+### Federated MCP (PR12)
+
+Willow's manifest now holds `federation_read` + `federation_call` +
+`mcp_federation`, so the orchestrator can drive downstream MCP servers
+directly. The gate is still layered — the runtime call needs
+`consent.federation` (per-lease) alongside the manifest grant.
+
+```bash
+willow-mcp consent set federation true            # once; then per-lease consent still applies
+```
+
+See `docs/design/permissions-matrix.md` §4 for the full ratified
+permission set, and `docs/design/envelope-accrual.md` for the mechanism
+overview.
