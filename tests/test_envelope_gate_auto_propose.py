@@ -282,3 +282,193 @@ def test_invalid_bounds_is_silent(
         "willow", "demo_verb", {"wrong_key": "value"}, sid
     )
     assert ea.list_pending() == []
+
+
+# --- discard-residue walk (Nestor two-walk pattern) ----------------------
+#
+# Silent-on-write is fine for _auto_propose_on_gate_miss (the specialist
+# still gets its real errno from _enveloped_verb_gate); silent OVERALL is
+# the failure. These tests pin the second walk: what got swallowed lands
+# in _auto_propose_discards with enough context to diagnose, per Nestor's
+# ledger.entries() + ledger.unreadable() prior.
+
+
+def test_unknown_verb_records_discard(
+    ring_with_rita, registry_with_demo_verb, attributed_orchestrator_session
+):
+    sid = attributed_orchestrator_session
+    server._auto_propose_on_gate_miss(
+        "willow", "verb_not_in_table", _call_args(), sid
+    )
+    discards = server.list_auto_propose_discards()
+    assert len(discards) == 1
+    d = discards[0]
+    assert d["verb"] == "verb_not_in_table"
+    assert d["session_id"] == sid
+    assert d["verifier"] == "rita"
+    assert d["app_id"] == "willow"
+    assert d["error_class"] == "UnknownVerbError"
+    assert d["bounds"] == _call_args()
+    assert d["at"].endswith("Z")
+
+
+def test_invalid_bounds_records_discard(
+    ring_with_rita, registry_with_demo_verb, attributed_orchestrator_session
+):
+    sid = attributed_orchestrator_session
+    server._auto_propose_on_gate_miss(
+        "willow", "demo_verb", {"wrong_key": "value"}, sid
+    )
+    discards = server.list_auto_propose_discards()
+    assert len(discards) == 1
+    assert discards[0]["error_class"] == "InvalidBoundsSignatureError"
+    assert discards[0]["bounds"] == {"wrong_key": "value"}
+
+
+def test_successful_propose_leaves_no_discard(
+    ring_with_rita, registry_with_demo_verb, attributed_orchestrator_session
+):
+    """The residue walk counts only what got swallowed. A successful
+    propose lands in pending[], not in discards[]."""
+    sid = attributed_orchestrator_session
+    server._auto_propose_on_gate_miss("willow", "demo_verb", _call_args(), sid)
+    assert len(ea.list_pending()) == 1
+    assert server.list_auto_propose_discards() == []
+
+
+def test_list_discards_filters_by_session(
+    ring_with_rita, registry_with_demo_verb
+):
+    dispatch.session_bind("willow", "s-discard-a", "", "idle", verifier="rita")
+    dispatch.session_bind("willow", "s-discard-b", "", "idle", verifier="rita")
+    human_session._remember_attributed("s-discard-a")
+    human_session._remember_attributed("s-discard-b")
+    server._auto_propose_on_gate_miss(
+        "willow", "verb_not_in_table", _call_args(), "s-discard-a"
+    )
+    server._auto_propose_on_gate_miss(
+        "willow", "demo_verb", {"wrong_key": "x"}, "s-discard-b"
+    )
+    all_ = server.list_auto_propose_discards()
+    assert len(all_) == 2
+    only_a = server.list_auto_propose_discards("s-discard-a")
+    assert len(only_a) == 1 and only_a[0]["session_id"] == "s-discard-a"
+    only_b = server.list_auto_propose_discards("s-discard-b")
+    assert len(only_b) == 1 and only_b[0]["session_id"] == "s-discard-b"
+
+
+def test_clear_cache_global_clears_discards(
+    ring_with_rita, registry_with_demo_verb, attributed_orchestrator_session
+):
+    sid = attributed_orchestrator_session
+    server._auto_propose_on_gate_miss(
+        "willow", "verb_not_in_table", _call_args(), sid
+    )
+    assert len(server.list_auto_propose_discards()) == 1
+    server.clear_auto_propose_cache()
+    assert server.list_auto_propose_discards() == []
+
+
+def test_clear_cache_session_scoped_leaves_other_discards(
+    ring_with_rita, registry_with_demo_verb
+):
+    dispatch.session_bind("willow", "s-discard-c", "", "idle", verifier="rita")
+    dispatch.session_bind("willow", "s-discard-d", "", "idle", verifier="rita")
+    human_session._remember_attributed("s-discard-c")
+    human_session._remember_attributed("s-discard-d")
+    server._auto_propose_on_gate_miss(
+        "willow", "verb_not_in_table", _call_args(), "s-discard-c"
+    )
+    server._auto_propose_on_gate_miss(
+        "willow", "verb_not_in_table", _call_args(), "s-discard-d"
+    )
+    server.clear_auto_propose_cache("s-discard-c")
+    remaining = server.list_auto_propose_discards()
+    assert len(remaining) == 1
+    assert remaining[0]["session_id"] == "s-discard-d"
+
+
+def _willow_manifest(tmp_path, monkeypatch):
+    """Minimal manifest so session_enter (guarded) doesn't get denied by
+    the manifest gate."""
+    root = tmp_path / "mcp_apps"
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(root))
+    path = root / "willow" / "manifest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "permissions": ["orchestrator", "full_access"],
+        "store_scope": ["projects_willow_*", "willow_*"],
+    }))
+
+
+def test_session_enter_orient_surfaces_discard_count(
+    ring_with_rita, registry_with_demo_verb, monkeypatch, tmp_path
+):
+    """The orient block on an orchestrator session_enter surfaces the
+    discard count so the operator sees residue at seat-open — the count
+    is not silently kept in a process-local variable no one reads."""
+    _willow_manifest(tmp_path, monkeypatch)
+    monkeypatch.setenv("WILLOW_HUMAN_ORCHESTRATOR", "1")
+    sid = "s-orient-discards"
+    dispatch.session_bind("willow", sid, "", "idle", verifier="rita")
+    human_session._remember_attributed(sid)
+    # Seed one discard
+    server._auto_propose_on_gate_miss(
+        "willow", "verb_not_in_table", _call_args(), sid
+    )
+    # Re-enter the orchestrator session — orient should carry the count
+    result = server.session_enter(
+        app_id="willow", session_id=sid, project="", workspace="",
+    )
+    orient = result.get("orientation") or {}
+    discard_block = orient.get("envelope_auto_propose_discards")
+    assert discard_block is not None
+    assert discard_block["count"] == 1
+    assert discard_block["latest_error_class"] == "UnknownVerbError"
+
+
+def test_session_enter_orient_zero_when_none(
+    ring_with_rita, registry_with_demo_verb,
+    attributed_orchestrator_session, monkeypatch, tmp_path,
+):
+    """No discards → count 0, latest_error_class None. Present on every
+    orchestrator orient, not conditionally hidden."""
+    _willow_manifest(tmp_path, monkeypatch)
+    monkeypatch.setenv("WILLOW_HUMAN_ORCHESTRATOR", "1")
+    sid = attributed_orchestrator_session
+    result = server.session_enter(
+        app_id="willow", session_id=sid, project="", workspace="",
+    )
+    orient = result.get("orientation") or {}
+    discard_block = orient.get("envelope_auto_propose_discards")
+    assert discard_block is not None
+    assert discard_block["count"] == 0
+    assert discard_block["latest_error_class"] is None
+
+
+def test_envelope_read_discards_tool_reads_residue(
+    ring_with_rita, registry_with_demo_verb, monkeypatch, tmp_path,
+):
+    """The MCP READ tool returns the same list list_auto_propose_discards
+    exposes internally, wrapped in {'discards': [...]}."""
+    _willow_manifest(tmp_path, monkeypatch)
+    # In CI WILLOW_APP_ID is unset at module-import time so _DEFAULT_APP_ID
+    # falls to ''. The guarded tool has no app_id parameter, so the guard
+    # falls back to _DEFAULT_APP_ID. Give it a valid one for this call.
+    monkeypatch.setattr(server, "_DEFAULT_APP_ID", "willow")
+    sid = "s-read-discards-tool"
+    dispatch.session_bind("willow", sid, "", "idle", verifier="rita")
+    human_session._remember_attributed(sid)
+    server._auto_propose_on_gate_miss(
+        "willow", "verb_not_in_table", _call_args(), sid
+    )
+    result = server.envelope_read_discards()
+    assert "discards" in result
+    assert len(result["discards"]) == 1
+    assert result["discards"][0]["error_class"] == "UnknownVerbError"
+
+    result_scoped = server.envelope_read_discards(session_id=sid)
+    assert len(result_scoped["discards"]) == 1
+    result_empty = server.envelope_read_discards(session_id="s-does-not-exist")
+    assert result_empty["discards"] == []

@@ -147,6 +147,23 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     "envelope_apply": frozenset({
         "envelope_apply",
     }),
+    # Envelope-accrual loop (docs/design/envelope-accrual.md; PR5-7 + PR8).
+    # envelope_apply above stays its own group — it is a specialist's
+    # capability-exercise path. The four groups below govern the AUTHORING
+    # loop: read the queue, propose, ratify (operator only), inspect the
+    # auto-propose discard residue (Nestor's ledger.unreadable() prior).
+    # Split into read/write mirrors dispatch_read/dispatch_write; splitting
+    # envelope_read_discards into its own group keeps the residue walk
+    # narrowly grantable without also granting the queue view.
+    "envelope_read": frozenset({
+        "envelope_list", "envelope_pending_read",
+    }),
+    "envelope_write": frozenset({
+        "envelope_propose", "envelope_ratify", "envelope_reject",
+    }),
+    "envelope_read_discards": frozenset({
+        "envelope_read_discards",
+    }),
     "context": frozenset({
         "context_save", "context_get", "context_list", "context_expire",
     }),
@@ -407,6 +424,13 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # Human-in-the-loop queue + attestations
         "human_required_list", "human_required_enqueue", "human_required_resolve",
         "human_attestation_list", "human_attestation_create",
+        # Envelope-accrual loop: reads + operator-facing writes. Same rule
+        # ORCHESTRATOR_WRITE_TOOLS enforces in human_session.py — a broad
+        # full_access grant reaches every envelope tool, but ratify/reject
+        # additionally refuse unless the calling session is keyring-attributed
+        # (a fresh gate check in each of them, not a manifest concern).
+        "envelope_list", "envelope_pending_read", "envelope_read_discards",
+        "envelope_propose", "envelope_ratify", "envelope_reject",
     }),
 }
 

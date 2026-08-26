@@ -697,6 +697,16 @@ def session_enter(
         from . import session_signing as _session_signing
         stored_verifier = verifier if _session_signing.signing_enabled() else ""
         session_bind(app_id, session_id, "", "idle", verifier=stored_verifier)
+        # NB: attribution cache warming happens in orchestrator_write_denial
+        # after it verifies the sidecar (PR4 lazy-cache shape). PR8's
+        # auto-sign path in session_start_hook writes the sidecar to disk
+        # BEFORE calling session_enter, so the first orchestrator write
+        # will find the sidecar there and populate the cache exactly the
+        # way a manually sign-session'd flow would. Warming the cache
+        # here without a sidecar on disk would break the invariant that
+        # session-is-attributed IFF sidecar+sig verify (a subsequent
+        # process restart would find the cache empty and the sidecar
+        # missing, refusing the operator).
         return {
             "entry_mode": "human_orchestrator",
             "app_id": app_id,

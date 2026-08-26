@@ -927,7 +927,8 @@ def test_main_stays_silent_for_the_sanctioned_web_tool():
 # outbound call has side effects the caller does not own.
 _WRITE_CAPABLE_GROUPS = {
     "agent_dispatch", "binding", "code_graph_write", "commitment_write",
-    "context", "dispatch_write", "envelope_apply", "federation_call", "fork_write",
+    "context", "dispatch_write", "envelope_apply", "envelope_write",
+    "federation_call", "fork_write",
     "frank_write",
     "friction_write", "full_access", "gap_promote", "gap_purge", "gap_write",
     "grove_all", "grove_write",
@@ -942,7 +943,8 @@ _WRITE_CAPABLE_GROUPS = {
 # and willow_web_search write no willow state, and the egress they front is
 # gated separately by the web_net capability (covered below), not by this group.
 _READ_ONLY_GROUPS = {
-    "audit", "code_graph_read", "commitment_read", "dispatch_read", "federation_read",
+    "audit", "code_graph_read", "commitment_read", "dispatch_read",
+    "envelope_read", "envelope_read_discards", "federation_read",
     "fleet_read", "grove_read",
     "fork_read", "friction_read", "gap_read", "human_loop_read",
     "integration_read", "knowledge_read", "lineage_read", "markdownai_read",
