@@ -290,6 +290,37 @@ record. `willow-mcp consent reconcile` keeps the canonical value and repairs its
 mirror. If the two disagree, `diagnostic_summary` reports both rather than
 guessing intent (B-30).
 
+### Earn-first — a lease for building
+
+Some tools in the roadmap are `EARN-FIRST`: real capabilities the fleet
+doesn't build ahead of a consumer. The consumer is the operator, asking,
+on the record. `grant-build` is that record — a lease with the same 3h
+ceiling as `grant-net` (FRANK `cc553729`), kept in
+`mcp_apps/_build_leases/<tool>.json`, and mintable only from the local CLI,
+never an MCP tool.
+
+```console
+$ willow-mcp grant-build workflow --ttl 30m \
+    --reason "ship the multi-phase engine so kart tasks compose"
+$ willow-mcp earn-check          # roster vs disk: ready / waiting / dry
+$ willow-mcp build-status        # every lease, active + expired + malformed
+$ willow-mcp revoke-build workflow
+```
+
+`willow-mcp gates` folds the roster into the same panel that shows net
+leases and manifest permissions — the roster carries an `Earn-first build
+leases` heading, one row per family, active leases counting down. When the
+lease expires the family falls back to earn-first; further work needs a
+fresh ask under the same terms. `earn-check` prints `ready` / `waiting` /
+`dry` per family so the case-by-case argument becomes a lookup.
+
+The rule this lease opens, and the roster of families it applies to, live
+in [`docs/design/slice-backlog.md`](docs/design/slice-backlog.md)
+under **Earn-first** — that's the doctrine; `grant-build` and `earn-check`
+are its enforcement seam. Integration stubs stay on a different rule
+(`earn_mode: two-cite`, see [`docs/design/integrations.md §6`](docs/design/integrations.md));
+different subject, different check.
+
 ### Governance continuity
 
 `willow-mcp roster status` compares the constitution repo's canonical
