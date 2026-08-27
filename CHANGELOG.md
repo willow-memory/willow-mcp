@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.18.0](https://github.com/willow-memory/willow-mcp/compare/v2.17.0...v2.18.0) (2026-08-27)
+
+
+### Added
+
+* **personas:** add model_hint_session field per specialist ([8f32ccf](https://github.com/willow-memory/willow-mcp/commit/8f32ccfd457c5951255aa23227a57f9dc182b86c))
+
 ## [2.17.0](https://github.com/willow-memory/willow-mcp/compare/v2.16.0...v2.17.0) (2026-08-26)
 
 
