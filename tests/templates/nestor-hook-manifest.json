@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "command": "hooks/nestor-hook",
+  "env": {
+    "NESTOR_PROJECT_ROOT": "{{PROJECT_ROOT}}"
+  },
+  "hooks": [
+    {
+      "event": "session_start",
+      "action": "session_start",
+      "timeout": 15,
+      "fail_closed": false
+    },
+    {
+      "event": "prompt_submit",
+      "action": "reinject"
+    },
+    {
+      "event": "prompt_submit",
+      "action": "before_build"
+    },
+    {
+      "event": "prompt_submit",
+      "action": "before_propose"
+    },
+    {
+      "event": "pre_compact",
+      "action": "reinject"
+    },
+    {
+      "event": "pre_tool_use",
+      "tool": "mcp",
+      "action": "before_mcp",
+      "timeout": 5
+    },
+    {
+      "event": "pre_tool_use",
+      "tool": "write",
+      "action": "before_write",
+      "timeout": 5
+    },
+    {
+      "event": "pre_tool_use",
+      "tool": "shell",
+      "action": "before_bash",
+      "timeout": 5
+    },
+    {
+      "event": "stop",
+      "action": "before_stop"
+    },
+    {
+      "event": "session_end",
+      "action": "session_end",
+      "timeout": 15,
+      "fail_closed": false
+    }
+  ]
+}
