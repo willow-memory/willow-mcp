@@ -152,12 +152,37 @@ def _rule_two_rows() -> dict[str, list[str]]:
     return rows
 
 
+def _unconsumed() -> set[str]:
+    """Roster members this package releases but does not depend on."""
+    fleet = _pyproject().get("tool", {}).get("willow", {}).get("fleet", {})
+    return {_canon(n) for n in fleet.get("unconsumed", [])}
+
+
+def test_unconsumed_members_are_on_the_roster():
+    """A typo here would exclude nothing and look like it excluded something."""
+    stray = _unconsumed() - _fleet()
+    assert not stray, (
+        f"{sorted(stray)} is listed in [tool.willow.fleet].unconsumed but is "
+        f"not in packages. The exclusion only means something for a roster member.")
+
+
+def test_unconsumed_members_are_not_actually_depended_on():
+    """The escape hatch closes itself. If willow-mcp ever takes a real
+    dependency on one of these, the pin rules must start applying to it — so the
+    package has to come off this list in the same commit that adds the pin."""
+    contradictory = _unconsumed() & set(_fleet_pins())
+    assert not contradictory, (
+        f"{sorted(contradictory)} is pinned in [project.dependencies] but also "
+        f"listed as unconsumed. Remove it from [tool.willow.fleet].unconsumed — "
+        f"a declared dependency is subject to Rule 1.")
+
+
 def test_every_fleet_package_is_pinned_with_both_bounds():
     """An unbounded fleet dependency is the same bug with the cap missing, and
     the regex would simply not match it — so check the roster, not just the
     entries that parsed. This package is excluded: it does not depend on
     itself, but it does need a row in the doc (below)."""
-    want = _fleet() - {_SELF}
+    want = _fleet() - {_SELF} - _unconsumed()
     missing = want - set(_fleet_pins())
     assert not missing, (
         f"{sorted(missing)} must appear in [project.dependencies] spelled "
