@@ -626,6 +626,88 @@ the residuals above still stands — an IDE seat cannot sign, and registering on
 buys nothing.
 
 @phase constraints
+## Verified against the running system (2026-08-27)
+
+This doc was written 2026-08-10. Everything below was re-measured against
+willow-mcp at **v2.18.0** — fourteen minors later — because a seam described but
+never re-run is a seam you are trusting on its own say-so.
+
+| claim | result |
+|---|---|
+| the two implementations agree on the wire | **byte-identical** canonical header; identical HMAC-SHA256 (`2135026c5780614b…` both sides) |
+| the trust ceiling is bound, not asserted | `claim 4` against ceiling 2 → `BindError: trust claim 4 exceeds registered ceiling 2` |
+| the funnel is still sole and complete (H2) | **121 `@_guarded` / 121 tool decorators**, exact 1:1 |
+| `_gate` still yields a distinct identity | `effective_app_id` computed, and `call_kwargs["app_id"]` overwritten with it |
+| receipts still record at the funnel (H3) | `bind_observed` / `bind_enforced`, `_announce_hook` attached |
+| `examples/signing_client.py` | **PASS** end to end on the current build — signed write + read ok, unsigned denied, check-out reconciles clean |
+
+willow-gate itself is **frozen, not drifted**: `main` is clean and identical to
+`origin/main` at `9e75137` (2026-08-10). Two API details have moved out from
+under this doc, and matter only if the package is ever installed alongside:
+
+- `WillowGate.__init__(operator_key_fpr=None, base_dir=None, require_pgp=True)`
+  — defaults to a hardcoded `/willowgate` base and PGP required, so a naive
+  construction raises `PermissionError: '/willowgate'`. A bridge must pass both.
+- willow-gate's own `registry.json` keeps `secret` inline; D2 above deliberately
+  **splits** that (ceiling in the registry, secret in a `0600` sidecar). The two
+  on-disk formats are not interchangeable.
+
+Neither blocks anything today, because **willow-mcp never imports willow-gate** —
+`agent_registry`, `session_binder` and the ceiling are all willow-mcp's own
+stdlib-only code (D5). That is why the round-trip works despite the freeze.
+
+## Deployment surface — nothing on this box can sign (2026-08-27)
+
+The credential rides the MCP request's out-of-band `_meta`
+(`CREDENTIAL_META_KEY`), so the **client** must hold the per-agent secret and
+HMAC every call. That is what `examples/signing_client.py` is: not a test
+fixture, but the production shape of a harness.
+
+A census of what actually calls this server:
+
+| app_id | IDE seats (rendered `.mcp.json`) | signed manifest |
+|---|---|---|
+| `willow` | **22** | yes |
+| `heimdallr` · `jeles` · `utety` · `vishwakarma` · `nestor` | 1 each | yes |
+| `ada` · `hanuman` · `loki` · `skirnir` | **0** | yes |
+
+All 27 wired seats resolve through Claude Code or Cursor. Neither attaches
+`_meta`; `_read_call_credential()` returns `None`, which for a **registered**
+agent is a denial. So:
+
+@constraint severity="critical"
+Registering binds an **app_id, not a client**. Every seat on this box is driven
+by an IDE client that cannot sign, so `register-agent X` + `ENFORCE_BINDING=on`
+locks that seat out of its own tools. `willow` is 22 seats — registering it
+would deny 22 projects at once. Register a seat only once something that can
+sign drives it.
+
+The four with manifests and `receive_dispatch: true` but **zero seats** are the
+only harness-shaped identities today, and only if a dispatch is executed by a
+harness rather than by a human opening a session as that agent — `session_enter`
+hands a dispatched specialist its assignment, which is a session, i.e. a client.
+
+**The Kart worker does not close this.** `worker.py` contains **zero**
+occurrences of `_gate` or `_guarded`; it imports `task_queue`,
+`egress_authorization`, `heartbeat` and `commitments`, and hands execution to
+`kartikeya.run_worker` → `sandbox.run_shell`. Submit and execute are governed
+separately, and correctly:
+
+| | surface | governed by |
+|---|---|---|
+| `task_submit` | MCP tool | `@_guarded` → `_gate` → manifest, **and binding when enforced** |
+| worker execution | daemon | sandbox mount policy + `ExecutorNetworkAuthorizer` (three-key egress lease) |
+
+So the worker is not an unbound caller slipping past `_gate` — it is downstream
+of a call that already went through it. A signing wrapper around the worker
+would protect nothing that is not already protected.
+
+**Conclusion.** No seat on this box both runs headless *and* calls MCP tools.
+Binding therefore has no deployment surface here yet — a fact about this box's
+shape, not a defect. `off` is the correct setting; `strict` (D3.1) is built and
+waiting for the first thing that can sign: a dispatch runner, the grove's serve
+mode with a signing client, or CI. D6's residual closes on that same day.
+
 ## Constraints
 
 @constraint severity="critical"
