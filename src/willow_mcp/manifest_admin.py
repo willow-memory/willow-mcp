@@ -21,9 +21,8 @@ from pathlib import Path
 
 from . import pgp
 from .gate import (
-    INTEGRATION_NET_PERMISSION,
-    WEB_NET_PERMISSION,
-    NET_PERMISSION,
+    CAPABILITY_PERMISSIONS,
+    FEDERATED_PERMISSION_PREFIX,
     PERMISSION_GROUPS,
     _apps_root,
     _validate_app_id,
@@ -32,7 +31,64 @@ from .gate import (
 #: Same typo-guard reasoning as `gate.store_scope`'s malformed-field check
 #: (B-25): an operator toggling a misspelled permission name would otherwise
 #: believe they granted or revoked something, and nothing would happen.
-KNOWN_PERMISSIONS = frozenset(PERMISSION_GROUPS) | {NET_PERMISSION, INTEGRATION_NET_PERMISSION, WEB_NET_PERMISSION}
+#:
+#: Derived from `gate` rather than restated here. The restatement is what broke:
+#: this line used to name three of the six capability permissions, so `task_db`,
+#: `mcp_federation` and `grove_relay` were enforced by `permitted()` and
+#: ungrantable by any operator command. A typo guard that refuses correctly
+#: spelled names is not a stricter guard, it is a broken one.
+KNOWN_PERMISSIONS = frozenset(PERMISSION_GROUPS) | CAPABILITY_PERMISSIONS
+
+
+def validate_permission(perm: str) -> str:
+    """Return `perm` if an operator may grant it, else raise `ValueError`.
+
+    Two shapes are legal, and they are checked differently on purpose:
+
+    * a name in `KNOWN_PERMISSIONS` — a fixed set, checked by membership;
+    * a federated per-tool grant `mcp:<server_id>:<tool>` — checked against the
+      ratification registry, because these names *cannot* be enumerated ahead
+      of time. A `server_id` is a digest of a server's launch identity
+      (`mcp_federation._stable_id`) and does not exist until an operator has
+      ratified that server, so there is no moment at which a static list could
+      contain it.
+
+    Requiring ratification here is the typo guard for the federated half, and
+    it is also the only place the two halves of `federation_egress`'s check can
+    be kept from drifting apart: a grant naming an unratified server would sit
+    in a manifest looking effective and deny at every call, which is the silent
+    shape this module exists to refuse.
+    """
+    if perm in KNOWN_PERMISSIONS:
+        return perm
+    if not perm.startswith(FEDERATED_PERMISSION_PREFIX):
+        raise ValueError(
+            f"unknown permission {perm!r} — expected one of "
+            f"{sorted(KNOWN_PERMISSIONS)}, or a federated grant "
+            f"'mcp:<server_id>:<tool>'"
+        )
+
+    from . import mcp_federation
+
+    parts = perm.split(":")
+    if len(parts) != 3 or not parts[1] or not parts[2]:
+        raise ValueError(
+            f"malformed federated permission {perm!r} — expected exactly "
+            f"'mcp:<server_id>:<tool>' with both parts non-empty"
+        )
+    server_id = parts[1]
+    if not mcp_federation.is_ratified(server_id):
+        ratified = [
+            f"{e.get('name', '?')} ({e.get('server_id', '?')})"
+            for e in mcp_federation.list_ratified()
+        ]
+        raise ValueError(
+            f"no ratified server {server_id!r} — a per-tool grant names the "
+            f"server it applies to, and that server must be ratified first "
+            f"(`willow-mcp federation ratify`). Ratified now: "
+            f"{ratified or 'none'}"
+        )
+    return perm
 
 
 def manifest_path(app_id: str) -> Path:
@@ -71,10 +127,7 @@ def set_permission(app_id: str, perm: str, granted: bool) -> dict:
     *unrestricted* — materializing an empty manifest here would turn a
     no-op revoke into a store-access grant nobody asked for.
     """
-    if perm not in KNOWN_PERMISSIONS:
-        raise ValueError(
-            f"unknown permission {perm!r} — expected one of {sorted(KNOWN_PERMISSIONS)}"
-        )
+    validate_permission(perm)
     existed = manifest_path(app_id).is_file()
     manifest = read_manifest(app_id)
     perms = list(manifest.get("permissions") or [])

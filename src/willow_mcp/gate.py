@@ -480,6 +480,39 @@ MCP_FEDERATION_PERMISSION = "mcp_federation"
 # future bridge seat (docs/design/permissions-matrix.md).
 GROVE_RELAY_PERMISSION = "grove_relay"
 
+#: Every capability permission above, as one set.
+#:
+#: These six are the flags an operator grants on their own line — each one
+#: deliberately outside `PERMISSION_GROUPS` and outside `full_access`, for the
+#: reasons each constant states. That shared property is what makes them a set
+#: worth naming: they are exactly the names `permitted()` will honor that no
+#: group grant can produce, so they are exactly the names an operator has to be
+#: able to type.
+#:
+#: It exists because listing them a second time by hand went wrong. The
+#: `allow-permission` CLI kept its own copy naming three of the six, so
+#: `task_db`, `mcp_federation` and `grove_relay` were each enforced by a gate
+#: no operator command could open — the federation lane sat unreachable from
+#: the day it was written, and the registry being empty read as neglect rather
+#: than as the only answer it could give. A second list is a list that goes
+#: stale; `tests/test_capability_permissions.py` pins this one against the
+#: module's own constants so a seventh capability cannot repeat it.
+CAPABILITY_PERMISSIONS: frozenset[str] = frozenset({
+    NET_PERMISSION,
+    DB_PERMISSION,
+    INTEGRATION_NET_PERMISSION,
+    WEB_NET_PERMISSION,
+    MCP_FEDERATION_PERMISSION,
+    GROVE_RELAY_PERMISSION,
+})
+
+#: Prefix of the namespaced per-tool federated grants `federated_tool_permission()`
+#: mints. These cannot appear in any static allowlist — a `server_id` does not
+#: exist until an operator ratifies the server that produced it — so a name
+#: carrying this prefix is validated against the ratification registry instead
+#: of against a fixed set. See `manifest_admin.validate_permission()`.
+FEDERATED_PERMISSION_PREFIX = "mcp:"
+
 
 def federated_tool_permission(server_id: str, tool: str) -> str:
     """The namespaced permission name for one tool on one downstream MCP
