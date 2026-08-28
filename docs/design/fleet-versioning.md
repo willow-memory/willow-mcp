@@ -110,6 +110,17 @@ callers hold — different for all three.
 | **jeles** | the importable Python API (`jeles.institutional`, `jeles.sources`, `jeles.corpus`, `jeles.willow_mcp_client`, the shared hit key set), `corpus_server`'s tool contract, **and the host-card schema** (`jeles/cards/*.json` — the `host`/`roles`/`publisher`/`custody`/`jurisdiction`/`status`/`notes` fields and the enum values `roles` and `custody` admit) | internals prefixed `_`, including `_egress`; the `observed` field the schema never shipped |
 | **kartikeya** | the `kartikeya`/`kart` CLI and the task-queue schema on disk and in Postgres | the worker internals |
 | **nestor-meaning** | the importable Python API (`nestor.answer`, `nestor.cascade`, `nestor.portable`, `nestor.entity.EntityResolver`, `nestor.sqlite_store.SqliteStore`), the `nestor` CLI | internals prefixed `_`; the dogfood store schema |
+| **willows-grove** | the Grove MCP tool contract (`grove_reader`, `grove_agent_message`, `grove_mcp_token` — names, parameters, documented return keys), the `grove-serve` console entry point, and the **u2u wire format**: Ed25519-signed `knock`/`consent`/`note` on the LAN | the served page itself — DOM, CSS, Web Component tag names and the 127.0.0.1:8766 route shapes it fetches; reader internals |
+
+willows-grove is the first roster member this repo does not depend on, and its
+row is why the roster and the pin rules had to come apart: a released package
+owes its callers a defined surface whether or not willow-mcp imports it. Its
+surface is also the first that is not mostly Python. The u2u wire format is held
+by *other nodes* — a peer that signed a `knock` under 0.9 has no way to learn
+that 1.0 changed the envelope — so it belongs in the left column even though
+nothing in this tree imports it. The served page is deliberately in the right:
+it is loopback-only by design (`safe-app-manifest.json` records no public HTTP
+surface), so its markup has no callers to break.
 
 The importability clause in willow-mcp's row is not decoration. Two fleet
 packages import it: `jeles/willow_mcp_client.py` probes `import willow_mcp` and

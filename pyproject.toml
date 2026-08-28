@@ -170,7 +170,23 @@ Changelog = "https://github.com/willow-memory/willow-mcp/blob/master/CHANGELOG.m
 # the test would pass — and that shrinking the set to `{"jeles"}` silently
 # disabled it. Adding a package here now forces both a correct pin and a row in
 # the doc's Rule 2 table, which is where its public surface gets decided.
-packages = ["willow-mcp", "jeles", "kartikeya", "nestor-meaning"]
+packages = ["willow-mcp", "jeles", "kartikeya", "nestor-meaning", "willows-grove"]
+
+# Roster members this operator releases but this package does not consume.
+# `packages` is the release roster — "the ones whose bump policy we know" — and
+# until willows-grove joined, every member was also a dependency, so the pin
+# rule could read the roster directly. It is not: the grove is the operator's
+# seat, a consumer of willow-mcp rather than a producer for it, and adding a
+# dependency here to satisfy a test would invert that.
+#
+# Rule 2 still applies to everything on the roster — a released package owes
+# callers a defined surface whether or not this repo imports it. Only the pin
+# rules skip these.
+#
+# Listed explicitly, not derived. "Skip anything absent from dependencies" would
+# mean a dropped jeles pin silently stops being enforced, which is the exact
+# failure the roster comment above was written to prevent.
+unconsumed = ["willows-grove"]
 
 [tool.hatch.version]
 # Derived from the git tag (hatch-vcs). At an exact tag `vX.Y.Z` the version is

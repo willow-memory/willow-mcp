@@ -362,10 +362,28 @@ def _claude_hooks_mode(
     entry: dict[str, Any],
     manifest: dict[str, Any] | None,
 ) -> str:
+    """Which Claude hook block, if any, sync writes into settings.local.json.
+
+    - ``generated`` (default) — render the canonical hook set, or compile the
+      project's hook_manifest when it has one.
+    - ``tracked`` — write no hooks; the repo commits its own in
+      ``.claude/settings.json`` and sync validates them against hook_manifest.
+      Requires a manifest, and only fits hooks shaped as one command taking
+      ``<client> <action>``.
+    - ``none`` — write no hooks and validate nothing. For a repo that wires its
+      own Claude hooks in a shape hook_manifest cannot express, so ``tracked``
+      is unavailable: willow-mcp itself keeps ``.claude/settings.json`` in sync
+      with ``deploy/claude-settings.json`` (pinned by
+      tests/test_hook_wiring_sync.py) across three entrypoints, none of which
+      takes an action argument. Without this mode, sync renders the installed
+      guard on top of the repo's dev copy of the same guard and Claude Code
+      merges both files — the identical hook runs twice per gated call.
+    """
     mode = normalize_wiring(entry).get("claude_hooks", "generated")
-    if mode not in ("generated", "tracked"):
+    if mode not in ("generated", "tracked", "none"):
         raise ValueError(
-            f"project {project_id!r}: claude_hooks must be 'generated' or 'tracked'"
+            f"project {project_id!r}: claude_hooks must be 'generated', 'tracked', "
+            f"or 'none'"
         )
     if mode == "tracked" and manifest is None:
         raise ValueError(
