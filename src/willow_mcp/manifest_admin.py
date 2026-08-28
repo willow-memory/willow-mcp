@@ -76,7 +76,7 @@ def validate_permission(perm: str) -> str:
             f"malformed federated permission {perm!r} — expected exactly "
             f"'mcp:<server_id>:<tool>' with both parts non-empty"
         )
-    server_id, tool = parts[1], parts[2]
+    server_id = parts[1]
     if not mcp_federation.is_ratified(server_id):
         ratified = [
             f"{e.get('name', '?')} ({e.get('server_id', '?')})"
