@@ -812,3 +812,100 @@ def test_mapping_path_never_touches_mcp_apps_root(home):
     assert path.exists()
     assert not apps_root.exists(), "mapping_path() must never create mcp_apps_root()"
     assert path.parent == paths.schema_maps_dir("testapp")
+
+
+# ── grant drift (audit_mapping_grants) ────────────────────────────────────────
+# A mapping is a photograph of what an app was permitted to touch when it was
+# profiled. Grants change; nothing re-takes the photograph. Measured 2026-08-28:
+# four agents denied `task_submit` still carried the full execution-and-
+# authorization task mapping, profiled two weeks before their manifests were
+# tightened, and one (nestor) had been re-profiled after and was correctly
+# narrow. Nothing surfaced the difference.
+
+
+@pytest.fixture()
+def home(tmp_path, monkeypatch):
+    """An isolated $WILLOW_HOME with one app."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    (tmp_path / "mcp_apps" / "app").mkdir(parents=True)
+    return tmp_path
+
+
+def _manifest(home, deny=()):
+    p = home / "mcp_apps" / "app" / "manifest.json"
+    p.write_text(json.dumps({"app_id": "app", "deny_tools": list(deny)}))
+    return p
+
+
+def _mapping(home, record):
+    d = home / "schema_maps" / "app"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "db1__tasks.json").write_text(json.dumps(record))
+
+
+def test_a_mapping_profiled_under_the_current_manifest_is_silent(home):
+    _manifest(home)
+    _mapping(home, {"table": "tasks", "confirmed": False,
+                    "manifest_sha256": sp.manifest_digest("app")})
+    assert sp.audit_mapping_grants("app") == []
+
+
+def test_a_grant_change_after_profiling_is_reported(home):
+    """The real defect: the manifest moved and the profile did not."""
+    _manifest(home)
+    _mapping(home, {"table": "tasks", "confirmed": False,
+                    "manifest_sha256": sp.manifest_digest("app")})
+    assert sp.audit_mapping_grants("app") == []
+
+    _manifest(home, deny=["task_submit"])          # the grant tightens
+    issues = sp.audit_mapping_grants("app")
+    assert len(issues) == 1
+    assert "profiled under a different manifest" in issues[0]
+    assert "re-profile before confirming" in issues[0]
+
+
+def test_a_confirmed_mapping_that_drifted_says_so_louder(home):
+    """Confirmed drift is worse: someone ratified a mapping the grant outgrew."""
+    _manifest(home)
+    _mapping(home, {"table": "tasks", "confirmed": True,
+                    "manifest_sha256": sp.manifest_digest("app")})
+    _manifest(home, deny=["task_submit"])
+    assert "already CONFIRMED" in sp.audit_mapping_grants("app")[0]
+
+
+def test_a_mapping_with_no_digest_is_its_own_state(home):
+    """"Not comparable" and "in sync" are different answers.
+
+    Every mapping on the box predates this check. Folding them into either
+    verdict would be a lie in one direction or a false alarm in the other.
+    """
+    _manifest(home)
+    _mapping(home, {"table": "tasks", "confirmed": False})
+    issues = sp.audit_mapping_grants("app")
+    assert len(issues) == 1
+    assert "predates grant tracking" in issues[0]
+    assert "different manifest" not in issues[0]
+
+
+def test_no_manifest_means_no_claim(home):
+    """Absent manifest is not drift — there is nothing to compare against."""
+    _mapping(home, {"table": "tasks", "manifest_sha256": "abc"})
+    assert sp.audit_mapping_grants("app") == []
+
+
+def test_the_digest_is_content_not_mtime(home):
+    """A git checkout rewrites mtimes; it must not move this.
+
+    $WILLOW_HOME is a checkout, so an mtime comparison would go silent or fire
+    on every file at once. Rewriting a manifest with identical bytes must leave
+    the digest unchanged.
+    """
+    path = _manifest(home)
+    first = sp.manifest_digest("app")
+    body = path.read_bytes()
+    path.unlink()
+    path.write_bytes(body)
+    assert sp.manifest_digest("app") == first
+
+    path.write_text(json.dumps({"app_id": "app", "deny_tools": ["task_submit"]}))
+    assert sp.manifest_digest("app") != first

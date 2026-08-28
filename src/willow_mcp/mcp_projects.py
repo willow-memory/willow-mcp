@@ -407,6 +407,20 @@ def audit_project(
 
     issues.extend(audit_project_wiring(project_id, entry))
 
+    # A schema mapping records what an app was permitted to touch when it was
+    # profiled. Grants change and nothing re-takes the profile, so a mapping can
+    # quietly describe a wider surface than the manifest now allows — measured
+    # 2026-08-28, four agents denied `task_submit` still carried the full
+    # execution-and-authorization task mapping, profiled two weeks before their
+    # manifests were tightened. This reports the drift; it does not judge which
+    # fields a grant should permit, because no table-to-tool relation is
+    # declared anywhere and inventing one here would be a second roster.
+    agent = str(entry.get("agent") or "").strip()
+    if agent:
+        from .schema_profile import audit_mapping_grants
+        issues.extend(f"{project_id}: agent {agent!r} {msg}"
+                      for msg in audit_mapping_grants(agent))
+
     proj_path = paths["root"]
     if not proj_path.is_dir():
         issues.append(f"{project_id}: path does not exist → {proj_path}")
