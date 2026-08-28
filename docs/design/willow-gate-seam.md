@@ -352,6 +352,28 @@ that owns `$WILLOW_HOME`):
 ## Open decisions (the forks to settle before wiring)
 - **D1 — tier↔group map:** **settled — see "D1" above.**
 - **D2 — secret store, rotation, CLI:** **settled — see "D2" above.**
+- **D3.1 — the third position, `strict` (added 2026-08-27).** D3 settled that
+  an unregistered app stays manifest-only, so a plain clone keeps working. Correct
+  for adoption, and it leaves one bit carrying two unrelated meanings: "binding is
+  not enabled for this deployment" and "this agent is unknown". willow-gate reads
+  the same fact the opposite way — an unregistered check-in has no expected
+  signature to compare against and is a hard stop
+  (`test_checkin_unregistered_agent_rejected`). While the halves disagree, partial
+  adoption *inverts* the control: registering the gatekeeper and leaving the
+  orchestrator unregistered hardens the lesser identity and leaves the most
+  privileged one on the unbound path, because nothing stops a caller passing a
+  different `app_id`. `on` closes H1 for agents that opted in, which is a weaker
+  claim than closing H1.
+
+  `WILLOW_MCP_ENFORCE_BINDING` now takes three positions — `off` / `on` /
+  `strict`. `strict` is `on` plus: an unregistered app_id is DENIED. It is a
+  separate position rather than a change to `on` because the rollout needs both:
+  register everyone, run `on` and read the `bind_observed` / `bind_enforced`
+  receipts, then move to `strict` once `list-agents` covers the roster. An
+  unrecognized value now raises rather than reading as off — a typo'd `stict`
+  silently meaning "no enforcement" is this section's own failure mode one layer
+  up.
+
 - **D3 — stdio default:** **settled — see "D3" above.** Both: an explicit env
   switch (`WILLOW_MCP_ENFORCE_BINDING`) *and* per-agent registration, so an
   operator can register + observe before the switch can deny anything.
