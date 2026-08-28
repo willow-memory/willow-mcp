@@ -84,8 +84,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Floor and current for requires-python >= 3.11.
-        python-version: ["3.11", "3.12"]
+        # Derived from pyproject.toml's classifiers, not chosen. willow-mcp
+        # advertises 3.11, 3.12 and 3.13 on PyPI; CI ran 3.11 and 3.12, so the
+        # ceiling was a support claim nothing had executed.
+        #
+        # Pull requests run floor and ceiling; push, schedule and dispatch run
+        # the full declared range. Safe only because the required check is the
+        # aggregate `test` job below, never a matrix cell.
+        python-version: ${{ fromJSON(github.event_name == 'pull_request'
+          && '["3.11","3.13"]'
+          || '["3.11","3.12","3.13"]') }}
 
     services:
       postgres:
