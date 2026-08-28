@@ -96,6 +96,63 @@ def test_on_unregistered_app_is_manifest_only(env, monkeypatch):
     assert err is None and eff == "plain"
 
 
+# ── strict: unregistered is refused, not waved through ────────────────────────
+
+def _strict(monkeypatch):
+    monkeypatch.setenv("WILLOW_MCP_ENFORCE_BINDING", "strict")
+
+
+def test_strict_denies_an_unregistered_app(env, monkeypatch):
+    """The whole point of the mode. Under `on` this same call passes
+    manifest-only (test_on_unregistered_app_is_manifest_only above), which is
+    what let a partial rollout harden one agent while the most privileged
+    identity stayed on the unbound path."""
+    env("plain")
+    _strict(monkeypatch)
+    eff, err = server._gate("plain", "store_put")
+    assert eff is None and "binding required" in err["error"]
+    assert "not registered" in err["error"]
+
+
+def test_strict_still_admits_a_registered_agent_that_signs(env, monkeypatch):
+    """Strict tightens only the unregistered case; a properly bound call is
+    unaffected."""
+    env("veep")
+    secret, sid = _check_in("veep", 3)
+    _strict(monkeypatch)
+    server._CALL_CREDENTIAL.set(_sign_call(secret, sid, "veep", "store_get"))
+    eff, err = server._gate("veep", "store_get")
+    assert err is None and eff == "veep"
+
+
+def test_strict_fails_closed_on_an_unreadable_secret_too(env, monkeypatch, tmp_path):
+    """The registered-but-broken tie-break must not be reachable only under
+    `on` — strict is a superset of its denials, never a different set."""
+    env("veep")
+    _check_in("veep", 3)
+    (tmp_path / "gate" / "secrets" / "veep.key").unlink()
+    _strict(monkeypatch)
+    server._CALL_CREDENTIAL.set(None)
+    eff, err = server._gate("veep", "store_get")
+    assert eff is None and "binding unavailable" in err["error"]
+
+
+def test_a_typo_in_the_switch_is_refused_not_read_as_off(env, monkeypatch):
+    """`WILLOW_MCP_ENFORCE_BINDING=stict` silently meaning "no enforcement" is
+    the failure this mode exists to prevent, one layer up."""
+    monkeypatch.setenv("WILLOW_MCP_ENFORCE_BINDING", "stict")
+    with pytest.raises(ValueError, match="not one of"):
+        server._binding_mode()
+
+
+def test_the_switch_has_exactly_three_positions(env, monkeypatch):
+    seen = set()
+    for raw in ("", "0", "false", "no", "off", "1", "true", "yes", "on", "strict"):
+        monkeypatch.setenv("WILLOW_MCP_ENFORCE_BINDING", raw)
+        seen.add(server._binding_mode())
+    assert seen == set(server._BINDING_MODES)
+
+
 # ── enforcement on + registered: the credential is required and checked ────────
 
 def test_registered_but_unreadable_secret_fails_closed(env, monkeypatch, tmp_path):

@@ -147,15 +147,60 @@ def _current_call_credential() -> Optional[dict]:
     return _read_call_credential()
 
 
+#: The three positions of the Phase 3 switch. `on` and `strict` differ only in
+#: what an UNREGISTERED app_id means — see `_binding_mode`.
+_BINDING_MODES = ("off", "on", "strict")
+
+
+def _binding_mode() -> str:
+    """Phase 3 switch, read live (not cached) so it can be toggled per process /
+    per test. Returns one of `_BINDING_MODES`.
+
+    - **off** (default) — registering an agent while this is off is exactly
+      Phase 2 (observe-only), so an operator can watch the binding in receipts
+      before the day it can lock anyone out.
+    - **on** — a *registered* app must present a valid per-call signature and
+      clear the tier ceiling. An *unregistered* app stays manifest-only
+      (seam-doc D3), so a plain clone keeps working.
+    - **strict** — as `on`, and an *unregistered* app is DENIED.
+
+    Why `strict` exists. Under `on`, "not in the keystore" means two unrelated
+    things at once: "binding is not enabled for this deployment" and "this agent
+    is unknown". willow-gate reads the same fact the opposite way — an
+    unregistered check-in has no expected signature to compare against and is a
+    hard stop (`test_checkin_unregistered_agent_rejected`). While the two halves
+    disagree, partial adoption inverts the control's value: registering the
+    gatekeeper and leaving the orchestrator unregistered hardens the lesser
+    identity and leaves the most privileged one on the unbound path, since
+    nothing stops a caller passing a different `app_id`. `on` closes H1 for
+    agents that opted in, which is a weaker claim than closing H1.
+
+    `strict` is where the halves finally agree: unknown means refuse, end to
+    end. It is a separate position rather than a change to `on` because the
+    rollout needs both — register everyone, run `on` and read the receipts, then
+    move to `strict` once `list-agents` covers the roster.
+
+    An unrecognized value is refused rather than silently treated as off: a
+    typo'd `WILLOW_MCP_ENFORCE_BINDING=stict` must not read as "no enforcement".
+    """
+    raw = os.environ.get("WILLOW_MCP_ENFORCE_BINDING", "").strip().lower()
+    if raw in ("", "0", "false", "no", "off"):
+        return "off"
+    if raw in ("1", "true", "yes", "on"):
+        return "on"
+    if raw == "strict":
+        return "strict"
+    raise ValueError(
+        f"WILLOW_MCP_ENFORCE_BINDING={raw!r} is not one of "
+        f"off/0/false/no, on/1/true/yes, strict")
+
+
 def _enforce_binding() -> bool:
-    """Phase 3 master switch, read live (not cached) so it can be toggled per
-    process / per test. OFF by default: registering an agent while this is off is
-    exactly Phase 2 (observe-only), so an operator can watch the binding in
-    receipts before the day it can lock anyone out. ON: a *registered* app must
-    present a valid per-call signature and clear the tier ceiling; an
-    *unregistered* app stays manifest-only (seam-doc D3)."""
-    return os.environ.get("WILLOW_MCP_ENFORCE_BINDING", "").strip().lower() in (
-        "1", "true", "yes", "on")
+    """True when the Phase 3 gate runs at all — `on` or `strict`. Call sites that
+    only need "is the gate live" keep using this; the on/strict distinction is
+    read inside `_enforce_binding_gate`, which is the one place it changes an
+    outcome."""
+    return _binding_mode() != "off"
 
 
 def _authority_check_enabled() -> bool:
@@ -276,10 +321,15 @@ def _enforce_binding_gate(app_id: str, tool_name: str) -> Optional[dict]:
     path. Records the successful bind receipt itself so the audit line survives;
     denials are receipted by the _guarded wrapper.
 
-    Rule (seam-doc §1 opt-in, D3): if the app is *not registered* in the keystore,
-    this is a no-op — a plain local clone keeps working with manifest-only auth and
-    no HMAC ceremony. If it *is* registered, the call must carry a valid signed
-    credential whose bound tier is high enough for this tool, or it is denied."""
+    Rule (seam-doc §1 opt-in, D3): under `on`, if the app is *not registered* in
+    the keystore this is a no-op — a plain local clone keeps working with
+    manifest-only auth and no HMAC ceremony. If it *is* registered, the call must
+    carry a valid signed credential whose bound tier is high enough for this
+    tool, or it is denied.
+
+    Under `strict`, an unregistered app is DENIED instead, which is the only
+    position in which this gate and willow-gate's own check-in agree that an
+    unknown identity is refused. See `_binding_mode`."""
     # The check-in call itself carries no per-call credential (there is no session
     # yet) and authenticates via its own header HMAC — exempt it, or enforcement is
     # a bootstrap deadlock. The only exemption.
@@ -296,7 +346,13 @@ def _enforce_binding_gate(app_id: str, tool_name: str) -> Optional[dict]:
                 f"binding unavailable: '{app_id}' is registered but its secret is "
                 f"unreadable or invalid — refusing (fail-closed). An operator must "
                 f"repair the keystore ($WILLOW_HOME/gate/secrets/).")}
-        return None  # genuinely unregistered ⇒ manifest-only, unchanged
+        if _binding_mode() == "strict":
+            return {"error": (
+                f"binding required: '{app_id}' is not registered in the keystore "
+                f"and WILLOW_MCP_ENFORCE_BINDING=strict refuses unregistered "
+                f"identities. Register it (`willow-mcp register-agent {app_id} "
+                f"--max-trust N`) or run with =on to allow manifest-only apps.")}
+        return None  # genuinely unregistered ⇒ manifest-only (mode 'on')
     cred = _current_call_credential()
     if not cred:
         return {"error": (
