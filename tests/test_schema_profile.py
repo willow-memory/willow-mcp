@@ -756,6 +756,30 @@ def test_preview_table_not_found():
     assert sp.preview(conn, "app", "ghost", CANONICAL) == {"error": "table_not_found", "table": "ghost"}
 
 
+# ── container names are not app_ids ─────────────────────────────────────────
+
+def test_container_dir_names_are_rejected_as_app_ids(home):
+    """`_APP_ID_RE` admits any word, so an app_id equal to its own container
+    built `<container>/<container>` and every per-app walk reported a phantom
+    app. It happened twice in the fleet tree: mcp_apps/schema_maps/ before the
+    B-50 relocation and schema_maps/schema_maps/ after it."""
+    import pytest
+    from willow_mcp import paths
+
+    for reserved in ("schema_maps", "mcp_apps", "handoffs", "sessions"):
+        for build in (paths.schema_maps_dir, paths.mcp_app_dir, paths.handoffs_dir):
+            with pytest.raises(ValueError, match="container directory"):
+                build(reserved)
+
+
+def test_ordinary_app_ids_still_resolve(home):
+    from willow_mcp import paths
+
+    assert paths.schema_maps_dir("willow").name == "willow"
+    assert paths.mcp_app_dir("heimdallr").name == "heimdallr"
+    assert paths.handoffs_dir("nestor").name == "nestor"
+
+
 # ── B-50/#238: schema_maps/ must never live under mcp_apps/ ─────────────────
 
 def test_schema_maps_dir_is_not_under_mcp_apps_root(home):

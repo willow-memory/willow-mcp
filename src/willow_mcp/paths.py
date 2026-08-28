@@ -37,6 +37,29 @@ def trusted_read(path: Path) -> None:
 
 _DISPATCH_ID_RE = re.compile(r"^[A-Z0-9]{8}$")
 _APP_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
+
+#: Directory names under $WILLOW_HOME that hold per-app subdirectories. An
+#: app_id equal to its own container yields `<container>/<container>` — a path
+#: that shadows the container and makes every per-app walk report a phantom
+#: app. The regex above admits these, so the collision has happened twice in
+#: this tree: `mcp_apps/schema_maps/` (2026-08-10, pre-B-50) and
+#: `schema_maps/schema_maps/` (2026-08-18, after the relocation). Neither is an
+#: app; both were discovered only by reading the directory.
+_CONTAINER_DIR_NAMES = frozenset({"mcp_apps", "schema_maps", "handoffs", "sessions"})
+
+
+def _validate_app_id(app_id: str) -> str:
+    """Shape check plus a reserved-name guard. Raises ValueError, never returns
+    an invalid id — callers build filesystem paths straight from the result."""
+    if not _APP_ID_RE.match(app_id or ""):
+        raise ValueError(f"invalid app_id: {app_id!r}")
+    if app_id in _CONTAINER_DIR_NAMES:
+        raise ValueError(
+            f"invalid app_id: {app_id!r} names a container directory, not an app"
+        )
+    return app_id
+
+
 _PROJECT_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")
 _PACKAGE_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 
@@ -148,8 +171,7 @@ def sessions_dir() -> Path:
 
 
 def session_path(app_id: str, session_id: str) -> Path:
-    if not _APP_ID_RE.match(app_id or ""):
-        raise ValueError(f"invalid app_id: {app_id!r}")
+    _validate_app_id(app_id)
     safe_sid = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id or "")[:64]
     return sessions_dir() / f"{app_id}-{safe_sid}.json"
 
@@ -172,8 +194,7 @@ def session_attestation_path(app_id: str, session_id: str) -> Path:
     {app_id, session_id} identity tuple attest-session actually needs to
     vouch for, and is written once, atomically with its .sig, by attest-session
     -- normal session writes never touch it."""
-    if not _APP_ID_RE.match(app_id or ""):
-        raise ValueError(f"invalid app_id: {app_id!r}")
+    _validate_app_id(app_id)
     safe_sid = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id or "")[:64]
     return sessions_dir() / f"{app_id}-{safe_sid}.attest.json"
 
@@ -182,8 +203,7 @@ def handoffs_dir(app_id: str = "") -> Path:
     base = willow_home() / "handoffs"
     if not app_id:
         return base
-    if not _APP_ID_RE.match(app_id):
-        raise ValueError(f"invalid app_id: {app_id!r}")
+    _validate_app_id(app_id)
     return base / app_id
 
 
@@ -256,8 +276,7 @@ def mcp_apps_root() -> Path:
 
 
 def mcp_app_dir(app_id: str) -> Path:
-    if not _APP_ID_RE.match(app_id or ""):
-        raise ValueError(f"invalid app_id: {app_id!r}")
+    _validate_app_id(app_id)
     return mcp_apps_root() / app_id
 
 
@@ -282,8 +301,7 @@ def schema_maps_dir(app_id: str) -> Path:
     sweep. Relocated here (a sibling of store_root()/dispatch_root(), same
     "runtime state, not policy" class) so the conflict can't happen at all.
     """
-    if not _APP_ID_RE.match(app_id or ""):
-        raise ValueError(f"invalid app_id: {app_id!r}")
+    _validate_app_id(app_id)
     return willow_home() / "schema_maps" / app_id
 
 
