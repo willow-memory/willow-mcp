@@ -599,6 +599,75 @@ def _validate_table(table: str) -> str:
     return table
 
 
+def manifest_digest(app_id: str) -> str:
+    """Content digest of the manifest in force for ``app_id``, or ``""``.
+
+    A mapping is a photograph of what an app was permitted to touch when the
+    profile was taken. Grants change; nothing re-takes the photograph. Recording
+    the manifest's digest alongside the mapping makes that drift *detectable*
+    rather than merely true — the same move `provenance.toolchain` makes in
+    nestor, and for the same stated reason: a content hash cannot be bumped by
+    hand and cannot go stale.
+
+    A digest rather than an mtime on purpose. ``$WILLOW_HOME`` is a git
+    checkout, so a clone or a `git checkout` rewrites every mtime and a
+    timestamp comparison would go silent or fire on every file at once.
+    """
+    try:
+        path = paths.willow_home() / "mcp_apps" / app_id / "manifest.json"
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+    except Exception:  # noqa: BLE001 — provenance is a courtesy, never an outage
+        return ""
+
+
+def audit_mapping_grants(app_id: str) -> list[str]:
+    """Mappings whose manifest changed since they were profiled.
+
+    Returns drift messages, empty when in sync. Messages are unprefixed —
+    the caller names the seat, because one agent's mappings are audited under
+    whichever project points at it (project ``github`` uses agent ``willow``). Deliberately says nothing about
+    WHICH fields a grant should permit: there is no declared table-to-tool
+    relation in this package, so any such rule would be a second roster invented
+    here and free to drift from the manifests it claims to describe. This
+    reports only the fact a reader can act on — *the grant moved after the
+    profile was taken; re-profile before confirming.*
+
+    A mapping with no recorded digest predates this check. That is reported as
+    its own state rather than folded into either verdict, because "not
+    comparable" and "in sync" are different answers and only one of them is
+    reassuring.
+    """
+    issues: list[str] = []
+    try:
+        root = paths.schema_maps_dir(app_id)
+    except Exception:  # noqa: BLE001
+        return issues
+    if not root.is_dir():
+        return issues
+    current = manifest_digest(app_id)
+    if not current:
+        return issues
+    for path in sorted(root.glob("*.json")):
+        try:
+            record = json.loads(path.read_text())
+        except Exception:  # noqa: BLE001
+            issues.append(f"unreadable schema mapping -> {path}")
+            continue
+        recorded = str(record.get("manifest_sha256") or "")
+        table = record.get("table") or path.stem
+        if not recorded:
+            issues.append(
+                f"schema mapping for {table!r} predates grant tracking "
+                f"(no manifest_sha256) - re-profile to establish a baseline")
+        elif recorded != current:
+            issues.append(
+                f"schema mapping for {table!r} was profiled under a "
+                f"different manifest ({recorded[:12]} != {current[:12]}) - the "
+                f"grant changed since; re-profile before confirming"
+                + ("  [and it is already CONFIRMED]" if record.get("confirmed") else ""))
+    return issues
+
+
 def mapping_path(app_id: str, fingerprint: str, table: str) -> Path:
     _validate_table(table)
     # B-50/#238: schema_maps/ lives outside mcp_apps/<app_id>/ specifically
@@ -671,6 +740,7 @@ def resolve(conn, app_id: str, table: str, canonical_fields: list[str]) -> dict:
         "database": fingerprint,
         "table": table,
         "discovered_at": datetime.now(timezone.utc).isoformat(),
+        "manifest_sha256": manifest_digest(app_id),
         "confirmed": False,
         "fields": fresh_fields,
     }
@@ -807,6 +877,10 @@ def confirm(
         "database": fingerprint,
         "table": table,
         "discovered_at": (existing or {}).get("discovered_at") or datetime.now(timezone.utc).isoformat(),
+        # Stamped at CONFIRM time, not carried from the profile: confirming is
+        # the act that says "this mapping is right for what this app may do",
+        # so the grant it was judged against is the one in force now.
+        "manifest_sha256": manifest_digest(app_id),
         "confirmed": True,
         "confirmed_at": datetime.now(timezone.utc).isoformat(),
         "fields": fields,
