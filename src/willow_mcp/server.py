@@ -7571,6 +7571,101 @@ def main():
         sys.exit(1)
 
 
+def _cmd_federation(args) -> None:
+    """`willow-mcp federation` — the operator half of federated MCP.
+
+    `mcp_federation.ratify()` says of itself "**Operator-only — never call this
+    from an MCP tool**", and it was right to: ratifying a downstream server is
+    the act `federation_egress`'s ceiling check depends on, so it must be a host
+    act. But no operator command reached it either, so the only supported way to
+    ratify anything was to import the module by hand. An operator-only function
+    with no operator path is not a locked door, it is a wall — and the empty
+    registry it produced read as nobody having federated a server yet rather
+    than as nobody being able to.
+
+    Local/stdio-only, exactly like `grant-net` and `allow-permission`.
+    """
+    from . import gate, mcp_federation
+
+    action = args.federation_action
+
+    if action == "list":
+        rows = mcp_federation.list_ratified()
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return
+        if not rows:
+            print("No ratified downstream MCP servers.")
+            print("  `willow-mcp federation discover` to see what exists on this host.")
+            return
+        for e in rows:
+            print(f"{e.get('server_id') or e.get('id')}  {e.get('name')}")
+            print(f"    command: {e.get('command')} {' '.join(e.get('args') or [])}")
+            print(f"    env_keys: {list(e.get('env_keys') or []) or '() — receives no environment'}")
+            print(f"    ratified: {e.get('ratified_by')} at {e.get('ratified_at')}")
+            if e.get("reason"):
+                print(f"    reason: {e['reason']}")
+        return
+
+    scan_root = Path(args.root) if getattr(args, "root", None) else Path(
+        os.environ.get("WILLOW_MCP_FEDERATION_SCAN_ROOT", "") or Path.home()
+    )
+
+    if action == "discover":
+        specs = mcp_federation.discover_all_specs(scan_root)
+        ratified = {e.get("id") or e.get("server_id") for e in mcp_federation.list_ratified()}
+        if args.json:
+            print(json.dumps(
+                [{**sp.to_dict(), "ratified": sp.id in ratified} for sp in specs], indent=2))
+            return
+        if not specs:
+            print(f"No .mcp.json server entries found under {scan_root}.")
+            return
+        print(f"Discovered under {scan_root} ({len(specs)} entries):")
+        for sp in specs:
+            mark = "ratified" if sp.id in ratified else "NOT ratified"
+            print(f"  {sp.id}  {sp.name}  [{mark}]")
+            print(f"      {sp.command} {' '.join(sp.args)}")
+            print(f"      from {sp.source_path}")
+        return
+
+    if action == "ratify":
+        specs = {sp.id: sp for sp in mcp_federation.discover_all_specs(scan_root)}
+        spec = specs.get(args.server_id)
+        if spec is None:
+            print(f"Error: no discovered server with id {args.server_id!r} under "
+                  f"{scan_root}.", file=sys.stderr)
+            print("Run `willow-mcp federation discover` to list ids. A server is "
+                  "ratified from a spec that was actually read off disk, never "
+                  "from arguments typed at this prompt — the id is a digest of "
+                  "the launch identity, so a hand-typed one would ratify "
+                  "something nobody verified exists.", file=sys.stderr)
+            raise SystemExit(1)
+        try:
+            entry = mcp_federation.ratify(
+                spec, ratified_by=args.by, reason=args.reason or "")
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"Ratified {entry['name']!r} (server_id={entry['id']}) by {entry['ratified_by']!r}.")
+        print(f"  env_keys: {list(entry.get('env_keys') or []) or '() — receives no environment'}")
+        print()
+        print("Ratification makes the server connectable. It grants nothing:")
+        print(f"  willow-mcp allow-permission <app_id> {gate.MCP_FEDERATION_PERMISSION}")
+        print(f"  willow-mcp allow-permission <app_id> mcp:{entry['id']}:<tool>   (one per tool)")
+        return
+
+    if action == "revoke":
+        if mcp_federation.revoke_ratification(args.server_id):
+            print(f"Revoked ratification for {args.server_id!r}.")
+            print("  Any `mcp:<server_id>:<tool>` grants naming it now deny at "
+                  "every call; revoke them too if they are meant to stay gone.")
+        else:
+            print(f"No ratified server {args.server_id!r}.", file=sys.stderr)
+            raise SystemExit(1)
+        return
+
+
 def _cmd_project(args) -> None:
     """`willow-mcp project` — sync/audit agent-agnostic IDE wiring from the registry."""
     from . import mcp_projects
@@ -8113,6 +8208,26 @@ def _main():
     deny_p.add_argument("app_id")
     deny_p.add_argument("permission")
 
+    federation_p = subparsers.add_parser(
+        "federation",
+        help="Operator half of federated MCP: discover, ratify, revoke downstream servers")
+    federation_sub = federation_p.add_subparsers(dest="federation_action", required=True)
+    fed_list_p = federation_sub.add_parser("list", help="Ratified downstream MCP servers")
+    fed_list_p.add_argument("--json", action="store_true")
+    fed_disc_p = federation_sub.add_parser(
+        "discover", help="`.mcp.json` server entries on this host, ratified or not")
+    fed_disc_p.add_argument("--root", default="", help="scan root (default: $HOME)")
+    fed_disc_p.add_argument("--json", action="store_true")
+    fed_rat_p = federation_sub.add_parser(
+        "ratify", help="Promote a discovered server into the ratified registry")
+    fed_rat_p.add_argument("server_id", help="id from `federation discover`")
+    fed_rat_p.add_argument("--by", required=True,
+                           help="who is ratifying — an unattributed ratification is not one")
+    fed_rat_p.add_argument("--reason", default="")
+    fed_rat_p.add_argument("--root", default="", help="scan root (default: $HOME)")
+    fed_rev_p = federation_sub.add_parser("revoke", help="Remove a server's ratification")
+    fed_rev_p.add_argument("server_id")
+
     tree_p = subparsers.add_parser(
         "tree",
         help="Dump every tree part (trunk/sap/canopy/roots/rings/leaves/litter/stomata) "
@@ -8291,6 +8406,8 @@ def _main():
     if args.command == "deny-permission":
         _cmd_set_permission(args, granted=False)
         return
+    if args.command == "federation":
+        return _cmd_federation(args)
     if args.command == "tree":
         _cmd_tree(args)
         return
