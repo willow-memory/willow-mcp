@@ -909,3 +909,99 @@ def test_the_digest_is_content_not_mtime(home):
 
     path.write_text(json.dumps({"app_id": "app", "deny_tools": ["task_submit"]}))
     assert sp.manifest_digest("app") != first
+
+
+# ── ring promotion over a lying exact name ───────────────────────────────────
+# propose_mapping decides exact -> rooted -> alias and the exact tier
+# `continue`s, so a column merely SHARING the field's name wins before any ring
+# is read. That is right almost always and wrong in exactly the case that grows
+# rings: measured 2026-08-28, confirming knowledge with content -> summary grew
+# the ring, and re-profiling still proposed content -> content because a column
+# named `content` exists. The correction could never reach the case that made it.
+
+_KNOWLEDGE_COLS = {"id": "text", "summary": "text", "content": "jsonb",
+                   "project": "text", "domain": "text", "source_type": "text"}
+_CANON = ["id", "content", "domain", "source"]
+
+
+def _by_name(cols=None):
+    return {n: sp.ColumnInfo(n, t) for n, t in (cols or _KNOWLEDGE_COLS).items()}
+
+
+def _fields(by_name, rings=None):
+    return sp.propose_mapping(list(by_name.values()), _CANON, rings)
+
+
+def test_a_ring_outranks_an_exact_name_the_data_contradicts():
+    by_name = _by_name()
+    fields = _fields(by_name)
+    assert fields["content"]["column"] == "content", "precondition: exact wins first"
+
+    shapes = {"content": "reference", "summary": "prose", "id": "freetext",
+              "project": "enum", "source_type": "enum"}
+    proms = sp.promote_rings_over_lying_names(
+        fields, shapes, {"summary": {"content": 1}}, by_name, _CANON)
+
+    assert fields["content"]["column"] == "summary"
+    assert fields["content"]["tier"] == "rooted"
+    assert [p["field"] for p in proms] == ["content"]
+
+
+def test_a_ring_does_not_hijack_an_exact_match_that_fits(): 
+    """The cross-table leak. Rings are keyed on column names GLOBALLY, not per
+    table, so an unconditional promotion would let a ring learned from one
+    table override a correct mapping on another that happens to share columns.
+    """
+    by_name = _by_name()
+    fields = _fields(by_name)
+    shapes = {"content": "prose", "summary": "prose"}   # here `content` is fine
+    proms = sp.promote_rings_over_lying_names(
+        fields, shapes, {"summary": {"content": 9}}, by_name, _CANON)
+
+    assert fields["content"]["column"] == "content", "a fitting exact match must stand"
+    assert proms == []
+
+
+def test_no_promotion_when_the_ring_points_somewhere_no_better():
+    by_name = _by_name()
+    fields = _fields(by_name)
+    shapes = {"content": "reference", "summary": "reference"}   # both wrong
+    assert sp.promote_rings_over_lying_names(
+        fields, shapes, {"summary": {"content": 1}}, by_name, _CANON) == []
+    assert fields["content"]["column"] == "content"
+
+
+def test_an_empty_column_cannot_demonstrate_the_name_lied():
+    """`domain` on the real table is empty. Emptiness is not evidence: a column
+    may be legitimately new and unpopulated, and promoting off it on that basis
+    would be a guess wearing a correction's clothes."""
+    by_name = _by_name()
+    fields = _fields(by_name)
+    shapes = {"domain": "empty", "project": "enum"}
+    assert sp.promote_rings_over_lying_names(
+        fields, shapes, {"project": {"domain": 1}}, by_name, _CANON) == []
+    assert fields["domain"]["column"] == "domain"
+
+
+def test_promotions_are_reported_never_silent():
+    """This changes which column a write lands in. Silence would be its own defect."""
+    by_name = _by_name()
+    fields = _fields(by_name)
+    proms = sp.promote_rings_over_lying_names(
+        fields, {"content": "reference", "summary": "prose"},
+        {"summary": {"content": 1}}, by_name, _CANON)
+    p = proms[0]
+    assert p["from_column"] == "content" and p["to_column"] == "summary"
+    assert p["from_shape"] == "reference" and p["to_shape"] == "prose"
+    assert "outside the expected" in p["reason"]
+
+
+def test_no_rings_and_no_shapes_change_nothing():
+    by_name = _by_name()
+    fields = _fields(by_name)
+    before = {f: fields[f]["column"] for f in _CANON}
+    assert sp.promote_rings_over_lying_names(fields, {}, {"summary": {"content": 1}},
+                                             by_name, _CANON) == []
+    assert sp.promote_rings_over_lying_names(fields, {"content": "reference"}, {},
+                                             by_name, _CANON) == []
+    assert {f: fields[f]["column"] for f in _CANON} == before
