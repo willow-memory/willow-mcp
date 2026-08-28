@@ -492,6 +492,68 @@ def _sample_columns(conn, table: str, columns: list, limit: int = 8) -> dict:
     return out
 
 
+def promote_rings_over_lying_names(fields: dict, shapes: dict, rings: dict,
+                                   by_name: dict, canonical_fields: list[str]) -> list[dict]:
+    """Let a learned ring outrank an exact name match the data contradicts.
+
+    `propose_mapping` decides `exact -> rooted -> alias`, and the exact tier
+    `continue`s, so a column that merely *shares the field's name* is chosen
+    before any ring is consulted. That short-circuit is right almost always and
+    catastrophic in exactly one case: the case that grows rings at all.
+
+    A ring only exists because a human once overrode a name match on that
+    column pair — `grow_ring` skips trivial `column == field` matches precisely
+    because they teach nothing. So the only rings held are corrections, and the
+    only situation they could correct is a lying name, which is the situation
+    the exact tier discards. Measured 2026-08-28: confirming the `knowledge`
+    mapping with `content -> summary` grew that ring, and re-profiling still
+    proposed `content -> content`, because a column named `content` exists. The
+    correction could never be applied to the case that produced it.
+
+    **Gated on shape, not merely on a ring existing.** The ring store is keyed
+    on column names globally rather than per table, so an unconditional
+    promotion would let `summary -> content`, learned from one table, hijack a
+    correct `content -> content` on any other table carrying both columns —
+    a worse defect than the one being fixed. Promotion therefore requires the
+    exact column's sampled shape to fall OUTSIDE the field's expected set: the
+    name match must be demonstrably wrong here, not merely overridden once
+    somewhere else.
+
+    Mutates `fields` in place and returns one record per promotion, for the
+    caller to surface. Silent promotion would be its own defect — this changes
+    which column a write lands in.
+    """
+    promotions: list[dict] = []
+    if not rings or not shapes:
+        return promotions
+    taken = {v.get("column") for v in fields.values() if v.get("column")}
+    for field in canonical_fields:
+        current = fields.get(field, {})
+        col = current.get("column")
+        if not col or current.get("tier") != "exact":
+            continue
+        expected = _EXPECTED_SHAPES.get(field)
+        if not expected or shapes.get(col) in expected or shapes.get(col) in (None, "empty"):
+            continue  # the name match is fine, or the data cannot say
+        rooted = _deepest_root(rings, field, by_name, taken - {col})
+        if rooted is None or rooted == col or shapes.get(rooted) not in expected:
+            continue  # no ring, or the ring points somewhere no better
+        fields[field] = {
+            "column": rooted, "tier": "rooted",
+            "confidence": 0.95, "data_type": by_name[rooted].data_type,
+        }
+        taken.discard(col)
+        taken.add(rooted)
+        promotions.append({
+            "field": field, "from_column": col, "to_column": rooted,
+            "from_shape": shapes.get(col), "to_shape": shapes.get(rooted),
+            "reason": (f"exact name match {col!r} holds {shapes.get(col)!r}, outside "
+                       f"the expected {sorted(expected)}; a confirmed ring names "
+                       f"{rooted!r}, which fits"),
+        })
+    return promotions
+
+
 def refine_with_data(conn, table: str, fields: dict, canonical_fields: list[str],
                      columns: Optional[list] = None, limit: int = 8) -> dict:
     """Advisory data-shape pass over a name-based proposal. Returns
@@ -827,6 +889,19 @@ def preview(conn, app_id: str, table: str, canonical_fields: list[str],
         err["table"] = table
         return err
     refined = refine_with_data(conn, table, fields, canonical_fields, columns=columns)
+    # Applied only when the caller supplied no override for that field: an
+    # explicit override is a human deciding now, and a ring is a human who
+    # decided once before. The present one wins.
+    promotions = promote_rings_over_lying_names(
+        fields, refined["shapes"], read_rings(), by_name,
+        [f for f in canonical_fields if f not in (overrides or {})])
+    # A suggestion for a field that was just promoted describes the mapping as
+    # it stood a moment ago. Leaving it in would report a trap the reader is
+    # looking at the fix for, which reads as the fix not having worked.
+    if promotions:
+        promoted = {p["field"] for p in promotions}
+        refined["suggestions"] = [g for g in refined["suggestions"]
+                                  if g.get("field") not in promoted]
     return {
         "schema_version": SCHEMA_VERSION,
         "database": fingerprint,
@@ -837,6 +912,7 @@ def preview(conn, app_id: str, table: str, canonical_fields: list[str],
         "sample": render_sample(conn, table, fields),
         "shapes": refined["shapes"],
         "suggestions": refined["suggestions"],
+        "ring_promotions": promotions,
     }
 
 
