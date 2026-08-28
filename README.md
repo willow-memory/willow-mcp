@@ -198,6 +198,12 @@ Runtime layout: [docs/design/product-layout.md](docs/design/product-layout.md) (
 See [docs/OPERATOR-ONBOARD.md](docs/OPERATOR-ONBOARD.md). Use `wmc` or the product venv
 binary — not bare `willow-mcp` on PATH when the legacy `sap_mcp.py` server is installed.
 
+**Wiring a project into the fleet:** [docs/PROJECT-WIRING.md](docs/PROJECT-WIRING.md) —
+the four `project sync` behaviors whose symptom shows up nowhere near the cause
+(`claude_hooks` defaulting to `generated`, `wiring.hooks` being Cursor-only,
+`trusted_read`'s real-path/mode-644 rules, and manifest verification refusing
+boot fleet-wide on one bad row).
+
 A task that reaches the network requires **all three standing keys** plus a
 one-use signed task envelope. Any missing element denies before shell launch:
 
