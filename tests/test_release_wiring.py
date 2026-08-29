@@ -50,6 +50,23 @@ def _tag_patterns() -> list[str]:
     return list(trigger["push"]["tags"])
 
 
+
+# A credential whose events actually trigger workflows — the property, not the
+# mechanism. GITHUB_TOKEN's events are suppressed; the willow-ci App token and
+# the PAT it replaces both are not. Matched against raw values because an App
+# token is `steps.app-token.outputs.token`, a step output rather than a secret
+# reference, so it never appears in a set of secret NAMES.
+NON_SUPPRESSED_CREDENTIALS = (
+    "RELEASE_PLEASE_TOKEN",              # fine-grained PAT (being retired)
+    "steps.app-token.outputs.token",     # willow-ci App installation token
+)
+
+
+def _names_a_non_suppressed_credential(value: object) -> bool:
+    text = str(value)
+    return any(c in text for c in NON_SUPPRESSED_CREDENTIALS)
+
+
 def test_the_tag_release_please_creates_matches_what_release_yml_listens_for():
     """The one that mattered. With `include-component-in-tag` unset it defaults
     to true, and the tag becomes `<package-name>-vX.Y.Z` — which `v*` does not
@@ -105,12 +122,14 @@ def test_release_automation_uses_the_pat_everywhere():
     # mentions GITHUB_TOKEN by name to explain the trap, and a plain substring
     # search flags that prose — which is a test failing on its own docstring.
     used = set()
+    values: list[str] = []
     for step in steps:
         for value in list((step.get("env") or {}).values()) + \
                      list((step.get("with") or {}).values()):
+            values.append(str(value))
             used.update(re.findall(r"secrets\.([A-Z_]+)", str(value)))
 
-    assert "RELEASE_PLEASE_TOKEN" in used, used
+    assert any(_names_a_non_suppressed_credential(v) for v in values), used
     assert "GITHUB_TOKEN" not in used, (
         "release-please and the auto-merge arming must both use the PAT — "
         f"events generated with GITHUB_TOKEN start no workflow runs. Found: {used}"
@@ -175,7 +194,7 @@ def test_the_release_body_is_synced_after_the_release_is_created():
     run = step["run"]
     assert "--print-section" in run, "must take the body from the corrected changelog"
     assert "gh release edit" in run
-    assert "RELEASE_PLEASE_TOKEN" in str(step.get("env"))
+    assert _names_a_non_suppressed_credential(step.get("env"))
     assert "GITHUB_TOKEN" not in str(step.get("env"))
 
     # The step above can leave the tree on the release PR branch; this one must
@@ -215,7 +234,7 @@ def test_the_release_prs_own_description_is_synced_too():
         "must reuse the section already computed for the changelog/release-body "
         "sync, not recompute it a third way"
     )
-    assert "RELEASE_PLEASE_TOKEN" in str(step.get("env"))
+    assert _names_a_non_suppressed_credential(step.get("env"))
     assert "GITHUB_TOKEN" not in str(step.get("env"))
 
     # The splice must run after CHANGELOG.md is pushed (so the section it reads
@@ -276,7 +295,7 @@ def test_the_checkout_uses_the_pat_so_its_pushes_are_not_gated():
     checkout = next(s for s in steps
                     if str(s.get("uses", "")).startswith("actions/checkout"))
     token = str((checkout.get("with") or {}).get("token", ""))
-    assert "RELEASE_PLEASE_TOKEN" in token, (
-        "checkout must use the PAT — its credential is what the changelog "
-        f"step pushes with. Got: {token!r}")
+    assert _names_a_non_suppressed_credential(token), (
+        "checkout must carry a credential whose events trigger workflows. "
+        f"Got: {token!r}")
     assert "GITHUB_TOKEN" not in token
