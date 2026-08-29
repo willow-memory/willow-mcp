@@ -26,10 +26,18 @@ and the code is written fresh against this package's own types.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Iterable, Optional, Sequence
+
+#: The environment variable a store declares its lane in. One variable, no
+#: table of store names — a mapping kept here would be a second copy of a fact
+#: the deployment already holds, and decision 0227's rule is that "the
+#: enumeration must be the authority, never a copy of one". `WILLOW_PG_DB`
+#: already says *which* store; this says *what kind*.
+LANE_ENV = "WILLOW_LANE"
 
 
 class Lane(Enum):
@@ -54,16 +62,58 @@ class Lane(Enum):
         return self.value
 
     @classmethod
-    def of(cls, sensitivity: Optional[str]) -> "Lane":
-        """The lane a row belongs to, from its `sensitivity` field.
+    def of_store(cls, declared: Optional[str] = None) -> "Lane":
+        """The lane the connected store carries — **the authoritative answer.**
 
-        **Fail closed.** An unset, empty, or unrecognised value resolves to
-        PERSONAL, never SYSTEM. An unmarked row is not a row proven open; it is
-        a row nobody has classified, and the cost of the two mistakes is not
-        symmetric — serving a private record as open cannot be undone by later
-        marking it, while refusing an open record produces a visible, fixable
-        complaint. Same asymmetry `gate.store_scope` uses when it reads "no
-        manifest" as deny-all.
+        A lane is a property of the store, not a column on the row, and that is
+        the whole design rather than an implementation convenience:
+
+        * a per-row label must be checked on every query, every join, and every
+          semantic neighbour, and one missed filter is a silent leak. A store
+          boundary is enforced by whether a connection exists at all.
+        * a row can be mislabeled; there is no label to get wrong.
+        * separability — the operator's stated requirement, that personal data
+          can be exported or deleted whole and the system keep running — is
+          `pg_dump` on one store, not a predicate over another's rows.
+
+        Declared, never guessed. `WILLOW_PG_DB` already names *which* store the
+        process is connected to; `WILLOW_LANE` says *what kind* it is. No table
+        of store names lives here on purpose (0227).
+
+        **Fail closed.** An undeclared store resolves to PERSONAL, which is
+        loud: reads from the system lane start refusing until somebody declares
+        the lane, and that complaint is visible and one env var from fixed.
+        Defaulting to SYSTEM would be silent and would serve private rows.
+        """
+        raw = declared if declared is not None else os.environ.get(LANE_ENV, "")
+        try:
+            return cls(str(raw).strip().lower())
+        except ValueError:
+            return cls.PERSONAL
+
+    @classmethod
+    def of_row(cls, sensitivity: Optional[str]) -> "Lane":
+        """The lane a row claims via its own `sensitivity` field — **legacy.**
+
+        Kept for rows written before the split, where the store cannot answer
+        because both lanes shared one. It is a weaker signal than
+        :meth:`of_store` and measurably so: on the live store 2026-08-28,
+        10,975 rows were marked `sensitive` and 8,752 of those were LoCoMo and
+        benchmark fixtures that inherited `kb_ingest`'s `sensitivity="sensitive"`
+        default without anyone deciding. A marking that is 80% default is not a
+        classification, which is why enforcing it directly was never possible
+        and why the lane moved to the store.
+
+        **Fail closed**, like :meth:`of_store`. An unset, empty, or unrecognised
+        value resolves to PERSONAL, never SYSTEM. An unmarked row is not a row
+        proven open; it is a row nobody classified, and the two mistakes do not
+        cost the same — serving a private record as open cannot be undone by
+        marking it later, while refusing an open record produces a visible,
+        fixable complaint. Same asymmetry `gate.store_scope` uses when it reads
+        "no manifest" as deny-all.
+
+        New writes should not set `sensitivity` at all; the store they land in
+        says what they are.
         """
         if sensitivity is None:
             return cls.PERSONAL
@@ -77,11 +127,8 @@ class Lane(Enum):
 
     @classmethod
     def is_personal(cls, sensitivity: Optional[str]) -> bool:
-        return cls.of(sensitivity) == cls.PERSONAL
-
-    @classmethod
-    def same(cls, a: Optional[str], b: Optional[str]) -> bool:
-        return cls.of(a) == cls.of(b)
+        """Legacy row-field question. See :meth:`of_row`."""
+        return cls.of_row(sensitivity) is cls.PERSONAL
 
 
 #: A signature must name a person. A role cannot sign, and neither can the thing
@@ -200,14 +247,14 @@ def response_lane(sensitivities: Iterable[Optional[str]]) -> "Lane":
     signing anything. Scoring the response as a whole is what makes the
     per-row marking enforceable rather than advisory.
     """
-    return (Lane.PERSONAL if any(Lane.of(s) is Lane.PERSONAL for s in sensitivities)
+    return (Lane.PERSONAL if any(Lane.of_row(s) is Lane.PERSONAL for s in sensitivities)
             else Lane.SYSTEM)
 
 
 def refusal(
     *,
     rows_sensitivity: Iterable[Optional[str]],
-    reader_lane: "Lane" = Lane.SYSTEM,
+    reader_lane: Optional["Lane"] = None,
     crossings: Sequence[Crossing] = (),
     at: Optional[datetime] = None,
 ) -> Optional[dict]:
@@ -218,6 +265,7 @@ def refusal(
     permit it, which is the difference between a refusal that teaches and one
     that merely blocks.
     """
+    reader_lane = reader_lane if reader_lane is not None else Lane.of_store()
     holding = response_lane(rows_sensitivity)
     if holding is reader_lane:
         return None

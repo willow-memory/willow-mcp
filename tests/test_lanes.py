@@ -12,6 +12,7 @@ the ways a crossing could be made to permit something nobody signed for.
 """
 from __future__ import annotations
 
+import pathlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -45,21 +46,21 @@ def _crossing(**kw) -> Crossing:
 # ── lane membership ────────────────────────────────────────────────────────
 
 def test_the_existing_sensitivity_vocabulary_maps_to_lanes():
-    """The mapping is read off what the store holds, not imposed on it."""
-    assert Lane.of("open") == Lane.SYSTEM
-    assert Lane.of("sensitive") == Lane.PERSONAL
+    """Legacy path. The mapping is read off what the store holds, not imposed."""
+    assert Lane.of_row("open") == Lane.SYSTEM
+    assert Lane.of_row("sensitive") == Lane.PERSONAL
 
 
 @pytest.mark.parametrize("value", [None, "", "   ", "unknown", "SENSITIVE-ish", "0"])
 def test_an_unclassified_row_is_personal_not_open(value):
     """Fail closed. An unmarked row is not a row proven open — it is a row
     nobody classified, and the two mistakes do not cost the same."""
-    assert Lane.of(value) == Lane.PERSONAL
+    assert Lane.of_row(value) == Lane.PERSONAL
 
 
 def test_case_and_whitespace_do_not_change_a_lane():
-    assert Lane.of("  OPEN  ") == Lane.SYSTEM
-    assert Lane.of("Sensitive") == Lane.PERSONAL
+    assert Lane.of_row("  OPEN  ") == Lane.SYSTEM
+    assert Lane.of_row("Sensitive") == Lane.PERSONAL
 
 
 def test_lanes_cannot_be_ordered():
@@ -79,6 +80,57 @@ def test_lanes_cannot_be_ordered():
     with pytest.raises(TypeError):
         sorted([Lane.PERSONAL, Lane.SYSTEM])
     assert Lane.SYSTEM is not Lane.PERSONAL
+
+
+# ── the store is the authoritative lane ────────────────────────────────────
+
+def test_a_store_declares_its_own_lane(monkeypatch):
+    monkeypatch.setenv("WILLOW_LANE", "system")
+    assert Lane.of_store() is Lane.SYSTEM
+    monkeypatch.setenv("WILLOW_LANE", "personal")
+    assert Lane.of_store() is Lane.PERSONAL
+
+
+@pytest.mark.parametrize("declared", ["", "   ", "SYSTEM ", "Personal"])
+def test_declaration_is_case_and_space_insensitive(declared, monkeypatch):
+    monkeypatch.setenv("WILLOW_LANE", declared)
+    got = Lane.of_store()
+    expected = {"system": Lane.SYSTEM, "personal": Lane.PERSONAL}.get(
+        declared.strip().lower(), Lane.PERSONAL)
+    assert got is expected
+
+
+@pytest.mark.parametrize("declared", [None, "", "open", "sensitive", "willow_20", "nonsense"])
+def test_an_undeclared_or_unknown_store_is_personal(declared, monkeypatch):
+    """Fail closed and loud: reads from the system lane start refusing until
+    somebody declares the lane. Defaulting to SYSTEM would be silent and would
+    serve private rows."""
+    if declared is None:
+        monkeypatch.delenv("WILLOW_LANE", raising=False)
+    else:
+        monkeypatch.setenv("WILLOW_LANE", declared)
+    assert Lane.of_store() is Lane.PERSONAL
+
+
+def test_there_is_no_table_of_store_names():
+    """0227's rule: the enumeration must be the authority, never a copy of one.
+    A map from database name to lane here would be a second copy of a fact the
+    deployment already holds, and it would drift."""
+    src = pathlib.Path("src/willow_mcp/lanes.py").read_text()
+    for name in ("willow_20", "willow_personal", "dev_kb"):
+        assert name not in src, (
+            f"{name!r} is hardcoded in lanes.py — the lane must be declared by "
+            f"the deployment, not enumerated here"
+        )
+
+
+def test_refusal_defaults_its_reader_to_the_connected_store(monkeypatch):
+    """A caller that does not say which lane it is reading from is answered
+    for the store it is actually connected to, not an assumed SYSTEM."""
+    monkeypatch.setenv("WILLOW_LANE", "personal")
+    assert refusal(rows_sensitivity=["sensitive"]) is None      # same lane
+    monkeypatch.setenv("WILLOW_LANE", "system")
+    assert refusal(rows_sensitivity=["sensitive"]) is not None  # crossing needed
 
 
 # ── the ways a crossing must refuse to exist ───────────────────────────────
