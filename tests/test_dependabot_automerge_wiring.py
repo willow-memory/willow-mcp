@@ -43,6 +43,26 @@ def _secrets_used(value) -> set[str]:
     return set(re.findall(r"secrets\.([A-Z_]+)", str(value)))
 
 
+# A credential whose events trigger workflows. What matters is that it is NOT
+# GITHUB_TOKEN: #297 shipped because arming with GITHUB_TOKEN attributed the
+# eventual merge to github-actions[bot], so the push to master started no runs
+# at all. The willow-ci App token has the same non-bot property as the PAT it
+# replaces, and expires in an hour instead of on a calendar.
+#
+# Checked against the raw env rather than _secrets_used(), because an App token
+# arrives as `steps.app-token.outputs.token` — a step output, not a secret
+# reference, so it can never appear in a set of secret NAMES.
+NON_SUPPRESSED_CREDENTIALS = (
+    "RELEASE_PLEASE_TOKEN",              # fine-grained PAT (being retired)
+    "steps.app-token.outputs.token",     # willow-ci App installation token
+)
+
+
+def _arms_with_non_suppressed_credential(value) -> bool:
+    text = str(value)
+    return any(c in text for c in NON_SUPPRESSED_CREDENTIALS)
+
+
 def test_automerge_arming_uses_the_pat_not_github_token():
     """The step that actually calls `gh pr merge --auto` on a fresh Dependabot
     PR must run with the PAT — GITHUB_TOKEN here silently reproduces #297."""
@@ -51,7 +71,7 @@ def test_automerge_arming_uses_the_pat_not_github_token():
     assert "gh pr merge --auto" in arm["run"]
 
     used = _secrets_used(arm.get("env"))
-    assert "RELEASE_PLEASE_TOKEN" in used, used
+    assert _arms_with_non_suppressed_credential(arm.get("env")), arm.get("env")
     assert "GITHUB_TOKEN" not in used, (
         "arming auto-merge with GITHUB_TOKEN attributes the eventual merge "
         f"to github-actions[bot], which starts no workflow run. Found: {used}"
@@ -69,7 +89,7 @@ def test_refresh_stale_prs_also_uses_the_pat():
     assert "gh pr merge --auto" in rearm["run"]
 
     used = _secrets_used(rearm.get("env"))
-    assert "RELEASE_PLEASE_TOKEN" in used, used
+    assert _arms_with_non_suppressed_credential(rearm.get("env")), rearm.get("env")
     assert "GITHUB_TOKEN" not in used, used
 
 
@@ -83,10 +103,16 @@ def test_metadata_fetch_stays_on_github_token():
     assert used == {"GITHUB_TOKEN"}, used
 
 
-def test_both_jobs_refuse_to_arm_without_the_pat():
-    """A missing RELEASE_PLEASE_TOKEN must fail loudly, not silently degrade to
-    a GITHUB_TOKEN arm that looks fine until the merge lands untested — the
-    same posture release-please.yml already takes on its own PAT requirement."""
+def test_both_jobs_mint_the_credential_before_arming():
+    """A missing credential must fail loudly, not silently degrade to a
+    GITHUB_TOKEN arm that looks fine until the merge lands untested.
+
+    This used to be a shell step that checked whether the secret was set. The
+    mint step replaces it and is a stronger guard: it fails if the App is not
+    installed, if the key is wrong, or if the org values are missing — states a
+    `[ -z "$TOKEN" ]` check could not see. What still has to hold is the
+    ordering: the credential must be minted BEFORE anything arms a merge with
+    it."""
     for job, arm_name in (
         ("dependabot-pr", "Enable auto-merge"),
         ("refresh-stale-dependabot-prs", "Re-arm auto-merge on open Dependabot PRs after the base moves"),
@@ -94,15 +120,19 @@ def test_both_jobs_refuse_to_arm_without_the_pat():
         steps = _steps(job)
         names = [s.get("name") for s in steps]
 
-        guard_idx = next(
-            i for i, n in enumerate(names) if n == "Require the release PAT"
+        mint_idx = next(
+            i for i, s_ in enumerate(steps)
+            if s_.get("id") == "app-token"
         )
         arm_idx = names.index(arm_name)
-        assert guard_idx < arm_idx, (job, names)
+        assert mint_idx < arm_idx, (job, names)
 
-        guard = steps[guard_idx]
-        assert "RELEASE_PLEASE_TOKEN" in _secrets_used(guard.get("env")), (job, guard)
-        assert "exit 1" in guard["run"], (job, "guard must fail, not just warn")
+        mint = steps[mint_idx]
+        assert str(mint.get("uses", "")).startswith(
+            "actions/create-github-app-token"), (job, mint)
+        with_ = mint.get("with") or {}
+        assert "WILLOW_CI_APP_ID" in str(with_.get("app-id")), (job, with_)
+        assert "WILLOW_CI_PRIVATE_KEY" in str(with_.get("private-key")), (job, with_)
 
 
 def test_no_gh_pr_merge_call_anywhere_uses_github_token():
@@ -121,7 +151,8 @@ def test_no_gh_pr_merge_call_anywhere_uses_github_token():
                 f"GITHUB_TOKEN — the merge it eventually performs would start "
                 f"no workflow run. Found: {used}"
             )
-            assert "RELEASE_PLEASE_TOKEN" in used, (job_name, step.get("name"), used)
+            assert _arms_with_non_suppressed_credential(step.get("env")), (
+                job_name, step.get("name"), step.get("env"))
 
 
 def test_permissions_are_read_only_now_that_arming_uses_the_pat():
