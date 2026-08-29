@@ -31,6 +31,15 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.19.0](https://github.com/willow-memory/willow-mcp/compare/v2.18.0...v2.19.0) (2026-08-29)
+
+
+### Added
+
+* **lanes:** mutually sealed lanes and the crossings that permit reading across one ([f568e6e](https://github.com/willow-memory/willow-mcp/commit/f568e6e27b8fee872cb46ae3436171947f2cffc9))
+* **lanes:** the lane is the store, not a column on the row ([c21ff16](https://github.com/willow-memory/willow-mcp/commit/c21ff16502d2590b7029d11eb5fad0e2c45155dc))
+* **lanes:** the read side of a marking that was enforced nowhere ([d0579c7](https://github.com/willow-memory/willow-mcp/commit/d0579c7652ebed23a998b5b520977b43bc03d65c))
+
 ## [2.18.0](https://github.com/willow-memory/willow-mcp/compare/v2.17.0...v2.18.0) (2026-08-27)
 
 
