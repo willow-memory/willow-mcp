@@ -9,6 +9,7 @@ See docs/design/product-layout.md (LOCKED).
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -77,12 +78,24 @@ _DEFAULT_ROTATION: dict[str, Any] = {
     "providers": {},
 }
 
+_GOVERNANCE_FILE_MODE = 0o600
+
+
+def _harden_governance_file(path: Path) -> None:
+    """trusted_read() refuses group/other-writable governance inputs."""
+    os.chmod(path, _GOVERNANCE_FILE_MODE)
+
 
 def _write_json_if_missing(path: Path, data: dict) -> bool:
     if path.exists():
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    if path.parent.name == "constitutional" or path.name in {
+        "pre-approved.json", "syscall-table.json", "review_queue.json",
+        "frank_head_anchor.json",
+    }:
+        _harden_governance_file(path)
     return True
 
 
@@ -111,6 +124,7 @@ def _copy_bundle_file_if_missing(src: Path, dest: Path) -> bool:
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
+    _harden_governance_file(dest)
     return True
 
 

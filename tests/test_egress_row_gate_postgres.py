@@ -24,7 +24,7 @@ from kartikeya import TaskRow
 from psycopg2.extras import Json
 
 from willow_mcp import db, egress_authorization as auth, task_queue as tq
-from tests.test_egress_authorization import _signed
+from test_egress_authorization import _signed
 
 # Layout name → primary-key column. "repo" is docs/schema/tasks.postgres.sql;
 # "fleet" is the adopted willow_20 shape the schema-adaptation layer maps.
