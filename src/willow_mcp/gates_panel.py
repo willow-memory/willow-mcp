@@ -269,7 +269,7 @@ def _global_rows() -> list[GateRow]:
             id=f"consent.{key}", label=f"consent.{key}", scope="global",
             state="on" if on else "off", detail=detail, timer_shape="standing",
             action_note=(f"read-only in willow-mcp by design — edit "
-                         f"{c['canonical_path']} (authored by willow-2.0) "
+                         f"{c['canonical_path']} (authored by legacy fleet monolith) "
                          "or use Grove's settings pane"),
         ))
 

@@ -251,7 +251,7 @@ class HuggingFaceAdapter(BaseAdapter):
 
 class JelesAdapter(BaseAdapter):
     """Jeles the Librarian, remote lane. The stateless network-search half of
-    willow-2.0's Jeles (`core/jeles_sources.py`), hosted as `jeles-remote` on
+    legacy fleet monolith's Jeles (`core/jeles_sources.py`), hosted as `jeles-remote` on
     Fly.io: `POST /search` fans out to ~65 institutional/academic sources
     (arXiv, PubMed, Crossref, OpenAlex, Library of Congress, ...) and returns
     citable results. Corroboration across independent sources is the whole

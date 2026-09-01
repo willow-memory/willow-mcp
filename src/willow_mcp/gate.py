@@ -116,7 +116,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     "fleet_read": frozenset({
         "fleet_status", "fleet_health", "frank_read", "frank_verify",
     }),
-    # Grove — the fleet's shared messaging room (willow-2.0's sap/grove_tools.py
+    # Grove — the fleet's shared messaging room (legacy fleet monolith's sap/grove_tools.py
     # successor; see willow_mcp/grove_tools.py). Read/write mirror the
     # store_read/store_write split above: 13 read tools (channel/message/thread/
     # flag/bus listing, plus grove_agents/grove_fleet_status/grove_human_required
@@ -263,7 +263,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     "web_read": frozenset({
         "willow_web_search", "willow_web_fetch", "willow_institutional_search",
     }),
-    # Bounded work-units (branch + PR tracking) — SOIL-backed port of willow-2.0 forks.
+    # Bounded work-units (branch + PR tracking) — SOIL-backed port of legacy fleet monolith forks.
     "fork_read": frozenset({
         "fork_list", "fork_status", "env_check",
     }),

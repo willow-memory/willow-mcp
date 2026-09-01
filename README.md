@@ -739,24 +739,23 @@ rebadges of one another:
 
 - **`willow-1.7` → `willow-1.9`** — earlier production lines; `willow-1.9` is
   **archived** (April–May 2026 era).
-- **`willow-2.0`** — a distinct, larger-surface fleet server; now **legacy /
-  migration source**, not the current stack.
+- **`legacy fleet monolith`** — a distinct, larger-surface fleet server; now **legacy /
+  migration source**, not the current stack (GitHub archive slug is historical).
 - **`willow-mcp`** — the **current substrate**: a re-scoped re-implementation of
-  willow-2.0's SOIL / knowledge / dispatch core.
+  the monolith's SOIL / knowledge / dispatch core.
 
 willow-mcp re-implements that core as a standalone product with a redesigned,
-smaller surface — **not** a drop-in copy of
-[willow-2.0](https://github.com/rudi193-cmd/willow-2.0)'s tool API. Many tools
-were renamed in the redesign (`soil_*` → `store_*`, `ledger_*` → `frank_*`,
+smaller surface — **not** a drop-in copy of the archived monolith's tool API.
+Many tools were renamed in the redesign (`soil_*` → `store_*`, `ledger_*` → `frank_*`,
 `agent_task_*` → `task_*`), so an app is not portable between the two unchanged.
 See [`docs/migrations/willow-2.0-gap-inventory.md`](docs/migrations/willow-2.0-gap-inventory.md)
 for the verified tool-by-tool diff, and query `lineage_why` on the recorded atoms
-(`version-willow-mcp`, `version-willow-2.0`, `version-willow-1.9`,
+(`version-willow-mcp`, `version-legacy-monolith`, `version-willow-1.9`,
 `version-willow-1.7`) for the provenance.
 
-> **Not the same "2.0".** The willow-**2.0** *fleet server* above is the
-> predecessor line. willow-mcp's own package version (e.g. "serve mode is
-> **2.0.0+**" below) is this product's semver — unrelated.
+> **Not the same "2.0".** The legacy *fleet monolith* above is the predecessor
+> line. willow-mcp's own package version (e.g. "serve mode is **2.0.0+**" below)
+> is this product's semver — unrelated.
 
 ## HTTP serve mode (OAuth)
 
@@ -866,7 +865,7 @@ just ask to turn serve mode on or off.
 
 `willow-mcp worker-service` manages separate fast and batch systemd user units.
 It writes every required environment value into the units, so workers do not
-inherit hidden willow-2.0 paths or depend on shell exports:
+inherit hidden legacy monolith paths or depend on shell exports:
 
 ```bash
 willow-mcp worker-service install
@@ -889,7 +888,7 @@ timestamps terminal rows.
 | `WILLOW_PG_USER` | `$USER` | Postgres user (Unix socket auth) |
 | `WILLOW_MCP_ENSURE_POSTGRES` | *(off)* | When `1`, `get_pg()` tries `pg_isready` and local `pg_ctlcluster` / `service postgresql start` before returning `postgres_unavailable` (#160) |
 | `WILLOW_PG_CLUSTER` | `16/main` | Cluster passed to `pg_ctlcluster` when ensure-postgres runs (Debian-style installs) |
-| `WILLOW_STORE_ROOT` | `~/.willow/store` | SQLite store directory — set to willow-2.0's store root to share data |
+| `WILLOW_STORE_ROOT` | `~/.willow/store` | SQLite store directory — set to the legacy monolith's store root to share data |
 | `WILLOW_MCP_FLEET_HOME` | *(unset)* | The fleet home this install claims to be **severed** from. Unset = no claim. See [Severance](#severance) |
 | `WILLOW_MCP_FLEET_PG_DB` | *(unset)* | The fleet database this install claims to be severed from |
 | `WILLOW_MCP_DISPATCH_MIRROR` | *(unset)* | Truthy on a **fleet host** to best-effort mirror dispatch packets into shared Postgres `dispatch_tasks` (so the fleet sees dispatches, like it already sees store/knowledge/tasks/agents). Off = filesystem-only; the filesystem packet is always canonical. See `docs/schema/dispatch_tasks.postgres.sql` |
@@ -980,7 +979,7 @@ deny), with credential-shaped keys never resolving at all.
 ### Grove — the fleet's shared messaging room
 
 The 20 `grove_*` tools (`willow_mcp/grove_tools.py`, data layer
-`willow_mcp/grove.py`) are the agent-side successor to willow-2.0's
+`willow_mcp/grove.py`) are the agent-side successor to the legacy monolith's
 `sap/grove_tools.py`: they give an agent a voice in Grove, the fleet's shared
 Postgres-backed chat (`grove.channels`/`grove.messages`/`grove.message_flags`
 tables) — channels, threads, flags, a priority bus protocol, and
@@ -997,7 +996,7 @@ is the fleet's shared Postgres messaging room.
 
 Every write tool's `sender` defaults to the calling agent's `grove_sender`,
 resolved from the specialist registry (`willow_mcp.registry.specialist_row`) —
-never the literal `"Auto"` the canonical willow-2.0 tools defaulted to. An
+never the literal `"Auto"` the canonical legacy monolith tools defaulted to. An
 agent posts as itself by default, and for free — `grove_write` alone covers
 that. Posting as a *different* identity (relaying on another identity's
 behalf) is a separate, sender-locked privilege: passing an explicit `sender`
