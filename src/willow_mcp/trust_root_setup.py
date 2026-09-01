@@ -509,6 +509,9 @@ def _run_privileged(argv: list[str], *, dry_run: bool) -> None:
     if dry_run:
         return
     if os.geteuid() != 0:
+        proc = subprocess.run(argv, check=False, text=True, capture_output=True)
+        if proc.returncode == 0:
+            return
         argv = ["sudo", *argv]
     proc = subprocess.run(argv, check=False, text=True, capture_output=True)
     if proc.returncode != 0:

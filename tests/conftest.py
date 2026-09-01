@@ -49,6 +49,9 @@ os.environ["WILLOW_MCP_APPS_ROOT"] = os.path.join(_tmp, "mcp_apps")
 os.environ.pop("WILLOW_MCP_STRICT_TRUST_ROOT", None)
 os.environ.pop("WILLOW_IN_KART", None)
 os.environ.pop("WILLOW_PGP_FINGERPRINT", None)
+os.environ.pop("NESTOR_KEYRING", None)
+os.environ.pop("NESTOR_DB", None)
+os.environ.pop("NESTOR_REQUIRE_SEAL_KEY", None)
 
 
 @pytest.fixture
