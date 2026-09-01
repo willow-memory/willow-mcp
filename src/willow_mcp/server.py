@@ -564,7 +564,7 @@ else:
     mcp = MCPServer("willow-mcp", **_common_kwargs)
 
 
-# ── MarkdownAI (mai) tools — vendored from willow-2.0 (sap/mai) ──────────────────
+# ── MarkdownAI (mai) tools — vendored from legacy fleet monolith (sap/mai) ──────────────────
 # Ten mai_* tools that render/execute @markdownai documents (phases, macros,
 # constraints, @env/@db/@http directives). Opt-in: these are ungated filesystem
 # tools, so they stay off unless WILLOW_MCP_MARKDOWNAI is set — the same posture
@@ -576,7 +576,7 @@ if os.environ.get("WILLOW_MCP_MARKDOWNAI", "").strip().lower() in ("1", "true", 
     _mai_tools.register(mcp)
 
 
-# ── Grove tools — agent-side successor to willow-2.0's sap/grove_tools.py ────────
+# ── Grove tools — agent-side successor to legacy fleet monolith's sap/grove_tools.py ────────
 # 20 grove_* tools (13 read + 7 write) giving agents a voice in the fleet's Grove
 # messaging room. Registered unconditionally, like store/knowledge/task — Grove
 # is a baseline fleet capability, not an opt-in surface like mai. Per-app access
@@ -5194,7 +5194,7 @@ def _derive_problems(store: dict, postgres: dict, manifest: dict, mode: str,
             # setting that is doing something.
             #
             # Do NOT advise deleting consent.json (B-30). It is a mirror, not a
-            # leftover: willow-2.0's save_global_settings(sync_legacy=True) — the
+            # leftover: legacy fleet monolith's save_global_settings(sync_legacy=True) — the
             # default — recreates it from the canonical block on every save, as does
             # Grove's consent toggle. A delete looks like a fix and comes back.
             keys = ", ".join(disagreement["keys"])
@@ -5204,7 +5204,7 @@ def _derive_problems(store: dict, postgres: dict, manifest: dict, mode: str,
                            f"canonical={disagreement['canonical']} "
                            f"legacy={disagreement['legacy']}. willow-mcp obeys the "
                            f"canonical file. {consent.get('legacy_path')} is a mirror "
-                           f"willow-2.0 rewrites on every save and reads only when the "
+                           f"legacy fleet monolith rewrites on every save and reads only when the "
                            f"canonical file is absent — so it is a stale mirror, not an "
                            f"inert file, and deleting it will not keep it gone."),
                 "fix": (
@@ -5766,7 +5766,7 @@ def commitment_list(app_id: str, state: str = "",
             "next_cursor": next_cursor}
 
 
-# ── code_graph — a local, budget-aware symbol graph (willow-2.0 port) ───────────
+# ── code_graph — a local, budget-aware symbol graph (legacy fleet monolith port) ───────────
 #
 # The top 🟢 item on the migration shortlist (docs/migrations/willow-2.0-gap-
 # inventory.md §6): the only call-graph capability willow-mcp lacked, and a
@@ -5882,7 +5882,7 @@ def code_graph_impact(app_id: str, file_paths: list, db_path: str = "") -> dict:
     return analyze_impact(db, file_paths)
 
 
-# ── open web (ported from willow-2.0 core/web_search + core/web_fetch) ────────
+# ── open web (ported from legacy fleet monolith core/web_search + core/web_fetch) ────────
 #
 # Server-process HTTP egress — gated by web_net + consent.internet + lease
 # (web_egress.py). Replaces native IDE WebSearch/WebFetch when the PreToolUse
@@ -6134,7 +6134,7 @@ def env_check(app_id: str, fork_id: str) -> dict:
 
 # ── human-in-the-loop: an attention queue + durable attestations ────────────────
 #
-# Ported from willow-2.0 core/human_required.py + core/human_attestation.py
+# Ported from legacy fleet monolith core/human_required.py + core/human_attestation.py
 # (migration shortlist §6). Homed on the SOIL store, not the fleet Postgres (no
 # unilateral schema migration — B-28), via willow_mcp.human_loop. The attester of
 # a human_attestation is ALWAYS the calling identity, never a free parameter, and
