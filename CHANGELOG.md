@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.20.0](https://github.com/willow-memory/willow-mcp/compare/v2.19.0...v2.20.0) (2026-09-01)
+
+
+### Added
+
+* **knowledge:** add kb_journal_read for C11 journal seam ([271d286](https://github.com/willow-memory/willow-mcp/commit/271d286b2033469517620538062155925ded51c7))
+* **knowledge:** add kb_journal_read for C11 journal seam ([cdb2942](https://github.com/willow-memory/willow-mcp/commit/cdb29422751cf5851ab73a4bd140e794484c729e))
+
 ## [2.19.0](https://github.com/willow-memory/willow-mcp/compare/v2.18.0...v2.19.0) (2026-08-29)
 
 
