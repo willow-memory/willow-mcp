@@ -16,7 +16,7 @@ VP=/home/user/willow-mcp/.venv/bin/python
 | Script | Job it takes off the model | Run |
 |---|---|---|
 | **`mai_lint.py`** | "read the doc and check the mai format by hand" — validates frontmatter/schema/header, catches the #156 `@constraint:` colon drop and structural-swallow, the #157 `@phase`/`@macro`-in-frontmatter leak, and unbalanced blocks. Exit-coded for hooks/CI. CI runs it in `.github/workflows/tests.yml`; locally use `pre-commit` (see repo `.pre-commit-config.yaml`, #158) or `$VP tools/mai_lint.py [FILE|DIR...]`. | `$VP tools/mai_lint.py [FILE|DIR...]` |
-| **`wtool.py`** | the substrate — call any of the 121 willow-mcp tools from a shell, so *any* script can do what a model does through the MCP client. | `$VP tools/wtool.py <tool> '<json>'` · `--list [substr]` |
+| **`wtool.py`** | the substrate — call any of the 122 willow-mcp tools from a shell, so *any* script can do what a model does through the MCP client. | `$VP tools/wtool.py <tool> '<json>'` · `--list [substr]` |
 | **`mai_metrics.py`** | "track how the loop is converging" — records one metric per bite into SOIL, reports the new-gaps-by-learnings curve. | `$VP tools/mai_metrics.py record '<json>'` · `report` |
 | **`mai_prose_split.py`** | "judge which parts of a narrative doc are convertible" — separates PROTECTED PROSE from DIRECTIVE CANDIDATES (`@constraint`/`@phase`/`@env`/`@if consumer=`), emits a conversion PLAN (JSON), and a `prose_ratio` verdict flags story-shaped docs "do not force" instead of mangling them. | `$VP tools/mai_prose_split.py [--summary] FILE\|DIR...` |
 | **`provision_gate.py`** | "hand-edit the gate manifest JSON" — unions the builder's introspection+loop permission groups into the manifest, validating every group name against `gate.PERMISSION_GROUPS` (loud-fails on a typo instead of granting nothing). | `$VP tools/provision_gate.py [manifest]` · `--print` |
@@ -26,7 +26,7 @@ VP=/home/user/willow-mcp/.venv/bin/python
 
 ## The wiring — hand-run job → the tool that already does it
 
-The willow-mcp server exposes 121 tools. Most of the "jobs" a builder agent runs
+The willow-mcp server exposes 122 tools. Most of the "jobs" a builder agent runs
 by hand are already one of them. After `provision_gate.py`, the `safe-app-store`
 identity is permitted to call each of these (verified live 2026-07-23):
 
