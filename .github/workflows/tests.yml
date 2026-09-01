@@ -38,7 +38,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       - name: Install lint tools
-        run: pip install ruff==0.16.4 bandit
+        run: pip install ruff==0.15.0 bandit
 
       - name: Ruff (enforced)
         run: ruff check src tests
