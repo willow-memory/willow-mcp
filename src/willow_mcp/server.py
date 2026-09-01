@@ -2707,6 +2707,81 @@ def kb_journal(
     return {"id": kid, "domain": "journal"}
 
 
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("kb_journal_read")
+def kb_journal_read(
+    app_id: str,
+    limit: int = 50,
+    since_id: Optional[str] = None,
+) -> list:
+    """Return recent kb_journal atoms (domain 'journal'), newest first.
+
+    Companion to kb_journal — the C11 read-back seam Grove's journal_reader
+    calls in-process or over HTTP. `limit` is clamped to [1, 200].
+    `since_id`, when set, returns only atoms strictly newer than that id in
+    newest-first order (same semantics as Grove's journal_reader). Read-only."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+
+    mapping = sp.resolve(pg, app_id, "knowledge", _KNOWLEDGE_FIELDS)
+    if "error" in mapping:
+        return mapping
+    fields = mapping["fields"]
+    id_col = fields["id"]["column"]
+    domain_col = fields["domain"]["column"]
+    if id_col is None or fields["content"]["column"] is None:
+        return {"error": "schema_unusable: 'knowledge' table has no mappable 'id' or 'content' column"}
+    if not domain_col:
+        return {"error": "schema_unusable: 'knowledge' table has no mappable 'domain' column"}
+
+    if not isinstance(limit, int) or limit <= 0:
+        limit = 50
+    if limit > 200:
+        limit = 200
+
+    select_clause, present, unmapped = _build_select(_KNOWLEDGE_FIELDS, fields)
+    cols_by_name = {c.name: c for c in sp.introspect(pg, "knowledge")}
+    tags_col = fields["tags"]["column"]
+    retract_sql, retract_params = kbc.sql_exclude_retracted(tags_col, cols_by_name)
+    order_col = "created_at" if "created_at" in cols_by_name else id_col
+    extra_ts = f', "{order_col}"' if order_col not in {fields[f]["column"] for f in present if fields[f]["column"]} else ""
+
+    sql = (
+        f'SELECT {select_clause}{extra_ts} FROM knowledge '
+        f'WHERE "{domain_col}" = %s{retract_sql} '
+        f'ORDER BY "{order_col}" DESC LIMIT %s'
+    )  # nosec B608 - built from confirmed schema_profile mapping, not request input
+    params: list = ["journal", *retract_params, 200]
+
+    cur = pg.cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close()
+
+    atoms: list[dict] = []
+    for row in rows:
+        base = list(row)
+        ts_val = None
+        if extra_ts and len(base) > len(present):
+            ts_val = base[-1]
+            base = base[:-1]
+        atom = kbc.enrich_atom(_row_to_dict(tuple(base), present, unmapped))
+        if ts_val is not None:
+            atom["created_at"] = ts_val.isoformat() if hasattr(ts_val, "isoformat") else str(ts_val)
+        if unmapped:
+            atom["_unmapped"] = unmapped
+        atoms.append(atom)
+
+    if since_id:
+        for i, atom in enumerate(atoms):
+            if atom.get("id") == since_id:
+                atoms = atoms[:i]
+                break
+
+    return atoms[:limit]
+
+
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("kb_ingest")
 def kb_ingest(

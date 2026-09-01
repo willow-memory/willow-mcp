@@ -66,7 +66,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     }),
     "knowledge_read": frozenset({
         "knowledge_search",
-        "kb_at", "kb_startup_continuity",
+        "kb_at", "kb_startup_continuity", "kb_journal_read",
         "knowledge_verify", "knowledge_check",
     }),
     "knowledge_write": frozenset({
@@ -368,7 +368,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         "store_search_all", "store_collections", "store_stats",
         # Knowledge
         "knowledge_search", "knowledge_ingest",
-        "kb_at", "kb_startup_continuity",
+        "kb_at", "kb_startup_continuity", "kb_journal_read",
         "kb_ingest", "kb_journal", "kb_promote",
         # Tasks
         "task_submit", "task_status", "task_list",

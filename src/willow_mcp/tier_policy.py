@@ -80,6 +80,7 @@ TOOL_CLASS: dict[str, str] = {
     "store_put": WRITE, "store_update": WRITE, "store_delete": WRITE,
     "store_purge_collection": WRITE,          # reversible + confirm-guarded — stays write (D1)
     "agent_seed_mirror": WRITE,
+    "kb_journal_read": READ,
     "knowledge_ingest": WRITE, "kb_ingest": WRITE, "kb_journal": WRITE,
     "kb_promote": WRITE, "knowledge_flag": WRITE, "knowledge_retract": WRITE,
     "gap_log": WRITE, "gap_resolve": WRITE, "gap_delete": WRITE,
