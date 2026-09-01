@@ -2,7 +2,7 @@
 
 SDK 2.0 deleted `mcp.server.lowlevel.server.request_ctx` and injects `Context`
 into tool functions instead — an injection that does not reach `_guarded`, which
-wraps 119 tools and reads the per-call credential in the wrapper. So
+wraps 120 tools and reads the per-call credential in the wrapper. So
 `request_context` republishes the `ServerRequestContext` on a ContextVar we own,
 fed by a `ServerMiddleware`.
 

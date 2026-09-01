@@ -714,6 +714,46 @@ def test_kb_journal_forces_domain_journal_and_unions_tags_after_confirm(app_id, 
     assert set(params[-1]) == {"journal", "extra"}
 
 
+def test_kb_journal_read_returns_journal_atoms_newest_first(app_id, monkeypatch):
+    fake = _FakePg(
+        columns=_KNOWLEDGE_COLUMNS_NO_TAGS
+        + [("tags", "text"), ("created_at", "timestamp with time zone")],
+        canned_rows=[
+            ("B2", "second", "journal", "watcher", None, "2026-09-01T02:00:00+00:00"),
+            ("B1", "first", "journal", "operator", None, "2026-09-01T01:00:00+00:00"),
+        ],
+    )
+    monkeypatch.setattr(server, "get_pg", lambda: fake)
+    server.schema_confirm_mapping(app_id=app_id, table="knowledge")
+
+    atoms = server.kb_journal_read(app_id=app_id, limit=10)
+
+    read_sql, read_params = fake.executed[-1]
+    assert '"domain" = %s' in read_sql
+    assert read_params[0] == "journal"
+    assert [a["id"] for a in atoms] == ["B2", "B1"]
+    assert atoms[0]["content"] == "second"
+    assert atoms[0]["created_at"].startswith("2026-09-01T02:00:00")
+
+
+def test_kb_journal_read_since_id_trims_newer_only(app_id, monkeypatch):
+    fake = _FakePg(
+        columns=_KNOWLEDGE_COLUMNS_NO_TAGS
+        + [("tags", "text"), ("created_at", "timestamp with time zone")],
+        canned_rows=[
+            ("B3", "third", "journal", "watcher", None, "2026-09-01T03:00:00+00:00"),
+            ("B2", "second", "journal", "watcher", None, "2026-09-01T02:00:00+00:00"),
+            ("B1", "first", "journal", "operator", None, "2026-09-01T01:00:00+00:00"),
+        ],
+    )
+    monkeypatch.setattr(server, "get_pg", lambda: fake)
+    server.schema_confirm_mapping(app_id=app_id, table="knowledge")
+
+    atoms = server.kb_journal_read(app_id=app_id, since_id="B2")
+
+    assert [a["id"] for a in atoms] == ["B3"]
+
+
 def test_kb_promote_refuses_until_confirmed(app_id, monkeypatch):
     fake = _FakePg(columns=_KNOWLEDGE_COLUMNS_NO_TAGS)
     monkeypatch.setattr(server, "get_pg", lambda: fake)
