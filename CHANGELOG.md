@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.20.3](https://github.com/willow-memory/willow-mcp/compare/v2.20.2...v2.20.3) (2026-09-02)
+
+
+### Fixed
+
+* **serve:** default the serve port to 8765, not the desk page's 8766 ([35ace48](https://github.com/willow-memory/willow-mcp/commit/35ace48acab27d95702c47b492bd80948d004c67))
+* **serve:** default the serve port to 8765, not the desk page's 8766 ([357da51](https://github.com/willow-memory/willow-mcp/commit/357da51330de1852cbf10046cae269ed41d8e0b4))
+
 ## [2.20.2](https://github.com/willow-memory/willow-mcp/compare/v2.20.1...v2.20.2) (2026-09-02)
 
 
