@@ -22,8 +22,19 @@ PDF_SUFFIX = ".pdf"
 OFFICE_SUFFIXES = {".docx"}
 # Anything we can read as UTF-8 and hand to the classifier as-is. Source code
 # counts: a .py / .sh / .jsx file is text the LLM can categorise (code, config…).
+#
+# A suffix missing from this set is not "skipped" — it never enters the walk at
+# all, so it lands in no counter: not extracted, not failed, not skipped. That
+# makes an omission here invisible rather than noisy, which is the opposite of
+# how the rest of this module fails.
+#
+# Found in exactly that way: .jsonl was excluded while .json was accepted,
+# though both are plain UTF-8. Nothing reported it — the files simply never
+# entered the walk. Seal ledgers are written as .jsonl, so a Nest could not
+# read its own sibling's records and had no counter saying so.
 TEXT_SUFFIXES = {
-    ".txt", ".md", ".csv", ".rst", ".tex", ".lean", ".json", ".yaml", ".yml",
+    ".txt", ".md", ".csv", ".rst", ".tex", ".lean", ".json", ".jsonl",
+    ".yaml", ".yml",
     ".py", ".sh", ".js", ".jsx", ".ts", ".tsx", ".html", ".xml",
     ".toml", ".ini", ".cfg", ".log", ".sql",
 }

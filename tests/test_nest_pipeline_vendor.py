@@ -33,7 +33,7 @@ EXPECTED_SHA256 = {
     "selflearn.py": "bde962fa401816681572da1e74805a1789e42e402498bc4c87df7c8fec2657fd",
     "taxonomy.py": "60d44d1c1d9a74dc23389feac7dce4600085ea408fb08ab528739559562d4f46",
     "classify.py": "7e81f75d98011aea824317e8fc977e16777fae1f6b7730b51bcfb93ab32748ca",
-    "ocr.py": "77d64d05beccb304614c63d6b03b9715883df189c4d58a4bc065968659aa2813",
+    "ocr.py": "92a4e5f5f8e30cced75c54f8239f2a9cc6492a021cdf8cdf84e84c525a5e739b",
 }
 
 
