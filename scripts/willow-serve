@@ -18,13 +18,21 @@
 #   willow-serve worker-status           # per-lane unit state
 #   willow-serve worker-logs [fast|batch]      # follow a lane's logs   (default: fast)
 #
-# Port/host come from WILLOW_MCP_PORT / WILLOW_MCP_HOST (defaults 8766 / 127.0.0.1).
+# Port/host come from WILLOW_MCP_PORT / WILLOW_MCP_HOST (defaults 8765 / 127.0.0.1).
+#
+# 8765, not 8766. This script defaulted to 8766 while the server it launches
+# (src/willow_mcp/server.py) defaults to 8765 — so the port depended on whether
+# you ran the module or this wrapper, and the installed unit had taken 8766.
+# 8766 is willows-grove's desk page, which is sealed loopback-only (D4) and must
+# never be fronted by a tunnel; KB 2026B306 says remote Pangolin terminates
+# "at :8765 only, never :8766". A remote seat pointed at "the serve port" was
+# therefore one race away from publishing the desk.
 # The worker's app_id (whose confirmed 'tasks' mapping it drains) comes from
 # WILLOW_APP_ID (default willow). Change them, re-run the install step, then on.
 set -euo pipefail
 
 UNIT="willow-mcp-serve"
-PORT="${WILLOW_MCP_PORT:-8766}"
+PORT="${WILLOW_MCP_PORT:-8765}"
 HOST="${WILLOW_MCP_HOST:-127.0.0.1}"
 ENTRY_NAME="willow-mcp-serve"
 WORKER_UNIT="willow-mcp-worker"

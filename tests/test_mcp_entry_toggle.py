@@ -13,7 +13,7 @@ mcp_entry_toggle = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mcp_entry_toggle)
 
 NAME = "willow-mcp-serve"
-URL = "http://127.0.0.1:8766/mcp"
+URL = "http://127.0.0.1:8765/mcp"
 
 
 @pytest.fixture

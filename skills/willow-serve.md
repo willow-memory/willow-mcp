@@ -32,7 +32,7 @@ for the `--serve` process and adds/removes the matching http entry in
 
 **2. First run only — install the unit.** If `on` reports
 `unit not installed`, run `scripts/willow-serve install` once (writes the
-systemd user unit), then `on` again. Port/host default to `8766`/`127.0.0.1`;
+systemd user unit), then `on` again. Port/host default to `8765`/`127.0.0.1`;
 to change them set `WILLOW_MCP_PORT` / `WILLOW_MCP_HOST` before `install`.
 
 **Serve mode does not inherit your shell environment.** The `systemd --user`
