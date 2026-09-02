@@ -29,6 +29,8 @@ import difflib
 import sys
 from pathlib import Path
 
+from vendor_drift import annotate, classify
+
 VENDORED = Path(__file__).resolve().parents[1] / "src/willow_mcp/subject_consent"
 
 # The module files whose CODE BODY must match canonical byte-for-byte.
@@ -80,12 +82,12 @@ def main(argv: list) -> int:
         if mine == theirs:
             print(f"vendored subject_consent/{mod} is in sync with safe-app-store ✓")
             continue
-        drift = 1
-        sys.stdout.write(
-            f"::error title=subject-consent drift::src/willow_mcp/subject_consent/{mod} "
-            "has drifted from rudi193-cmd/safe-app-store libs/subject-consent. Re-sync "
-            "it (procedure in tests/test_subject_consent.py) and update the pinned "
-            "hash there.\n")
+        verdict = classify(theirs_path, mine, body)
+        drift = drift or int(verdict.fatal)
+        sys.stdout.write(annotate(
+            "subject-consent", f"src/willow_mcp/subject_consent/{mod}", verdict,
+            "Re-sync it (procedure in tests/test_subject_consent.py) and update "
+            "the pinned hash there."))
         sys.stdout.writelines(difflib.unified_diff(
             theirs.splitlines(True), mine.splitlines(True),
             fromfile=f"safe-app-store/subject_consent/{mod}",

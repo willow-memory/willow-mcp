@@ -22,6 +22,8 @@ import difflib
 import sys
 from pathlib import Path
 
+from vendor_drift import annotate, classify
+
 VENDORED = Path(__file__).resolve().parents[1] / "src/willow_mcp/friction_floor.py"
 
 
@@ -45,14 +47,15 @@ def main(argv: list) -> int:
     if mine == theirs:
         print("vendored friction_floor.py is in sync with willow-gate ✓")
         return 0
-    sys.stdout.write(
-        "::error title=vendor drift::src/willow_mcp/friction_floor.py has drifted "
-        "from willow-memory/willow-gate. Re-sync it (procedure in "
-        "tests/test_stance_friction.py) and update the pinned hash there.\n")
+    verdict = classify(upstream, mine, body)
+    sys.stdout.write(annotate(
+        "vendor", "src/willow_mcp/friction_floor.py", verdict,
+        "Re-sync it (procedure in tests/test_stance_friction.py) and update the "
+        "pinned hash there."))
     sys.stdout.writelines(difflib.unified_diff(
         theirs.splitlines(True), mine.splitlines(True),
         fromfile="willow-gate/friction_floor.py", tofile="willow-mcp/friction_floor.py"))
-    return 1
+    return 1 if verdict.fatal else 0
 
 
 if __name__ == "__main__":
