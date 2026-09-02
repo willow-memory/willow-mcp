@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.21.0](https://github.com/willow-memory/willow-mcp/compare/v2.20.3...v2.21.0) (2026-09-02)
+
+
+### Added
+
+* **integrations:** add the Pangolin adapter, behind the egress gate ([cd0be8b](https://github.com/willow-memory/willow-mcp/commit/cd0be8b49daecb9c8e16d3191b815db13bbeac6f))
+
 ## [2.20.3](https://github.com/willow-memory/willow-mcp/compare/v2.20.2...v2.20.3) (2026-09-02)
 
 
