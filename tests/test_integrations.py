@@ -12,6 +12,7 @@ Properties under test:
 import io
 import json
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -61,7 +62,8 @@ def test_registry_lists_live_and_stub_adapters():
     assert "huggingface" in by_status["live"]
     assert "jeles" in by_status["live"]
     assert "utety" in by_status["live"]
-    assert len(by_status["live"]) == 4
+    assert "pangolin" in by_status["live"]
+    assert len(by_status["live"]) == 5
     assert len(by_status["stub"]) == 6
 
 
@@ -267,7 +269,7 @@ def test_integration_list_tool_is_gated(home):
 def test_full_access_grants_ledger_but_not_call(home):
     app = _manifest(home, permissions=["full_access"])
     out = server.integration_list(app_id=app)
-    assert len(out["integrations"]) == 10
+    assert len(out["integrations"]) == 11
     out = server.integration_call(app_id=app, name="github", method="GET", path="/user")
     assert "gate denied" in out["error"]
 
@@ -298,3 +300,51 @@ def test_integration_status_reads_gate_without_network(home, monkeypatch):
     assert out["status"] == "stub"
     assert out["egress"] == "denied"
     assert out["egress_denial"] == "net_denied"
+
+
+# ── pangolin: the adapter that controls what this box exposes ─────────────────
+
+def test_pangolin_is_registered_live_and_host_pinned():
+    a = integrations.get("pangolin")
+    assert a is not None and a.status == "live"
+    # base_url owns scheme + host, and _PATH_RE forbids a path re-pointing
+    # either. That property is load-bearing here in a way it is not for a
+    # read-only adapter: this one creates and deletes PUBLIC resources, so a
+    # re-pointable host would be an attacker choosing which control plane the
+    # fleet's credential is presented to.
+    assert a.base_url == "https://api.pangolin.net/v1"
+    assert a.base_url.startswith("https://")
+
+
+def test_pangolin_requires_a_credential_before_egress(monkeypatch):
+    # There are no anonymous reads on this API. Failing at the adapter rather
+    # than at the far end means a keyless call never opens a socket at all.
+    a = integrations.get("pangolin")
+    for var in a.env_vars:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(type(a), "credential", lambda self: None)
+
+    def _boom(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("opened a socket without a credential")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    out = a.request("GET", "/org/willow/public-resources")
+    assert "error" in out
+    assert "credential" in out["error"].lower()
+
+
+def test_pangolin_credential_env_vars_are_declared():
+    a = integrations.get("pangolin")
+    assert "WILLOW_PANGOLIN_TOKEN" in a.env_vars
+    # env beats vault (BaseAdapter.credential), so the operator's export always
+    # wins over stored state — same rule as every other adapter.
+    assert a.env_vars[0] == "WILLOW_PANGOLIN_TOKEN"
+
+
+def test_pangolin_egress_needs_integration_net_like_any_other(home):
+    # No exemption for the tunnel's own control plane: task_net and full_access
+    # never imply integration_net (B-19, egress is granted on its own line).
+    _manifest(home, "tunneler", permissions=["full_access", "task_net"])
+    denial = integrations.egress_denial("tunneler")
+    assert denial is not None
+    assert "integration_net" in json.dumps(denial)
