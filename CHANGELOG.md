@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **nest:** re-sync vendored ocr.py so .jsonl is admitted as plaintext ([f58d482](https://github.com/willow-memory/willow-mcp/commit/f58d482652341119c87b7b645130b53aaec3b010))
 * **nest:** re-sync vendored ocr.py so .jsonl is admitted as plaintext ([f791cfb](https://github.com/willow-memory/willow-mcp/commit/f791cfbd60a8c841bb69a0515cd756f9aa5bde1c))
 
 ## [2.20.0](https://github.com/willow-memory/willow-mcp/compare/v2.19.0...v2.20.0) (2026-09-01)
