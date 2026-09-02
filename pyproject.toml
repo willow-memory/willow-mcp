@@ -56,7 +56,18 @@ dependencies = [
     # below 1.0 — see docs/design/fleet-versioning.md Rule 1 for why that was
     # withdrawn. Short version: kartikeya's own config says its next `feat:` is
     # 0.1.0, so the tight cap would have expired on the next feature commit.
-    "kartikeya>=0.0.9,<1.0.0",
+    #
+    # Floor raised again to 0.0.12 for B-65: that release binds WILLOW_ROOT
+    # read-only and makes {{WILLOW_ROOT}}/worktrees the writable lane, so a
+    # sandboxed task can no longer edit gate.py — the code deciding what tasks
+    # may do. This floor is load-bearing rather than housekeeping. 0.0.12 adds
+    # `ensure_work_root()`, which CREATES that lane; on an older kartikeya the
+    # read-only posture still applies from config, but a missing worktrees/
+    # directory is never recreated and every task then fails with what reads
+    # like a permissions bug. Same class as B-33's floor, and the same reason it
+    # is regression-tested rather than trusted to the pin
+    # (tests/test_b65_work_root_sandbox.py).
+    "kartikeya>=0.0.12,<1.0.0",
     # Jeles the Librarian — the ~60 named institutional and academic collections
     # behind `willow_institutional_search`. A hard dependency rather than an
     # extra because the tool is registered unconditionally: an optional import
