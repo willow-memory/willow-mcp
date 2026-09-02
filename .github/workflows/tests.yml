@@ -266,8 +266,19 @@ jobs:
     # advancing while the vendored copy stays behind (exactly how the
     # stance_friction block went missing). Deliberately NOT in `test`'s needs,
     # so it never blocks a merge on its own: if an upstream isn't reachable
-    # (private, no token) that check soft-skips with a warning; when it CAN read
-    # upstream it fails hard on any drift.
+    # (private, no token) that check soft-skips with a warning.
+    #
+    # On drift it does NOT just report "the bytes differ" — that sentence is
+    # true of two opposite situations, and reporting both identically cost a
+    # diagnosis on every paired canonical+vendor change. scripts/vendor_drift.py
+    # classifies against upstream history and open upstream PR heads:
+    #   behind   → error. Upstream advanced, the copy stood still.
+    #   ahead    → warning. The canonical half is an OPEN upstream PR, so this
+    #              is a merge ORDER; merge upstream, re-run, green untouched.
+    #   diverged → error. Matches no upstream version and no open PR, i.e. a
+    #              hand-edit of the vendored copy. Never forgiven.
+    # Only a positive match against a real PR head is downgraded, so the guard
+    # is narrowed to the truth rather than weakened.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

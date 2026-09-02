@@ -24,6 +24,8 @@ import difflib
 import sys
 from pathlib import Path
 
+from vendor_drift import annotate, classify
+
 VENDORED_DIR = Path(__file__).resolve().parents[1] / "src/willow_mcp/nest"
 # The shared-core modules whose body must stay byte-for-byte with canonical. The
 # vendored tree adds its own pieces (bridge/digest/intake/rules/__init__) that
@@ -60,11 +62,12 @@ def main(argv: list) -> int:
         if mine == theirs:
             print(f"vendored nest/{name} is in sync with safe-app-store ✓")
             continue
-        drift = True
-        sys.stdout.write(
-            f"::error title=nest-pipeline drift::src/willow_mcp/nest/{name} has drifted "
-            "from safe-app-store libs/nest-pipeline. Re-sync it (procedure in "
-            "tests/test_nest_pipeline_vendor.py) and update the pinned hash there.\n")
+        verdict = classify(upstream, mine, body)
+        drift = drift or verdict.fatal
+        sys.stdout.write(annotate(
+            "nest-pipeline", f"src/willow_mcp/nest/{name}", verdict,
+            "Re-sync it (procedure in tests/test_nest_pipeline_vendor.py) and "
+            "update the pinned hash there."))
         sys.stdout.writelines(difflib.unified_diff(
             theirs.splitlines(True), mine.splitlines(True),
             fromfile=f"safe-app-store/nest_pipeline/{name}",

@@ -23,6 +23,8 @@ import difflib
 import sys
 from pathlib import Path
 
+from vendor_drift import annotate, classify
+
 VENDORED_DIR = Path(__file__).resolve().parents[1] / "src/willow_mcp/mem_ratify"
 # Files whose body must stay byte-for-byte with upstream. The vendored tree may
 # add its own pieces (none today); only these are contract-bound.
@@ -57,11 +59,12 @@ def main(argv: list) -> int:
         if mine == theirs:
             print(f"vendored mem_ratify/{name} is in sync with willow ✓")
             continue
-        drift = True
-        sys.stdout.write(
-            f"::error title=mem_ratify drift::src/willow_mcp/mem_ratify/{name} has drifted "
-            "from willow-memory/Willow. Re-sync it (procedure in tests/test_mem_ratify.py) "
-            "and update the pinned hash there.\n")
+        verdict = classify(upstream, mine, body)
+        drift = drift or verdict.fatal
+        sys.stdout.write(annotate(
+            "mem_ratify", f"src/willow_mcp/mem_ratify/{name}", verdict,
+            "Re-sync it (procedure in tests/test_mem_ratify.py) and update the "
+            "pinned hash there."))
         sys.stdout.writelines(difflib.unified_diff(
             theirs.splitlines(True), mine.splitlines(True),
             fromfile=f"willow/mem_ratify/{name}", tofile=f"willow-mcp/mem_ratify/{name}"))
