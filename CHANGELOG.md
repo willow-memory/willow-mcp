@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.20.2](https://github.com/willow-memory/willow-mcp/compare/v2.20.1...v2.20.2) (2026-09-02)
+
+
+### Fixed
+
+* **deps:** raise the kartikeya floor to 0.0.12 for the B-65 work root ([d2f6cc5](https://github.com/willow-memory/willow-mcp/commit/d2f6cc542c2ba35cc6a90049be94adeda11a2c90))
+
 ## [2.20.1](https://github.com/willow-memory/willow-mcp/compare/v2.20.0...v2.20.1) (2026-09-02)
 
 
