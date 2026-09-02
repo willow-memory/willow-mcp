@@ -240,6 +240,41 @@ class GitHubAdapter(BaseAdapter):
                      "X-GitHub-Api-Version": os.environ.get("WILLOW_GITHUB_API_VERSION", "2022-11-28")}
 
 
+class PangolinAdapter(BaseAdapter):
+    """The tunnel's control plane, and therefore a control plane over what this
+    box exposes to the public internet.
+
+    Pangolin fronts `willow-mcp --serve` for the remote seat (KB 5B7F11AF /
+    2026B306). Its Integration API creates, targets, protects and deletes those
+    resources — so the thing being automated here is *what becomes publicly
+    reachable*, which is exactly the class of action that must leave receipts
+    rather than happen in a shell.
+
+    Concretely, from `/v1/openapi.json`:
+      GET    /org/{orgId}/public-resources          audit what is exposed
+      GET    /org/{orgId}/sites                     connector state
+      PUT    /org/{orgId}/public-resource           create
+      PUT    /public-resource/{id}/target           point it at a local port
+      POST   /public-resource/{id}/password|pincode|header-auth|whitelist
+      PUT    /public-resource-policy/{id}/access-control
+      DELETE /public-resource/{id}                  retire
+
+    A key is always required: there are no anonymous reads, so
+    `credential_required` is True and a call without one fails before egress
+    rather than at the far end with a 401. Mint it at Organization -> API Keys
+    with only the permissions the task needs; the key is shown once.
+
+    The API's own docs warn that "REST API routes and behavior may include
+    breaking changes between updates", so treat a shape change as expected and
+    pin what this fleet depends on rather than trusting the surface.
+    """
+    name = "pangolin"
+    base_url = "https://api.pangolin.net/v1"
+    doc = "Pangolin Integration API — sites, public/private resources, targets, resource auth"
+    env_vars = ("WILLOW_PANGOLIN_TOKEN", "PANGOLIN_API_KEY")
+    credential_required = True
+
+
 class HuggingFaceAdapter(BaseAdapter):
     """Model/dataset metadata for the fleet's local-model work. Public reads
     work without a token; a token raises rate limits and opens private repos."""
@@ -373,6 +408,7 @@ class JiraStub(StubAdapter):
 
 _ADAPTERS: tuple = (
     GitHubAdapter(), HuggingFaceAdapter(), JelesAdapter(), UtetyAdapter(),
+    PangolinAdapter(),
     GmailStub(), SlackStub(), NotionStub(),
     GoogleDriveStub(), DatadogStub(), JiraStub(),
 )
