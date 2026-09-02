@@ -32,3 +32,9 @@ logs/
 .coverage
 .coverage.*
 htmlcov/
+
+# The Kart work root. WILLOW_ROOT (this repo) is bound READ-ONLY into the
+# sandbox so a task cannot edit the code that decides what tasks may do; this
+# directory is the one writable lane inside it, created by the host and used
+# for worktrees. Host-local runtime, not source. See docs/BUGS.md B-65.
+/worktrees/
