@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.20.1](https://github.com/willow-memory/willow-mcp/compare/v2.20.0...v2.20.1) (2026-09-02)
+
+
+### Fixed
+
+* **nest:** re-sync vendored ocr.py so .jsonl is admitted as plaintext ([f791cfb](https://github.com/willow-memory/willow-mcp/commit/f791cfbd60a8c841bb69a0515cd756f9aa5bde1c))
+
 ## [2.20.0](https://github.com/willow-memory/willow-mcp/compare/v2.19.0...v2.20.0) (2026-09-01)
 
 
