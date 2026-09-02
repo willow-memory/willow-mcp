@@ -118,6 +118,18 @@ for mod, dist in (("willow_mcp", "willow-mcp"), ("jeles", "jeles"), ("nestor", "
 PY
 "$PY" -m pip check || warn "dependency conflicts above — usually a missing 'git fetch --tags'"
 
+if [ -n "$NESTOR_REPO" ]; then
+  say "nestor established-knowledge lane"
+  "$PY" - <<'PY' || warn "established lane install failed (non-fatal)"
+try:
+    from nestor.established import install, installed
+    install()
+    print("  tier-1.5 recognizer:", "installed" if installed() else "NOT installed")
+except Exception as exc:
+    raise SystemExit(str(exc))
+PY
+fi
+
 # ── 5. seats in the gate ─────────────────────────────────────────────────────
 say "gate seats"
 # willow-mcp authorizes every tool call against
