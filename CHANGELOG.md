@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **deps:** raise the kartikeya floor to 0.0.12 for the B-65 work root ([34af0ae](https://github.com/willow-memory/willow-mcp/commit/34af0ae9c80e1d8caff9cfd050a6df134f9af6e9))
 * **deps:** raise the kartikeya floor to 0.0.12 for the B-65 work root ([d2f6cc5](https://github.com/willow-memory/willow-mcp/commit/d2f6cc542c2ba35cc6a90049be94adeda11a2c90))
 
 ## [2.20.1](https://github.com/willow-memory/willow-mcp/compare/v2.20.0...v2.20.1) (2026-09-02)
