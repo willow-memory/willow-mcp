@@ -833,7 +833,7 @@ scripts/willow-serve logs        # follow the serve logs (journalctl)
 ```
 
 After `on`/`off`, reconnect your MCP client (in Claude Code: `/mcp`) so it
-picks up the changed `.mcp.json`. Port/host default to `8766`/`127.0.0.1`; set
+picks up the changed `.mcp.json`. Port/host default to `8765`/`127.0.0.1`; set
 `WILLOW_MCP_PORT` / `WILLOW_MCP_HOST` before `install` to change them. Claude
 Code users get this as the [`willow-serve` skill](skills/willow-serve.md) —
 just ask to turn serve mode on or off.
