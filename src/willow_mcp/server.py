@@ -63,6 +63,7 @@ from .db import Store, get_pg, encode_cursor, decode_cursor
 from .gate import log_manifest_verify_sweep, permitted, resolve_collection_alias
 from .identity_binding import resolve_app_id
 from .receipts import ReceiptLog
+from .meter import Meter
 from . import paths
 from . import schema_profile as sp
 from . import dispatch as dispatch_stack
@@ -75,6 +76,23 @@ from . import secret_scan
 
 _store = Store()
 _receipt_log = ReceiptLog()
+
+# Move one: joules per tool call, into the same hash chain as everything else.
+# WILLOW_MCP_METER = inference (default) | all | off. "inference" meters only
+# the tools whose names begin with a prefix below — the seams that can reach a
+# model (nest embed/generate, KB ingest/search, corpus, guarded web) — because
+# the GPU query is a subprocess and would tax every store_put. "all" meters
+# everything (RAPL is a file read; the GPU query is skipped when nvidia-smi is
+# absent). The meter never raises into the call and never fails open: an absent
+# counter is recorded as "unmetered", never as zero.
+_METER_MODE = os.environ.get("WILLOW_MCP_METER", "inference").strip().lower()
+_METERED_PREFIXES = ("nest_", "knowledge_ingest", "knowledge_search", "kb_",
+                     "corpus_", "willow_web_", "willow_institutional_", "infer_")
+
+def _metered(tool_name: str) -> bool:
+    if _METER_MODE == "off":
+        return False
+    return _METER_MODE == "all" or tool_name.startswith(_METERED_PREFIXES)
 
 from .lineage import Lineage
 _lineage = Lineage(_store)
@@ -1039,7 +1057,13 @@ def _guarded(tool_name: str, *, list_error: bool = False, paginated: bool = Fals
                 return _shape({"error": "rate_limited", "retry_after": retry_after})
 
             try:
-                result = fn(**call_kwargs)
+                if _metered(tool_name):
+                    with Meter() as m:
+                        result = fn(**call_kwargs)
+                    meter_row = m.row
+                else:
+                    result = fn(**call_kwargs)
+                    meter_row = None
             except Exception as e:
                 _receipt_log.record(effective_app_id, tool_name, "error", f"{type(e).__name__}: {e}")
                 raise
@@ -1049,7 +1073,13 @@ def _guarded(tool_name: str, *, list_error: bool = False, paginated: bool = Fals
             if isinstance(probe, dict) and "error" in probe:
                 _receipt_log.record(effective_app_id, tool_name, "error", str(probe["error"]))
             else:
-                _receipt_log.record(effective_app_id, tool_name, "ok", None)
+                # The meter rides in `detail` as JSON so it is INSIDE the entry
+                # hash — an edited joule count breaks the chain like any other
+                # field — with no schema change and no migration. Rows without a
+                # meter keep detail=None exactly as before, so since()/tail()
+                # consumers and every existing hash are untouched.
+                detail = json.dumps({"meter": meter_row}, separators=(",", ":")) if meter_row else None
+                _receipt_log.record(effective_app_id, tool_name, "ok", detail)
 
             # Egress secret redaction (defense-in-depth for the README
             # guarantee "No tool ever returns a credential"). Enforced at this
