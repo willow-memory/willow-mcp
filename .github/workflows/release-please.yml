@@ -74,7 +74,7 @@ jobs:
       # wrong it fails here and loudly, rather than degrading to GITHUB_TOKEN.
       - name: Mint a willow-ci installation token
         id: app-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ vars.WILLOW_CI_APP_ID }}
           private-key: ${{ secrets.WILLOW_CI_PRIVATE_KEY }}
