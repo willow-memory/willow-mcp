@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -140,6 +141,12 @@ def _atomic_write(path: Path, doc: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    # paths.trusted_read fail-closed refuses a group/other-writable source
+    # (mode & 0o022) — the umask-derived mode open() leaves on tmp (typically
+    # 664) trips that on the very next read. Strip those bits before the
+    # atomic rename so a fresh write never re-triggers the guard it's meant
+    # to satisfy.
+    os.chmod(tmp, stat.S_IMODE(os.stat(tmp).st_mode) & ~0o022)
     os.replace(tmp, path)
 
 
