@@ -380,7 +380,7 @@ that owns `$WILLOW_HOME`):
 - **D4 — declaration schema:** **settled — see "D4" above.** Entry = the 13-field
   check-in header; the reconciled subset is `{tools, pass_count, fail_count, drift,
   state_hash}`, of which only `tools` has receipt-log ground truth.
-- **D5 — vendoring:** **settled — vendored/pure, no PGP dep.** Every shipped
+- **D5 — vendoring:** **superseded 2026-09-03** — willow-gate is a declared dependency (`willow-gate>=0.1.0,<1.0.0`), taken the way forge-play was; the trust ladder in `session_binder` and `tier_policy` is derived from `willow_gate.TRUST_LEVELS` (tests/test_gate_take.py). The earlier text stands as the record of why it was vendored first: **settled — vendored/pure, no PGP dep.** Every shipped
   piece (`friction_floor`, `agent_registry`, `session_binder`, `tier_policy`,
   `announce`) is stdlib-only; willow-gate's PGP-encrypted announcement ledger is
   left as a pluggable `announce.set_sink()` an operator can wire, so the base

@@ -107,6 +107,20 @@ dependencies = [
     # bump-minor-pre-major false, so a breaking change cuts 1.0.0 and <1.0.0 is
     # a real range.
     "forge-play>=0.1.0,<1.0.0",
+    # willow-gate — the check-in/check-out gate this fleet's trust tiers were
+    # first written for (trust_scale, custody, message_integrity, and the
+    # original friction_floor the Forge later vendored byte-for-byte). Taken
+    # the same way forge-play was, on the operator's word 2026-09-03: the
+    # dependency lands first, with tests/test_gate_take.py proving the package
+    # installs and its names resolve; moving any seam here onto it is its own
+    # change, one module at a time, never this commit. willow-gate never
+    # imports willow-mcp; that is the only direction the arrow may point.
+    #
+    # Cheap to take: python-gnupg and cryptography, both already in this tree's
+    # environment for the PGP path. Cap at the next major per Rule 1;
+    # willow-gate sets bump-minor-pre-major false, so a breaking change cuts
+    # 1.0.0 and <1.0.0 is a real range.
+    "willow-gate>=0.1.0,<1.0.0",
     "requests>=2.31,<3.0",
 ]
 

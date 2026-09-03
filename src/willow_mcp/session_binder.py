@@ -29,9 +29,18 @@ from typing import Optional
 from . import agent_registry, paths, tier_policy
 
 # (name, read_only) — the ladder for logging; D1 maps tiers→groups at enforcement.
+#
+# Home: willow-gate, `willow_gate.TRUST_LEVELS`. Until 2026-09-03 this was a
+# hand-kept twin of the gate's ladder, pinned to it only by a golden vector in
+# both repos' tests/test_trust_ladder_canonical.py because the two could not
+# share code (seam doc D5: no willow-gate dependency, no PGP). With willow-gate
+# taken as a dependency the same way forge-play was, the twin is derived from
+# the gate's own object — one ladder, read here in the shape this module's
+# callers already use. The golden-vector test stays as the independent check.
+from willow_gate import TRUST_LEVELS as _GATE_LEVELS
+
 TRUST_LEVELS = {
-    0: ("Exiled", True), 1: ("Rookie", True), 2: ("Steady", False),
-    3: ("Veteran", False), 4: ("Elder", False),
+    level: (tl.name, tl.read_only) for level, tl in sorted(_GATE_LEVELS.items())
 }
 REQUIRED_FIELDS = {
     "agent_id", "agent_name", "last_gate", "pass_count", "fail_count", "drift",
