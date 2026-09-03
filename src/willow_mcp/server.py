@@ -7792,6 +7792,14 @@ def _main():
     confirm_p.add_argument("--subject", required=True, help="The IdP 'sub' claim for this identity")
     confirm_p.add_argument("--app-id", required=True, dest="app_id")
 
+    listen_p = subparsers.add_parser(
+        "grove-listen",
+        help="Listen on the Grove for one seat and log what concerns it (mentions, "
+             "bus-addressed messages, its own channel); publishes a HEARTBEAT",
+    )
+    from .grove_listen import build_parser as _grove_listen_parser
+    _grove_listen_parser(listen_p)
+
     worker_p = subparsers.add_parser(
         "worker",
         help="Run the Kart task worker (drains the queue; publishes a liveness heartbeat)",
@@ -8364,6 +8372,9 @@ def _main():
     if args.command == "worker":
         _cmd_worker(args)
         return
+    if args.command == "grove-listen":
+        from .grove_listen import main as _grove_listen_main
+        raise SystemExit(_grove_listen_main(args))
     if args.command == "voice":
         _cmd_voice(args)
         return

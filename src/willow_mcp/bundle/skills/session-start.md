@@ -31,6 +31,7 @@ Run in order:
 | 2 | `diagnostic_summary(app_id="willow")` | `broken` → stop and report; `ok` or `degraded` → continue |
 | 3 | `dispatch_list(app_id="willow", …)` | Desk view — pending / working / complete packets |
 | 4 | `commitment_surface(app_id="willow")` | What may be worth the operator's attention now |
+| 5 | `willow-mcp grove-listen --app-id willow --quiet &` then tail its log | Grove listener up — see **Grove listener** below |
 
 Work in **whatever mode the user asks for** (governance, portfolio, commitments, dispatch, build). No lane declaration required at open.
 
@@ -99,8 +100,9 @@ No `WILLOW_HUMAN_ORCHESTRATOR` on specialist MCP configs.
 | 1 | `session_enter(app_id, session_id, dispatch_id=…)` — read `entry_mode`, `assignment` (if dispatch), `persona`, `closeout` / `closeout_tools` |
 | 2 | Apply voice + boundaries from `persona-overlays.md` for your `app_id` |
 | 3 | `diagnostic_summary(app_id=…)` when the role monitors or builds — `broken` → report once and stop |
-| 4 | Work within manifest permissions only |
-| 5 | Close with the tool named in `closeout_tools` |
+| 4 | Open your ear on the Grove (see **Grove listener** below) — otherwise the fleet cannot reach you |
+| 5 | Work within manifest permissions only |
+| 6 | Close with the tool named in `closeout_tools` |
 
 `session_enter` embeds persona text in the `persona` field (source: `$WILLOW_HOME/personas/<agent>.md`).
 Overlays are voice and posture only — they do not change `app_id`, namespace, or grants.
@@ -127,6 +129,34 @@ Full overlay text: `persona-overlays.md`.
 1. `session_enter` → `entry_mode: human`
 2. Work
 3. `session_handoff_write`
+
+## Grove listener (every seat, willow included)
+
+`grove_inbox` and `grove_watch` are polls; a seat that is not polling hears
+nothing. The listener is the push side: a background process that LISTENs on
+Postgres, writes one line per message that concerns the seat, and announces
+the seat with a HEARTBEAT so `grove_agents` shows it alive.
+
+```bash
+# background, once per session; a second launch for the same seat exits 0
+willow-mcp grove-listen --app-id <your app_id> --quiet &
+```
+
+Then tail the log with your client's background monitor
+(Claude Code: `Monitor` on `$WILLOW_HOME/logs/grove-listen-<app_id>.log`).
+Lines and what to do with them:
+
+| Line | Meaning | Response |
+|------|---------|----------|
+| `[MENTION:BROADCAST]` | `@all` on any channel | read the thread; act only if it names your role |
+| `[MENTION:DIRECT:<you>]` | your handle or alias | reply on the thread (`grove_reply`) |
+| `[BUS:COMMAND]` / `[BUS:EVENT]` … | bus message addressed to you | `grove_bus_receive`, then `grove_ack` when done |
+| `[INBOX]` | a post in `#<your app_id>` | read it |
+| `[CHANNEL]` | a channel you asked to follow (`--verbose-channels`) | informational |
+
+The listener needs `grove_read`; `grove_write` adds the heartbeat. It reports
+and never acts — replying, acking, dispatching stay yours, through the gated
+tools. It never speaks as anyone but your resolved `grove_sender`.
 
 ## Constraints
 
