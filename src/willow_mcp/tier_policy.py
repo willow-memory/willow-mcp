@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+from willow_gate import TRUST_LEVELS as _GATE_LEVELS  # home of the fleet trust ladder
 
 logger = logging.getLogger(__name__)
 
@@ -134,20 +135,32 @@ EGRESS_TOOLS: frozenset = frozenset({
     "willow_institutional_search", "federation_call",
 })
 
-# Cumulative class sets by trust level. Mirrors session_binder.TRUST_LEVELS:
-#   0 Exiled (read_only, entry denied)  1 Rookie (read_only)
-#   2 Steady                            3 Veteran            4 Elder
+# Cumulative class sets by trust level — derived from the gate's ladder.
+#
+# Home: willow-gate, `willow_gate.TRUST_LEVELS[n].allowed_tools`. Until
+# 2026-09-03 this was a hand-kept mirror (0 Exiled, 1 Rookie read-only,
+# 2 Steady, 3 Veteran, 4 Elder), pinned to the gate by a golden vector. Now the
+# gate's own object is the source and only the fleet-wide rule is applied
+# here: `query` is a read-synonym (no capability is "query but not read"), so
+# wherever the gate grants read, this ceiling also lists QUERY. Exiled grants
+# nothing and is entry_allowed=False upstream.
+
+def _classes_for(allowed_tools) -> frozenset:
+    classes = set(allowed_tools)
+    if READ in classes:
+        classes.add(QUERY)
+    return frozenset(classes)
+
+
 _TIER_CLASSES: dict[int, frozenset] = {
-    0: frozenset(),                                   # Exiled — entry_allowed=False upstream
-    1: frozenset({READ, QUERY}),                      # Rookie — read only
-    2: frozenset({READ, QUERY, WRITE}),               # Steady
-    3: frozenset({READ, QUERY, WRITE, EXECUTE}),      # Veteran
-    4: frozenset({READ, QUERY, WRITE, EXECUTE, ADMIN}),  # Elder
+    level: _classes_for(tl.allowed_tools) for level, tl in sorted(_GATE_LEVELS.items())
 }
 
 # Which trust levels are read-only (write/execute/admin stripped even if the
-# class map somehow lists them) — belt-and-suspenders mirror of TRUST_LEVELS.
-_READ_ONLY_LEVELS: frozenset = frozenset({0, 1})
+# class map somehow lists them) — the gate's own read_only flag.
+_READ_ONLY_LEVELS: frozenset = frozenset(
+    level for level, tl in _GATE_LEVELS.items() if tl.read_only
+)
 
 
 def classify(tool_name: str) -> str | None:
