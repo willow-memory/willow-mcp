@@ -22,6 +22,22 @@ os.environ["WILLOW_HOME"] = _tmp
 os.environ["WILLOW_STORE_ROOT"] = os.path.join(_tmp, "store")
 os.environ["WILLOW_MCP_RECEIPT_DB"] = os.path.join(_tmp, "mcp_receipt.db")
 os.environ["WILLOW_MCP_APPS_ROOT"] = os.path.join(_tmp, "mcp_apps")
+# The egress config dir lives OUTSIDE $WILLOW_HOME by design (keys must not sit
+# in a sandbox mount), so the isolation above does not cover it. Without this
+# line, `home_init.ensure_home_layout` -> `egress_setup.ensure_keypair` ->
+# `save_manifest` writes the operator's REAL ~/.config/willow-mcp/egress/
+# manifest.json from inside the suite. On a box where harden-trust-root has
+# put that file under a separate uid, 52 tests fail with PermissionError; on a
+# box where it has not, the suite silently rewrites the operator's manifest.
+os.environ["WILLOW_MCP_EGRESS_CONFIG_DIR"] = os.path.join(_tmp, "egress")
+# `paths.trusted_read` refuses a governance input that is group- or
+# other-writable. pytest's tmp files take the runner's umask, so under a 002
+# umask (a Kart sandbox, some CI images) every fixture pre-approved.json and
+# FRANK anchor is born 664 and 37 tests fail with "untrusted ownership or
+# permissions" — a property of the shell, not the code. Pin the umask the
+# trust check assumes; a test that means to exercise the refusal chmods on
+# purpose and is unaffected.
+os.umask(0o022)
 
 # The same principle applied to the variables that decide GATE OUTCOMES rather
 # than paths. The list above pinned where the suite reads and writes; these
@@ -60,6 +76,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(tmp_path / "mcp_apps"))
     monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
+    monkeypatch.setenv("WILLOW_MCP_EGRESS_CONFIG_DIR", str(tmp_path / "egress"))
     monkeypatch.delenv("WILLOW_HUMAN_ORCHESTRATOR", raising=False)
     return tmp_path
 
