@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.24.1](https://github.com/willow-memory/willow-mcp/compare/v2.24.0...v2.24.1) (2026-09-03)
+
+
+### Fixed
+
+* envelope registry writer leaves file group-writable, tripping trusted_read ([0e741c2](https://github.com/willow-memory/willow-mcp/commit/0e741c20a6000a934dec75d864635967b5626bba))
+
 ## [2.24.0](https://github.com/willow-memory/willow-mcp/compare/v2.23.0...v2.24.0) (2026-09-03)
 
 
