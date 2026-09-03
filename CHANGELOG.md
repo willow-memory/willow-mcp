@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.23.0](https://github.com/willow-memory/willow-mcp/compare/v2.22.0...v2.23.0) (2026-09-03)
+
+
+### Added
+
+* **grove:** the seat's ear — grove-listen, the LISTEN/NOTIFY monitor 2.0 left behind ([5ffa33c](https://github.com/willow-memory/willow-mcp/commit/5ffa33cea0a66894892925902ecd6d8cce60fe2b))
+
 ## [2.22.0](https://github.com/willow-memory/willow-mcp/compare/v2.21.0...v2.22.0) (2026-09-03)
 
 
