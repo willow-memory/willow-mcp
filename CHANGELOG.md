@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.22.0](https://github.com/willow-memory/willow-mcp/compare/v2.21.0...v2.22.0) (2026-09-03)
+
+
+### Added
+
+* **deps:** take forge-play — human_loop, friction_floor and the egress detector come home to the Forge ([c3d1597](https://github.com/willow-memory/willow-mcp/commit/c3d159732b371f6d991a376c0a18acbd7677e9b1))
+
 ## [2.21.0](https://github.com/willow-memory/willow-mcp/compare/v2.20.3...v2.21.0) (2026-09-02)
 
 
