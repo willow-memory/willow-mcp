@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **grove:** grove-listen — the seat's ear on the Grove ([e693477](https://github.com/willow-memory/willow-mcp/commit/e693477ac9ac70268699af6e357b0fa6915dec7a))
 * **grove:** the seat's ear — grove-listen, the LISTEN/NOTIFY monitor 2.0 left behind ([5ffa33c](https://github.com/willow-memory/willow-mcp/commit/5ffa33cea0a66894892925902ecd6d8cce60fe2b))
 
 ## [2.22.0](https://github.com/willow-memory/willow-mcp/compare/v2.21.0...v2.22.0) (2026-09-03)
