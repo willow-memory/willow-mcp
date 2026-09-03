@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **deps:** take willow-gate — the fleet's trust ladder comes home to the gate ([34de95f](https://github.com/willow-memory/willow-mcp/commit/34de95f1c4696a47c6479ffc0c8ab107fcab9094))
 * **deps:** take willow-gate — the fleet's trust ladder comes home to the gate ([dbddf32](https://github.com/willow-memory/willow-mcp/commit/dbddf32fe5ffd1770af5bd6fcb12bc03c963f178))
 
 ## [2.23.0](https://github.com/willow-memory/willow-mcp/compare/v2.22.0...v2.23.0) (2026-09-03)
