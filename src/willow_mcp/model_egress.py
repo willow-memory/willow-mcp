@@ -12,6 +12,22 @@ checked where that pointed. An operator who exported it at a box across the room
 Meanwhile `consent.cloud_llm` existed, was persisted, reconciled against the
 legacy mirror, and rendered in the gates panel, and **nothing read it**.
 
+TWO HALVES, TWO HOMES
+---------------------
+The DETECTION half — `model_host` / `_addresses` / `is_local_host`, the
+fail-closed "is the model on this machine?" primitive (only all-loopback is
+local; an unparseable URL, an unresolvable name, or a loopback/non-loopback mix
+all read as OFF the machine) — was written here, vendored byte-for-byte by the
+Forge on 2026-08-11 as the thing its declared-not-ambient routing turns on, and
+is now imported back from `forge.model_egress` since forge-play 0.1.0 (the
+operator's 2026-09-02 decision: Willow depends on the engine). It is
+security-relevant and subtle, exactly the kind of thing to hold in one place.
+
+The POLICY half — `denial()` — stays here. It reads THIS repo's consent store
+(`consent.cloud_llm`); the Forge gates egress on the build's signed manifest
+instead and deliberately did not take it. `tests/test_forge_take.py` pins the
+split. The Forge never imports willow-mcp.
+
 WHY THE GATE IS HERE AND NOT AT THE POST
 ----------------------------------------
 The obvious place to check is `nest/embed.py:_post` / `nest/llm.py:_http_json`,
@@ -51,64 +67,17 @@ post-resolution check at the socket, which is the vendored library's business.
 
 from __future__ import annotations
 
-import ipaddress
-import os
-import socket
 from typing import Optional
-from urllib.parse import urlparse
 
-#: Read from the environment on every call, never cached — an operator may
-#: re-point the host between calls, and a cached answer would authorize the old
-#: destination for the new one.
-MODEL_HOST_ENV = "OLLAMA_HOST"
-DEFAULT_MODEL_HOST = "http://localhost:11434"
-
-
-def model_host() -> str:
-    return os.environ.get(MODEL_HOST_ENV) or DEFAULT_MODEL_HOST
-
-
-def _addresses(hostname: str) -> list[str]:
-    """Every address `hostname` resolves to, or [] if it cannot be resolved.
-
-    An unresolvable name is NOT treated as loopback — `is_local_host` fails
-    closed on the empty list, because "I could not tell where this goes" must
-    not read as "it goes nowhere".
-    """
-    try:
-        infos = socket.getaddrinfo(hostname, None)
-    except (socket.gaierror, UnicodeError, ValueError):
-        return []
-    return [i[4][0] for i in infos]
-
-
-def is_local_host(host_url: str) -> bool:
-    """True only when every address this URL resolves to is loopback.
-
-    Every branch that cannot positively establish loopback returns False, so an
-    unparseable URL, an unresolvable name, or a name that resolves to a mix of
-    loopback and non-loopback all require consent.
-    """
-    try:
-        hostname = urlparse(host_url).hostname
-    except ValueError:
-        return False
-    if not hostname:
-        return False
-
-    # A literal address needs no resolution and cannot be re-pointed by DNS.
-    try:
-        return ipaddress.ip_address(hostname).is_loopback
-    except ValueError:
-        pass
-
-    addrs = _addresses(hostname)
-    if not addrs:
-        return False
-    try:
-        return all(ipaddress.ip_address(a).is_loopback for a in addrs)
-    except ValueError:
-        return False
+# The detection half, from its home. `_addresses` is re-exported too so any
+# caller that reached for it by this path keeps working; it is the Forge's.
+from forge.model_egress import (  # noqa: F401
+    DEFAULT_MODEL_HOST,
+    MODEL_HOST_ENV,
+    _addresses,
+    is_local_host,
+    model_host,
+)
 
 
 def denial(tool_name: str = "this tool") -> Optional[dict]:

@@ -320,7 +320,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Compare vendored friction_floor.py against upstream
+      # The friction scorer's body lives in forge-play now (src/willow_mcp/
+      # friction_floor.py re-exports it), so the guard compares the INSTALLED
+      # forge.friction_floor against willow-gate. Install this package (which
+      # pins forge-play) so the comparison is against what a user actually gets.
+      - name: Install this package (brings the pinned forge-play)
+        run: pip install -e .
+
+      - name: Compare the friction scorer (forge-play's copy) against willow-gate upstream
         run: python scripts/check_vendor_sync.py .willow-gate-upstream/src/willow_gate/friction_floor.py
 
       - name: Compare vendored subject_consent against upstream (A1)
