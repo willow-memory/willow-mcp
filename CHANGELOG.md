@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **deps:** take forge-play — human_loop, friction_floor and the egress detector come home to the Forge ([a5369d3](https://github.com/willow-memory/willow-mcp/commit/a5369d3a3bcf923c97f17e198ef581ddf9f026d3))
 * **deps:** take forge-play — human_loop, friction_floor and the egress detector come home to the Forge ([c3d1597](https://github.com/willow-memory/willow-mcp/commit/c3d159732b371f6d991a376c0a18acbd7677e9b1))
 
 ## [2.21.0](https://github.com/willow-memory/willow-mcp/compare/v2.20.3...v2.21.0) (2026-09-02)
