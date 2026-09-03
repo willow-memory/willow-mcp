@@ -91,6 +91,22 @@ dependencies = [
     # that defence at 0.5.x until this package cut a release of its own. See
     # docs/design/fleet-versioning.md, Rule 1.
     "jeles>=0.5.1,<1.0.0",
+    # The Forge — the engine that refuses a confident wrong answer (checkpoint
+    # loop, measuring panel, calibration). The three modules this repo used to
+    # OWN and the Forge used to vendor — human_loop, friction_floor, and the
+    # detection half of model_egress — now live there, and src/willow_mcp/
+    # {human_loop,friction_floor,model_egress}.py are re-export seams so no
+    # import path here changes (tests/test_forge_take.py proves they are the
+    # same objects). Operator, 2026-09-02: "willow gains the dependency on the
+    # engine, but the apps here will only run on it." The Forge never imports
+    # willow-mcp; that is the only direction the arrow may point.
+    #
+    # Cheap to take, same as jeles: forge-play declares no runtime dependencies
+    # (its heavy pieces — Nestor, fsrs, kartikeya — are all soft), so this adds
+    # one wheel and no tree. Cap at the next major per Rule 1; forge-play sets
+    # bump-minor-pre-major false, so a breaking change cuts 1.0.0 and <1.0.0 is
+    # a real range.
+    "forge-play>=0.1.0,<1.0.0",
     "requests>=2.31,<3.0",
 ]
 
@@ -181,7 +197,7 @@ Changelog = "https://github.com/willow-memory/willow-mcp/blob/master/CHANGELOG.m
 # the test would pass — and that shrinking the set to `{"jeles"}` silently
 # disabled it. Adding a package here now forces both a correct pin and a row in
 # the doc's Rule 2 table, which is where its public surface gets decided.
-packages = ["willow-mcp", "jeles", "kartikeya", "nestor-meaning", "willows-grove"]
+packages = ["willow-mcp", "jeles", "kartikeya", "nestor-meaning", "willows-grove", "forge-play"]
 
 # Roster members this operator releases but this package does not consume.
 # `packages` is the release roster — "the ones whose bump policy we know" — and

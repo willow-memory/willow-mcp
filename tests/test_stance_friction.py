@@ -99,12 +99,18 @@ EXPECTED_BODY_SHA256 = "f0d4a48bf27ca92ce19ef9ec2f8fcf9bf614ad977e0ee106cb1e672a
 
 
 def test_vendored_body_matches_pinned_hash():
-    src = pathlib.Path(__file__).resolve().parents[1] / "src/willow_mcp/friction_floor.py"
-    text = src.read_text()
+    """The body now lives in the Forge (forge-play, `forge/friction_floor.py`);
+    `src/willow_mcp/friction_floor.py` is a re-export seam. The drift guard
+    follows the body: it hashes the INSTALLED Forge module, docstring onward —
+    the same bytes this file used to hold, so the pin did not change — against
+    the willow-gate original this scorer was written for."""
+    import forge.friction_floor as home
+    text = pathlib.Path(home.__file__).read_text()
     body = text[text.index('"""'):]     # docstring onward — the vendored contract
     got = hashlib.sha256(body.encode()).hexdigest()
     assert got == EXPECTED_BODY_SHA256, (
-        "vendored friction_floor body drifted from the pinned willow-gate copy.\n"
+        "the Forge's friction_floor body drifted from the pinned willow-gate copy.\n"
         f"  got:      {got}\n  expected: {EXPECTED_BODY_SHA256}\n"
-        "If you re-synced from willow-gate on purpose, update EXPECTED_BODY_SHA256.\n"
-        "If you edited the vendored copy directly — don't; edit willow-gate and re-sync.")
+        "If the Forge re-synced from willow-gate on purpose, update EXPECTED_BODY_SHA256\n"
+        "and the forge-play floor. If the Forge edited the scorer itself — that is a\n"
+        "willow-gate decision first; the three copies stay byte-for-byte below the header.")
