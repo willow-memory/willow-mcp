@@ -140,7 +140,11 @@ legacy_key). What the operator does day-to-day:
 
 ### One-time keyring setup
 
+`WILLOW_KEYRING` is a **file path**, not a boolean — `keys add`/`keys status`
+need it too, either exported in the shell or passed via `--keyring PATH`:
+
 ```bash
+export WILLOW_KEYRING=/path/to/.willow/config/verifiers.json   # must match the MCP config's WILLOW_KEYRING below
 willow-mcp keys add rita         # your operator handle (any name; matches WILLOW_OPERATOR_VERIFIER below)
 willow-mcp keys status rita      # confirm the key is active
 ```
@@ -154,12 +158,18 @@ Then set the env in the MCP config so every SessionStart auto-signs:
     "env": {
       "WILLOW_APP_ID": "willow",
       "WILLOW_HUMAN_ORCHESTRATOR": "1",
-      "WILLOW_KEYRING": "on",
+      "WILLOW_KEYRING": "/path/to/.willow/config/verifiers.json",
       "WILLOW_OPERATOR_VERIFIER": "rita"
     }
   }
 }
 ```
+
+Note: `sign-session` (and `keys add`/`keys status`) read `WILLOW_KEYRING`
+straight from the process environment — there's no `--keyring` flag on
+`sign-session`. Running it from an operator terminal that doesn't export
+the same path the MCP server uses fails with "WILLOW_KEYRING is not set"
+even though the server-side keyring is configured correctly.
 
 With `WILLOW_OPERATOR_VERIFIER` set, the SessionStart hook (PR8) auto-signs
 each new session: it writes the `_v2` sidecar + `.sig`, warms the
@@ -171,6 +181,13 @@ An **unknown or compromised verifier REFUSES `session_enter` outright**
 (PR8 Commit A): a compromised key that continued unattested is exactly
 the fail-quiet pattern the fleet forbids. Rotate with
 `willow-mcp keys add rita --rotate` and reopen the session.
+
+If `WILLOW_OPERATOR_VERIFIER` isn't set (no auto-sign), signing after the
+fact does not get picked up by a bare `session_enter` retry — pass the
+sidecar's `verifier`, `attested_at`, and the hex contents of the `.sig`
+file explicitly as `session_enter`'s `verifier`/`attested_at`/`seal_sig`
+arguments, read from
+`sessions/willow-{id}.attest.json` and `sessions/willow-{id}.attest.json.sig`.
 
 ### The envelope-accrual loop in one flow
 
