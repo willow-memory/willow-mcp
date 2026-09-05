@@ -6370,7 +6370,7 @@ def _cmd_confirm_binding(args) -> None:
     except ValueError as e:
         print(f"Error: {e}")
         raise SystemExit(1)
-    print(f"Bound ({record['issuer']}, {record['subject_id']}) -> app_id={record['app_id']!r} "
+    print(f"Bound ({record['idp']}, {record['subject_id']}) -> app_id={record['app_id']!r} "
           f"(email: {record.get('email')}, basis: {record.get('email_basis', 'unknown')})")
     if record.get("email_drift"):
         print(f"  WARNING: email changed since this binding was first proposed "
