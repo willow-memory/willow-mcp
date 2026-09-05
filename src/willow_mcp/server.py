@@ -524,6 +524,58 @@ def _serve_mode() -> bool:
 _BASE_URL_ENV = (os.getenv("WILLOW_MCP_URL") or "").strip().rstrip("/")
 _BASE_URL = _BASE_URL_ENV if _BASE_URL_ENV else f"http://{_HOST}:{_PORT}"
 
+
+def _csv_env(name: str) -> list[str]:
+    return [v.strip() for v in (os.getenv(name) or "").split(",") if v.strip()]
+
+
+_EXTRA_HOSTS = _csv_env("WILLOW_MCP_EXTRA_HOSTS")
+_EXTRA_ORIGINS = _csv_env("WILLOW_MCP_EXTRA_ORIGINS")
+
+
+def _transport_security():
+    """Host/Origin allowlist for the Streamable HTTP transport.
+
+    Ported from willows-grove's grove/mcp_local.py::_transport_security —
+    same gap, same fix. The MCP SDK's own default (mcpserver/server.py,
+    triggered whenever host is loopback) hardcodes
+    allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"] and nothing else,
+    so a request whose Host header is the public WILLOW_MCP_URL (exactly the
+    tunnelled deployment this serve mode exists for) is refused with 421
+    regardless of what WILLOW_MCP_URL is set to -- discovered live via a
+    Pangolin-fronted connection that got a valid OAuth token and then 421'd
+    on the first authenticated /mcp call. Loopback stays allowed for the
+    forwarded-Host case some tunnels use; the public host comes from the
+    configured base URL, which the operator sets and an attacker does not.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+    from urllib.parse import urlparse
+
+    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    origins = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+
+    parsed = urlparse(_BASE_URL)
+    if parsed.scheme in ("http", "https") and parsed.netloc:
+        if parsed.netloc not in hosts:
+            hosts.append(parsed.netloc)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin not in origins:
+            origins.append(origin)
+
+    for h in _EXTRA_HOSTS:
+        if h not in hosts:
+            hosts.append(h)
+    for o in _EXTRA_ORIGINS:
+        if o not in origins:
+            origins.append(o)
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=hosts,
+        allowed_origins=origins,
+    )
+
+
 from .request_context import RequestContextMiddleware
 
 _common_kwargs: dict[str, Any] = dict(
@@ -8587,7 +8639,7 @@ def _main():
         # SDK 2.x: host/port moved off the constructor onto the transport,
         # which is the stateless core making "where this instance listens" a
         # property of the run rather than of the server object.
-        mcp.run(transport="streamable-http", host=_HOST, port=_PORT)
+        mcp.run(transport="streamable-http", host=_HOST, port=_PORT, transport_security=_transport_security())
     else:
         mcp.run(transport="stdio")
 
