@@ -113,6 +113,7 @@ callers hold — different for all three.
 | **willows-grove** | the Grove MCP tool contract (`grove_reader`, `grove_agent_message`, `grove_mcp_token` — names, parameters, documented return keys), the `grove-serve` console entry point, and the **u2u wire format**: Ed25519-signed `knock`/`consent`/`note` on the LAN | the served page itself — DOM, CSS, Web Component tag names and the 127.0.0.1:8766 route shapes it fetches; reader internals |
 | **forge-play** | the importable Python API the engine exposes — `forge.entry` (`open_bite`), `forge.checkpoint` (`run_checkpoint`, `Decision`, `Option`, `Responder`), `forge.plan_shape` (the `fork` entry), `forge.decision_extract`, `forge.build_loop`, `forge.majors` + `forge/keywords.toml`, `forge.measure_panel`, `forge.calibration_ledger`, and the three seams this repo re-exports (`forge.human_loop`, `forge.friction_floor`, the detection half of `forge.model_egress`); the `python -m forge.*` CLIs | internals prefixed `_`; the `~/.forge` on-disk layout; the demo; the tools/ directory |
 | **willow-gate** | the gate's importable API — `willow_gate.trust_scale` (`Trust`, `outranks`, `at_least`, `to_int`, `from_int`), `willow_gate.custody`, `willow_gate.message_integrity`, `willow_gate.friction_floor` (the original the Forge vendored) | internals prefixed `_`; the encrypted ledger's on-disk layout; the CLI |
+| **willow-ratatosk** | the permission seam — `ratatosk.permission` (`Verdict`, `Decision`, `NeedsConfirmation`, `check`, `enforce`) and `ratatosk.capabilities` (`ActionResult`, `PendingConfirm`, `CapabilityGate`); the `ratatosk` console entry point and its flags; the on-disk `policy.json` and `hooks.json` schemas; the session JSONL record shape | internals prefixed `_`; module layout under `ratatosk.*` beyond those two; the REPL's slash commands and their printed output; the Grove envelope wire format (owned by the protocol, not by this package) |
 
 willows-grove is the first roster member this repo does not depend on, and its
 row is why the roster and the pin rules had to come apart: a released package
@@ -123,6 +124,22 @@ that 1.0 changed the envelope — so it belongs in the left column even though
 nothing in this tree imports it. The served page is deliberately in the right:
 it is loopback-only by design (`safe-app-manifest.json` records no public HTTP
 surface), so its markup has no callers to break.
+
+**willow-ratatosk is the second, and it is the grove's shape rather than jeles'.**
+The session runtime spawns `python -m willow_mcp` over stdio and holds this
+package's console entry point and tool contract; nothing in this tree imports it.
+That is not a permanent judgement — its `promotion.json` nominates
+`ratatosk.capabilities:CapabilityGate` as its semantic seam, and this repo has a
+gate of its own, so a real take is conceivable. But the precedent set here is
+that a dependency is taken when there is a caller. Adding one to make a roster
+entry look tidier would invert the direction the fleet runs in, which is the
+mistake the `unconsumed` list exists to prevent.
+
+Its row is also worth reading against kartikeya's. kartikeya's left column names
+the CLI and the on-disk schema while this repo actually imports `kartikeya.queue`
+and `kartikeya.sandbox` — a gap that only bites if someone refactors "worker
+internals" within their declared rights. ratatosk's row names the Python seam
+first precisely because that is the half a consumer would hold.
 
 The importability clause in willow-mcp's row is not decoration. Two fleet
 packages import it: `jeles/willow_mcp_client.py` probes `import willow_mcp` and
