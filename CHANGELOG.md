@@ -31,6 +31,17 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.24.2](https://github.com/willow-memory/willow-mcp/compare/v2.24.1...v2.24.2) (2026-09-07)
+
+
+### Fixed
+
+* **ci:** repair two failures inherited from master ([13339a1](https://github.com/willow-memory/willow-mcp/commit/13339a162140d0128eda90676bdd7ea2bda08d9b))
+* **cli:** confirm-binding success message KeyError's on 'issuer' ([54389a8](https://github.com/willow-memory/willow-mcp/commit/54389a874f5da5a518d77d0ecea656fb9943d714))
+* **frank:** tell a stale anchor apart from a relinked chain ([08e31c8](https://github.com/willow-memory/willow-mcp/commit/08e31c896ce005843d9f902bb3aafb96dc7928d4))
+* **frank:** tell a stale anchor apart from a relinked chain ([3a1bca7](https://github.com/willow-memory/willow-mcp/commit/3a1bca739c65a9af24e887ccd242d47070120fb1))
+* **serve:** DNS-rebinding allowlist hardcodes loopback, ignores WILLOW_MCP_URL ([5431120](https://github.com/willow-memory/willow-mcp/commit/5431120a2de99e81a8f5fb3d69aaa9a04b9c8b4c))
+
 ## [2.24.1](https://github.com/willow-memory/willow-mcp/compare/v2.24.0...v2.24.1) (2026-09-03)
 
 
