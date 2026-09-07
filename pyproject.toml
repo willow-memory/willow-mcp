@@ -213,7 +213,7 @@ Changelog = "https://github.com/willow-memory/willow-mcp/blob/master/CHANGELOG.m
 # the doc's Rule 2 table, which is where its public surface gets decided.
 packages = [
     "willow-mcp", "jeles", "kartikeya", "nestor-meaning", "willows-grove",
-    "forge-play", "willow-ratatosk",
+    "forge-play", "willow-ratatosk", "willow-gate",
 ]
 
 # Roster members this operator releases but this package does not consume.
