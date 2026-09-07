@@ -46,12 +46,15 @@ if TYPE_CHECKING:
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _postgres_unavailable() -> dict:
+    from .db import last_pg_error
     return {
         "error": "postgres_unavailable",
         "detail": (
             "No Postgres connection — set WILLOW_PG_HOST / WILLOW_PG_SOCKET or "
             "ensure the fleet Postgres is reachable."
         ),
+        # What the attempt actually said, rather than a guess at it.
+        "reason": last_pg_error() or "no reason recorded (no connection attempt this process)",
     }
 
 

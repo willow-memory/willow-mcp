@@ -120,13 +120,16 @@ def _resolve_sender_checked(app_id: str, sender: str = "") -> tuple[Optional[str
 
 
 def _pg_unavailable() -> dict:
+    from .db import last_pg_error
     return {
         "error": "postgres_unavailable",
         "detail": (
-            "Postgres is not reachable (unix socket connection failed) — "
-            "grove_* tools degrade until it's back. Run diagnostic_summary "
-            "for current status, or start your Postgres cluster and retry."
+            "Postgres is not reachable — grove_* tools degrade until it's "
+            "back. Run diagnostic_summary for current status, or start your "
+            "Postgres cluster and retry."
         ),
+        # What the attempt actually said, rather than a guess at it.
+        "reason": last_pg_error() or "no reason recorded (no connection attempt this process)",
     }
 
 
