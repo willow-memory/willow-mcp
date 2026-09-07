@@ -172,7 +172,24 @@ class GovernanceLedger:
         """Walk the chain. ``expected_head`` is the externally-held anchor:
         pass the ``head`` a previous verify returned (kept OUTSIDE this
         database) and "is this the same chain it was yesterday?" gets an
-        answer, which internal consistency alone can never give (#280)."""
+        answer, which internal consistency alone can never give (#280).
+
+        A head that differs from the anchor has two very different causes and
+        the caller has to be able to tell them apart (gap d6d0a632184f). The
+        chain may simply have GROWN since the anchor was taken -- every append
+        moves the head, so a stale anchor ALWAYS mismatches -- or it may have
+        been relinked by an edit-then-``rechain()``. The discriminator is
+        whether the anchored head is still somewhere in this chain: if the
+        running head equals ``expected_head`` at any point in the walk, every
+        entry up to there is byte-identical to what was anchored and
+        everything after it is an append. If it never appears, the anchored
+        chain is not a prefix of this one, which is the relink.
+
+        ``anchor_in_chain`` reports that, with ``anchor_index`` (1-based) and
+        ``entries_since_anchor`` for the benign case. ``valid`` stays False
+        for BOTH -- the caller asked whether the head still matches and it
+        does not -- so no existing gate is loosened by the new distinction.
+        """
         cur = self.pg.cursor()
         cur.execute(
             f"SELECT id, project, event_type, content, prev_hash, hash "  # nosec B608 - TABLE is the module-level constant "frank_ledger"; no user input reaches this string
@@ -181,26 +198,46 @@ class GovernanceLedger:
         rows = cur.fetchall()
         cur.close()
         previous = None
-        for record_id, project, event_type, content, prev_hash, stored_hash in rows:
+        anchor_index = None
+        for index, row in enumerate(rows, start=1):
+            record_id, project, event_type, content, prev_hash, stored_hash = row
             # A row is intact if its stored hash matches the v2 digest (id +
             # project covered) OR the legacy v1 digest (pre-A7 rows). Both are
             # accepted so the code upgrade doesn't flag an un-migrated chain as
             # tampered; a simple project-column UPDATE on a v2 row still breaks
             # BOTH digests and is caught. Run rechain() to bring v1 rows to v2.
-            ok = prev_hash == previous and (
-                entry_hash_v2(previous, record_id, project, event_type, content) == stored_hash
-                or entry_hash(previous, event_type, content) == stored_hash)
-            if not ok:
+            # The two conditions are reported apart (same shape as
+            # receipts.ReceiptLog.verify) because they fail for different
+            # reasons: a linkage break means rows were reordered, inserted or
+            # deleted; a digest break means a row's own content was edited.
+            if prev_hash != previous:
                 return {"valid": False, "broken_at": record_id,
-                        "count": len(rows), "head": None}
+                        "count": len(rows), "head": previous,
+                        "reason": "prev_hash linkage"}
+            if not (entry_hash_v2(previous, record_id, project, event_type, content) == stored_hash
+                    or entry_hash(previous, event_type, content) == stored_hash):
+                return {"valid": False, "broken_at": record_id,
+                        "count": len(rows), "head": previous,
+                        "reason": "entry_hash mismatch"}
             previous = stored_hash
+            if expected_head is not None and previous == expected_head:
+                anchor_index = index
         if expected_head is not None and previous != expected_head:
             # Internally consistent but not the chain the caller anchored:
             # exactly what an edit-plus-rechain forgery looks like from
             # outside. broken_at stays None so the two failures are
             # distinguishable.
+            extended = anchor_index is not None
             return {"valid": False, "broken_at": None, "count": len(rows),
-                    "head": previous, "expected_head": expected_head}
+                    "head": previous, "expected_head": expected_head,
+                    "anchor_in_chain": extended,
+                    "anchor_index": anchor_index,
+                    "entries_since_anchor": (
+                        len(rows) - anchor_index if extended else None),
+                    "reason": (
+                        "chain extends the anchored chain"
+                        if extended
+                        else "anchored head is not in this chain")}
         return {"valid": True, "broken_at": None, "count": len(rows),
                 "head": previous}
 

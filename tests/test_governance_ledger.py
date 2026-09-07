@@ -247,6 +247,94 @@ def test_verify_expected_head_on_empty_chain():
     assert r["head"] is None
 
 
+def test_verify_stale_anchor_reports_extension():
+    """A stale anchor is the common case: the chain grew, so the head moved.
+    The anchored head is still in the chain, and everything up to it is
+    untouched."""
+    rows = _v2_chain([(c, "p", "d", {"n": i}) for i, c in enumerate("abcde")])
+    r = GovernanceLedger(_FakePg(rows)).verify(expected_head=rows[1]["hash"])
+    assert r["valid"] is False
+    assert r["broken_at"] is None
+    assert r["anchor_in_chain"] is True
+    assert r["anchor_index"] == 2
+    assert r["entries_since_anchor"] == 3
+    assert r["reason"] == "chain extends the anchored chain"
+
+
+def test_verify_anchor_absent_from_chain_reports_relink():
+    rows = _v2_chain([(c, "p", "d", {"n": i}) for i, c in enumerate("abc")])
+    r = GovernanceLedger(_FakePg(rows)).verify(expected_head="f" * 64)
+    assert r["valid"] is False
+    assert r["broken_at"] is None
+    assert r["anchor_in_chain"] is False
+    assert r["anchor_index"] is None
+    assert r["entries_since_anchor"] is None
+    assert r["reason"] == "anchored head is not in this chain"
+
+
+def test_verify_distinguishes_relink_from_growth():
+    """The case the anchor exists for: edit an early row, re-link the whole
+    chain, and internal consistency is restored. The walk is clean and
+    broken_at is None either way — only the anchored head's absence tells a
+    relink apart from ordinary appends."""
+    original = _v2_chain([
+        ("a", "p", "d", {"n": 1}),
+        ("b", "p", "d", {"n": 2}),
+    ])
+    anchored_head = original[-1]["hash"]
+
+    grown = _v2_chain([
+        ("a", "p", "d", {"n": 1}),
+        ("b", "p", "d", {"n": 2}),
+        ("c", "p", "d", {"n": 3}),
+    ])
+    relinked = _v2_chain([
+        ("a", "p", "d", {"n": 999}),
+        ("b", "p", "d", {"n": 2}),
+    ])
+
+    grown_r = GovernanceLedger(_FakePg(grown)).verify(expected_head=anchored_head)
+    relinked_r = GovernanceLedger(_FakePg(relinked)).verify(expected_head=anchored_head)
+
+    # Both walk clean; the old return shape could not tell them apart.
+    assert grown_r["broken_at"] is None and relinked_r["broken_at"] is None
+    assert grown_r["valid"] is False and relinked_r["valid"] is False
+    assert grown_r["anchor_in_chain"] is True
+    assert grown_r["entries_since_anchor"] == 1
+    assert relinked_r["anchor_in_chain"] is False
+
+
+def test_verify_empty_chain_anchor_not_in_chain():
+    r = GovernanceLedger(_FakePg([])).verify(expected_head="f" * 64)
+    assert r["anchor_in_chain"] is False
+    assert r["entries_since_anchor"] is None
+
+
+def test_verify_prev_hash_break_reports_reason_and_last_head():
+    rows = _v2_chain([
+        ("a", "p", "decision", {"n": 1}),
+        ("b", "p", "decision", {"n": 2}),
+    ])
+    rows[1]["prev_hash"] = "bogus"
+    r = GovernanceLedger(_FakePg(rows)).verify()
+    assert r["broken_at"] == "b"
+    assert r["reason"] == "prev_hash linkage"
+    # the head reached before the break, not None
+    assert r["head"] == rows[0]["hash"]
+
+
+def test_verify_content_tamper_reports_digest_reason():
+    rows = _v2_chain([
+        ("a", "p", "decision", {"n": 1}),
+        ("b", "p", "decision", {"n": 2}),
+    ])
+    rows[0]["content"] = {"n": 999}
+    r = GovernanceLedger(_FakePg(rows)).verify()
+    assert r["broken_at"] == "a"
+    assert r["reason"] == "entry_hash mismatch"
+    assert r["head"] is None
+
+
 # ── rechain() anchor-guard paths ─────────────────────────────────────────────
 
 def test_rechain_refuses_on_head_mismatch():
