@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **envelope:** let dispatch_send name which governing envelope it cites ([bfb665b](https://github.com/willow-memory/willow-mcp/commit/bfb665b6cbfa79a1567f46dcb67a8107a220a714))
 * **envelope:** let dispatch_send name which governing envelope it cites ([c343bf8](https://github.com/willow-memory/willow-mcp/commit/c343bf885f4d2416da867a50d2b399b696b15afd))
 
 ## [2.24.3](https://github.com/willow-memory/willow-mcp/compare/v2.24.2...v2.24.3) (2026-09-07)
