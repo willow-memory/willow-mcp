@@ -4008,7 +4008,21 @@ def frank_verify(app_id: str) -> dict:
     actually compared; the other three are reported explicitly rather than
     silently treated as a pass. Use `willow-mcp frank-anchor` (CLI-only —
     never an MCP tool, so an agent cannot mint its own anchor) to create or
-    refresh one. Read-only; may take a moment on a long ledger."""
+    refresh one.
+
+    On a head mismatch, `anchor_in_chain` says which of the two causes it is.
+    True means the anchored head is still in the chain at `anchor_index`, so
+    the anchored entries are untouched and `entries_since_anchor` rows were
+    simply appended after them — an anchor that has gone stale, not a
+    tampered chain. False means the anchored head is nowhere in this chain,
+    which is what an edit-then-`rechain()` relink looks like; investigate
+    before re-anchoring, because refreshing the anchor would erase the only
+    external record that the chain ever differed. `anchor_count` is the row
+    count recorded when the anchor was taken. A broken LINK (`broken_at` set)
+    also carries `reason`: "prev_hash linkage" (rows reordered, inserted or
+    deleted) or "entry_hash mismatch" (a row's own content edited), plus the
+    last good `head` reached before the break. Read-only; may take a moment
+    on a long ledger."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
@@ -4022,6 +4036,7 @@ def frank_verify(app_id: str) -> dict:
         result["anchor_status"] = anchor["status"]
         if anchor["status"] == "anchored":
             result["anchor_recorded_at"] = anchor.get("anchored_at")
+            result["anchor_count"] = anchor.get("count")
         return result
     except Exception as exc:
         return {"error": f"frank_unavailable: {exc}"}
