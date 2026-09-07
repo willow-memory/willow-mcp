@@ -854,15 +854,23 @@ def _postgres_unavailable() -> dict:
     `res["error"] in ("postgres_unavailable",)`); `detail` carries the
     actionable half, reusing the phrasing diagnostic_summary's own Postgres
     check already has, rather than the 15+ call sites each inventing (or
-    not inventing) their own."""
+    not inventing) their own.
+
+    `reason` carries what the connection attempt ACTUALLY said, when it said
+    anything. This message used to assert "unix socket connection failed"
+    unconditionally — a cause it had not checked. When the real fault was a
+    wrong `WILLOW_PG_DB`, that sentence was simply false and cost an hour of
+    looking at a healthy socket."""
+    from .db import last_pg_error
+    reason = last_pg_error()
     return {
         "error": "postgres_unavailable",
         "detail": (
-            "Postgres is not reachable (unix socket connection failed) — "
-            "knowledge_*/task_*/fleet_* degrade until it's back. Run "
-            "diagnostic_summary for current status, or start your Postgres "
-            "cluster and retry."
+            "Postgres is not reachable — knowledge_*/task_*/fleet_* degrade "
+            "until it's back. Run diagnostic_summary for current status, or "
+            "start your Postgres cluster and retry."
         ),
+        "reason": reason or "no reason recorded (no connection attempt this process)",
     }
 
 
