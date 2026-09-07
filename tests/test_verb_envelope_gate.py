@@ -239,6 +239,70 @@ def test_dispatch_send_refuses_ambiguously_governed_verb(home, monkeypatch, tmp_
     assert pg.rows == []
 
 
+def test_envelope_id_disambiguates_two_governing_grants(home, monkeypatch, tmp_path):
+    """Two legitimate grants is a normal registry state. Naming one lets the
+    call proceed and charges THAT envelope -- the caller says which, the gate
+    does not guess."""
+    _write_manifest(home, "loki")
+    extra = [{
+        "id": "env-dispatch-2", "verb_id": 11, "verb": "dispatch", "grantee": "loki",
+        "bounds": {"to_agents": ["hanuman"], "task_class": ["hanuman"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }]
+    _set_charter(monkeypatch, tmp_path, maximum=None, extra_active=extra)
+    pg = _FakeGovernancePg()
+    monkeypatch.setattr(server, "get_pg", lambda: pg)
+
+    result = server.dispatch_send("loki", "hanuman", "# One\n",
+                                  envelope_id="env-dispatch-2")
+
+    assert "error" not in result, result
+    assert len(pg.rows) == 1
+    assert "env-dispatch-2" in json.dumps(pg.rows[0])
+
+
+def test_envelope_id_cannot_name_an_envelope_that_does_not_govern(home, monkeypatch, tmp_path):
+    """The parameter disambiguates; it must never widen. An id outside the
+    actor's own governing set is refused, and nothing is cited."""
+    _write_manifest(home, "loki")
+    extra = [{
+        "id": "env-dispatch-2", "verb_id": 11, "verb": "dispatch", "grantee": "loki",
+        "bounds": {"to_agents": ["hanuman"], "task_class": ["hanuman"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }]
+    _set_charter(monkeypatch, tmp_path, maximum=None, extra_active=extra)
+    pg = _FakeGovernancePg()
+    monkeypatch.setattr(server, "get_pg", lambda: pg)
+
+    result = server.dispatch_send("loki", "hanuman", "# One\n",
+                                  envelope_id="env-somebody-elses")
+
+    assert result.get("error") == "ENOENT"
+    assert pg.rows == []
+
+
+def test_eambig_names_the_parameter_that_resolves_it(home, monkeypatch, tmp_path):
+    """An error that says what to do next. The ids to choose from are already
+    in the payload; the reason now says how to use them."""
+    _write_manifest(home, "loki")
+    extra = [{
+        "id": "env-dispatch-2", "verb_id": 11, "verb": "dispatch", "grantee": "loki",
+        "bounds": {"to_agents": ["hanuman"], "task_class": ["hanuman"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }]
+    _set_charter(monkeypatch, tmp_path, maximum=None, extra_active=extra)
+    monkeypatch.setattr(server, "get_pg", lambda: _FakeGovernancePg())
+
+    result = server.dispatch_send("loki", "hanuman", "# One\n")
+
+    assert result.get("error") == "EAMBIG"
+    assert "envelope_id" in result.get("reason", "")
+    assert set(result["envelope_ids"]) >= {"env-dispatch-2"}
+
+
 # ── (c) non-enveloped verbs / actors are unaffected ─────────────────────────
 
 def test_dispatch_send_unaffected_when_no_envelope_governs_this_actor(home, monkeypatch, tmp_path):
