@@ -4,7 +4,9 @@
 **Scope:** the packages listed in `[tool.willow.fleet]` in this repo's
 `pyproject.toml`, which is where the roster lives and where
 `tests/test_fleet_versioning.py` reads it from. Not `jeles-remote` (a deployed
-service, not a package) or `willow-gate` (unpublished).
+service, not a package). `willow-gate` was excluded here as "unpublished" and is
+no longer: it has been on PyPI since 0.1.0 (2026-09-03) and is a hard dependency
+of this package, so it joins the roster.
 
 The release *mechanics* are already uniform and tested — tag-derived versions
 via hatch-vcs, `release-type: simple`, `include-component-in-tag: false`,
