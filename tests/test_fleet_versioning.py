@@ -259,6 +259,50 @@ def test_the_installed_jeles_still_has_the_surface_we_use():
             f"{name} is no longer keyword-only; server.py passes it by keyword")
 
 
+def test_the_installed_kartikeya_still_has_the_surface_we_use():
+    """Rule 1's real instrument, for the package whose row was wrong.
+
+    kartikeya's table row used to say the surface was the CLI and the on-disk
+    schema. This repo has never invoked the `kart` CLI: it holds the Python API,
+    and `run_worker` is called with a live queue object plus callbacks, which is
+    not a thing a command line can carry.
+
+    Narrow on purpose, the same way the jeles check is. Only the names this repo
+    actually calls are asserted — kartikeya exports more, and pinning those would
+    be pinning a surface we do not hold.
+    """
+    kartikeya = pytest.importorskip("kartikeya", reason="declared runtime dependency")
+    import inspect
+
+    params = inspect.signature(kartikeya.run_worker).parameters
+    assert "queue" in params, "run_worker takes the queue as its first argument"
+    for name in ("lane", "slots", "interval", "once", "on_heartbeat", "network_authorizer"):
+        assert name in params, f"worker.py passes {name}= to run_worker"
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+
+    from kartikeya import queue as kqueue
+
+    for name in ("TaskQueue", "TaskRow", "QueueStats", "SqliteTaskQueue"):
+        assert hasattr(kqueue, name), f"task_queue.py imports {name}"
+
+
+def test_the_sandbox_seam_we_hold_is_present_though_kartikeya_does_not_declare_it():
+    """The asymmetry the row records: `kartikeya.sandbox` is not in kartikeya's
+    `__all__`, but worker.py refuses to start without two of these and the
+    pyproject floor comments call the other two load-bearing (B-33, B-65).
+
+    Kept separate from the test above so the day kartikeya declares them — or
+    removes them — the failure says which half moved.
+    """
+    pytest.importorskip("kartikeya", reason="declared runtime dependency")
+    from kartikeya import sandbox
+
+    for name in ("resolve_sandbox_config", "is_vendored_default",
+                 "collect_mcp_trust_ro_overlays", "ensure_work_root"):
+        assert hasattr(sandbox, name), \
+            f"willow-mcp holds kartikeya.sandbox.{name}; it is gone"
+
+
 def test_the_convention_classifies_every_fleet_package():
     """Rule 2 assigns each package a public surface — the thing whose breakage
     forces a major — and they differ: willow-mcp's is its tool contract and not

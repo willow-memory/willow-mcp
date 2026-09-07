@@ -110,7 +110,7 @@ callers hold — different for all three.
 |---|---|---|
 | **willow-mcp** | the MCP tool contract — tool names, parameter names and meanings, documented return keys; the seven `[project.scripts]` console entry points; **and the fact that `willow_mcp` is importable and `python -m willow_mcp` runs** | the Python API — module layout, function signatures, anything under `willow_mcp.*` beyond the package importing |
 | **jeles** | the importable Python API (`jeles.institutional`, `jeles.sources`, `jeles.corpus`, `jeles.willow_mcp_client`, the shared hit key set), `corpus_server`'s tool contract, **and the host-card schema** (`jeles/cards/*.json` — the `host`/`roles`/`publisher`/`custody`/`jurisdiction`/`status`/`notes` fields and the enum values `roles` and `custody` admit) | internals prefixed `_`, including `_egress`; the `observed` field the schema never shipped |
-| **kartikeya** | the `kartikeya`/`kart` CLI and the task-queue schema on disk and in Postgres | the worker internals |
+| **kartikeya** | the importable Python API its own `__init__` calls public — `TaskQueue`, `TaskRow`, `QueueStats`, `SqliteTaskQueue`, `lanes`, `check_kart_task`, `execute_task_row`, `drain_claimed_tasks`, `run_shell_task`, `NetworkAuthorizer`, and `run_worker` **with its keyword arguments** (`lane`, `slots`, `interval`, `once`, `on_heartbeat`, `network_authorizer`); the `kartikeya`/`kart` CLI; and the task-queue schema on disk and in Postgres | internals prefixed `_`; the bubblewrap invocation it builds; the vendored default mount policy |
 | **nestor-meaning** | the importable Python API (`nestor.answer`, `nestor.cascade`, `nestor.portable`, `nestor.entity.EntityResolver`, `nestor.sqlite_store.SqliteStore`), the `nestor` CLI | internals prefixed `_`; the dogfood store schema |
 | **willows-grove** | the Grove MCP tool contract (`grove_reader`, `grove_agent_message`, `grove_mcp_token` — names, parameters, documented return keys), the `grove-serve` console entry point, and the **u2u wire format**: Ed25519-signed `knock`/`consent`/`note` on the LAN | the served page itself — DOM, CSS, Web Component tag names and the 127.0.0.1:8766 route shapes it fetches; reader internals |
 | **forge-play** | the importable Python API the engine exposes — `forge.entry` (`open_bite`), `forge.checkpoint` (`run_checkpoint`, `Decision`, `Option`, `Responder`), `forge.plan_shape` (the `fork` entry), `forge.decision_extract`, `forge.build_loop`, `forge.majors` + `forge/keywords.toml`, `forge.measure_panel`, `forge.calibration_ledger`, and the three seams this repo re-exports (`forge.human_loop`, `forge.friction_floor`, the detection half of `forge.model_egress`); the `python -m forge.*` CLIs | internals prefixed `_`; the `~/.forge` on-disk layout; the demo; the tools/ directory |
@@ -152,6 +152,32 @@ modules were free to move because *"nothing imports `willow_mcp.web_fetch` from
 outside"* — true, and it does not support the conclusion. **willow-mcp is a
 library to the rest of the fleet whatever it is to the outside world**, and the
 dependency graph is a cycle: willow-mcp → jeles → willow-mcp.
+
+**kartikeya's row said the surface was "the CLI and the task-queue schema on
+disk and in Postgres", and the not-surface was "the worker internals". That was
+wrong in both columns, and had been since the take.** This repo has never invoked
+the `kart` CLI. It imports `kartikeya.queue` (`task_queue.py`), calls
+`kartikeya.run_worker(queue, ..., on_heartbeat=..., network_authorizer=...)`
+(`worker.py`, `gates_actions.py`) and reads `kartikeya.sandbox`
+(`worker.py`) — so what it actually holds is the Python API, and part of what
+the old row disclaimed as "worker internals" sat directly under the call.
+
+The correction is not a concession by kartikeya: its own `__init__.py` opens
+with *"Public surface:"* and lists exactly these names, and `__all__` repeats
+them. Only this table disagreed. `run_worker`'s keyword arguments are named
+explicitly because the integration is inherently in-process — a live queue
+object, a heartbeat callback and a network authorizer cannot cross a CLI
+boundary — so "swap to the CLI instead" was never an available answer.
+
+One asymmetry survives and is worth stating rather than papering over.
+`kartikeya.sandbox` is **not** in kartikeya's `__all__`, yet this repo imports
+`resolve_sandbox_config` and `is_vendored_default` from it, refuses to start a
+worker when they are absent, and pins `collect_mcp_trust_ro_overlays` and
+`ensure_work_root` in `test_b33_consent_sandbox.py` and
+`test_b65_work_root_sandbox.py` — both named as load-bearing in this file's own
+floor comments. So a consumer depends on a module the producer has not declared.
+The row above lists it because that is the truth of what is held; closing the gap
+properly means kartikeya adding those four names to its stated surface.
 
 **The host-card schema joined jeles' row on 2026-08-09, later than the day the
 decision was made.** `Jeles/docs/design/host-cards.md` §6.1 (commit `6a08553`,
