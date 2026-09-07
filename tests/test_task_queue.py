@@ -282,3 +282,61 @@ def test_factory_uses_postgres_when_available(monkeypatch):
     q = tq.build_task_queue("app")
     assert isinstance(q, tq.PgTaskQueue)
     assert isinstance(q, TaskQueue)
+
+
+# ── connection recovery across a Postgres restart ──────────────────────────
+
+def test_live_connection_is_reused_not_re_resolved(queue, pg, monkeypatch):
+    from willow_mcp import db
+
+    monkeypatch.setattr(
+        db, "get_pg", lambda: pytest.fail("get_pg called for a live connection")
+    )
+    assert queue._pg is pg
+
+
+def test_closed_connection_is_re_resolved(queue, pg, monkeypatch):
+    """The 2026-09-05 outage: Postgres restarted, the cached handle stayed
+    closed forever, and every claim raised for 43 hours."""
+    from willow_mcp import db
+
+    fresh = _FakePg()
+    pg.closed = 1
+    monkeypatch.setattr(db, "get_pg", lambda: fresh)
+
+    assert queue._pg is fresh
+    # and it is cached, not re-resolved on every access
+    monkeypatch.setattr(
+        db, "get_pg", lambda: pytest.fail("re-resolved an already-healthy connection")
+    )
+    assert queue._pg is fresh
+
+
+def test_claim_recovers_on_the_first_tick_after_the_database_returns(
+    queue, pg, monkeypatch
+):
+    """The property that makes the worker self-healing: no restart needed."""
+    from willow_mcp import db
+
+    fresh = _FakePg()
+    fresh.next_rows = [("t1", "echo hi", "kart")]
+    pg.closed = 1
+    monkeypatch.setattr(db, "get_pg", lambda: fresh)
+
+    rows = queue.claim_pending("kart", 1, lane="fast")
+
+    assert [r.task_id for r in rows] == ["t1"]
+    assert fresh.executed, "the claim ran on the replacement connection"
+    assert not pg.executed, "nothing ran on the dead one"
+
+
+def test_unavailable_database_raises_rather_than_returning_a_dead_handle(
+    queue, pg, monkeypatch
+):
+    from willow_mcp import db
+
+    pg.closed = 1
+    monkeypatch.setattr(db, "get_pg", lambda: None)
+
+    with pytest.raises(RuntimeError, match="postgres unavailable"):
+        queue._pg

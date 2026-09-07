@@ -95,7 +95,7 @@ class PgTaskQueue(TaskQueue):
         retry_delay_seconds: int = 5,
         stale_after_seconds: int | None = None,
     ):
-        self._pg = pg
+        self._pg_conn = pg
         self.claim_owner = claim_owner or (
             f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:12]}"
         )
@@ -138,6 +138,41 @@ class PgTaskQueue(TaskQueue):
                 + ", ".join(missing)
                 + " — apply the reviewed worker migration and reconfirm the mapping"
             )
+
+    @property
+    def _pg(self):
+        """The live connection, re-resolved if the cached one has died.
+
+        A worker process outlives the database. When Postgres restarts, the
+        connection handed in at construction is closed forever, and every
+        query on it raises "connection already closed" — for the life of the
+        process, because nothing here ever asked for another one. That is not
+        theoretical: a fast-lane worker spent 43 hours failing every claim
+        that way after the 2026-09-05 crash, while still publishing a healthy
+        heartbeat.
+
+        ``db.get_pg()`` already owns the recovery logic — it checks ``closed``,
+        reconnects, revalidates with ``SELECT 1``, and can bring a downed
+        server back via ``postgres_lifecycle``. So ask it again instead of
+        holding a handle. The worker then heals on the first tick after the
+        database returns, with no operator in the loop.
+
+        ``getattr`` rather than ``.closed`` directly: this class is also
+        constructed over test doubles and any DB-API connection, not only
+        psycopg2's.
+        """
+        conn = self._pg_conn
+        if conn is not None and not getattr(conn, "closed", 0):
+            return conn
+        from .db import get_pg
+        fresh = get_pg()
+        if fresh is None:
+            raise RuntimeError(
+                "postgres unavailable: the task queue's connection is closed "
+                "and could not be re-established"
+            )
+        self._pg_conn = fresh
+        return fresh
 
     def _q(self, field: str) -> str:
         return f'"{self._col[field]}"'
