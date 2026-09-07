@@ -38,7 +38,10 @@ def test_absent_package_is_flagged(tmp_path):
 
 
 def test_satisfied_pin_is_silent(tmp_path):
-    assert df.unsatisfied(_write(tmp_path, ["kartikeya>=0.0.7,<0.1.0"])) == []
+    from importlib.metadata import version
+
+    have = version("kartikeya")
+    assert df.unsatisfied(_write(tmp_path, [f"kartikeya>={have}"])) == []
 
 
 def test_inapplicable_marker_is_skipped(tmp_path):
