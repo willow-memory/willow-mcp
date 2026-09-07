@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.24.3](https://github.com/willow-memory/willow-mcp/compare/v2.24.2...v2.24.3) (2026-09-07)
+
+
+### Fixed
+
+* **worker:** re-resolve the queue connection after a Postgres restart ([83a2a4f](https://github.com/willow-memory/willow-mcp/commit/83a2a4f6197187091efc541f28dca50d3991d2f1))
+* **worker:** re-resolve the queue connection after a Postgres restart ([cbd7852](https://github.com/willow-memory/willow-mcp/commit/cbd78526041ce13318c3c8afd92e4ae0f33dba42))
+
 ## [2.24.2](https://github.com/willow-memory/willow-mcp/compare/v2.24.1...v2.24.2) (2026-09-07)
 
 
