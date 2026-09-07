@@ -36,8 +36,8 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **worker:** re-resolve the queue connection after a Postgres restart ([83a2a4f](https://github.com/willow-memory/willow-mcp/commit/83a2a4f6197187091efc541f28dca50d3991d2f1))
 * **worker:** re-resolve the queue connection after a Postgres restart ([cbd7852](https://github.com/willow-memory/willow-mcp/commit/cbd78526041ce13318c3c8afd92e4ae0f33dba42))
+* **ci:** repair two failures inherited from master ([c8f4665](https://github.com/willow-memory/willow-mcp/commit/c8f4665a3db8fe82c8745dfe905a5300252dda8c))
 
 ## [2.24.2](https://github.com/willow-memory/willow-mcp/compare/v2.24.1...v2.24.2) (2026-09-07)
 
