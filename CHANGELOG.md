@@ -36,7 +36,7 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **envelope:** a writer for revocation, and a listing that agrees with the gate ([81d886c](https://github.com/willow-memory/willow-mcp/commit/81d886c27c16cacb5d23a23f796001ec20a9017a))
+* **envelope:** a writer for revocation, and a listing that agrees with the gate ([6d80fcb](https://github.com/willow-memory/willow-mcp/commit/6d80fcba10ab783d6a87ff5944ed42a77ae2cb53))
 
 ## [2.25.0](https://github.com/willow-memory/willow-mcp/compare/v2.24.3...v2.25.0) (2026-09-07)
 
