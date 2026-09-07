@@ -7,8 +7,11 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 
 
+from . import paths
+
+
 def _willow_home() -> Path:
-    return Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
+    return paths.willow_home()
 
 
 class Vault:
@@ -17,9 +20,8 @@ class Vault:
         vault_path: Path | None = None,
         key_path: Path | None = None,
     ):
-        home = _willow_home()
-        self._vault = Path(vault_path) if vault_path is not None else home / "vault.db"
-        self._key_path = Path(key_path) if key_path is not None else home / "vault.key"
+        self._vault = Path(vault_path) if vault_path is not None else paths.vault_db_path()
+        self._key_path = Path(key_path) if key_path is not None else paths.vault_key_path()
         self._fernet: Fernet | None = None
 
     def init(self) -> None:
@@ -83,11 +85,10 @@ class Vault:
 
 
 def default_vault() -> "Vault":
-    """Return a Vault pointing at $WILLOW_HOME/vault.db, initializing if needed."""
+    """Return a Vault pointing at the operator secrets box, initializing if needed."""
     v = Vault()
-    home = _willow_home()
-    db_exists  = (home / "vault.db").exists()
-    key_exists = (home / "vault.key").exists()
+    db_exists = paths.vault_db_path().exists()
+    key_exists = paths.vault_key_path().exists()
     if db_exists and not key_exists:
         raise FileNotFoundError(
             f"Vault database exists but key file is missing: {v._key_path}\n"

@@ -132,7 +132,7 @@ def call_sig(secret: bytes, session_id: str, app_id: str, tool: str, call_nonce:
 class SessionBinder:
     def __init__(self):
         self._sessions: dict = {}          # nonce -> session dict (process-lived)
-        self._used_nonces_file = paths.willow_home() / "gate" / "used_checkin_nonces"
+        self._used_nonces_file = paths.gate_dir() / "used_checkin_nonces"
         # FastMCP dispatches sync tools on a threadpool, so session state is
         # touched concurrently. A reentrant lock guards the session dict, the
         # per-session nonce sets, and the check-in nonce file's check-then-mark.
