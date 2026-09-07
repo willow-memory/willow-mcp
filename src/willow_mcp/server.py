@@ -4275,12 +4275,26 @@ def envelope_reject(
 
 @mcp.tool(annotations=_ANNO_READ)
 @_guarded("envelope_list")
-def envelope_list(grantee: str = "", verb: str = "") -> dict:
+def envelope_list(grantee: str = "", verb: str = "",
+                  include_revoked: bool = False) -> dict:
     """List currently ACTIVE envelopes, optionally filtered by grantee
-    and/or verb. Read-only."""
+    and/or verb. Read-only.
+
+    "Active" means what the GATE means by it — not revoked, status
+    "active" — so this listing and the surface that enforces cannot
+    disagree. A revoked envelope stays in the register (what was granted
+    and withdrawn both stay auditable) but is not in force and is not
+    listed here. Pass ``include_revoked`` to see the withdrawn rows, each
+    with its ``revoked_at`` / ``revoked_by`` / ``revoked_reason``, under a
+    separate ``revoked`` key — never mixed into ``active``."""
     from . import envelope_authoring as _ea
     rows = _ea.list_active(grantee=grantee or None, verb=verb or None)
-    return {"active": rows, "count": len(rows)}
+    out = {"active": rows, "count": len(rows)}
+    if include_revoked:
+        revoked = _ea.list_revoked(grantee=grantee or None, verb=verb or None)
+        out["revoked"] = revoked
+        out["revoked_count"] = len(revoked)
+    return out
 
 
 @mcp.tool(annotations=_ANNO_READ)

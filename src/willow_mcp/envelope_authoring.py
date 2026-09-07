@@ -63,6 +63,7 @@ from . import keyring as _keyring
 FRANK_EVENT_PROPOSED = "envelope_proposed"
 FRANK_EVENT_RATIFIED = "envelope_ratified"
 FRANK_EVENT_REJECTED = "envelope_rejected"
+FRANK_EVENT_REVOKED = "envelope_revoked"
 
 
 class EnvelopeAuthoringError(Exception):
@@ -89,6 +90,10 @@ class InvalidBoundsSignatureError(EnvelopeAuthoringError):
 
 class ProposalNotFoundError(EnvelopeAuthoringError):
     """No pending proposal with the given id."""
+
+
+class EnvelopeNotFoundError(EnvelopeAuthoringError):
+    """No ACTIVE envelope carries the named id."""
 
 
 class EnvelopeIdCollisionError(EnvelopeAuthoringError):
@@ -524,14 +529,137 @@ def list_active(
     *, grantee: Optional[str] = None, verb: Optional[str] = None
 ) -> list[dict]:
     """Currently active envelopes, filterable by grantee and/or verb.
-    Read-only."""
+    Read-only.
+
+    "Active" means what the GATE means by it: a row in ``active[]`` that is
+    not revoked and whose ``status`` is ``"active"`` — the same predicate
+    ``envelopes.usable_active_grants`` applies. Membership of ``active[]``
+    alone is not enough. A revoked envelope stays in that list on purpose
+    (the register keeps the history of what was granted and withdrawn), and
+    listing it here reported grants as in force that the gate would refuse —
+    the surface an operator reads disagreeing with the surface that enforces.
+    Use :func:`list_revoked` to see what was withdrawn."""
     registry = _load_registry()
-    rows = registry.get("active") or []
+    rows = [row for row in (registry.get("active") or []) if not _is_revoked(row)]
     if grantee is not None:
         rows = [row for row in rows if _grantee_matches(row.get("grantee"), grantee)]
     if verb is not None:
         rows = [row for row in rows if row.get("verb") == verb]
     return list(rows)
+
+
+def _is_revoked(row: dict) -> bool:
+    """The gate's own predicate (``envelopes.py`` line ~198), one place."""
+    return bool(row.get("revoked")) or row.get("status") == "revoked"
+
+
+def list_revoked(
+    *, grantee: Optional[str] = None, verb: Optional[str] = None
+) -> list[dict]:
+    """Envelopes that were granted and later withdrawn. Read-only.
+
+    These rows stay in ``active[]`` rather than moving to ``archived[]``: an
+    envelope that was in force and was withdrawn is a different fact from a
+    proposal that was never granted, and the register should be able to say
+    which happened."""
+    registry = _load_registry()
+    rows = [row for row in (registry.get("active") or []) if _is_revoked(row)]
+    if grantee is not None:
+        rows = [row for row in rows if _grantee_matches(row.get("grantee"), grantee)]
+    if verb is not None:
+        rows = [row for row in rows if row.get("verb") == verb]
+    return list(rows)
+
+
+def revoke(
+    envelope_id: str,
+    *,
+    verifier: str,
+    reason: str,
+    ledger=None,
+) -> dict:
+    """Withdraw an ACTIVE envelope. Operator act, CLI only.
+
+    Until this existed, revocation was a state the system could read and not
+    produce: the gate honours ``revoked``/``status == "revoked"``
+    (``envelopes.py``), no code path ever set either, and ``envelope reject``
+    acts on pending PROPOSALS. Withdrawing a live grant therefore meant
+    hand-editing ``constitutional/pre-approved.json`` — the trust root — which
+    is the act the envelope programme exists to keep hands off.
+
+    The row is marked in place and KEPT, never deleted: the register's value
+    is that it records what was granted AND what was taken back, and a
+    disappeared grant cannot be audited. ``bounds`` and ``ratified_via``
+    survive intact so the row still scores as a precedent.
+
+    Deliberately NOT an MCP tool, for the same reason ``frank-anchor`` is
+    CLI-only: an agent must not be able to withdraw the grants that bound it,
+    nor a peer's. Narrowing authority is safer than widening it, but a seat
+    that can revoke can also deny — it could strip another agent's dispatch
+    grant and stall the fleet. Revocation is an operator act, and the
+    keyring check below is what makes "operator" mean something.
+
+    Returns ``{envelope_id, verifier, revoked_at, reason}`` and appends
+    ``envelope_revoked`` to FRANK when a ledger is available.
+    """
+    if not _keyring_verifier_active(verifier):
+        raise OperatorVerifierRequired(
+            f"revoke requires an operator verifier known to the keyring "
+            f"and not compromised; got {verifier!r}."
+        )
+    if not (reason or "").strip():
+        # A withdrawn grant with no stated reason is the thing a later reader
+        # cannot act on: they can see the authority is gone and not whether
+        # it was redundant, mistaken, or abused.
+        raise EnvelopeAuthoringError("revoke requires a reason")
+
+    registry = _load_registry()
+    rows = registry.get("active") or []
+    matches = [row for row in rows if row.get("id") == envelope_id]
+    if not matches:
+        raise EnvelopeNotFoundError(f"no envelope with id {envelope_id!r}")
+    row = matches[0]
+    if _is_revoked(row):
+        raise EnvelopeAuthoringError(
+            f"envelope {envelope_id!r} is already revoked "
+            f"(at {row.get('revoked_at') or 'unknown time'})")
+
+    revoked_at = _now_iso()
+    row["status"] = "revoked"
+    row["revoked"] = True
+    row["revoked_at"] = revoked_at
+    row["revoked_by"] = verifier
+    row["revoked_reason"] = reason
+    _atomic_write(_envelopes.registry_path(), registry)
+
+    ledger_record_id = None
+    ledger_error = None
+    if ledger is not None:
+        try:
+            ledger_record_id = ledger.append(
+                "willow",
+                FRANK_EVENT_REVOKED,
+                {
+                    "envelope_id": envelope_id,
+                    "verb": row.get("verb"),
+                    "grantee": row.get("grantee"),
+                    "bounds_digest": _bounds_digest(row.get("bounds") or {}),
+                    "ratified_via": row.get("ratified_via"),
+                    "revoked_by": verifier,
+                    "revoked_at": revoked_at,
+                    "reason": reason,
+                },
+            )
+        except Exception as exc:                      # ledger down != act undone
+            ledger_error = str(exc)
+    return {
+        "envelope_id": envelope_id,
+        "verifier": verifier,
+        "revoked_at": revoked_at,
+        "reason": reason,
+        "ledger_record_id": ledger_record_id,
+        "ledger_error": ledger_error,
+    }
 
 
 def list_archived(

@@ -7,6 +7,10 @@ PR5 of the envelope-accrual plan. Thin CLI shell around
 * ``willow-mcp envelope ratify <proposal_id> --verifier NAME``
   Move a proposal from ``proposals[]`` to ``active[]``. Operator terminal
   only; keyring verifier must be active.
+* ``willow-mcp envelope revoke <envelope_id> --verifier NAME --reason TEXT``
+  withdraws an ACTIVE envelope. The row is marked and KEPT, never deleted.
+  CLI-only on purpose, like ``frank-anchor``: an agent must not be able to
+  withdraw the grants that bound it, nor a peer's.
 * ``willow-mcp envelope reject <proposal_id> --verifier NAME
   --reason TEXT [--reopen-when TEXT]``
   Record a "no" on the proposal. Same guard as ratify. ``reopen_when``
@@ -166,6 +170,39 @@ def cmd_envelope(args: argparse.Namespace) -> int:
         )
         return EXIT_OK
 
+    if args.envelope_command == "revoke":
+        if not args.proposal_id:
+            print("`willow-mcp envelope revoke` needs an envelope_id.", file=sys.stderr)
+            return EXIT_USAGE
+        if not args.verifier:
+            print("`--verifier NAME` is required.", file=sys.stderr)
+            return EXIT_USAGE
+        if not args.reason:
+            print("`--reason TEXT` is required.", file=sys.stderr)
+            return EXIT_USAGE
+        tty_err = _require_operator()
+        if tty_err:
+            print(f"Error: {tty_err}", file=sys.stderr)
+            return EXIT_USAGE
+        try:
+            row = _ea.revoke(
+                args.proposal_id, reason=args.reason, verifier=args.verifier,
+            )
+        except _ea.EnvelopeAuthoringError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return EXIT_FAIL
+        _emit(
+            {"ok": True, "revocation": row}, args.json,
+            f"Revoked {args.proposal_id} by verifier {args.verifier}.\n"
+            f"  reason: {args.reason}\n"
+            "  The row is kept in the register with status=revoked, not deleted — "
+            "what was granted and withdrawn both stay auditable.\n"
+            "Note: no FRANK ledger event from CLI (subprocess has no Postgres); "
+            "append one from an attributed session so the withdrawal is "
+            "ledgered like the ratification was.",
+        )
+        return EXIT_OK
+
     print(f"unknown envelope subcommand {args.envelope_command!r}", file=sys.stderr)
     return EXIT_USAGE
 
@@ -182,11 +219,12 @@ def register(subparsers: "argparse._SubParsersAction") -> None:
         "envelope-accrual plan)",
     )
     env.add_argument(
-        "envelope_command", choices=("list", "pending", "ratify", "reject")
+        "envelope_command",
+        choices=("list", "pending", "ratify", "reject", "revoke")
     )
     env.add_argument(
         "proposal_id", nargs="?", default="",
-        help="proposal id (for ratify/reject)",
+        help="proposal id (ratify/reject) or envelope id (revoke)",
     )
     env.add_argument(
         "--verifier", default="",
@@ -195,7 +233,7 @@ def register(subparsers: "argparse._SubParsersAction") -> None:
     )
     env.add_argument(
         "--reason", default="",
-        help="reason for rejection (required for reject)",
+        help="reason for rejection/revocation (required for reject and revoke)",
     )
     env.add_argument(
         "--reopen-when", dest="reopen_when", default="",
