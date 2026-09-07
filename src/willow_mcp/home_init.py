@@ -25,6 +25,7 @@ from .paths import (
     persona_envelopes_path,
     personas_dir,
     rotation_path,
+    review_queue_path,
     seeds_dir,
     settings_global_path,
     syscall_table_path,
@@ -32,6 +33,15 @@ from .paths import (
 )
 from .exposure import default_exposure_config
 from .registry import ManifestSignError, compile_manifests, load_registry
+
+
+def _path_label(path: Path) -> str:
+    home = willow_home()
+    try:
+        return str(path.relative_to(home))
+    except ValueError:
+        return str(path)
+
 
 _DEFAULT_ROSTER: dict[str, Any] = {
     "format": "agent_roster_v1",
@@ -191,9 +201,9 @@ def ensure_home_layout(home: Path | None = None) -> dict[str, Any]:
     if _write_json_if_missing(exposure_config_path(), default_exposure_config()):
         config_created.append(str(exposure_config_path().relative_to(willow_home())))
 
-    review_q = willow_home() / "constitutional" / "review_queue.json"
+    review_q = review_queue_path()
     if _write_json_if_missing(review_q, {"format": "review_queue_v1", "items": []}):
-        config_created.append(str(review_q.relative_to(willow_home())))
+        config_created.append(_path_label(review_q))
 
     # The Article III.2 envelope registry and its companion syscall table.
     # Copied (not inlined like _DEFAULT_ROSTER etc.) because they're real
@@ -204,9 +214,9 @@ def ensure_home_layout(home: Path | None = None) -> dict[str, Any]:
     # mechanism data, not a secret, so there's nothing to start empty.
     constitutional_seeded: list[str] = []
     if _copy_bundle_file_if_missing(bundle_dir() / "constitutional" / "pre-approved.json", envelope_registry_path()):
-        constitutional_seeded.append(str(envelope_registry_path().relative_to(willow_home())))
+        constitutional_seeded.append(_path_label(envelope_registry_path()))
     if _copy_bundle_file_if_missing(bundle_dir() / "constitutional" / "syscall-table.json", syscall_table_path()):
-        constitutional_seeded.append(str(syscall_table_path().relative_to(willow_home())))
+        constitutional_seeded.append(_path_label(syscall_table_path()))
 
     registry_result = _materialize_registry()
 

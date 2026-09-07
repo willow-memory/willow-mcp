@@ -33,7 +33,7 @@ _SECRET_MIN_BYTES = 32
 
 
 def _gate_dir() -> Path:
-    d = paths.willow_home() / "gate"
+    d = paths.gate_dir()
     d.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(d, 0o700)

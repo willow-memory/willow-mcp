@@ -68,6 +68,24 @@ def willow_home() -> Path:
     return Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
 
 
+def vault_box() -> Path | None:
+    """Operator secrets box (``WILLOW_VAULT_BOX``) — outside any github checkout."""
+    raw = os.environ.get("WILLOW_VAULT_BOX", "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def operator_secrets_root() -> Path:
+    """Keys, Fernet vault, gate keystore, FRANK ledgers — vault-shaped, not fleet wiring."""
+    box = vault_box()
+    return box if box is not None else willow_home()
+
+
+def charter_repo() -> Path | None:
+    """Grove charter repository (``WILLOW_CHARTER_REPO``)."""
+    raw = os.environ.get("WILLOW_CHARTER_REPO", "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
 def layout_version_path() -> Path:
     return willow_home() / ".layout-version"
 
@@ -308,7 +326,11 @@ def schema_maps_dir(app_id: str) -> Path:
 # ── ledgers / resources / constitutional / logs ───────────────────────────────
 
 def ledgers_dir() -> Path:
-    return willow_home() / "ledgers"
+    return operator_secrets_root() / "ledgers"
+
+
+def gate_dir() -> Path:
+    return operator_secrets_root() / "gate"
 
 
 def ledger_entry_path(entry_hash: str) -> Path:
@@ -323,6 +345,10 @@ def resources_dir() -> Path:
 
 
 def constitutional_dir() -> Path:
+    """Article III.2 registry home — grove charter when ``WILLOW_CHARTER_REPO`` is set."""
+    charter = charter_repo()
+    if charter is not None:
+        return charter / "envelopes"
     return willow_home() / "constitutional"
 
 
@@ -347,16 +373,17 @@ def frank_head_anchor_path() -> Path:
 def envelope_registry_path() -> Path:
     """Default location of the Article III.2 pre-approved envelope registry.
 
-    Previously this lived in a sibling ``willow`` charter repo
-    (``~/github/willow/envelopes/pre-approved.json``) — a hard dependency on a
-    second repo existing at all. It is operator-instance data (real grants,
-    real paths, real dates), not shippable package content, so it belongs
-    under $WILLOW_HOME next to `review_queue_path()`, not inside the
-    installed package tree. `envelopes.py`'s `registry_path()` still honors
-    `WILLOW_ENVELOPE_REGISTRY` first; this is only the default when that is
-    unset.
+    When ``WILLOW_CHARTER_REPO`` is set, the canonical copy lives at
+    ``<charter>/envelopes/pre-approved.json`` in the grove charter repo.
+    Otherwise the default is ``$WILLOW_HOME/constitutional/pre-approved.json``
+    (seeded on ``willow-mcp-init``). ``envelopes.registry_path()`` still honors
+    ``WILLOW_ENVELOPE_REGISTRY`` first.
     """
     return constitutional_dir() / "pre-approved.json"
+
+
+def dispatch_signing_key_path() -> Path:
+    return operator_secrets_root() / "dispatch_signing.key"
 
 
 def syscall_table_path() -> Path:
@@ -387,7 +414,11 @@ def worker_heartbeat_dir() -> Path:
 
 
 def vault_db_path() -> Path:
-    return willow_home() / "vault.db"
+    return operator_secrets_root() / "vault.db"
+
+
+def vault_key_path() -> Path:
+    return operator_secrets_root() / "vault.key"
 
 
 def mcp_token_path() -> Path:

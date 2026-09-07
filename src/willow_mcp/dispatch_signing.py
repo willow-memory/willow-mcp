@@ -78,7 +78,7 @@ _ALG = "hmac-sha256"
 
 
 def signing_key_path() -> Path:
-    return paths.willow_home() / _KEY_FILE_NAME
+    return paths.dispatch_signing_key_path()
 
 
 def _ensure_key() -> bytes:

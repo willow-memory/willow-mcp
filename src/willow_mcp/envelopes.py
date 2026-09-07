@@ -14,15 +14,11 @@ from .paths import envelope_registry_path, syscall_table_path, trusted_read
 def registry_path() -> Path:
     """Resolve the active envelope registry.
 
-    `WILLOW_ENVELOPE_REGISTRY` always wins when set. Otherwise this used to
-    fall back to a sibling `willow` charter repo (`WILLOW_PROJECT_ROOT`, or
-    `~/github/willow` by default) — a hard dependency on a second repo
-    existing. The default is now `$WILLOW_HOME/constitutional/pre-approved.json`
-    (see `paths.envelope_registry_path`), seeded on `willow-mcp-init` with an
-    empty starter shape and populated by the operator from there. There is no
-    `WILLOW_PROJECT_ROOT` fallback anymore: an install with neither the env
-    var nor a seeded file fails closed, the same as any other missing
-    governance input.
+    ``WILLOW_ENVELOPE_REGISTRY`` always wins when set. Otherwise the default is
+    ``<WILLOW_CHARTER_REPO>/envelopes/pre-approved.json`` when
+    ``WILLOW_CHARTER_REPO`` is set, else
+    ``$WILLOW_HOME/constitutional/pre-approved.json`` (see
+    ``paths.envelope_registry_path``).
     """
     configured = os.environ.get("WILLOW_ENVELOPE_REGISTRY", "").strip()
     if configured:

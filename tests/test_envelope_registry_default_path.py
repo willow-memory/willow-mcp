@@ -15,12 +15,22 @@ from willow_mcp import envelopes, home_init as hi, paths
 
 def test_registry_path_defaults_under_home_when_unset(home, monkeypatch):
     monkeypatch.delenv("WILLOW_ENVELOPE_REGISTRY", raising=False)
+    monkeypatch.delenv("WILLOW_CHARTER_REPO", raising=False)
     assert envelopes.registry_path() == home / "constitutional" / "pre-approved.json"
+
+
+def test_registry_path_defaults_to_charter_envelopes_when_set(home, monkeypatch, tmp_path):
+    monkeypatch.delenv("WILLOW_ENVELOPE_REGISTRY", raising=False)
+    charter = tmp_path / "willows-grove"
+    (charter / "envelopes").mkdir(parents=True)
+    monkeypatch.setenv("WILLOW_CHARTER_REPO", str(charter))
+    assert envelopes.registry_path() == charter / "envelopes" / "pre-approved.json"
 
 
 def test_syscall_path_defaults_under_home_when_unset(home, monkeypatch):
     monkeypatch.delenv("WILLOW_ENVELOPE_REGISTRY", raising=False)
     monkeypatch.delenv("WILLOW_SYSCALL_TABLE", raising=False)
+    monkeypatch.delenv("WILLOW_CHARTER_REPO", raising=False)
     assert envelopes.syscall_path() == home / "constitutional" / "syscall-table.json"
 
 
@@ -37,6 +47,7 @@ def test_syscall_path_still_follows_a_custom_registry_directory(home, monkeypatc
 def test_home_init_seeds_an_empty_registry_and_a_real_syscall_table(home, monkeypatch):
     monkeypatch.delenv("WILLOW_ENVELOPE_REGISTRY", raising=False)
     monkeypatch.delenv("WILLOW_SYSCALL_TABLE", raising=False)
+    monkeypatch.delenv("WILLOW_CHARTER_REPO", raising=False)
     result = hi.ensure_home_layout()
 
     registry_path = paths.envelope_registry_path()
@@ -62,6 +73,7 @@ def test_home_init_seeds_an_empty_registry_and_a_real_syscall_table(home, monkey
 def test_home_init_never_overwrites_an_existing_registry(home, monkeypatch):
     monkeypatch.delenv("WILLOW_ENVELOPE_REGISTRY", raising=False)
     monkeypatch.delenv("WILLOW_SYSCALL_TABLE", raising=False)
+    monkeypatch.delenv("WILLOW_CHARTER_REPO", raising=False)
 
     registry_path = paths.envelope_registry_path()
     registry_path.parent.mkdir(parents=True, exist_ok=True)
@@ -81,6 +93,7 @@ def test_seeded_registry_passes_the_fail_closed_ownership_check(home, monkeypatc
     an unusable (fail-closed-refused) registry."""
     monkeypatch.delenv("WILLOW_ENVELOPE_REGISTRY", raising=False)
     monkeypatch.delenv("WILLOW_SYSCALL_TABLE", raising=False)
+    monkeypatch.delenv("WILLOW_CHARTER_REPO", raising=False)
     hi.ensure_home_layout()
 
     paths.trusted_read(envelopes.registry_path())  # raises PermissionError on failure
@@ -91,25 +104,18 @@ def test_verb13_declared_registry_path_resolves_to_the_enforced_file(home, monke
     """#332(a): verb 13 (envelope.apply) declares its registry in the syscall
     table's `bounds.registry_path`. That declaration is the governed, human-read
     statement of *which file is law*; the enforcer reads `envelopes.registry_path()`.
-    The two must name one file.
-
-    They diverged once already: the declaration kept `envelopes/pre-approved.json`
-    — the pre-migration sibling-repo location — after the registry moved to
-    `$WILLOW_HOME/constitutional/`. The governed table pointed at a dead path
-    while enforcement resolved a live one, and a reader auditing the charter had
-    two natural readings (repo-root vs `$WILLOW_HOME`) naming different files.
-    This binds declaration to enforcement so the next drift fails here."""
+    The two must name one file."""
     monkeypatch.delenv("WILLOW_ENVELOPE_REGISTRY", raising=False)
+    monkeypatch.delenv("WILLOW_CHARTER_REPO", raising=False)
+    hi.ensure_home_layout()
 
-    table = json.loads((paths.bundle_dir() / "constitutional" / "syscall-table.json").read_text())
+    table = json.loads(paths.syscall_table_path().read_text())
     verb13 = next(v for v in table["verbs"] if v["id"] == 13)
     declared = verb13["bounds"]["registry_path"]
 
-    # The declaration pins the single declared root explicitly — no second
-    # "relative to repo root" reading is possible.
     assert "${WILLOW_HOME}" in declared, (
-        "verb 13's registry_path must name $WILLOW_HOME as its root, not a bare "
-        "relative path with two natural readings"
+        "verb 13's registry_path must name $WILLOW_HOME as its root when charter "
+        "repo is unset, not a bare relative path with two natural readings"
     )
     resolved = Path(os.path.expandvars(declared)).expanduser()
     assert resolved == envelopes.registry_path(), (
