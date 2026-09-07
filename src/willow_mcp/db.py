@@ -2,6 +2,7 @@
 
 import base64
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -16,8 +17,13 @@ import psycopg2.extras
 
 from . import postgres_lifecycle
 
+logger = logging.getLogger(__name__)
+
 _pg_conn = None
 _pg_lock = threading.Lock()
+#: Why the last get_pg() failed. Kept because get_pg returns Optional and its
+#: callers only see None — see last_pg_error().
+_pg_last_error: Optional[str] = None
 
 # server.py's _sanitize() already rejects a path-traversal collection before
 # a tool call reaches Store — this is a second, independent check inside
@@ -80,9 +86,29 @@ def collection_in_scope(collection: str, scope: Optional[list]) -> bool:
     return False
 
 
+def last_pg_error() -> Optional[str]:
+    """Why the most recent :func:`get_pg` failed, or None if it succeeded.
+
+    `get_pg` returns ``Optional[connection]``, so every caller sees exactly
+    one bit: None. For a long time it also swallowed the exception with a bare
+    ``except Exception``, and the shared "postgres_unavailable" responses then
+    ASSERTED a cause — "unix socket connection failed" — that they had not
+    checked. On 2026-09-07 the real cause was ``database "willow" does not
+    exist`` (a caller spawned this server without ``WILLOW_PG_DB``, so it fell
+    back to the default name); the socket was fine and the reported reason sent
+    the reader an hour in the wrong direction. A failure that knows why it
+    failed must not throw that away."""
+    return _pg_last_error
+
+
 def get_pg() -> Optional[psycopg2.extensions.connection]:
-    """Return a Postgres connection via Unix socket, or None."""
-    global _pg_conn
+    """Return a Postgres connection via Unix socket, or None.
+
+    On failure the reason is recorded for :func:`last_pg_error` and logged at
+    WARNING, then None is returned — the contract every caller already relies
+    on is unchanged, deliberately: raising here would turn a degraded fleet
+    into a dead one at 100+ call sites."""
+    global _pg_conn, _pg_last_error
 
     def _connect():
         conn = psycopg2.connect(
@@ -92,21 +118,46 @@ def get_pg() -> Optional[psycopg2.extensions.connection]:
         conn.autocommit = True
         return conn
 
+    def _describe(exc: Exception) -> str:
+        # psycopg2 puts the server's own diagnosis here ('database "x" does not
+        # exist', 'role "y" does not exist', 'No such file or directory' for a
+        # genuinely absent socket) and does NOT include the password. Naming
+        # the resolved dbname/user makes an environment fault legible without
+        # the reader having to guess which env var was missing.
+        detail = " ".join(str(exc).split())
+        return (
+            f"{type(exc).__name__}: {detail} "
+            f"(dbname={os.environ.get('WILLOW_PG_DB', 'willow')!r}, "
+            f"user={os.environ.get('WILLOW_PG_USER', os.environ.get('USER', ''))!r})"
+        )
+
     with _pg_lock:
         try:
             if _pg_conn is None or _pg_conn.closed:
                 _pg_conn = _connect()
             _pg_conn.cursor().execute("SELECT 1")
+            _pg_last_error = None
             return _pg_conn
-        except Exception:
+        except Exception as exc:
             _pg_conn = None
+            # The FIRST failure is the real diagnosis; a recovery attempt that
+            # also fails usually just repeats it, and if it differs the second
+            # one is about the restart, not about why we could not connect.
+            _pg_last_error = _describe(exc)
+            logger.warning("get_pg: %s", _pg_last_error)
             if postgres_lifecycle.ensure_enabled() and postgres_lifecycle.try_recover():
                 try:
                     _pg_conn = _connect()
                     _pg_conn.cursor().execute("SELECT 1")
+                    _pg_last_error = None
                     return _pg_conn
-                except Exception:
+                except Exception as exc2:
                     _pg_conn = None
+                    _pg_last_error = (
+                        f"{_pg_last_error}; after a recovery restart it still "
+                        f"failed: {_describe(exc2)}"
+                    )
+                    logger.warning("get_pg: %s", _pg_last_error)
             return None
 
 
