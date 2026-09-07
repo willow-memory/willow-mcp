@@ -254,7 +254,15 @@ def test_serve_takes_the_instance_lock_before_running(monkeypatch):
     server._main()
 
     assert len(calls) == 1
-    assert ran == [{"transport": "streamable-http", "host": server._HOST, "port": server._PORT}]
+    assert len(ran) == 1
+    assert ran[0]["transport"] == "streamable-http"
+    assert ran[0]["host"] == server._HOST
+    assert ran[0]["port"] == server._PORT
+    # serve() also passes transport_security -- the loopback-only allowlist
+    # default defeats any tunnelled deployment (5431120). Assert it is wired
+    # and rebinding protection is on, rather than pinning the whole kwargs
+    # dict: pinning it is what made this test fail on an unrelated fix.
+    assert ran[0]["transport_security"].enable_dns_rebinding_protection is True
     assert server._INSTANCE_LOCK == "handle"
 
 

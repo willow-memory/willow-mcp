@@ -36,6 +36,8 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
+* **cli:** confirm-binding success message KeyError's on 'issuer' ([54389a8](https://github.com/willow-memory/willow-mcp/commit/54389a874f5da5a518d77d0ecea656fb9943d714))
+* **serve:** DNS-rebinding allowlist hardcodes loopback, ignores WILLOW_MCP_URL ([5431120](https://github.com/willow-memory/willow-mcp/commit/5431120a2de99e81a8f5fb3d69aaa9a04b9c8b4c))
 * envelope registry writer leaves file group-writable, tripping trusted_read ([0e741c2](https://github.com/willow-memory/willow-mcp/commit/0e741c20a6000a934dec75d864635967b5626bba))
 
 ## [2.24.0](https://github.com/willow-memory/willow-mcp/compare/v2.23.0...v2.24.0) (2026-09-03)
