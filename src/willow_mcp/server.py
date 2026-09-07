@@ -3142,7 +3142,8 @@ VERB_LEVEL_ENFORCED_VERBS = frozenset({"dispatch"})
 
 
 def _enveloped_verb_gate(
-    app_id: str, verb: str, call_args: dict, *, project: str, session: str = ""
+    app_id: str, verb: str, call_args: dict, *, project: str, session: str = "",
+    envelope_id: str = "",
 ) -> Optional[dict]:
     """Cite-before-act for one verb-governed MCP tool call (#333).
 
@@ -3208,10 +3209,29 @@ def _enveloped_verb_gate(
         # unchanged.
         _auto_propose_on_gate_miss(app_id, verb, call_args, session)
         return None
+    if envelope_id:
+        # The caller named which of ITS OWN governing grants to charge. The
+        # named envelope must be in `matches` — the set already resolved for
+        # this actor+verb — so citing can only DISAMBIGUATE among grants the
+        # actor already holds, never reach one it does not. Without that
+        # membership check this parameter would be a bypass: name any id and
+        # skip the resolution entirely.
+        if envelope_id not in matches:
+            return {
+                "error": "ENOENT",
+                "reason": (f"envelope {envelope_id!r} does not govern verb "
+                           f"{verb!r} for this actor"),
+                "envelope_ids": matches,
+            }
+        matches = [envelope_id]
     if len(matches) > 1:
+        # Two legitimate grants covering one verb is a normal registry state,
+        # not a corrupt one — but the gate cannot say which would be charged,
+        # and guessing would meter the wrong envelope. Name one to proceed.
         return {
             "error": "EAMBIG",
-            "reason": "multiple active envelopes govern this verb for actor",
+            "reason": ("multiple active envelopes govern this verb for actor — "
+                       "pass envelope_id to name which one to cite"),
             "envelope_ids": matches,
         }
     pg = get_pg()
@@ -3427,6 +3447,7 @@ def dispatch_send(
     phase: str = "operate",
     priority: str = "normal",
     context_refs: Optional[list] = None,
+    envelope_id: str = "",
 ) -> dict:
     """Create a dispatch packet assigning work to another agent: writes
     meta.json + assignment.md with status 'pending' under
@@ -3436,7 +3457,14 @@ def dispatch_send(
     Filesystem-backed unless an authority envelope governs verb "dispatch"
     for this caller (#333) — then citing that envelope (and its quota) gates
     the write, Postgres-backed for that one check. Returns the new packet's
-    metadata including its dispatch_id."""
+    metadata including its dispatch_id.
+
+    `envelope_id` names WHICH governing envelope to cite when more than one
+    covers this verb for you. Leave it empty and a single governing envelope
+    is resolved automatically (the common case); pass it only after an
+    ``EAMBIG`` names your options in ``envelope_ids``. It can only select
+    among envelopes that already govern you — naming one that does not
+    returns ``ENOENT``, so it disambiguates and never widens."""
     # #333: cite-before-act. `role` is resolved here with dispatch.py's own
     # fallback (`role or to_app`, lowercased) so the bounds an envelope is
     # checked against name the same task_class dispatch.py will actually
@@ -3449,6 +3477,7 @@ def dispatch_send(
         {"to_agents": to_app, "task_class": resolved_role},
         project=_VERB_CITATION_PROJECT,
         session=orch_session,
+        envelope_id=envelope_id,
     )
     if gate_err:
         return gate_err
