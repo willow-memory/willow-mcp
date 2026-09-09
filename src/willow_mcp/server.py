@@ -3783,6 +3783,19 @@ def session_enter(
     if snap:
         result["orientation"]["stack_snapshot"] = snap
 
+    # What this seat cannot do, said at entry rather than discovered when it
+    # refuses. Same argument as the envelope-pending block below, wider scope:
+    # an unattested session, a dead egress lease and a stopped worker are all
+    # readable here, and every one of them has been found mid-task instead.
+    # blockers.collect never raises; a failing check reports itself as an item.
+    try:
+        from . import blockers
+
+        result["orientation"]["blockers"] = blockers.collect(app_id, session_id)
+    except Exception:
+        # Orientation is sugar. It must never be the reason entry fails.
+        pass
+
     # PR6 (envelope-accrual): surface the operator's pending-proposal count
     # at seat entry so an attributed orchestrator sees "N proposals waiting
     # for ratification" as part of orient, not mid-dispatch when the queue
