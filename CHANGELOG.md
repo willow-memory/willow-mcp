@@ -31,6 +31,26 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.30.0](https://github.com/willow-memory/willow-mcp/compare/v2.29.0...v2.30.0) (2026-09-09)
+
+
+### Added
+
+* **gates:** a request may name a permission, not only a lease ([063318f](https://github.com/willow-memory/willow-mcp/commit/063318fbba775cfd21ae852967f286e2e67c09a1))
+* **gates:** a blocked caller can ask, and the ask is a row ([e42ea43](https://github.com/willow-memory/willow-mcp/commit/e42ea43dae420b1f44296c1090bd1e235d0fa48a))
+
+
+### Fixed
+
+* **paths:** refuse an implicit fallback to a retired home ([eab2cf8](https://github.com/willow-memory/willow-mcp/commit/eab2cf8fdd76fd7bd899f384192b08700f730f83))
+
+## [2.29.0](https://github.com/willow-memory/willow-mcp/compare/v2.28.1...v2.29.0) (2026-09-09)
+
+
+### Added
+
+* **env:** derive store root, pg db and fleet roster from the box ([d3b02ab](https://github.com/willow-memory/willow-mcp/commit/d3b02ab7ee6c6b181793418bfb4e0730ed5cf8e0))
+
 ## [2.28.1](https://github.com/willow-memory/willow-mcp/compare/v2.28.0...v2.28.1) (2026-09-09)
 
 
