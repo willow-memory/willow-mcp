@@ -36,12 +36,13 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **gates:** a request may name a permission, not only a lease ([3826a29](https://github.com/willow-memory/willow-mcp/commit/3826a29de9fdbc2c6221fb217d85a90375a6fb3f))
+* **gates:** a request may name a permission, not only a lease ([063318f](https://github.com/willow-memory/willow-mcp/commit/063318fbba775cfd21ae852967f286e2e67c09a1))
+* **gates:** a blocked caller can ask, and the ask is a row ([e42ea43](https://github.com/willow-memory/willow-mcp/commit/e42ea43dae420b1f44296c1090bd1e235d0fa48a))
 
 
 ### Fixed
 
-* **paths:** refuse an implicit fallback to a retired home ([0416072](https://github.com/willow-memory/willow-mcp/commit/041607254185a35e351039e8595af9b507e5d449))
+* **paths:** refuse an implicit fallback to a retired home ([eab2cf8](https://github.com/willow-memory/willow-mcp/commit/eab2cf8fdd76fd7bd899f384192b08700f730f83))
 
 ## [2.29.0](https://github.com/willow-memory/willow-mcp/compare/v2.28.1...v2.29.0) (2026-09-09)
 
