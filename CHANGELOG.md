@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.30.0](https://github.com/willow-memory/willow-mcp/compare/v2.29.0...v2.30.0) (2026-09-09)
+
+
+### Added
+
+* **gates:** a request may name a permission, not only a lease ([3826a29](https://github.com/willow-memory/willow-mcp/commit/3826a29de9fdbc2c6221fb217d85a90375a6fb3f))
+
+
+### Fixed
+
+* **paths:** refuse an implicit fallback to a retired home ([0416072](https://github.com/willow-memory/willow-mcp/commit/041607254185a35e351039e8595af9b507e5d449))
+
 ## [2.29.0](https://github.com/willow-memory/willow-mcp/compare/v2.28.1...v2.29.0) (2026-09-09)
 
 
