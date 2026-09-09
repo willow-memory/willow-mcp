@@ -1,6 +1,6 @@
 {
   "format": "specialist_registry_v1",
-  "updated_at": "2026-08-27T18:00:00Z",
+  "updated_at": "2026-09-09T20:30:00Z",
   "note": "Ratified permissions per docs/design/permissions-matrix.md. Compile with willow-mcp compile-agents.",
   "note_model_hint_session": "The per-persona `model_hint_session` field names the Claude session-scoped model each persona dispatches under (parallel to `model_hint` which targets local Ollama). Values are literal Anthropic model IDs (e.g. `claude-sonnet-5`, `claude-opus-<n>`, `claude-haiku-4-5-<date>`). null means: inherit the caller's session default. Assignments are ratified by the human trust root — the fleet does not self-assign models. The Fable tier (`claude-fable-5`) is reserved and not currently assigned to any fleet member.",
   "collection_aliases": {
@@ -166,6 +166,35 @@
       "receive_dispatch": true,
       "human_only": false,
       "sort_order": 70
+    },
+    {
+      "agent_id": "binder",
+      "function": "RECORD",
+      "display_name": "The Binder",
+      "role": "records",
+      "roles": ["records", "archivist"],
+      "permissions": ["dispatch_read", "store_read", "knowledge_read", "gap_read", "markdownai_read", "store_write", "dispatch_write", "gap_write", "task_queue", "context", "markdownai_write"],
+      "deny_tools": ["kb_promote", "kb_journal", "knowledge_ingest", "knowledge_retract"],
+      "persona_path": "personas/binder.md",
+      "persona_bundle": true,
+      "entry_mode": "dispatch",
+      "store_scope": ["binder_*", "projects_homestead_stack", "projects_homestead_pm_milestones", "projects_homestead_governance_flags", "projects_homestead_governance_decisions", "projects_homestead_orient"],
+      "namespace": "binder/",
+      "collection_aliases": {
+        "stack": "projects_homestead_stack",
+        "pm/milestones": "projects_homestead_pm_milestones",
+        "governance/flags": "projects_homestead_governance_flags",
+        "governance/decisions": "projects_homestead_governance_decisions",
+        "orient": "projects_homestead_orient"
+      },
+      "job": "The homestead's records — homestead and homestead-ledger: file, retrieve, and say which of filed / not filed / unreachable is true",
+      "not_job": "homestead-law and homestead-health (operator hold, 2026-09-09); KB promotion, journalling, knowledge ingest or retraction",
+      "model_hint": "",
+      "model_hint_session": null,
+      "grove_sender": "binder",
+      "receive_dispatch": true,
+      "human_only": false,
+      "sort_order": 80
     }
   ],
   "orchestrator_seat": {
