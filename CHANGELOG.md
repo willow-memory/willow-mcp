@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **env:** derive store root, pg db and fleet roster from the box ([c54b30f](https://github.com/willow-memory/willow-mcp/commit/c54b30f49498c55626ea8dccfc1ec5f9b1fdcf8e))
 * **env:** derive store root, pg db and fleet roster from the box ([d3b02ab](https://github.com/willow-memory/willow-mcp/commit/d3b02ab7ee6c6b181793418bfb4e0730ed5cf8e0))
 
 ## [2.28.1](https://github.com/willow-memory/willow-mcp/compare/v2.28.0...v2.28.1) (2026-09-09)
