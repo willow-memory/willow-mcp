@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.29.0](https://github.com/willow-memory/willow-mcp/compare/v2.28.1...v2.29.0) (2026-09-09)
+
+
+### Added
+
+* **env:** derive store root, pg db and fleet roster from the box ([d3b02ab](https://github.com/willow-memory/willow-mcp/commit/d3b02ab7ee6c6b181793418bfb4e0730ed5cf8e0))
+
 ## [2.28.1](https://github.com/willow-memory/willow-mcp/compare/v2.28.0...v2.28.1) (2026-09-09)
 
 
