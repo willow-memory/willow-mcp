@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.27.0](https://github.com/willow-memory/willow-mcp/compare/v2.26.1...v2.27.0) (2026-09-07)
+
+
+### Added
+
+* **paths:** resolve constitutional and secrets from charter and vault env. ([06f101d](https://github.com/willow-memory/willow-mcp/commit/06f101d1752c1e03d38d9e971775cf065eecd0b1))
+
 ## [2.26.1](https://github.com/willow-memory/willow-mcp/compare/v2.26.0...v2.26.1) (2026-09-07)
 
 
