@@ -144,6 +144,28 @@
       "receive_dispatch": true,
       "human_only": false,
       "sort_order": 60
+    },
+    {
+      "agent_id": "heimdallr",
+      "function": "WATCH",
+      "display_name": "Heimdallr",
+      "role": "watchman",
+      "roles": ["watchman", "gatekeeper"],
+      "permissions": ["dispatch_read", "dispatch_write", "fleet_read", "knowledge_read", "store_read", "store_write", "context"],
+      "deny_tools": ["task_submit", "tool_oracle_seal", "knowledge_ingest", "kb_promote", "kb_journal", "envelope_ratify", "human_attestation_create"],
+      "persona_path": "personas/heimdallr.md",
+      "persona_bundle": false,
+      "entry_mode": "dispatch",
+      "store_scope": ["heimdallr_*", "grove-dashboard"],
+      "namespace": "heimdallr/",
+      "job": "Served-page honesty, resident watcher and its classification, Gjallarhorn / #alerts, serve-mode OAuth",
+      "not_job": "Desk posture; seat/willow/ maintenance",
+      "model_hint": "",
+      "model_hint_session": null,
+      "grove_sender": "heimdallr",
+      "receive_dispatch": true,
+      "human_only": false,
+      "sort_order": 70
     }
   ],
   "orchestrator_seat": {
