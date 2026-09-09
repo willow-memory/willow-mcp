@@ -140,13 +140,27 @@ def test_a_live_lease_request_needs_ttl_and_reason(store):
     assert spec.needs == ("ttl", "reason")
 
 
-def test_a_permission_request_has_no_action():
-    """The rule, at the describe layer: activate, never create."""
-    row = GateRow(id="request.x", label="gate request", scope="perm.store_write",
+def test_a_permission_request_is_actionable_since_stage_1b():
+    """Stage 1 refused every `perm.` request here, on "activate, never create".
+
+    Stage 1b narrowed that: the line is between asking and confirming, not
+    between a lease and a permission, because the press is the operator's act
+    either way. What a permission request may and may not name is pinned in
+    tests/test_gate_permission_requests.py — including the groups the queue may
+    never carry. This test is left behind deliberately, so the rule that used
+    to live here is visibly superseded rather than silently gone.
+    """
+    row = GateRow(id="request.x", label="gate request",
+                  scope="perm.binder.store_write", state="off", detail="")
+    assert gates_actions.describe(row).kind == "request_permission"
+
+
+def test_a_gate_that_is_neither_lease_nor_permission_has_no_action():
+    row = GateRow(id="request.x", label="gate request", scope="binding.whatever",
                   state="off", detail="")
     spec = gates_actions.describe(row)
     assert spec.kind == "none"
-    assert "never create one" in spec.reason
+    assert "nothing else" in spec.reason
 
 
 # ── apply ────────────────────────────────────────────────────────────────────

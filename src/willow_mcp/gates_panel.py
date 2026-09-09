@@ -506,12 +506,60 @@ REQUEST_MARKER = "gate-request:"
 #: `human_loop.enqueue` validates against QUEUE_KINDS and raises otherwise.
 REQUEST_QUEUE_KIND = "consent"
 
-#: Gate id prefixes a request may name. `lease.` only, on purpose: a request
-#: may ask to ACTIVATE a standing grant, never to CREATE one. The manifest
-#: capability is the grant; the lease is the clock on it. A `perm.` request
-#: would be an app asking to amend its own manifest through a queue row —
-#: that belongs in the envelope path with a human reading it, not a button.
-REQUESTABLE_PREFIXES = ("lease.",)
+#: Gate id prefixes a request may name.
+#:
+#: `lease.` was the whole list at first, on the rule "a request may ACTIVATE a
+#: standing grant, never CREATE one." For a lease that rule is exactly right —
+#: the manifest capability is the grant, the lease is the clock on it. It was
+#: too broad as a general principle, and the case that showed it was ordinary:
+#: a new seat needed six permission groups, and the only way to ask for them
+#: was six commands typed by hand.
+#:
+#: The sudo invariant this serves (FRANK 90e52ab7) says an agent may REQUEST a
+#: seat and may never CONFIRM it. Requesting is the sanctioned half. A row the
+#: operator presses is the operator's act whether the gate holds a lease or a
+#: permission — `apply()` is only ever called by a UI on a press, and nothing
+#: here auto-grants. So the line is not between `lease.` and `perm.`; it is
+#: between asking and confirming, plus the set below.
+REQUESTABLE_PREFIXES = ("lease.", "perm.")
+
+#: Permission groups a request may never name, at any distance.
+#:
+#: These grant authority over the *system* rather than over the work: the
+#: ability to write policy, to sign, to bind an identity, to reach the network,
+#: or simply to do anything at all. Adding one of these stays a deliberate
+#: operator act with no agent anywhere in the loop — not because a press is
+#: insufficient, but because an agent should not be able to put "grant me
+#: full_access" in front of a tired operator at the top of a list, hoping the
+#: press is reflexive. The queue must not become a phishing surface.
+PERM_NEVER_REQUESTABLE = frozenset({
+    "full_access",
+    "orchestrator",
+    "envelope_apply",
+    "envelope_write",
+    "frank_write",
+    "binding",
+    "schema_admin",
+    "tool_oracle_seal",
+    "task_db",
+    NET_PERMISSION,
+    INTEGRATION_NET_PERMISSION,
+    WEB_NET_PERMISSION,
+    MCP_FEDERATION_PERMISSION,
+})
+
+
+def split_permission_gate(gate_id: str) -> tuple[str, str]:
+    """`perm.<app_id>.<group>` -> (app_id, group), or ("", "") if malformed.
+
+    Split from the left with a bounded count rather than parsed loosely:
+    `_APP_ID_RE` admits no dots and no permission group contains one, so the
+    first two segments are unambiguous and everything after them is the group.
+    """
+    parts = (gate_id or "").split(".", 2)
+    if len(parts) != 3 or parts[0] != "perm" or not parts[1] or not parts[2]:
+        return "", ""
+    return parts[1], parts[2]
 
 
 def encode_request(*, gate_id: str, task_id: str, nonce: str, expires_at: str) -> str:
