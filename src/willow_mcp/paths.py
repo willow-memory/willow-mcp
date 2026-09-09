@@ -136,6 +136,73 @@ def settings_global_legacy_path() -> Path:
     return willow_home() / "settings.global.json"
 
 
+def _settings_global() -> dict:
+    """The canonical settings object, or {} when absent/unreadable.
+
+    Deliberately not routed through ``consent.settings_path()``: ``consent``
+    imports this module, so the dependency only runs one way. Fail-soft on
+    purpose — a missing or malformed settings file must leave every caller on
+    its built-in default, never raise from a path lookup.
+    """
+    import json
+
+    for candidate in (settings_global_path(), settings_global_legacy_path()):
+        try:
+            if not candidate.is_file():
+                continue
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def pg_db() -> str:
+    """Fleet Postgres database name.
+
+    ``WILLOW_PG_DB`` wins; otherwise ``postgres.db`` in the canonical
+    ``config/settings.global.json``; otherwise ``"willow"``. The settings layer
+    exists because the built-in default is wrong on any box whose database is
+    not literally named ``willow``, and getting it wrong is silent: ``grove.py``
+    documents that a misresolved name yields an *empty* grove rather than an
+    error, so every desk has had to repeat the variable to avoid a fault that
+    does not announce itself. Env stays the override — this adds a box-level
+    default beneath it, it does not move authority into a file.
+    """
+    override = os.environ.get("WILLOW_PG_DB", "").strip()
+    if override:
+        return override
+    block = _settings_global().get("postgres")
+    if isinstance(block, dict):
+        name = block.get("db")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return "willow"
+
+
+def fleet_roster_path() -> Path:
+    """Canonical fleet roster (``fleet.json``).
+
+    ``WILLOW_FLEET_ROSTER`` wins; otherwise ``$WILLOW_HOME/fleet.json``, which
+    is where the roster actually lives. The historical fallback was
+    ``$WILLOW_PROJECT_ROOT/fleet.json`` — a per-repo path that does not exist in
+    most checkouts, so an unset variable produced a missing-file failure rather
+    than the box's own roster. That fallback is kept last for installs that do
+    keep the roster beside a project.
+    """
+    configured = os.environ.get("WILLOW_FLEET_ROSTER", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    home_roster = willow_home() / "fleet.json"
+    if home_roster.is_file():
+        return home_roster
+    project = os.environ.get("WILLOW_PROJECT_ROOT", "").strip()
+    if project:
+        return Path(project).expanduser() / "fleet.json"
+    return home_roster
+
+
 def consent_path() -> Path:
     return config_dir() / "consent.json"
 

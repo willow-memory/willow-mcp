@@ -3,17 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 
 
 def roster_path() -> Path:
-    configured = os.environ.get("WILLOW_FLEET_ROSTER", "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    project = os.environ.get("WILLOW_PROJECT_ROOT", "").strip()
-    root = Path(project).expanduser() if project else Path.home() / "github" / "willow"
-    return root / "fleet.json"
+    from .paths import fleet_roster_path
+
+    return fleet_roster_path()
 
 
 def load_roster() -> dict:
