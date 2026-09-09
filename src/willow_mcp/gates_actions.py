@@ -68,8 +68,9 @@ def describe(row: GateRow) -> ActionSpec:
             return ActionSpec(kind="request_permission")
         return ActionSpec(
             kind="none",
-            reason=f"{row.scope} names no requestable gate — a request may only "
-                   f"name {', '.join(gates_panel.REQUESTABLE_PREFIXES)}",
+            reason=f"{row.scope} names no requestable gate — a request may ask "
+                   f"for {', '.join(gates_panel.REQUESTABLE_PREFIXES)} and "
+                   f"nothing else",
         )
     if rid.startswith("perm."):
         return ActionSpec(kind="toggle_permission")
