@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.30.1](https://github.com/willow-memory/willow-mcp/compare/v2.30.0...v2.30.1) (2026-09-09)
+
+
+### Fixed
+
+* **orient:** name the live egress lanes, and whose reachability this is ([a874479](https://github.com/willow-memory/willow-mcp/commit/a87447952c6f4ce3917cfb99435e26103991018f))
+
 ## [2.30.0](https://github.com/willow-memory/willow-mcp/compare/v2.29.0...v2.30.0) (2026-09-09)
 
 
