@@ -64,8 +64,61 @@ _PROJECT_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")
 _PACKAGE_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 
 
+#: Marker file a retired home carries. Not a new convention — the tombstoned
+#: pre-migration home already had one when this guard was written.
+TOMBSTONE_MARKER = "TOMBSTONE.md"
+
+#: Memoised {resolved_path: is_retired}. `willow_home()` is called on nearly
+#: every operation and must not grow a stat per call.
+_retired_home_cache: dict[str, bool] = {}
+
+
+class RetiredHomeError(RuntimeError):
+    """The implicit default home has been retired and must not be written to."""
+
+
+def _is_retired(home: Path) -> bool:
+    key = str(home)
+    if key not in _retired_home_cache:
+        try:
+            _retired_home_cache[key] = (home / TOMBSTONE_MARKER).is_file()
+        except OSError:
+            _retired_home_cache[key] = False
+    return _retired_home_cache[key]
+
+
 def willow_home() -> Path:
-    return Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
+    """`$WILLOW_HOME`, or `~/.willow` — unless that default has been retired.
+
+    The fallback is refused when the directory it lands on carries a
+    ``TOMBSTONE.md``, because a retired home is not empty. On the box this
+    guard was written for, `~/.willow` still held a complete parallel tree —
+    its own `fleet.json`, `vault.key`, `dispatch_signing.key`, `store/`,
+    `sessions/` and a full `mcp_apps/`. Writing into it succeeds, reports
+    success, and reaches nothing: the operator ran six `allow-permission`
+    commands from a shell with no `WILLOW_HOME` and every one of them landed
+    in the tombstone while the live seat kept its old manifest. The same
+    command run where `WILLOW_HOME` is set writes to the real home, so one
+    command had two destinations and the output looked identical either way.
+
+    **An explicitly set ``WILLOW_HOME`` is always honoured**, tombstone or not.
+    That is deliberate: pointing at a retired home on purpose is what a
+    migration tool does, and refusing it would break the one job that still
+    has to work there. The guard is for the *implicit* fallback, which nobody
+    chose and which is invisible in the output when it is wrong.
+    """
+    configured = os.environ.get("WILLOW_HOME")
+    if configured:
+        return Path(configured)
+    default = Path.home() / ".willow"
+    if _is_retired(default):
+        raise RetiredHomeError(
+            f"the default willow home {default} has been retired (it carries "
+            f"{TOMBSTONE_MARKER}) and must not be written to. Set WILLOW_HOME "
+            f"to the live home — writing here would appear to succeed and "
+            f"reach nothing."
+        )
+    return default
 
 
 def vault_box() -> Path | None:
