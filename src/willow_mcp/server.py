@@ -8568,6 +8568,7 @@ def _main():
         return
     if args.command == "sign-net-task":
         _cmd_sign_net_task(args)
+        return
     if args.command == "sign-db-task":
         _cmd_sign_db_task(args)
         return
