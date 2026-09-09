@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **personas:** add heimdallr to the persona bundle and specialist registry ([87c5fcd](https://github.com/willow-memory/willow-mcp/commit/87c5fcd2cf09566a38e0cec8cc999b37e2dd9d06))
 * **personas:** add heimdallr to the persona bundle and specialist registry ([8f4b73a](https://github.com/willow-memory/willow-mcp/commit/8f4b73aabb975233db86e351a6edefd9e5bcf7ab))
 
 ## [2.27.0](https://github.com/willow-memory/willow-mcp/compare/v2.26.1...v2.27.0) (2026-09-07)
