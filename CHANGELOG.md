@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **personas:** make the heimdallr row match the manifest already signed for it ([a0c19ee](https://github.com/willow-memory/willow-mcp/commit/a0c19ee1e722080842352f1916c8efb1da81fbf1))
 * **personas:** make the heimdallr row match the manifest already signed for it ([6c8288a](https://github.com/willow-memory/willow-mcp/commit/6c8288af6f0f8018c7cee0ecb9850269db3e5566))
 
 ## [2.28.0](https://github.com/willow-memory/willow-mcp/compare/v2.27.0...v2.28.0) (2026-09-09)
