@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-from pathlib import Path
 from uuid import uuid4
 
 from kartikeya.queue import QueueStats, TaskQueue, TaskRow
@@ -383,7 +382,8 @@ def build_task_queue(app_id: str, *, require_postgres: bool = False) -> TaskQueu
             "lane-agnostic SQLite fallback"
         )
     k = _require_kartikeya()
-    root = os.environ.get("WILLOW_STORE_ROOT") or str(Path.home() / ".willow")
-    db_path = Path(root).expanduser() / "kart.db"
+    from .paths import store_root
+
+    db_path = store_root().expanduser() / "kart.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return k.SqliteTaskQueue(str(db_path))

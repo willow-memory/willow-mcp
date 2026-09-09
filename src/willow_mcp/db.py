@@ -15,7 +15,7 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 
-from . import postgres_lifecycle
+from . import paths, postgres_lifecycle
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ def get_pg() -> Optional[psycopg2.extensions.connection]:
 
     def _connect():
         conn = psycopg2.connect(
-            dbname=os.environ.get("WILLOW_PG_DB", "willow"),
+            dbname=paths.pg_db(),
             user=os.environ.get("WILLOW_PG_USER", os.environ.get("USER", "")),
         )
         conn.autocommit = True
@@ -127,7 +127,7 @@ def get_pg() -> Optional[psycopg2.extensions.connection]:
         detail = " ".join(str(exc).split())
         return (
             f"{type(exc).__name__}: {detail} "
-            f"(dbname={os.environ.get('WILLOW_PG_DB', 'willow')!r}, "
+            f"(dbname={paths.pg_db()!r}, "
             f"user={os.environ.get('WILLOW_PG_USER', os.environ.get('USER', ''))!r})"
         )
 
@@ -190,10 +190,7 @@ class Store:
     """
 
     def __init__(self, store_root: Optional[str] = None):
-        self.root = Path(store_root or os.environ.get(
-            "WILLOW_STORE_ROOT",
-            Path.home() / ".willow" / "store"
-        ))
+        self.root = Path(store_root) if store_root else paths.store_root()
         self.root.mkdir(parents=True, exist_ok=True)
         self._conns: dict[str, sqlite3.Connection] = {}
         # RLock (not Lock): _conn() is called from within an already-locked
