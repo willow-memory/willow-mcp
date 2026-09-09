@@ -36,7 +36,7 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **seat:** the Binder gets a persona, so its signed manifest resolves ([c92a476](https://github.com/willow-memory/willow-mcp/commit/c92a4767ddaea30eadc82b8f776824918cd0f6bf))
+* **seat:** the Binder gets a persona, so its signed manifest resolves ([6fa5716](https://github.com/willow-memory/willow-mcp/commit/6fa57163400397b5d1119708a184043c4d6458cc))
 
 ## [2.30.1](https://github.com/willow-memory/willow-mcp/compare/v2.30.0...v2.30.1) (2026-09-09)
 
