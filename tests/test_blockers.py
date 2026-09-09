@@ -77,38 +77,113 @@ def test_every_item_names_an_effect_and_a_fix(quiet, monkeypatch):
 
 # ── individual gates ─────────────────────────────────────────────────────────
 
-def test_an_unattested_orchestrator_session_is_blocked(tmp_path, monkeypatch):
+def _seat(tmp_path, monkeypatch, *, keyring: bool = True):
+    """An orchestrator home with a verifier configured.
+
+    The keyring is what makes the attestation question meaningful. These tests
+    used to assert on `verifier` in the session record, which is never written
+    for this purpose -- `sign-session` writes a sidecar and the enforcing gate
+    has read only that since #313. They now ask the same function the gate asks,
+    so the two cannot drift apart again.
+    """
+    from willow_mcp import human_session
+    from willow_mcp import keyring as keyring_mod
+
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    monkeypatch.setenv("WILLOW_HUMAN_ORCHESTRATOR", "1")
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
     sessions = tmp_path / "sessions"
-    sessions.mkdir()
+    sessions.mkdir(exist_ok=True)
+    human_session.clear_attribution_cache()
+
+    if keyring:
+        ring = keyring_mod.Keyring()
+        ring.add("sean")
+        path = tmp_path / "verifiers.json"
+        path.write_text(json.dumps(ring.to_json()), encoding="utf-8")
+        monkeypatch.setenv("WILLOW_KEYRING", str(path))
+        keyring_mod.set_keyring(ring)
+        monkeypatch.setattr(keyring_mod, "set_keyring", keyring_mod.set_keyring)
+    else:
+        monkeypatch.delenv("WILLOW_KEYRING", raising=False)
+        keyring_mod.set_keyring(None)
+    return sessions
+
+
+@pytest.fixture(autouse=True)
+def _drop_injected_keyring():
+    """No test may leave a keyring installed for the next one."""
+    yield
+    from willow_mcp import human_session
+    from willow_mcp import keyring as keyring_mod
+
+    keyring_mod.set_keyring(None)
+    human_session.clear_attribution_cache()
+
+
+def test_an_unattested_orchestrator_session_is_blocked(tmp_path, monkeypatch):
+    """A live session with no attestation sidecar: the gate refuses, so the
+    seat must say so at entry."""
+    sessions = _seat(tmp_path, monkeypatch)
     (sessions / "willow-s1.json").write_text(
-        json.dumps({"app_id": "willow", "verifier": ""}), encoding="utf-8")
+        json.dumps({"app_id": "willow", "session_id": "s1"}), encoding="utf-8")
     found = blockers._check_attestation("willow", "s1")
     assert found and found["id"] == "session_unattested"
     assert "envelope_propose" in found["effect"]
     assert "sign-session s1" in found["fix"]
+    # The remedy must carry the environment the operator's shell does not have.
+    assert f"WILLOW_HOME={tmp_path}" in found["fix"]
+    assert f"WILLOW_KEYRING={tmp_path / 'verifiers.json'}" in found["fix"]
 
 
 def test_an_attested_session_is_not_blocked(tmp_path, monkeypatch):
-    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
+    """Attested the way `sign-session` attests: a signed v2 sidecar on disk,
+    and the session record left exactly as `session_bind` leaves it."""
+    from willow_mcp import session_signing
+
+    sessions = _seat(tmp_path, monkeypatch)
     (sessions / "willow-s1.json").write_text(
-        json.dumps({"app_id": "willow", "verifier": "sean"}), encoding="utf-8")
+        json.dumps({"app_id": "willow", "session_id": "s1", "verifier": ""}),
+        encoding="utf-8")
+    attested_at = "2026-09-09T20:52:54Z"
+    payload = {"format": "orchestrator_session_attestation_v2",
+               "app_id": "willow", "session_id": "s1",
+               "verifier": "sean", "attested_at": attested_at}
+    sig = session_signing.sign_session(app_id="willow", session_id="s1",
+                                       verifier="sean", attested_at=attested_at)
+    (sessions / "willow-s1.attest.json").write_text(
+        json.dumps(payload), encoding="utf-8")
+    (sessions / "willow-s1.attest.json.sig").write_text(sig, encoding="utf-8")
+
     assert blockers._check_attestation("willow", "s1") is None
 
 
 def test_a_specialist_is_not_asked_for_attestation(tmp_path, monkeypatch):
     """Only the orchestrator seat authors envelopes."""
-    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    _seat(tmp_path, monkeypatch)
     assert blockers._check_attestation("binder", "s1") is None
 
 
 def test_a_missing_session_record_reads_as_unattested(tmp_path, monkeypatch):
     """Absence is not attestation."""
-    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    _seat(tmp_path, monkeypatch)
     found = blockers._check_attestation("willow", "s-nope")
     assert found and found["id"] == "session_unattested"
+
+
+def test_no_verifier_configured_reports_nothing(tmp_path, monkeypatch):
+    """The false positive in the other direction, and the reason the old check
+    could not simply be patched: with neither a keyring nor a PGP fingerprint,
+    `orchestrator_write_denial` returns early and NOTHING refuses. Reporting a
+    blocker there sent the operator to fix a gate that was not shut."""
+    from willow_mcp import human_session
+
+    sessions = _seat(tmp_path, monkeypatch, keyring=False)
+    (sessions / "willow-s1.json").write_text(
+        json.dumps({"app_id": "willow", "session_id": "s1"}), encoding="utf-8")
+    assert human_session.orchestrator_write_denial(
+        "willow", "envelope_propose", serve_mode=False, session_id="s1") is None
+    assert blockers._check_attestation("willow", "s1") is None
 
 
 @pytest.mark.parametrize("status,fragment", [
