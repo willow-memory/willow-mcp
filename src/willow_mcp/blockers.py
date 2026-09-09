@@ -23,6 +23,16 @@ with a wider scope.
 **Every check is individually wrapped.** Orientation is sugar. A reader that
 raises must cost the caller one blocker entry, never the session — the same
 rule the envelope-pending block already follows.
+
+**This reports the CALLER's reachability, not the box's.** Measured: run in
+the MCP server process on the operator box, `collect()` finds one blocker —
+a dead lease. The identical call from inside the Kart sandbox finds four,
+because the session record is not mounted there, Postgres has no socket, and
+no worker heartbeat is visible across the PID namespace. Every one of those
+is true *for the process that asked*, which is the point — a seat should learn
+what it cannot do, not what someone else could. But do not read a sandbox-side
+report as a claim about the box: "postgres_unreachable" from inside bwrap
+means bwrap cannot reach it, not that the fleet is down.
 """
 from __future__ import annotations
 
@@ -82,12 +92,19 @@ def _check_lease(app_id: str) -> dict | None:
         "malformed": row.get("error") or "malformed",
         "mismatch": row.get("error") or "names a different app_id",
     }.get(status, str(status))
+    # Two lanes need this lease and they fail differently, so both are named:
+    # only one of them is unblocked by a lease alone. Federated jeles is the
+    # open-web path since the operator retired willow_web_* on this seat
+    # (KB 805162C1, 2026-09-01) — one organ, one confidence ladder.
     return _item(
         "no_egress_lease",
         f"no active egress lease for {app_id!r} — {detail}",
-        "git push, net.fetch and any task carrying allow_net refuse; the task "
-        "runs network-isolated instead of failing loudly",
-        f"willow-mcp grant-net {app_id} --ttl 30m --reason \"...\" — operator only",
+        "federated jeles calls (corpus_*) refuse — they need this lease "
+        "alongside mcp_federation and consent.federation. A Kart task carrying "
+        "allow_net needs MORE than this lease: an operator-signed per-task "
+        "envelope too, so granting the lease alone will not unblock git push",
+        f"willow-mcp grant-net {app_id} --ttl 30m --reason \"...\" — operator "
+        f"only; a task also needs willow-mcp sign-net-task",
         status=status,
         expires_at=row.get("expires_at"),
     )
