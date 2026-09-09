@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.31.0](https://github.com/willow-memory/willow-mcp/compare/v2.30.1...v2.31.0) (2026-09-09)
+
+
+### Added
+
+* **seat:** the Binder gets a persona, so its signed manifest resolves ([6fa5716](https://github.com/willow-memory/willow-mcp/commit/6fa57163400397b5d1119708a184043c4d6458cc))
+
 ## [2.30.1](https://github.com/willow-memory/willow-mcp/compare/v2.30.0...v2.30.1) (2026-09-09)
 
 
