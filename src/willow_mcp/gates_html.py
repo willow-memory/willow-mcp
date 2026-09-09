@@ -158,6 +158,7 @@ SHARED_CSS = """
 #: test_gates_html.py rather than importing Python into a JS string.
 _CATEGORY_ORDER_JS = """
 const CATEGORY_ORDER = [
+  ["requests", "Waiting on you"],
   ["egress", "Egress & network"],
   ["build", "Earn-first build leases"],
   ["system", "System"],

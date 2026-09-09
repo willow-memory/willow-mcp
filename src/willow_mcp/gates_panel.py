@@ -206,6 +206,8 @@ def _category(row_id: str, label: str) -> str:
     the capability half of the same egress decision, not routine access
     control — so they're pulled into "egress" by label rather than by id
     prefix alone."""
+    if row_id.startswith("request."):
+        return "requests"
     if row_id.startswith("binding."):
         return "identity"
     if row_id.startswith("consent.") or row_id.startswith("lease."):
@@ -229,6 +231,7 @@ _STATE_LABELS: dict[str, dict[str, str]] = {
     "lease.": {"on": "ACTIVE", "off": "NONE"},
     "build.": {"on": "ACTIVE", "off": "NONE"},
     "binding.": {"on": "CONFIRMED", "off": "PENDING"},
+    "request.": {"off": "ASKED", "warn": "STALE"},
     "worker": {"on": "RUNNING", "warn": "STALLED", "off": "STOPPED"},
     "strict_trust_root": {"on": "ENABLED", "off": "DISABLED"},
     "severance": {"on": "ENABLED", "off": "DISABLED"},
@@ -483,10 +486,147 @@ def _build_lease_rows() -> list[GateRow]:
     return rows
 
 
+# ── request rows (approval broker, stage 1) ──────────────────────────────────
+#
+# A gate row says "this is off." It does not say "something is blocked on it,
+# right now, and here is why" — so the operator has to already know to look.
+# Stage 1 of docs/design/approval-broker.md closes that: a blocked caller
+# ENQUEUES a request, and it shows up here as a row that can be pressed.
+#
+# Deliberately parasitic on what exists. `human_loop` is a byte-for-byte
+# re-export of forge-play's module, whose home is another repo, so a request
+# gets no new columns — it rides in `source_ref` behind a marker, and the
+# structure is parsed on this side. `kind` must be one of forge's
+# QUEUE_KINDS; `consent` is the one that means "a human must allow something."
+
+#: Marker prefixing the JSON blob a request packs into `source_ref`.
+REQUEST_MARKER = "gate-request:"
+
+#: The forge queue kind a gate request rides on. Not a free choice —
+#: `human_loop.enqueue` validates against QUEUE_KINDS and raises otherwise.
+REQUEST_QUEUE_KIND = "consent"
+
+#: Gate id prefixes a request may name. `lease.` only, on purpose: a request
+#: may ask to ACTIVATE a standing grant, never to CREATE one. The manifest
+#: capability is the grant; the lease is the clock on it. A `perm.` request
+#: would be an app asking to amend its own manifest through a queue row —
+#: that belongs in the envelope path with a human reading it, not a button.
+REQUESTABLE_PREFIXES = ("lease.",)
+
+
+def encode_request(*, gate_id: str, task_id: str, nonce: str, expires_at: str) -> str:
+    """Pack a request into the `source_ref` a caller passes to
+    `human_required_enqueue`. Bound to a task id, a nonce and an expiry for
+    the reason `task_submit`'s `network_authorization` is: an approval that
+    names nothing in particular authorizes everything after it."""
+    return REQUEST_MARKER + json.dumps(
+        {"gate_id": gate_id, "task_id": task_id, "nonce": nonce,
+         "expires_at": expires_at},
+        sort_keys=True, separators=(",", ":"),
+    )
+
+
+def decode_request(source_ref: str) -> Optional[dict]:
+    """The request encoded in `source_ref`, or None if this is an ordinary
+    queue item. Never raises — a malformed blob is not a request, and a
+    queue reader must not die on one somebody hand-edited."""
+    raw = (source_ref or "").strip()
+    if not raw.startswith(REQUEST_MARKER):
+        return None
+    try:
+        data = json.loads(raw[len(REQUEST_MARKER):])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not isinstance(data.get("gate_id"), str) or not data["gate_id"]:
+        return None
+    return data
+
+
+def _expiry_seconds(expires_at: str) -> Optional[int]:
+    """Seconds until `expires_at`, negative once past it, None if unparseable."""
+    from datetime import datetime, timezone
+
+    try:
+        when = datetime.fromisoformat((expires_at or "").replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return int((when - datetime.now(timezone.utc)).total_seconds())
+
+
+def open_requests(store=None) -> list[dict]:
+    """Open queue items that carry a gate request, newest last.
+
+    Returns the raw queue rows with a parsed `request` key attached, so both
+    `_request_rows` and `gates_actions` read the same decode.
+    """
+    from . import human_loop
+
+    if store is None:
+        from .db import Store
+
+        store = Store()
+    try:
+        # limit well past list_queue's default of 20: that default is sized
+        # for "show me the queue", and a request sitting behind twenty
+        # ordinary items would silently never render.
+        items = human_loop.list_queue(store, status=human_loop.QUEUE_OPEN,
+                                      limit=500)
+    except Exception:
+        return []
+    out: list[dict] = []
+    for item in items or []:
+        req = decode_request(item.get("source_ref", ""))
+        if req is None:
+            continue
+        out.append({**item, "request": req})
+    return out
+
+
+def _request_rows(store=None) -> list[GateRow]:
+    """One row per open gate request.
+
+    `state` is "off" while the request is live and "warn" once it has passed
+    its own expiry — the request carries the TTL of the lease it is asking
+    for, so a stale ask is one whose justification has already run out. It is
+    rendered rather than hidden, because a request that quietly vanished
+    would teach the operator to distrust the queue.
+    """
+    rows: list[GateRow] = []
+    for item in open_requests(store):
+        req = item["request"]
+        gate_id = req["gate_id"]
+        left = _expiry_seconds(req.get("expires_at", ""))
+        stale = left is not None and left <= 0
+        who = item.get("source_agent") or "?"
+        why = item.get("summary") or item.get("title") or "(no reason given)"
+        detail = f"{who} asks for {gate_id} — {why}"
+        if req.get("task_id"):
+            detail += f" [task {req['task_id']}]"
+        if stale:
+            detail += " — EXPIRED; approving it would grant for a request " \
+                      "whose justification has run out"
+        rows.append(GateRow(
+            id=f"request.{item['id']}", label="gate request", scope=gate_id,
+            friendly=f"Request: {gate_id}",
+            state="warn" if stale else "off",
+            detail=detail,
+            remaining_seconds=None if left is None or stale else left,
+            expires_at=req.get("expires_at") or None,
+            timer_shape="lease",
+            action_note=None if not stale else
+            "expired — dismiss it and ask again rather than granting late",
+        ))
+    return rows
+
+
 def collect(app_id: str = "") -> list[GateRow]:
     """Every gate row. Pass `app_id` to scope the per-app rows to one app;
     omit it to show every app under `mcp_apps/`."""
-    rows = _global_rows() + _binding_rows() + _build_lease_rows()
+    rows = _request_rows() + _global_rows() + _binding_rows() + _build_lease_rows()
     for a in ([app_id] if app_id else list_app_ids()):
         rows.extend(_app_rows(a))
     return rows
@@ -502,6 +642,7 @@ _ANSI = {"on": "\033[97;42m", "off": "\033[97;41m", "warn": "\033[30;43m", "rese
 #: mostly-boring routine-access list nobody needs to see before anything
 #: else). Both renderers (TUI, HTML) iterate this instead of a flat list.
 CATEGORY_ORDER: list[tuple[str, str]] = [
+    ("requests", "Waiting on you"),
     ("egress", "Egress & network"),
     ("build", "Earn-first build leases"),
     ("system", "System"),
