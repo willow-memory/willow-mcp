@@ -62,6 +62,19 @@ os.umask(0o022)
 #
 # A test that needs any of these ON sets it itself with monkeypatch.setenv, which
 # overrides these — deliberate setters keep working, ambient ones stop deciding.
+#   WILLOW_VAULT_BOX — paths.operator_secrets_root() prefers it over WILLOW_HOME,
+#     so with it set the gate keystore, the Fernet vault and the FRANK ledgers
+#     resolve to the OPERATOR'S LIVE SECRETS BOX no matter what home a test
+#     pins. Measured 2026-09-10 inside the Kart sandbox, where a task inherits
+#     it from the fleet env: six tests in test_session_binding.py and
+#     test_binding_enforcement.py wrote their throwaway agent secrets into the
+#     live box's gate/ and then failed looking for them under tmp_path, and one
+#     hit FileExistsError on the live used_checkin_nonces file. They read as
+#     "the unreadable-secret class" for two days. On the host the variable is
+#     usually absent, which is why the suite passed there and not in Kart. Same
+#     for WILLOW_CHARTER_REPO, which redirects constitutional_dir() the same way.
+os.environ.pop("WILLOW_VAULT_BOX", None)
+os.environ.pop("WILLOW_CHARTER_REPO", None)
 os.environ.pop("WILLOW_MCP_STRICT_TRUST_ROOT", None)
 os.environ.pop("WILLOW_IN_KART", None)
 os.environ.pop("WILLOW_PGP_FINGERPRINT", None)
