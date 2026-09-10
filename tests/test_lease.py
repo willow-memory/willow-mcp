@@ -98,7 +98,51 @@ def test_revoke(home):
     assert lease.revoke("app") is True
     assert lease.active("app") is False
     assert lease.read_lease("app")["status"] == "none"
-    assert lease.revoke("app") is False  # idempotent
+
+
+# ── a lease is a public grant: readable by the process it authorizes ─────────
+#
+# Gap d90246688413 (2026-09-10): `sudo … grant-net` printed success; the seat
+# then read "Permission denied" on the file. Root's umask made a 0600 root-
+# owned lease inside the 994-owned lease root. Correct on disk, invisible to
+# the process it authorized, and reported as "malformed" with advice to
+# re-issue — which reproduces the same file.
+
+def test_grant_leaves_the_lease_world_readable_regardless_of_umask(home):
+    import os
+    import stat
+
+    old = os.umask(0o077)
+    try:
+        lease.grant("app", 600, issuer="op")
+    finally:
+        os.umask(old)
+    mode = stat.S_IMODE(lease.lease_path("app").stat().st_mode)
+    assert mode == 0o644, f"lease landed at {oct(mode)}; must be readable by the seat"
+    assert lease.read_lease("app")["status"] == "active"
+
+
+@pytest.mark.skipif(__import__("os").geteuid() == 0, reason="root can read anything")
+def test_an_unreadable_lease_reports_unreadable_not_malformed(home):
+    lease.grant("app", 600, issuer="op")
+    path = lease.lease_path("app")
+    path.chmod(0o000)
+    try:
+        state = lease.read_lease("app")
+        authorizes = lease.active("app")
+    finally:
+        path.chmod(0o644)
+    assert state["status"] == "unreadable", state
+    assert "permission denied" in state["error"]
+    assert state["path"] == str(path)
+    assert authorizes is False
+
+
+def test_unparseable_is_still_malformed_not_unreadable(home):
+    """The two states must not collapse: garbage is malformed, refused is unreadable."""
+    path = lease.lease_path("app", create_root=True)
+    path.write_text("{not json", encoding="utf-8")
+    assert lease.read_lease("app")["status"] == "malformed"
 
 
 def test_no_lease_file_is_no_lease(home):

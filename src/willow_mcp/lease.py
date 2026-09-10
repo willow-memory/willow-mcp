@@ -187,12 +187,50 @@ def parse_ttl(value: str) -> int:
     return seconds
 
 
+#: A lease is a public grant, not a secret: the process it authorizes must be
+#: able to read it, and it carries nothing (app_id, deadline, issuer, reason)
+#: that reading could forge. Owner-write, world-read — the same class the
+#: manifests beside it are in after harden-trust-root.
+_LEASE_FILE_MODE = 0o644
+
+
+def _make_lease_readable(path: Path) -> None:
+    """Leave the lease world-readable and, when issued as root, owned by the
+    trust owner rather than root.
+
+    Measured 2026-09-10 (gap d90246688413): `sudo … willow-mcp grant-net`
+    printed success and the seat then read "Permission denied" on the file it
+    had just been granted — root's umask produced a root-owned 0600 lease
+    inside the 994-owned lease root, so the grant was correct on disk and
+    invisible to the process it authorized. The previous night's root-issued
+    lease happened to land readable; the mode was never stable. This makes it
+    stable. Best-effort: a chown that fails (no such trust owner) is not a
+    failed grant, and is logged rather than raised.
+    """
+    try:
+        os.chmod(path, _LEASE_FILE_MODE)
+    except OSError as e:
+        logger.warning("lease: could not set mode on %s (%s)", path, e)
+    if os.geteuid() != 0:
+        return
+    try:
+        import pwd
+
+        from .trust_root_setup import default_trust_owner
+
+        owner = pwd.getpwnam(default_trust_owner())
+        os.chown(path, owner.pw_uid, owner.pw_gid)
+    except (KeyError, OSError, ImportError) as e:
+        logger.warning("lease: issued as root; could not chown %s to the trust owner (%s)", path, e)
+
+
 def _write_json_atomic(path: Path, record: dict) -> None:
     """Temp file + atomic rename: a crash mid-write must never leave a lease that
     parses as JSON with a truncated `expires_at`."""
     tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
     tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+    _make_lease_readable(path)
 
 
 def _parse_deadline(raw: object) -> Optional[datetime]:
@@ -216,7 +254,10 @@ def read_lease(app_id: str) -> dict:
       `none`      no lease file
       `active`    well-formed, matching, unexpired
       `expired`   well-formed and matching, but its deadline has passed
-      `malformed` unreadable, unparseable, or claiming more than MAX_TTL_SECONDS
+      `unreadable` the file (or its directory) exists and this process is
+                  refused by the OS — a mode/owner problem, NOT a bad lease;
+                  the fix is chmod/chown, never a re-grant
+      `malformed` unparseable, or claiming more than MAX_TTL_SECONDS
       `mismatch`  the record names a different app_id than the file it lives in
     Only `active` authorizes anything.
     """
@@ -224,6 +265,9 @@ def read_lease(app_id: str) -> dict:
                    "expires_at": None, "remaining_seconds": None}
     try:
         path = lease_path(app_id)
+    except PermissionError as e:
+        logger.error("lease: cannot reach the lease root for %r (%s) — denying egress", app_id, e)
+        return {**check, "status": "unreadable", "error": f"permission denied: {e}"}
     except (ValueError, OSError) as e:
         logger.warning("lease: %s — no lease", e)
         return {**check, "status": "malformed", "error": str(e)}
@@ -232,12 +276,22 @@ def read_lease(app_id: str) -> dict:
     try:
         if not path.is_file():
             return check
+    except PermissionError as e:
+        logger.error("lease: cannot stat %s (%s) — denying egress", path, e)
+        return {**check, "status": "unreadable", "error": f"permission denied: {e}"}
     except OSError as e:  # unreadable directory, etc. — not a lease
         logger.error("lease: cannot stat %s (%s) — denying egress", path, e)
         return {**check, "status": "malformed", "error": f"unreadable: {e}"}
 
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
+    except PermissionError as e:
+        # The lease is there and correct for all we know; THIS process may not
+        # open it. Reporting that as "malformed" sent the operator to re-issue
+        # a lease that was fine (2026-09-10) — name the actual fault.
+        logger.error("lease: %s exists but is not readable by uid %s (%s) — denying egress",
+                     path, os.geteuid(), e)
+        return {**check, "status": "unreadable", "error": f"permission denied: {str(e)[:120]}"}
     except Exception as e:
         logger.error("lease: %s is unparseable (%s) — denying egress", path, e)
         return {**check, "status": "malformed", "error": f"unparseable: {str(e)[:120]}"}
