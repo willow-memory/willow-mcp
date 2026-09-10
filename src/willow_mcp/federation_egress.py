@@ -64,13 +64,17 @@ def egress_denial(app_id: str, server_id: str, tool: str) -> Optional[dict]:
 
     lease_state = lease.read_lease(app_id)
     if lease_state["status"] != "active":
+        from . import gate_request
+
         return {"error": (
             f"lease_denied: federated MCP calls require an unexpired egress "
             f"lease for '{app_id}' (status: {lease_state['status']}"
             + (f" — {lease_state['error']}" if lease_state.get("error") else "")
             + "). Leases are issued only by the operator via `willow-mcp "
             f"grant-net {app_id or '<app_id>'} --ttl 30m --reason ...` and "
-            "they expire. No MCP tool can mint one.")}
+            "they expire. No MCP tool can mint one."
+            + gate_request.note_for_lease_denial(
+                app_id, reason="federated MCP calls were refused for want of a lease"))}
 
     if lease.strict_trust_root():
         forgeable = lease.self_writable_trust_paths(app_id)

@@ -41,6 +41,7 @@ _check_rate, and receipts.ReceiptLog.
 """
 # b17: WLWMCP  ΔΣ=42
 
+import hashlib
 import inspect
 import json
 import math
@@ -2341,13 +2342,30 @@ def task_submit(
         # self-granted an hour ago; a lease has a clock and an issuer.
         lease_state = lease.read_lease(app_id)
         if lease_state["status"] != "active":
+            from . import gate_request
+
+            # The ask names the exact task, not the app — the operator's
+            # decision of 2026-07-29, because "a lease is per-app but the
+            # signed authority is per-task, so an ask that names the app would
+            # be broader than the grant it leads to". No task_id exists yet at
+            # denial time, so the task text's digest stands in: stable across
+            # retries of the same task, which is what keeps one task retrying
+            # from becoming one queue row per attempt.
             return {"error": (
                 f"lease_denied: shared network access requires an unexpired egress lease for '{app_id}' "
                 f"(status: {lease_state['status']}"
                 + (f" — {lease_state['error']}" if lease_state.get("error") else "")
                 + "). Leases are issued only by the operator, on the host, via "
                 f"`willow-mcp grant-net {app_id or '<app_id>'} --ttl 30m --reason ...`, and they "
-                "expire. No MCP tool can mint one. Ask for a lease; do not write the file.")}
+                "expire. No MCP tool can mint one. Ask for a lease; do not write the file."
+                + gate_request.note_for_lease_denial(
+                    app_id,
+                    task_id=hashlib.sha256((task or "").encode("utf-8")).hexdigest()[:16],
+                    reason=(
+                        "a Kart task asked for network access and was refused for "
+                        f"want of a lease. Task: {(task or '').strip()[:300]}"
+                    ),
+                ))}
         # Whichever keys are within this process's own write reach are keys it
         # could have forged. Reported always; enforced only under strict mode,
         # because on a single-uid host that is every install (B-32 residual).
