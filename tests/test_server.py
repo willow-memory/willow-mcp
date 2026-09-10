@@ -1545,6 +1545,25 @@ def test_fleet_health_not_stranded_when_queue_is_empty(app_id, monkeypatch, tmp_
     assert result["stranded"] is False
 
 
+def test_fleet_health_stranded_when_the_only_live_worker_fails_every_claim(
+    app_id, monkeypatch, tmp_path
+):
+    """Gap d5f7a03fa110: alive is not draining. A worker that ticks but whose
+    last claim failed read alive/stranded:false for 43 hours with work pending."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    from willow_mcp.heartbeat import WorkerHeartbeat
+    beat = WorkerHeartbeat(interval=5.0)
+    beat(tick_ok=False)
+    fake = _FakePg(columns=_TASKS_COLUMNS, canned_rows=[("pending", 2)])
+    monkeypatch.setattr(server, "get_pg", lambda: fake)
+
+    result = server.fleet_health(app_id=app_id)
+
+    assert result["workers"]["alive"] == 1
+    assert result["stranded_by_liveness"] is False
+    assert result["stranded"] is True
+
+
 def test_fleet_health_reports_per_lane_stranding(app_id, monkeypatch, tmp_path):
     # With a mapped lane column and pending work, fleet_health issues the per-lane
     # pending query and reports stranded_lanes for any lane with no alive worker

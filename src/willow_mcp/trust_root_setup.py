@@ -307,12 +307,28 @@ def audit_trust_root(app_id: str = "") -> dict[str, Any]:
     strict = lease.strict_trust_root()
     all_forgeable = forgeable + consent_writable
     store = audit_store_writable()
+    # Gap 5fd840cb5000: run inside the Kart sandbox, every writability probe
+    # answers for the bind mount, not the file — os.access(W_OK) is false on a
+    # read-only bind whatever the mode bits say — so `harden-trust-root
+    # --dry-run` in a task reported forgeable=[consent only] and omitted the
+    # lease root the host names. A measurement taken from the wrong vantage
+    # is reported as such rather than asserted.
+    in_sandbox = bool(os.environ.get("WILLOW_IN_KART", "").strip())
     return {
         "strict_trust_root": strict,
         "forgeable": all_forgeable,
         "secret_file_exposure": secret_exposure,
         "store_db_exposure": store_exposure,
         "hardened": strict and not all_forgeable and not secret_exposure and not store_exposure,
+        "measured_in_sandbox": in_sandbox,
+        "unmeasurable_in_sandbox": (
+            ["forgeable", "store", "hardened"] if in_sandbox else []
+        ),
+        "vantage_note": (
+            "measured inside the Kart sandbox: writability answers for the bind "
+            "mounts, not the host files — re-run from the host before acting on "
+            "forgeable/hardened" if in_sandbox else ""
+        ),
         "trust_roots": [str(p) for p in trust_root_directories()],
         "trust_policy_files": [str(p) for p in trust_policy_files()],
         "runtime_paths": [str(p) for p in runtime_writable_directories()],

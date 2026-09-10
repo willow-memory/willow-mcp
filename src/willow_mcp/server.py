@@ -4499,13 +4499,24 @@ def fleet_health(app_id: str) -> dict:
             cur.close()
         except Exception:
             pending_by_lane = {}
-        by_lane = workers.get("by_lane", {})
         stranded_lanes = [
             lane
             for lane, n in pending_by_lane.items()
-            if n > 0 and by_lane.get(lane, {}).get("readiness") != "alive"
+            if n > 0 and not _lane_has_draining_worker(workers, lane)
         ]
 
+    # Gap d5f7a03fa110: liveness alone is not draining. A worker that fails
+    # every claim ticks, reports alive, and drains nothing — measured once at
+    # 43 hours with two tasks pending and stranded:false the whole time.
+    # kartikeya 0.0.13 made last_tick_ok truthful; this is the consumer.
+    # `stranded_by_liveness` keeps the old rule beside the new one so a reader
+    # can see which fired: liveness says a process exists, tick_ok says it is
+    # succeeding at the one thing it is for.
+    stranded_by_liveness = pending > 0 and workers.get("alive", 0) == 0
+    draining = any(
+        w.get("state") == "alive" and w.get("last_tick_ok") is not False
+        for w in workers.get("workers", [])
+    )
     return {
         "pending":   pending,
         "running":   counts.get("running", 0),
@@ -4513,10 +4524,21 @@ def fleet_health(app_id: str) -> dict:
         "failed":    counts.get("failed", 0),
         "total":     sum(counts.values()),
         "workers":   workers,
-        "stranded":  pending > 0 and workers.get("alive", 0) == 0,
+        "stranded":  pending > 0 and not draining,
+        "stranded_by_liveness": stranded_by_liveness,
         "pending_by_lane": pending_by_lane,
         "stranded_lanes":  stranded_lanes,
     }
+
+
+def _lane_has_draining_worker(workers: dict, lane: str) -> bool:
+    """An alive worker on ``lane`` whose last claim attempt did not fail."""
+    return any(
+        w.get("state") == "alive"
+        and (w.get("lane") or "unknown") == lane
+        and w.get("last_tick_ok") is not False
+        for w in workers.get("workers", [])
+    )
 
 
 # ── Session context tools ────────────────────────────────────────────────────
@@ -5023,6 +5045,13 @@ def _diag_net_lease(app_id: str) -> dict:
         "lease": lease.read_lease(app_id) if app_id else {"status": "none"},
         "self_writable": forgeable,
         "private_key_readable": key_exposed,
+        # Gap 8aaf7b59bb13: the sandbox's credential lane names prefixes it
+        # will pass through on allow_net; nothing said which of them the box
+        # actually holds, so a task could pay all three egress keys and fail
+        # at the API for a credential that was never loaded. This names the
+        # populated ones — never the values — so "you hold a lease for a key
+        # you do not have" is legible before a task runs.
+        "credential_prefixes_populated": _credential_prefixes_populated(),
         # A sub-check that lists the keys this process could forge and then calls
         # itself "ok" is asserting a membrane it just measured a hole in. The
         # verdict still turns on _derive_problems (a lone `warn` here would make
@@ -5030,6 +5059,19 @@ def _diag_net_lease(app_id: str) -> dict:
         # says what it found.
         "status": "ok" if not forgeable and not key_exposed else "warn",
     }
+
+
+def _credential_prefixes_populated() -> dict:
+    """Which of the sandbox's credential env prefixes have at least one
+    variable set in this process — names only, never values. Reads the same
+    kart-sandbox.json the worker resolves; degrades to an empty map when
+    kartikeya or the config is unavailable, and says so."""
+    try:
+        from kartikeya.sandbox import load_sandbox_config
+        prefixes = tuple(load_sandbox_config(None).get("credential_env_prefixes") or ())
+    except Exception as e:  # kartikeya missing or config unreadable — not a diag failure
+        return {"_error": f"unreadable: {str(e)[:80]}"}
+    return {p: any(k.startswith(p) for k in os.environ) for p in prefixes}
 
 
 def _diag_build_leases() -> dict:

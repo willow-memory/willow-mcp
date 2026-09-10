@@ -132,6 +132,60 @@ def test_stale_threshold_floors_at_30s(hb_root):
     assert hb.stale_after(20.0) == 60.0  # 3 missed idle ticks
 
 
+# ── gap c400089095c7: a recycled pid must not keep a dead worker alive ───────
+
+def test_writer_records_its_own_start_time(hb_root):
+    beat = hb.WorkerHeartbeat(interval=5.0)
+    beat()
+    record = json.loads(beat.path.read_text())
+    assert record["starttime"] == hb._proc_starttime(os.getpid())
+    assert isinstance(record["starttime"], int)
+
+
+def test_live_pid_with_a_different_start_time_is_dead(hb_root):
+    """The phantom: kart-fast-4.json named pid 4, a kernel thread that answers
+    os.kill(4, 0) for the life of the machine. Same number, not the writer."""
+    _write(hb_root, "kart-fast-5.json", starttime=1)  # our own live pid, wrong birth
+    out = hb.read_workers()
+    assert out["workers"][0]["state"] == "dead"
+    assert out["alive"] == 0
+
+
+def test_live_pid_with_matching_start_time_is_alive(hb_root):
+    _write(hb_root, "kart-fast-6.json", starttime=hb._proc_starttime(os.getpid()))
+    assert hb.read_workers()["workers"][0]["state"] == "alive"
+
+
+def test_record_without_start_time_still_classifies_by_pid(hb_root):
+    """Pre-field records (and platforms with no /proc) keep the old rule."""
+    _write(hb_root, "kart-fast-7.json")
+    assert hb.read_workers()["workers"][0]["state"] == "alive"
+
+
+def test_far_past_interval_is_dead_regardless_of_pid(hb_root):
+    """A live pid twenty intervals silent is not a worker you can count on,
+    and this is the rule that retires a phantom written before starttime
+    existed, or one from another host nobody can probe."""
+    _write(hb_root, "kart-fast-8.json", ts=time.time() - 3600.0, interval=5.0)
+    assert hb.read_workers()["workers"][0]["state"] == "dead"
+    _write(hb_root, "kart-fast-9.json", host="some-other-box", pid=1,
+           ts=time.time() - 3600.0, interval=5.0)
+    states = {w["pid"]: w["state"] for w in hb.read_workers()["workers"]}
+    assert states[1] == "dead"
+
+
+def test_dead_threshold_floors_at_ten_minutes(hb_root):
+    assert hb.dead_after(0.0) == 600.0
+    assert hb.dead_after(5.0) == 600.0
+    assert hb.dead_after(60.0) == 1200.0
+
+
+def test_reap_removes_a_phantom_with_a_live_recycled_pid(hb_root):
+    _write(hb_root, "kart-fast-10.json", starttime=1)
+    assert hb.reap() == 1
+    assert list(hb_root.glob("*.json")) == []
+
+
 def test_torn_file_is_skipped_not_fatal(hb_root):
     hb_root.mkdir(parents=True, exist_ok=True)
     (hb_root / "garbage.json").write_text("{not json")

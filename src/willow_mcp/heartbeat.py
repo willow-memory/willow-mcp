@@ -36,6 +36,14 @@ logger = logging.getLogger("willow_mcp.heartbeat")
 # when busy. Three missed idle ticks (floor 30s) is a real absence, not a slow
 # poll — long enough that a worker mid-`bwrap`-setup is never called dead.
 _STALE_FLOOR_S = 30.0
+# A record this far past its own interval is dead no matter what the pid says.
+# Gap c400089095c7: kart-fast-4.json, written by a worker that died 2026-09-03,
+# was immortal because PID 4 on this host is a kernel thread that lives as long
+# as the machine — `os.kill(4, 0)` succeeds forever, so the file never reaped
+# and fleet_health showed a phantom worker for a week. Liveness of *a* process
+# with that number is not liveness of *the* process that wrote the file.
+_DEAD_FLOOR_S = 600.0
+_DEAD_MULTIPLIER = 20.0
 # The busy loop ticks twice a second; a disk write per tick is pointless churn.
 _MIN_WRITE_INTERVAL_S = 1.0
 
@@ -51,6 +59,33 @@ def heartbeat_root() -> Path:
 
 def stale_after(interval: float) -> float:
     return max(3.0 * float(interval or 0.0), _STALE_FLOOR_S)
+
+
+def dead_after(interval: float) -> float:
+    """Age past which a record is dead regardless of pid liveness."""
+    return max(_DEAD_MULTIPLIER * float(interval or 0.0), _DEAD_FLOOR_S)
+
+
+def _proc_starttime(pid: int) -> int | None:
+    """The kernel's start time for ``pid`` (clock ticks since boot), or None.
+
+    Field 22 of ``/proc/<pid>/stat``. Recorded by the writer and compared by the
+    reader: a recycled pid has the same number and a different start time, and
+    that difference is what tells a live unrelated process from the worker
+    that actually wrote the file. Linux only; elsewhere the check degrades to
+    age alone, which is still enough to retire a phantom.
+    """
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text()
+    except (OSError, ValueError, TypeError):
+        return None
+    # comm (field 2) may contain spaces and parens; everything after the LAST
+    # ')' is fields 3..N, so starttime (field 22) is index 19 of that tail.
+    tail = raw.rsplit(")", 1)[-1].split()
+    try:
+        return int(tail[19])
+    except (IndexError, ValueError):
+        return None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -80,6 +115,7 @@ class WorkerHeartbeat:
         self.lane = lane
         self.interval = float(interval)
         self.pid = os.getpid()
+        self.starttime = _proc_starttime(self.pid)
         self.host = socket.gethostname()
         self.root = Path(root) if root is not None else heartbeat_root()
         self.path = self.root / f"{self.agent}-{self.lane}-{self.pid}.json"
@@ -95,6 +131,7 @@ class WorkerHeartbeat:
             "agent": self.agent,
             "lane": lane or self.lane,
             "pid": self.pid,
+            "starttime": self.starttime,
             "host": self.host,
             "interval": self.interval,
             "tick_ok": bool(tick_ok),
@@ -122,11 +159,27 @@ class WorkerHeartbeat:
 def _classify(record: dict, now: float) -> tuple[str, float]:
     age = now - float(record.get("ts") or 0.0)
     pid, host = record.get("pid"), record.get("host")
+    interval = record.get("interval", 0.0)
     # A pid is only meaningful on the host that recorded it; cross-host records
     # fall back to age alone rather than probing an unrelated local process.
-    if host == socket.gethostname() and isinstance(pid, int) and not _pid_alive(pid):
+    if host == socket.gethostname() and isinstance(pid, int):
+        if not _pid_alive(pid):
+            return "dead", age
+        # The pid is live — but is it the process that wrote this file? A
+        # recycled pid (gap c400089095c7) answers os.kill(pid, 0) for a
+        # stranger. When the writer recorded its start time, require a match.
+        recorded = record.get("starttime")
+        if isinstance(recorded, int):
+            live = _proc_starttime(pid)
+            if live is not None and live != recorded:
+                return "dead", age
+    # Far past its own interval is dead whatever the pid says: no worker goes
+    # twenty intervals (floor ten minutes) without a tick and is still the one
+    # you want to count. This is what retires a phantom that predates the
+    # starttime field, and any cross-host record nobody can probe.
+    if age > dead_after(interval):
         return "dead", age
-    if age > stale_after(record.get("interval", 0.0)):
+    if age > stale_after(interval):
         return "stale", age
     return "alive", age
 
