@@ -46,9 +46,22 @@ def describe(row: GateRow) -> ActionSpec:
         # it must do exactly what pressing that gate does, so the approval
         # path and the direct path stay one implementation. `warn` means the
         # request outlived its own expiry; nothing to press but dismissal.
+        from . import gates_panel
+
         if row.state == "warn":
             return ActionSpec(kind="none",
                               reason=row.action_note or "request has expired")
+        # Asked for and grantable-by-press are two different questions. An
+        # `attest.` row is a legitimate ask with no approval half: the signature
+        # needs the operator's key at their own terminal, and delegating it is
+        # §5b, unratified. The row carries the command; pressing it does nothing
+        # and must not pretend otherwise.
+        if not gates_panel.is_pressable(row.scope):
+            return ActionSpec(
+                kind="none",
+                reason=row.action_note or
+                f"{row.scope} surfaces an ask that no press can grant",
+            )
         if row.scope.startswith("lease."):
             return ActionSpec(kind="request_grant", needs=("ttl", "reason"))
         if row.scope.startswith("perm."):
@@ -56,7 +69,8 @@ def describe(row: GateRow) -> ActionSpec:
         return ActionSpec(
             kind="none",
             reason=f"{row.scope} names no requestable gate — a request may ask "
-                   f"for an egress lease or a manifest permission, nothing else",
+                   f"for {', '.join(gates_panel.REQUESTABLE_PREFIXES)} and "
+                   f"nothing else",
         )
     if rid.startswith("perm."):
         return ActionSpec(kind="toggle_permission")

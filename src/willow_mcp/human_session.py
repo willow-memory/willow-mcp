@@ -206,16 +206,15 @@ def _verify_v2_sidecar_via_keyring(attest_path, sig_path, session_id: str):
     """
     import json
 
-    from . import session_signing
+    from . import remedy, session_signing
 
     try:
         payload = json.loads(attest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return (
             f"orchestrator_session_attestation_invalid: session {session_id!r} "
-            f"attestation sidecar is unreadable ({exc}) — re-run "
-            f"`willow-mcp sign-session {session_id} --verifier NAME` from the "
-            "operator terminal."
+            f"attestation sidecar is unreadable ({exc}) — re-run:\n"
+            f"    {remedy.sign_session(session_id)}"
         )
     if payload.get("format") != _ATTEST_FORMAT_V2:
         return None  # v1 sidecar; caller falls through to PGP legacy path
@@ -241,7 +240,8 @@ def _verify_v2_sidecar_via_keyring(attest_path, sig_path, session_id: str):
         return (
             f"orchestrator_session_attestation_invalid: session {session_id!r} "
             "v2 attestation is missing one of verifier/attested_at/signature; "
-            f"re-run `willow-mcp sign-session {session_id} --verifier NAME`."
+            "re-run:\n"
+            f"    {remedy.sign_session(session_id)}"
         )
     if not session_signing.session_is_valid(
         ORCHESTRATOR_APP_ID, session_id, verifier, attested_at, sig_hex
@@ -251,9 +251,8 @@ def _verify_v2_sidecar_via_keyring(attest_path, sig_path, session_id: str):
             f"was v2-attested by {verifier!r} but the signature does not "
             "verify against that verifier's key in the keyring (rotated key, "
             "compromised key, tampered sidecar, or the operator signed under a "
-            "different keyring). Re-run "
-            f"`willow-mcp sign-session {session_id} --verifier {verifier}` from "
-            "the operator terminal."
+            "different keyring). Re-run:\n"
+            f"    {remedy.sign_session(session_id, verifier)}"
         )
     return None  # verified — allow the write
 
@@ -356,6 +355,34 @@ def orchestrator_write_denial(
             "env). Agents cannot run Willow."
         )
 
+    return session_attestation_denial(session_id)
+
+
+def session_attestation_denial(
+    session_id: str, *, mutate_cache: bool = True
+) -> str | None:
+    """Would this session's attestation state refuse an orchestrator write?
+
+    Returns the operator-facing denial reason, or None if the attestation is
+    in order (including the configurations where no attestation is required
+    at all). Split out of :func:`orchestrator_write_denial` so the entry-time
+    reporter and the enforcing gate decide from ONE implementation.
+
+    They did not, and the divergence is the reason this function exists.
+    ``blockers._check_attestation`` used to read ``verifier`` out of the live
+    session record while this path verified the sidecar, so an operator who
+    attested correctly was told at every seat entry that they had not — the
+    record is never written by ``sign-session``, and since #313 nothing reads
+    it for this purpose. A second copy of a security decision does not stay a
+    copy; it becomes a second, quieter policy.
+
+    ``mutate_cache=False`` makes the call side-effect-free for read-only
+    callers. The attribution cache is consulted either way — agreeing with
+    the gate is the whole point — but a reporter must not warm it, and must
+    not clear it either: ``blockers`` promises it "adds no state and no
+    authority", and a seat-entry probe silently invalidating a live session's
+    cached attribution would be exactly that.
+    """
     # P2 (#186): once PGP is enabled, env attestation alone is no longer
     # enough — the current session must also carry a valid signature over
     # its stable identity. No-op (interim env-only) until either
@@ -363,6 +390,15 @@ def orchestrator_write_denial(
     # is set.
     from . import keyring as keyring_mod
     from . import pgp
+    from . import remedy
+
+    def _forget(sid: str) -> None:
+        if mutate_cache:
+            clear_attribution_cache(sid)
+
+    def _remember(sid: str) -> None:
+        if mutate_cache:
+            _remember_attributed(sid)
 
     keyring_on = keyring_mod.enabled()
     if not pgp.pgp_enabled() and not keyring_on:
@@ -374,10 +410,8 @@ def orchestrator_write_denial(
         return (
             "orchestrator_session_attestation_missing: no active orchestrator "
             "session on record for this process — call "
-            "session_enter(app_id='willow', session_id=...) first, then "
-            "`willow-mcp attest-session <session_id>` (legacy PGP) or "
-            "`willow-mcp sign-session <session_id> --verifier NAME` (keyring, PR3) "
-            "from the operator terminal."
+            "session_enter(app_id='willow', session_id=...) first, then run:\n"
+            f"    {remedy.attestation_command('<session_id>', keyring_on=keyring_on)}"
         )
 
     # Live session file must still exist (proof session_enter's binding is on
@@ -388,14 +422,12 @@ def orchestrator_write_denial(
     if not live_session.is_file():
         # Also drop the cache: a session whose live file was deleted must
         # re-verify from scratch if it comes back.
-        clear_attribution_cache(session_id)
+        _forget(session_id)
         return (
             f"orchestrator_session_attestation_missing: session {session_id!r} "
             "has no live session file on disk — call "
-            "session_enter(app_id='willow', session_id=...) first, then "
-            f"`willow-mcp attest-session {session_id}` (legacy PGP) or "
-            f"`willow-mcp sign-session {session_id} --verifier NAME` (keyring) "
-            "from the operator terminal."
+            "session_enter(app_id='willow', session_id=...) first, then run:\n"
+            f"    {remedy.attestation_command(session_id, keyring_on=keyring_on)}"
         )
 
     # PR4: fast path — a session that already verified once in this process
@@ -429,12 +461,12 @@ def orchestrator_write_denial(
         if v2_denial is not None:
             # A prior successful verify may be cached; a fresh failed verify
             # invalidates it (revoked key, tampered sidecar, swapped signer).
-            clear_attribution_cache(session_id)
+            _forget(session_id)
             return v2_denial
         # v2_denial is None either because verification succeeded (allow the
         # write) or because the sidecar is v1 (fall through to PGP legacy).
         if _sidecar_is_v2(attest_path):
-            _remember_attributed(session_id)
+            _remember(session_id)
             return None
 
     if not attest_path.is_file() or not sig_path.is_file():
@@ -446,15 +478,10 @@ def orchestrator_write_denial(
         # Token rename from orchestrator_session_attestation_required (#186):
         # parsers that still match the old needle should look for
         # orchestrator_session_attestation_missing / _invalid instead.
-        remedy = (
-            f"`willow-mcp sign-session {session_id} --verifier NAME`"
-            if keyring_on
-            else f"`willow-mcp attest-session {session_id}`"
-        )
         return (
             f"orchestrator_session_attestation_missing: session {session_id!r} "
-            f"has never been attested (no attestation record on file) — run "
-            f"{remedy} from the operator terminal."
+            f"has never been attested (no attestation record on file) — run:\n"
+            f"    {remedy.attestation_command(session_id, keyring_on=keyring_on)}"
         )
     # PR3: reaching here means either the keyring is off (legacy PGP path)
     # or the sidecar is v1 (predates keyring adoption). Both need the PGP
@@ -467,18 +494,18 @@ def orchestrator_write_denial(
             f"orchestrator_session_attestation_invalid: session {session_id!r} "
             "has a v1 (PGP) attestation sidecar but WILLOW_PGP_FINGERPRINT is "
             "not set, so it cannot be verified. The keyring is on — re-attest "
-            f"under it with `willow-mcp sign-session {session_id} --verifier "
-            "NAME` from the operator terminal to roll the sidecar to v2."
+            "under it to roll the sidecar to v2:\n"
+            f"    {remedy.sign_session(session_id)}"
         )
     ok, detail = pgp.verify_detached(attest_path)
     if not ok:
-        clear_attribution_cache(session_id)
+        _forget(session_id)
         return (
             f"orchestrator_session_attestation_invalid: session {session_id!r} "
             f"was attested but the signature is BAD ({detail}) — the "
             "attestation was invalidated (tampered sidecar, unexpected signer, "
-            f"or a rotated key). Re-run `willow-mcp attest-session {session_id}` "
-            "from the operator terminal to restore it."
+            "or a rotated key). Restore it with:\n"
+            f"    {remedy.attest_session(session_id)}"
         )
 
     # Belt-and-braces: the signature verifies, but also confirm the signed
@@ -494,17 +521,17 @@ def orchestrator_write_denial(
     except (OSError, ValueError) as exc:
         return (
             f"orchestrator_session_attestation_invalid: session {session_id!r} "
-            f"attestation sidecar is unreadable ({exc}) — re-run "
-            f"`willow-mcp attest-session {session_id}` from the operator terminal."
+            f"attestation sidecar is unreadable ({exc}) — re-run:\n"
+            f"    {remedy.attest_session(session_id)}"
         )
     if payload.get("app_id") != ORCHESTRATOR_APP_ID or payload.get("session_id") != session_id:
         return (
             f"orchestrator_session_attestation_invalid: session {session_id!r} "
             "attestation sidecar signs a different identity than claimed — "
-            f"re-run `willow-mcp attest-session {session_id}` from the operator "
-            "terminal."
+            "re-run:\n"
+            f"    {remedy.attest_session(session_id)}"
         )
     # PR4: v1 legacy path succeeded — remember it too so subsequent writes are
     # O(1) rather than re-running gpg --verify per call.
-    _remember_attributed(session_id)
+    _remember(session_id)
     return None
