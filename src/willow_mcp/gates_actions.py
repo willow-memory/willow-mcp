@@ -62,15 +62,31 @@ def describe(row: GateRow) -> ActionSpec:
                 reason=row.action_note or
                 f"{row.scope} surfaces an ask that no press can grant",
             )
+        # The allowlist is read here, not restated. It used to be documentation
+        # only — `REQUESTABLE_PREFIXES` decided nothing while this chain carried
+        # the same list inline, so the constant with the descriptive name was
+        # the copy that did not matter. Two copies of one security list is how
+        # the attestation blocker and its gate drifted apart (#457).
+        if not row.scope.startswith(gates_panel.REQUESTABLE_PREFIXES):
+            return ActionSpec(
+                kind="none",
+                reason=f"{row.scope} names no requestable gate — a request may ask "
+                       f"for {', '.join(gates_panel.REQUESTABLE_PREFIXES)} and "
+                       f"nothing else",
+            )
         if row.scope.startswith("lease."):
             return ActionSpec(kind="request_grant", needs=("ttl", "reason"))
         if row.scope.startswith("perm."):
             return ActionSpec(kind="request_permission")
+        # Requestable, pressable, and claimed by no branch above: a prefix was
+        # added to the allowlist without an approval path here. Say that, rather
+        # than reporting it unrequestable — the reader would go and check the
+        # one list that is not the problem.
         return ActionSpec(
             kind="none",
-            reason=f"{row.scope} names no requestable gate — a request may ask "
-                   f"for {', '.join(gates_panel.REQUESTABLE_PREFIXES)} and "
-                   f"nothing else",
+            reason=f"{row.scope} is requestable but has no approval path — add "
+                   f"one here, or add its prefix to UNPRESSABLE_PREFIXES if "
+                   f"pressing it is meant to grant nothing",
         )
     if rid.startswith("perm."):
         return ActionSpec(kind="toggle_permission")
