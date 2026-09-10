@@ -31,6 +31,17 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.31.1](https://github.com/willow-memory/willow-mcp/compare/v2.31.0...v2.31.1) (2026-09-10)
+
+
+### Fixed
+
+* **blockers:** the attestation check reads the artifact the gate reads ([1785504](https://github.com/willow-memory/willow-mcp/commit/1785504f17f7505d07feaef2ed4510efce22f85b))
+* **blockers:** the attestation check reads the artifact the gate reads ([ebfe0b3](https://github.com/willow-memory/willow-mcp/commit/ebfe0b3b6928b8c36f193bfd4120539b6788274c))
+* **cli:** sign-net-task returns instead of booting the server ([c79be03](https://github.com/willow-memory/willow-mcp/commit/c79be03f383ef5a2c99936fded0193dadac3e372))
+* **cli:** sign-net-task returns instead of booting the server ([72797fa](https://github.com/willow-memory/willow-mcp/commit/72797faa8b206bf421829857ff1e44c25c69282e))
+* **gates:** keep the refusal wording the existing contract asserts ([5d27f4f](https://github.com/willow-memory/willow-mcp/commit/5d27f4f454bde7d61dea2de8967064b299b0a515))
+
 ## [2.31.0](https://github.com/willow-memory/willow-mcp/compare/v2.30.1...v2.31.0) (2026-09-09)
 
 
