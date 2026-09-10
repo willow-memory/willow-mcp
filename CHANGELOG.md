@@ -36,13 +36,11 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **gates:** the denial files the ask — a producer for gate requests ([48ce51d](https://github.com/willow-memory/willow-mcp/commit/48ce51d8ff365808e7cd72f9d943216c9db131cf))
 * **gates:** the denial files the ask — a producer for gate requests ([d4028e4](https://github.com/willow-memory/willow-mcp/commit/d4028e40adea4cb5bf205fc3c7f047e5186f4f9e))
 
 
 ### Changed
 
-* **cli:** dispatch subcommands from a table, not a fall-through ladder ([ca650fb](https://github.com/willow-memory/willow-mcp/commit/ca650fb229f911ea447024bc3e645beb445587fd))
 * **cli:** dispatch subcommands from a table, not a fall-through ladder ([b8e0068](https://github.com/willow-memory/willow-mcp/commit/b8e00686c50575d83e674f51de163481d82cae87))
 
 ## [2.31.1](https://github.com/willow-memory/willow-mcp/compare/v2.31.0...v2.31.1) (2026-09-10)
