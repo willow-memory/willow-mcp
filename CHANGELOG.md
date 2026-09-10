@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.32.0](https://github.com/willow-memory/willow-mcp/compare/v2.31.1...v2.32.0) (2026-09-10)
+
+
+### Added
+
+* **gates:** the denial files the ask — a producer for gate requests ([d4028e4](https://github.com/willow-memory/willow-mcp/commit/d4028e40adea4cb5bf205fc3c7f047e5186f4f9e))
+
+
+### Changed
+
+* **cli:** dispatch subcommands from a table, not a fall-through ladder ([b8e0068](https://github.com/willow-memory/willow-mcp/commit/b8e00686c50575d83e674f51de163481d82cae87))
+
 ## [2.31.1](https://github.com/willow-memory/willow-mcp/compare/v2.31.0...v2.31.1) (2026-09-10)
 
 
