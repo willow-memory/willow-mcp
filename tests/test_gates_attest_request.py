@@ -9,8 +9,6 @@ approve by pressing.
 """
 from __future__ import annotations
 
-import pytest
-
 from willow_mcp import gates_actions, gates_panel
 from willow_mcp.gates_panel import GateRow
 
