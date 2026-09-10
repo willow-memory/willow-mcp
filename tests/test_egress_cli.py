@@ -143,3 +143,34 @@ def test_setup_egress_merges_mcp_json(tmp_path, monkeypatch):
     assert out.returncode == 0, out.stderr
     data = json.loads(mcp_json.read_text(encoding="utf-8"))
     assert "WILLOW_MCP_EGRESS_PUBLIC_KEY" in data["mcpServers"]["willow-mcp"]["env"]
+
+
+# ── the signing subcommand is terminal, like every one around it ─────────────
+
+def test_sign_net_task_does_not_fall_through_into_the_server(monkeypatch):
+    """`sign-net-task` must return, not boot the stdio server after signing.
+
+    Its dispatch branch was the only one in `_main` without a `return`, so the
+    envelope printed and then the process started serving stdio. To an operator
+    at a terminal that is indistinguishable from a hang, and the envelope they
+    came for has already scrolled past — measured live 2026-09-09, twice, before
+    the cause was read out of the source.
+    """
+    from willow_mcp import server
+
+    signed = []
+    monkeypatch.setattr(server, "_cmd_sign_net_task", lambda args: signed.append(args.app_id))
+
+    def _served(*_args, **_kwargs):
+        raise AssertionError("_main fell through into the server after signing")
+
+    monkeypatch.setattr(server.mcp, "run", _served)
+    monkeypatch.setattr(
+        server.sys,
+        "argv",
+        ["willow-mcp", "sign-net-task", "--task", "# allow_net\ntrue", "willow"],
+    )
+
+    server._main()
+
+    assert signed == ["willow"]
