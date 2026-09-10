@@ -213,6 +213,24 @@ def test_an_active_lease_does_not_block(monkeypatch):
     assert blockers._check_lease("kart") is None
 
 
+def test_an_unreadable_lease_blocks_with_a_chmod_fix_not_a_regrant(monkeypatch):
+    """Gap d90246688413: the fix for a lease this process cannot read is a
+    mode change. Telling the operator to re-issue reproduces the same file."""
+    import willow_mcp.lease as lease
+
+    monkeypatch.setattr(lease, "read_lease", lambda a: {
+        "status": "unreadable", "path": "/box/mcp_apps/_net_leases/kart.json",
+        "error": "permission denied: [Errno 13]", "expires_at": None,
+    })
+    found = blockers._check_lease("kart")
+    assert found["id"] == "no_egress_lease"
+    assert "cannot read it" in found["summary"]
+    assert "/box/mcp_apps/_net_leases/kart.json" in found["summary"]
+    assert "chmod 644 /box/mcp_apps/_net_leases/kart.json" in found["fix"]
+    assert "grant-net" not in found["fix"].split("Do NOT")[0]
+    assert found["path"] == "/box/mcp_apps/_net_leases/kart.json"
+
+
 def test_consent_off_says_the_lease_will_not_help(monkeypatch):
     import willow_mcp.consent as consent
 

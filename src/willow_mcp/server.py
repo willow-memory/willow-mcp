@@ -5464,7 +5464,23 @@ def _derive_problems(store: dict, postgres: dict, manifest: dict, mode: str,
     if net_lease:
         lease_state = net_lease.get("lease", {})
         status = lease_state.get("status")
-        if status in ("malformed", "mismatch"):
+        if status == "unreadable":
+            # Not a bad lease — a lease this process is refused by the OS.
+            # Measured 2026-09-10: a root-issued grant landed 0600 root-owned
+            # and this block called it malformed and told the operator to
+            # re-issue, which reproduces the same file. Gap d90246688413.
+            problems.append({
+                "severity": "warn", "check": "net_lease",
+                "detail": (f"egress lease at {lease_state.get('path')} exists but this "
+                           f"process cannot read it"
+                           + (f": {lease_state['error']}" if lease_state.get("error") else "")
+                           + " — allow_net is denied until the file is readable. A lease is a "
+                             "public grant, not a secret; this is a mode/owner problem, "
+                             "not a re-grant problem."),
+                "fix": (f"from an operator terminal: sudo chmod 644 {lease_state.get('path')} "
+                        f"— do not re-issue; a fresh grant-net from the same root shell "
+                        f"writes the same unreadable file")})
+        elif status in ("malformed", "mismatch"):
             problems.append({
                 "severity": "warn", "check": "net_lease",
                 "detail": (f"egress lease at {lease_state.get('path')} is {status}"

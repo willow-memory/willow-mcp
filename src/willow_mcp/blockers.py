@@ -107,6 +107,8 @@ def _check_lease(app_id: str) -> dict | None:
     detail = {
         "none": "no lease on disk",
         "expired": f"expired at {row.get('expires_at')}",
+        "unreadable": (f"a lease exists at {row.get('path')} but this process "
+                       f"cannot read it ({row.get('error') or 'permission denied'})"),
         "malformed": row.get("error") or "malformed",
         "mismatch": row.get("error") or "names a different app_id",
     }.get(status, str(status))
@@ -114,17 +116,32 @@ def _check_lease(app_id: str) -> dict | None:
     # only one of them is unblocked by a lease alone. Federated jeles is the
     # open-web path since the operator retired willow_web_* on this seat
     # (KB 805162C1, 2026-09-01) — one organ, one confidence ladder.
-    return _item(
-        "no_egress_lease",
-        f"no active egress lease for {app_id!r} — {detail}",
+    effect = (
         "federated jeles calls (corpus_*) refuse — they need this lease "
         "alongside mcp_federation and consent.federation. A Kart task carrying "
         "allow_net needs MORE than this lease: an operator-signed per-task "
-        "envelope too, so granting the lease alone will not unblock git push",
-        f"willow-mcp grant-net {app_id} --ttl 30m --reason \"...\" — operator "
-        f"only; a task also needs willow-mcp sign-net-task",
+        "envelope too, so granting the lease alone will not unblock git push"
+    )
+    if status == "unreadable":
+        # Measured 2026-09-10 (gap d90246688413): a root-issued lease landed
+        # 0600 root-owned; the seat read "malformed" and the advice was to
+        # re-issue. Re-issuing as root reproduces the same file. The fix is a
+        # mode, and saying so is the whole point of a distinct status.
+        fix = (f"the lease is fine; its FILE MODE is not — from an operator "
+               f"terminal: sudo chmod 644 {row.get('path')} (a lease is a public "
+               f"grant, not a secret). Do NOT re-issue: a fresh grant-net from "
+               f"the same shell writes the same unreadable file")
+    else:
+        fix = (f"willow-mcp grant-net {app_id} --ttl 30m --reason \"...\" — operator "
+               f"only; a task also needs willow-mcp sign-net-task")
+    return _item(
+        "no_egress_lease",
+        f"no active egress lease for {app_id!r} — {detail}",
+        effect,
+        fix,
         status=status,
         expires_at=row.get("expires_at"),
+        path=row.get("path"),
     )
 
 
