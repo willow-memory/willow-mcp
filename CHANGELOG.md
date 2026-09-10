@@ -36,13 +36,9 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **handoff:** closeout renders every finding shape; verify_handoff says why it refused ([7f39f28](https://github.com/willow-memory/willow-mcp/commit/7f39f28a69389b823c93123fdc0bb2a063d11aa0))
 * **handoff:** closeout renders every finding shape; verify_handoff says why it refused ([41ac725](https://github.com/willow-memory/willow-mcp/commit/41ac725ac4dcb6d72834891c61693b7eb74336f1))
-* **lease:** a lease is readable by the seat it authorizes; unreadable is its own state ([7b35d3c](https://github.com/willow-memory/willow-mcp/commit/7b35d3c8b4cb713217b821099c06d4011be42b54))
 * **lease:** a lease is readable by the seat it authorizes; unreadable is its own state ([22909da](https://github.com/willow-memory/willow-mcp/commit/22909daf714f8ad39550a87266eedfc074a96598))
-* **mcp-projects:** registry reads never seed; audit and list report a missing registry ([a5cbf9f](https://github.com/willow-memory/willow-mcp/commit/a5cbf9f63f40df4794b30d9ba14c0b3d239583a1))
 * **mcp-projects:** registry reads never seed; audit and list report a missing registry ([d342feb](https://github.com/willow-memory/willow-mcp/commit/d342feb96bd3132cf5db3a8b6057a2eb75a8eef8))
-* **trust-root:** permission sweeps tighten only, never widen, never strip +x ([f0a215d](https://github.com/willow-memory/willow-mcp/commit/f0a215d451ee4c1936245cd410213f9a5fa7466b))
 * **trust-root:** permission sweeps tighten only, never widen, never strip +x ([5b9f4f6](https://github.com/willow-memory/willow-mcp/commit/5b9f4f6ce7e8da12d340a8d7ebb59e3566e87a13))
 
 ## [2.33.0](https://github.com/willow-memory/willow-mcp/compare/v2.32.0...v2.33.0) (2026-09-10)
