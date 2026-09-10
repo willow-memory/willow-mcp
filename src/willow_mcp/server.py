@@ -132,7 +132,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 120 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 121 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -4249,6 +4249,55 @@ def envelope_apply(
         )
     except Exception as exc:
         return {"error": f"envelope_apply_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def git_push_execute(
+    app_id: str,
+    checkout: str,
+    repo: str,
+    branch: str,
+    remote: str = "origin",
+    force: bool = False,
+    envelope_id: str = "",
+    project: str = "",
+    task_id: str = "",
+) -> dict:
+    """Push `branch` of the checkout at `checkout` to `remote`, performed by
+    THIS process under the `git.push` envelope that governs `app_id`. The
+    brokered push (operator ruling 2026-09-10): the agent initiates, the
+    broker holds the credential and acts inside a signed envelope, and no
+    token ever enters a sandbox. `repo` is `org/name` as the envelope names
+    it; the checkout's remote must be that repo. `force` is honoured only
+    when the envelope grants it. A refusal is cited in FRANK with its errno
+    and files the ask in the human-required queue so the operator sees
+    "X wants to push Y to Z" while the work is still waiting. Returns the
+    pushed sha and citation id on success. Gated as envelope_apply: this is
+    an envelope application with the act attached, not a new capability.
+    See docs/design/brokered-push.md."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import push_executor
+        from .governance_ledger import GovernanceLedger
+
+        return push_executor.execute_push(
+            app_id,
+            checkout=checkout,
+            repo=repo,
+            branch=branch,
+            remote=remote,
+            force=force,
+            envelope_id=envelope_id,
+            project=project or repo,
+            session=_current_orchestrator_session(),
+            task_id=task_id,
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "pushed": False, "error": f"git_push_execute_failed: {exc}"}
 
 
 # ---------------------------------------------------------------------------
