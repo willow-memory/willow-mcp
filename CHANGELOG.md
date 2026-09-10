@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.33.0](https://github.com/willow-memory/willow-mcp/compare/v2.32.0...v2.33.0) (2026-09-10)
+
+
+### Added
+
+* **egress:** pause the call for the operator instead of losing it (SEP-2322) ([5052d27](https://github.com/willow-memory/willow-mcp/commit/5052d2740e8cac9c8c327228b46f637870aee077))
+* **egress:** pause the call for the operator instead of losing it (SEP-2322) ([6d76b63](https://github.com/willow-memory/willow-mcp/commit/6d76b63f749dfec73387739065375a63acd544b4))
+
 ## [2.32.0](https://github.com/willow-memory/willow-mcp/compare/v2.31.1...v2.32.0) (2026-09-10)
 
 
