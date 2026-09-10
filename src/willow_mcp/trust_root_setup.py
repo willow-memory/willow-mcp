@@ -474,20 +474,107 @@ def resolve_runtime_user(runtime_user: str) -> str:
     return name
 
 
+#: Execute bits are never touched by the tighten-only sweep. A venv's bin/
+#: lives under $WILLOW_HOME and the absolute-mode sweep stripped +x from 38
+#: of 42 entries there on 2026-09-01 (both workers crash-looped, 203/EXEC) and
+#: from 39 entries again by 2026-09-10 (`willow-mcp` itself: Permission
+#: denied). Removing +x is "tightening" by the arithmetic and breakage by
+#: every other measure, so it is carved out explicitly.
+_EXEC_BITS = 0o111
+_CHMOD_BATCH = 256
+
+
+def _tighten_plan(root: Path, *, dir_mode: int, file_mode: int) -> dict[int, list[str]]:
+    """Which paths under ``root`` need a mode change to satisfy tighten-only,
+    grouped by the mode they should end up with.
+
+    tighten-only: ``new = current & target`` for every path, plus the file's
+    own execute bits preserved. A 0600 file under a 0644 target stays 0600; a
+    0666 file drops to 0644; a 0755 script stays 0755. Nothing is ever
+    widened, and a path already at or below its target is not listed.
+    Symlinks are skipped: their mode is meaningless and chmod would follow
+    them out of the tree.
+    """
+    plan: dict[int, list[str]] = {}
+
+    def _consider(path: Path, is_dir: bool) -> None:
+        try:
+            st = path.lstat()
+        except OSError:
+            return
+        if stat.S_ISLNK(st.st_mode):
+            return
+        current = stat.S_IMODE(st.st_mode)
+        if is_dir:
+            desired = current & dir_mode
+        else:
+            desired = (current & file_mode) | (current & _EXEC_BITS)
+        if desired != current:
+            plan.setdefault(desired, []).append(str(path))
+
+    if root.is_file():
+        _consider(root, False)
+        return plan
+    _consider(root, True)
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        for name in dirnames:
+            _consider(base / name, True)
+        for name in filenames:
+            _consider(base / name, False)
+    return plan
+
+
 def _chmod_tree(
     root: Path,
     *,
     dir_mode: int,
     file_mode: int,
     dry_run: bool = False,
+    never_widen: bool = True,
 ) -> list[str]:
-    """Set modes under ``root`` using the same privilege boundary as chown."""
+    """Set modes under ``root`` using the same privilege boundary as chown.
+
+    ``never_widen`` (the default) makes this a tighten-only sweep: ``dir_mode``
+    and ``file_mode`` are ceilings, not targets. A mode the operator already
+    tightened by hand is left alone; only bits ABOVE the ceiling are cleared,
+    and execute bits are never cleared (``_EXEC_BITS``). This is the fix for
+    the loop where ``repair-runtime-perms`` / ``harden-trust-root`` re-widened
+    ``friction_flags/store.db`` and ``config/verifiers.json`` to 0644 every
+    run, undoing each hand chmod within the day (measured three times,
+    2026-09-09 → 2026-09-10).
+
+    ``never_widen=False`` is the pre-fix absolute sweep, kept only so a caller
+    that genuinely wants "exactly this mode" can still say so.
+    """
     actions: list[str] = []
     if not root.exists():
         return actions
     file_mode_s = format(file_mode, "o")
     dir_mode_s = format(dir_mode, "o")
     target = str(root)
+
+    if never_widen:
+        plan = _tighten_plan(root, dir_mode=dir_mode, file_mode=file_mode)
+        changes = sum(len(v) for v in plan.values())
+        # Always one line per sweep so a dry run reads as "looked, N to do"
+        # rather than as silence — silence and no-op are the failure mode
+        # the gap record on this sweep is about.
+        actions.append(
+            f"chmod tighten-only files<={file_mode_s} dirs<={dir_mode_s} "
+            f"{target}: {changes} change(s)"
+        )
+        for desired in sorted(plan):
+            desired_s = format(desired, "o")
+            paths_ = plan[desired]
+            # One action line per path — the same `chmod MODE PATH` form the
+            # absolute sweep printed, so a dry run stays greppable per file.
+            actions.extend(f"chmod {desired_s} {p}" for p in paths_)
+            for i in range(0, len(paths_), _CHMOD_BATCH):
+                chunk = paths_[i : i + _CHMOD_BATCH]
+                _run_privileged(["chmod", desired_s, *chunk], dry_run=dry_run)
+        return actions
+
     if root.is_file():
         actions.append(f"chmod {file_mode_s} {target}")
         _run_privileged(["chmod", file_mode_s, target], dry_run=dry_run)
@@ -544,6 +631,18 @@ def apply_trust_root_hardening(owner: str, *, dry_run: bool = False) -> dict[str
             actions.extend(
                 _chmod_tree(root, dir_mode=0o755, file_mode=0o644, dry_run=dry_run)
             )
+    # The per-verifier keyring holds ed25519 PRIVATE halves beside the public
+    # ones (gap 6a36cfdceb5d), so it belongs in the 0600 class with vault.key,
+    # not in the world-readable class the rest of config/ gets. It sits inside
+    # a trust dir rather than at $WILLOW_HOME's top level, so _SECRET_FILE_NAMES
+    # (matched on top-level names) never reaches it; tighten it explicitly.
+    # session_enter already refuses a world-readable keyring — this stops the
+    # sweep from creating the state that refusal exists to catch.
+    keyring_file = paths.config_dir() / "verifiers.json"
+    if keyring_file.is_file():
+        actions.extend(
+            _chmod_tree(keyring_file, dir_mode=0o700, file_mode=0o600, dry_run=dry_run)
+        )
     for policy_file in trust_policy_files():
         if policy_file.is_file() or dry_run:
             actions.extend(_chown_target(policy_file, trust_owner, dry_run=dry_run))

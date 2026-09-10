@@ -58,10 +58,17 @@ def test_harden_dry_run_lists_actions(home, monkeypatch):
     result = trs.harden_trust_root(owner="operator", dry_run=True)
     assert result["filesystem"]["dry_run"] is True
     assert any("chown -R operator:operator" in action for action in result["filesystem"]["actions"])
-    assert any("find " in action and "chmod 644" in action for action in result["filesystem"]["actions"])
+    # The sweep is tighten-only: its action line names the ceilings it applied
+    # and how many paths were above them, even when that number is zero.
+    assert any(
+        "tighten-only" in action and "files<=644" in action
+        for action in result["filesystem"]["actions"]
+    )
 
 
-def test_chmod_tree_uses_privileged_find(home, monkeypatch):
+def test_chmod_tree_legacy_absolute_mode_uses_privileged_find(home, monkeypatch):
+    """never_widen=False is the pre-fix absolute sweep, kept for a caller that
+    genuinely wants 'exactly this mode'. It still goes through find."""
     hi.ensure_home_layout()
     calls: list[list[str]] = []
 
@@ -69,9 +76,100 @@ def test_chmod_tree_uses_privileged_find(home, monkeypatch):
         calls.append(list(argv))
 
     monkeypatch.setattr(trs, "_run_privileged", _capture)
-    trs._chmod_tree(paths.mcp_apps_root(), dir_mode=0o755, file_mode=0o644)
+    trs._chmod_tree(paths.mcp_apps_root(), dir_mode=0o755, file_mode=0o644, never_widen=False)
     assert any(cmd[:4] == ["find", str(paths.mcp_apps_root()), "-type", "f"] for cmd in calls)
     assert any(cmd[:4] == ["find", str(paths.mcp_apps_root()), "-type", "d"] for cmd in calls)
+
+
+def test_chmod_tree_never_widens_a_hand_tightened_file(home):
+    """The loop this fixes: an operator chmods a file to 0600, the next sweep
+    puts it back to 0644. Real chmod on real files — a 0600 file under a 0644
+    ceiling must stay 0600 while a 0666 sibling still drops to 0644."""
+    hi.ensure_home_layout()
+    root = paths.mcp_apps_root()
+    tightened = root / "tightened.json"
+    loose = root / "loose.json"
+    tightened.write_text("{}")
+    loose.write_text("{}")
+    tightened.chmod(0o600)
+    loose.chmod(0o666)
+
+    actions = trs._chmod_tree(root, dir_mode=0o755, file_mode=0o644)
+
+    assert stat.S_IMODE(tightened.stat().st_mode) == 0o600, "sweep widened a hand-tightened file"
+    assert stat.S_IMODE(loose.stat().st_mode) == 0o644
+    assert any("tighten-only" in a for a in actions)
+
+
+def test_chmod_tree_never_strips_execute_bits(home):
+    """venvs/ lives under $WILLOW_HOME. The absolute sweep stripped +x from
+    the venv's bin/ twice (2026-09-01: 38 of 42, workers crash-looped 203/EXEC;
+    2026-09-10: 39, `willow-mcp` Permission denied). Execute bits are carved
+    out of tighten-only entirely."""
+    hi.ensure_home_layout()
+    venv_bin = home / "venvs" / "x" / "bin"
+    venv_bin.mkdir(parents=True)
+    script = venv_bin / "willow-mcp"
+    script.write_text("#!/bin/sh\n")
+    script.chmod(0o755)
+    world_writable_script = venv_bin / "wmc"
+    world_writable_script.write_text("#!/bin/sh\n")
+    world_writable_script.chmod(0o777)
+
+    trs._chmod_tree(home / "venvs", dir_mode=0o755, file_mode=0o644)
+
+    assert stat.S_IMODE(script.stat().st_mode) == 0o755, "sweep stripped +x"
+    # Group/other write is above the ceiling and is cleared; x stays.
+    assert stat.S_IMODE(world_writable_script.stat().st_mode) == 0o755
+
+
+def test_chmod_tree_dry_run_changes_nothing_but_reports_the_count(home, monkeypatch):
+    hi.ensure_home_layout()
+    root = paths.mcp_apps_root()
+    loose = root / "loose.json"
+    loose.write_text("{}")
+    loose.chmod(0o666)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(trs, "_run_privileged", lambda argv, *, dry_run: calls.append(list(argv)))
+
+    actions = trs._chmod_tree(root, dir_mode=0o755, file_mode=0o644, dry_run=True)
+
+    assert stat.S_IMODE(loose.stat().st_mode) == 0o666
+    assert any("1 change(s)" in a for a in actions)
+    assert calls and calls[0][:2] == ["chmod", "644"]
+
+
+def test_repair_runtime_keeps_a_hand_tightened_runtime_file(home, monkeypatch):
+    """At the repair level, not just the helper: a non-secret runtime file the
+    operator tightened stays tightened across repair_runtime_permissions()."""
+    hi.ensure_home_layout()
+    real_user = pwd.getpwuid(os.geteuid()).pw_name
+    monkeypatch.setattr(trs, "resolve_runtime_user", lambda _u: real_user)
+    runtime_dir = home / "dispatch"
+    runtime_dir.mkdir(exist_ok=True)
+    tightened = runtime_dir / "hand-tightened.json"
+    tightened.write_text("{}")
+    tightened.chmod(0o600)
+
+    trs.repair_runtime_permissions(dry_run=False)
+
+    assert stat.S_IMODE(tightened.stat().st_mode) == 0o600
+
+
+def test_harden_trust_root_tightens_the_keyring_to_owner_only(home, monkeypatch):
+    """config/verifiers.json holds private halves; harden-trust-root used to
+    leave it at the 0644 the rest of config/ gets, and session_enter then
+    refused the world-readable keyring. Now it lands at 0600."""
+    hi.ensure_home_layout()
+    real_user = pwd.getpwuid(os.geteuid()).pw_name
+    monkeypatch.setattr(trs, "resolve_trust_owner", lambda _o: real_user)
+    keyring = paths.config_dir() / "verifiers.json"
+    keyring.write_text("{}")
+    keyring.chmod(0o644)
+
+    trs.apply_trust_root_hardening(real_user, dry_run=False)
+
+    assert stat.S_IMODE(keyring.stat().st_mode) == 0o600
 
 
 def test_resolve_trust_owner_requires_existing_user(monkeypatch):
@@ -157,8 +255,8 @@ def test_repair_runtime_dry_run_leaves_ordinary_files_world_readable(home, monke
     hi.ensure_home_layout()
     monkeypatch.setattr(trs, "resolve_runtime_user", lambda _user: "runtime")
     result = trs.repair_runtime_permissions(dry_run=True)
-    assert any("chmod 644" in a for a in result["actions"])
-    assert any("chmod 755" in a for a in result["actions"])
+    assert any("files<=644" in a for a in result["actions"])
+    assert any("dirs<=755" in a for a in result["actions"])
 
 
 def test_secret_file_exposure_empty_when_nothing_present(home):
@@ -533,13 +631,13 @@ def test_repair_runtime_dry_run_plans_owner_only_mode_for_store_root(home, monke
     result = trs.repair_runtime_permissions(dry_run=True)
     store_root = str(paths.store_root())
     assert any(
-        f"find {store_root} -type f -exec chmod 600" in a for a in result["actions"]
+        f"tighten-only files<=600 dirs<=700 {store_root}" in a for a in result["actions"]
     )
     assert any(
-        f"find {store_root} -type d -exec chmod 700" in a for a in result["actions"]
+        f"chmod 700 {store_root}" in a for a in result["actions"]
     )
     assert not any(
-        f"find {store_root} -type f -exec chmod 644" in a for a in result["actions"]
+        f"files<=644 dirs<=755 {store_root}" in a for a in result["actions"]
     )
 
 
