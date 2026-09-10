@@ -287,12 +287,19 @@ class Keyring:
     def _require_signable(self, name: str) -> VerifierKey:
         entry = self._by_name.get(name)
         if entry is None:
+            # The name is quoted through `remedy.keys_add`, not interpolated
+            # bare: a two-word verifier ("sean campbell") used to print as
+            # `willow-mcp keys add sean campbell`, which argparse reads as the
+            # name `sean` plus a stray positional. A remedy that does not parse
+            # is worse than none — it looks authoritative and fails obscurely.
+            from . import remedy
+
             raise UnknownVerifierError(
                 f"{name or '(empty)'!r} is not in the keyring "
                 f"({', '.join(self.names()) or 'no verifiers registered'}). "
                 f"An attestation records who was in the seat; with "
                 f"per-verifier keys there is no key to sign this one with. "
-                f"Add them with `willow-mcp keys add {name or 'NAME'}`, or "
+                f"Add them with `{remedy.keys_add(name)}`, or "
                 f"unset WILLOW_KEYRING to go back to the legacy "
                 f"PGP-fingerprint path."
             )

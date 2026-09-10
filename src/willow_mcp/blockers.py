@@ -36,7 +36,6 @@ means bwrap cannot reach it, not that the fleet is down.
 """
 from __future__ import annotations
 
-import json
 import os
 from typing import Any, Callable
 
@@ -55,27 +54,46 @@ def _item(id_: str, summary: str, effect: str, fix: str, **extra: Any) -> dict:
 # ── the checks ───────────────────────────────────────────────────────────────
 
 def _check_attestation(app_id: str, session_id: str) -> dict | None:
-    from . import paths
-    from .human_session import is_orchestrator_app
+    """Ask the gate itself, rather than guessing from the session record.
 
-    if not is_orchestrator_app(app_id) or not session_id:
+    This check used to read ``verifier`` out of ``sessions/willow-<id>.json``
+    and report the seat unattested whenever it was empty. It is always empty:
+    ``sign-session`` writes a sidecar (``willow-<id>.attest.json`` + ``.sig``)
+    and never touches the record, and since #313 the enforcing gate reads only
+    that sidecar — deliberately, because ``session_bind`` rewrites the record
+    on every ordinary state change and kept self-invalidating a signature taken
+    over it.
+
+    So the old check was wrong in both directions. It reported an attested
+    session as unattested (observed 2026-09-09: operator signed at 20:52:54Z,
+    the gate passed, this blocker still fired), and it would have reported an
+    UNattested one as fine on any deployment with neither a keyring nor a PGP
+    fingerprint configured, where the gate returns early and nothing refuses.
+
+    ``mutate_cache=False``: a reporter consults the attribution cache so its
+    answer agrees with the gate's, but must not warm it and must not clear it.
+    """
+    from . import human_session, remedy
+
+    if not human_session.is_orchestrator_app(app_id) or not session_id:
         return None
-    try:
-        record = json.loads(
-            paths.session_path(app_id, session_id).read_text(encoding="utf-8")
-        )
-    except Exception:
-        record = {}
-    if (record.get("verifier") or "").strip():
+
+    denial = human_session.session_attestation_denial(
+        session_id, mutate_cache=False
+    )
+    if denial is None:
         return None
+
+    invalid = "orchestrator_session_attestation_invalid" in denial
     return _item(
         "session_unattested",
-        "this orchestrator session has no verifier on record",
+        "this orchestrator session's attestation does not verify"
+        if invalid
+        else "this orchestrator session has never been attested",
         "envelope_propose and envelope_ratify refuse; nothing can be authored "
         "or granted until it is attested",
-        f"willow-mcp sign-session {session_id} --verifier NAME from an operator "
-        f"terminal, then call session_enter again passing verifier, attested_at "
-        f"and the hex contents of the .sig file",
+        remedy.attestation_command(session_id, keyring_on=remedy.keyring_on()),
+        denial=denial,
     )
 
 

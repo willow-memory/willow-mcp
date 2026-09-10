@@ -521,7 +521,27 @@ REQUEST_QUEUE_KIND = "consent"
 #: permission — `apply()` is only ever called by a UI on a press, and nothing
 #: here auto-grants. So the line is not between `lease.` and `perm.`; it is
 #: between asking and confirming, plus the set below.
-REQUESTABLE_PREFIXES = ("lease.", "perm.")
+#: `attest.<session_id>` is the third, and it is a different animal from the
+#: first two: pressing it grants NOTHING. Session attestation is a signature
+#: made with the operator's own key, and `sign-session` refuses anywhere but a
+#: real operator terminal (`require_operator_terminal`). Delegated signature is
+#: §5b / stage 2 and is not ratified.
+#:
+#: So why is it here at all? Because the alternative was worse. An unattested
+#: seat could only print a command at the operator — and that command was, for
+#: the whole life of this code, unrunnable in the operator's own shell, since
+#: WILLOW_HOME and WILLOW_KEYRING live in the MCP child's env block and nowhere
+#: else. The ask had no way to reach the one surface the operator actually
+#: watches. A row that says "this seat is blocked, here is the exact line to
+#: paste" is not an approval; it is the ask made visible, which is stage 1's
+#: entire premise applied to a gate whose approval half does not exist yet.
+REQUESTABLE_PREFIXES = ("lease.", "perm.", "attest.")
+
+#: Prefixes whose row is informational: it surfaces the ask and carries the
+#: command, and pressing it does nothing. Kept as its own set rather than as a
+#: branch in `describe()` so that "can be asked for" and "can be granted by a
+#: press" stay two separate questions with two separate answers.
+UNPRESSABLE_PREFIXES = ("attest.",)
 
 #: Permission groups a request may never name, at any distance.
 #:
@@ -547,6 +567,24 @@ PERM_NEVER_REQUESTABLE = frozenset({
     WEB_NET_PERMISSION,
     MCP_FEDERATION_PERMISSION,
 })
+
+
+def split_attest_gate(gate_id: str) -> str:
+    """`attest.<session_id>` -> session_id, or "" if malformed.
+
+    Split once from the left, not with the bounded three-way split
+    `split_permission_gate` uses: a session_id is opaque and may itself contain
+    dots, so everything after the first separator is the id.
+    """
+    prefix = "attest."
+    if not (gate_id or "").startswith(prefix):
+        return ""
+    return gate_id[len(prefix):].strip()
+
+
+def is_pressable(gate_id: str) -> bool:
+    """Whether pressing this gate's request row can grant anything."""
+    return not (gate_id or "").startswith(UNPRESSABLE_PREFIXES)
 
 
 def split_permission_gate(gate_id: str) -> tuple[str, str]:
@@ -657,6 +695,25 @@ def _request_rows(store=None) -> list[GateRow]:
         if stale:
             detail += " — EXPIRED; approving it would grant for a request " \
                       "whose justification has run out"
+
+        action_note = None
+        if stale:
+            action_note = ("expired — dismiss it and ask again rather than "
+                           "granting late")
+        elif not is_pressable(gate_id):
+            # The row carries the command instead of a button. Built here, at
+            # render time, from this process's own resolved WILLOW_HOME and
+            # WILLOW_KEYRING — `gates_actions.describe()` is documented pure and
+            # must stay that way, so it reads this rather than computing it.
+            from . import remedy
+
+            session_id = split_attest_gate(gate_id)
+            action_note = (
+                "this one is not pressable — attestation is a signature made "
+                "with the operator's own key, and no press can produce it. Run:"
+                f"\n    {remedy.attestation_command(session_id, keyring_on=remedy.keyring_on())}"
+            )
+
         rows.append(GateRow(
             id=f"request.{item['id']}", label="gate request", scope=gate_id,
             friendly=f"Request: {gate_id}",
@@ -665,8 +722,7 @@ def _request_rows(store=None) -> list[GateRow]:
             remaining_seconds=None if left is None or stale else left,
             expires_at=req.get("expires_at") or None,
             timer_shape="lease",
-            action_note=None if not stale else
-            "expired — dismiss it and ask again rather than granting late",
+            action_note=action_note,
         ))
     return rows
 
