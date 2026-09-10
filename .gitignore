@@ -9,6 +9,16 @@ logs/
 .venv/
 .venv
 
+# uv's resolved lockfile. Deliberately NOT committed: nothing in this repo
+# consumes it. CI installs with `pip install -e ".[test]"` (.github/workflows/
+# tests.yml), the release workflow builds with `python -m build`, and the
+# declared dependency set lives in pyproject.toml. A committed lockfile that no
+# pipeline reads is worse than none — it regenerates on every dependency change
+# and reads as authoritative pinning that is not actually in force anywhere.
+# If uv ever becomes the build path here, commit it in the same change that
+# makes CI use it, not before.
+uv.lock
+
 # Local sandbox: scaffolded WILLOW_HOME + ad-hoc MCP probe harness (runtime state, not source)
 .willow/
 .willow-probe/
