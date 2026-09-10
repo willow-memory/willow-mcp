@@ -90,8 +90,36 @@ def load_seed() -> dict:
     return json.loads(seed_path().read_text(encoding="utf-8"))
 
 
+class RegistryMissing(FileNotFoundError):
+    """The registry is not where ``$WILLOW_HOME`` says it should be.
+
+    Raised by every READ of the registry instead of seeding one. Measured
+    2026-09-09 and again 2026-09-10: ``project audit`` run where the registry
+    was not visible (a Kart sandbox that does not mount ``$WILLOW_HOME/mcp``;
+    a shell with ``WILLOW_HOME`` unset) silently wrote the two-row seed into
+    whatever ``registry_path()`` resolved to and then audited the seed,
+    printing ``Wrote …`` on a read verb and reporting drift against a file
+    that was never the box's. An absent registry on a box that has a home is
+    a wiring fault to report, not a default to paper over.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        super().__init__(
+            f"MCP registry missing: {path} — nothing was created. If this box "
+            f"has a registry, WILLOW_HOME is pointing somewhere else (resolved "
+            f"home: {willow_home()}). To seed a NEW registry deliberately, run "
+            f"`willow-mcp project sync` (a write verb) — audit and list never "
+            f"create one."
+        )
+
+
 def ensure_registry(*, dry_run: bool = False) -> Path:
-    """Copy seed → fleet home if projects.json missing."""
+    """Copy seed → fleet home if projects.json missing. The ONLY creator.
+
+    Called by ``sync_all`` (a write verb, and the documented first step of
+    onboarding: ``willow-mcp project sync``) — never by a read.
+    """
     dest = registry_path()
     if dest.is_file():
         return dest
@@ -100,13 +128,19 @@ def ensure_registry(*, dry_run: bool = False) -> Path:
     return dest
 
 
-def load_registry(*, bootstrap: bool = True) -> dict:
+def load_registry(*, bootstrap: bool = False) -> dict:
+    """Read the registry. Raises ``RegistryMissing`` when it is absent.
+
+    ``bootstrap=True`` seeds a missing registry first and is for write verbs
+    only (``sync_all`` passes it). The default is False so that every other
+    caller — audit, list, anything new — fails loudly and creates nothing.
+    """
     path = registry_path()
     if not path.is_file():
         if bootstrap:
             ensure_registry(dry_run=False)
         else:
-            raise FileNotFoundError(f"MCP registry missing: {path}")
+            raise RegistryMissing(path)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data.get("projects"), dict):
         raise ValueError(f"Invalid registry (missing projects): {path}")
@@ -490,7 +524,9 @@ def sync_all(
     project_ids: list[str] | None = None,
     dry_run: bool = False,
 ) -> list[str]:
-    reg = load_registry()
+    # sync is the one write verb here, and the onboarding step that creates
+    # the registry on a fresh box. Reads (audit_all, list_projects) never do.
+    reg = load_registry(bootstrap=not dry_run)
     projects: dict[str, Any] = reg.get("projects", {})
     selected = project_ids or sorted(projects.keys())
     written: list[str] = []

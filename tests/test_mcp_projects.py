@@ -371,3 +371,72 @@ def test_resolve_willow_mcp_python_follows_willow_home(tmp_path, monkeypatch):
     (venv_bin / "python").write_text("#!/bin/sh\n", encoding="utf-8")
 
     assert resolve_willow_mcp_python() == str(venv_bin / "python")
+
+
+# ── reads never seed (gap 00ed2d1bd5c7) ──────────────────────────────────────
+#
+# Measured 2026-09-09 and 2026-09-10: `project audit` run where the registry
+# was not visible wrote the two-row seed and audited it. A read verb must
+# report the absence and create nothing.
+
+
+def test_load_registry_raises_and_creates_nothing_when_missing(tmp_path, monkeypatch):
+    from willow_mcp.mcp_projects import RegistryMissing
+
+    wh = tmp_path / ".willow"
+    monkeypatch.setenv("WILLOW_HOME", str(wh))
+    with pytest.raises(RegistryMissing) as excinfo:
+        load_registry()
+    assert not (wh / "mcp" / "projects.json").exists(), "a read seeded the registry"
+    assert not (wh / "mcp").exists()
+    # The message names the resolved path and the remedy, so a caller in the
+    # wrong home learns which home it was in rather than reading a seed back.
+    assert str(wh / "mcp" / "projects.json") in str(excinfo.value)
+    assert "project sync" in str(excinfo.value)
+
+
+def test_audit_all_reports_a_missing_registry_and_creates_nothing(tmp_path, monkeypatch):
+    from willow_mcp.mcp_projects import RegistryMissing
+
+    wh = tmp_path / ".willow"
+    monkeypatch.setenv("WILLOW_HOME", str(wh))
+    with pytest.raises(RegistryMissing):
+        audit_all()
+    assert not (wh / "mcp" / "projects.json").exists()
+
+
+def test_list_projects_reports_a_missing_registry_and_creates_nothing(tmp_path, monkeypatch):
+    from willow_mcp.mcp_projects import RegistryMissing, list_projects
+
+    wh = tmp_path / ".willow"
+    monkeypatch.setenv("WILLOW_HOME", str(wh))
+    with pytest.raises(RegistryMissing):
+        list_projects()
+    assert not (wh / "mcp" / "projects.json").exists()
+
+
+def test_sync_all_is_the_one_verb_that_seeds(tmp_path, monkeypatch):
+    """The onboarding path (`willow-mcp project sync`) still works on a fresh
+    box: sync is a write verb and may create the registry from the seed."""
+    from willow_mcp.mcp_projects import sync_all
+
+    wh = tmp_path / ".willow"
+    monkeypatch.setenv("WILLOW_HOME", str(wh))
+    # Sync a project id that does not exist so nothing is rendered; the
+    # registry itself is the artifact under test.
+    with pytest.raises(KeyError):
+        sync_all(project_ids=["no-such-project"])
+    reg = wh / "mcp" / "projects.json"
+    assert reg.is_file(), "sync did not seed the registry on a fresh home"
+    assert "github" in json.loads(reg.read_text(encoding="utf-8"))["projects"]
+
+
+def test_sync_dry_run_does_not_seed(tmp_path, monkeypatch):
+    """A dry run is a read: it must report, not create."""
+    from willow_mcp.mcp_projects import RegistryMissing, sync_all
+
+    wh = tmp_path / ".willow"
+    monkeypatch.setenv("WILLOW_HOME", str(wh))
+    with pytest.raises(RegistryMissing):
+        sync_all(dry_run=True)
+    assert not (wh / "mcp" / "projects.json").exists()
