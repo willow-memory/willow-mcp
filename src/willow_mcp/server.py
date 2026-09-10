@@ -7926,7 +7926,166 @@ def _cmd_project(args) -> None:
         return
 
 
-def _main():
+# ── subcommands whose handler lived inline in the dispatch ladder ────────────
+#
+# These four propagate an exit code rather than returning, and three of them
+# used to do it with a bare `sys.exit(...)` written into the ladder itself.
+# They are functions now for one reason: `_COMMANDS` below is a table of
+# `command -> callable(args)`, and a table with exceptions in it is a ladder
+# wearing a dict's clothes.
+
+def _cmd_keys(args) -> None:
+    """`willow-mcp keys` — propagates cli_keys' own exit code."""
+    from . import cli_keys as _cli_keys
+
+    sys.exit(_cli_keys.cmd_keys(args))
+
+
+def _cmd_sign_session(args) -> None:
+    """`willow-mcp sign-session` — propagates sign_session_cli's exit code."""
+    from . import sign_session_cli as _sign_session_cli
+
+    sys.exit(_sign_session_cli.cmd_sign_session(args))
+
+
+def _cmd_envelope(args) -> None:
+    """`willow-mcp envelope` — propagates cli_envelope's exit code."""
+    from . import cli_envelope as _cli_envelope
+
+    sys.exit(_cli_envelope.cmd_envelope(args))
+
+
+def _cmd_grove_listen(args) -> None:
+    """`willow-mcp grove-listen` — propagates the listener's exit code."""
+    from .grove_listen import main as _grove_listen_main
+
+    raise SystemExit(_grove_listen_main(args))
+
+
+def _cmd_compile_agents(args) -> None:
+    """`willow-mcp compile-agents` — materialize agent manifests from the registry."""
+    from .registry import ManifestSignError, compile_agents_main
+
+    reg = Path(args.registry).expanduser() if args.registry else None
+    try:
+        result = compile_agents_main(
+            force=args.force,
+            dry_run=args.dry_run,
+            registry_file=reg,
+        )
+    except ManifestSignError as e:
+        print(json.dumps(e.result, indent=2))
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+    print(json.dumps(result, indent=2))
+
+
+def _cmd_compile_persona(args) -> None:
+    """`willow-mcp compile-persona` — render one agent's persona file."""
+    from .persona_compile import compile_persona
+
+    out = Path(args.out).expanduser() if args.out else None
+    print(json.dumps(
+        compile_persona(args.agent_id, dry_run=args.dry_run,
+                        force=args.force, out_path=out),
+        indent=2,
+    ))
+
+
+def _cmd_allow_permission(args) -> None:
+    """`willow-mcp allow-permission` — grant a manifest permission group."""
+    _cmd_set_permission(args, granted=True)
+
+
+def _cmd_deny_permission(args) -> None:
+    """`willow-mcp deny-permission` — revoke a manifest permission group."""
+    _cmd_set_permission(args, granted=False)
+
+
+#: Every subcommand, mapped to the callable that runs it.
+#:
+#: This was a ~45-branch `if args.command == "...":` ladder in which each branch
+#: was responsible for terminating itself, by one of three conventions
+#: (`return`, `sys.exit`, `raise SystemExit`). Nothing enforced that a branch
+#: terminated at all, and one did not: `sign-net-task` (#458) signed, printed
+#: the envelope, then fell through every remaining comparison and off the end
+#: of the ladder into the stdio server boot. Because `sign-net-task` refuses to
+#: run outside an operator terminal, what that looked like to the operator was
+#: a hang — Ctrl-C, a `KeyboardInterrupt` out of `asyncio`, and the envelope
+#: they came for scrolled off above the traceback. Two good signatures were
+#: read as failures before the cause was found in the source.
+#:
+#: A table cannot fall through. Registration is the only way in and the single
+#: `return` in `_main` is the only way out, so the class of bug #458 fixed one
+#: instance of is now unrepresentable rather than merely absent. A handler ends
+#: by returning (exit 0) or by raising `SystemExit` with its own code; it never
+#: decides what happens next.
+#:
+#: `test_cli_dispatch.py` asserts this table and the parser agree in both
+#: directions, so a subcommand added to one and not the other fails at test
+#: time instead of quietly booting a server.
+#:
+#: Values are handler NAMES, not function objects, and that is deliberate. The
+#: ladder called `_cmd_sign_net_task(args)` — a module-global lookup made at
+#: call time, so `monkeypatch.setattr(server, "_cmd_...", ...)` reached the
+#: dispatch. A table of function objects binds at import instead and would
+#: silently break that, starting with #458's own regression test. Resolving
+#: through the module namespace keeps the late binding the ladder had; the
+#: cost is that a typo'd name is not a NameError at import, which is why
+#: `test_cli_dispatch.py` resolves every entry.
+_COMMANDS: dict[str, str] = {
+    "setup": "_cmd_setup",
+    "confirm-binding": "_cmd_confirm_binding",
+    "worker": "_cmd_worker",
+    "grove-listen": "_cmd_grove_listen",
+    "voice": "_cmd_voice",
+    "voice-service": "_cmd_voice_service",
+    "consent": "_cmd_consent",
+    "grant-consent": "_cmd_grant_consent",
+    "revoke-consent": "_cmd_revoke_consent",
+    "consent-status": "_cmd_consent_status",
+    "roster": "_cmd_roster",
+    "repo-sweep": "_cmd_repo_sweep",
+    "repo-sweep-service": "_cmd_repo_sweep_service",
+    "worker-service": "_cmd_worker_service",
+    "sign-net-task": "_cmd_sign_net_task",
+    "sign-db-task": "_cmd_sign_db_task",
+    "sign-manifest": "_cmd_sign_manifest",
+    "attest-session": "_cmd_attest_session",
+    "keys": "_cmd_keys",
+    "sign-session": "_cmd_sign_session",
+    "envelope": "_cmd_envelope",
+    "frank-anchor": "_cmd_frank_anchor",
+    "setup-egress": "_cmd_setup_egress",
+    "onboard": "_cmd_onboard",
+    "doctor": "_cmd_doctor",
+    "run-net": "_cmd_run_net",
+    "register-agent": "_cmd_register_agent",
+    "list-agents": "_cmd_list_agents",
+    "revoke-agent": "_cmd_revoke_agent",
+    "rotate-agent": "_cmd_rotate_agent",
+    "grant-net": "_cmd_grant_net",
+    "revoke-net": "_cmd_revoke_net",
+    "net-status": "_cmd_net_status",
+    "dev-net": "_cmd_dev_net",
+    "grant-build": "_cmd_grant_build",
+    "revoke-build": "_cmd_revoke_build",
+    "build-status": "_cmd_build_status",
+    "earn-check": "_cmd_earn_check",
+    "harden-trust-root": "_cmd_harden_trust_root",
+    "repair-runtime-perms": "_cmd_repair_runtime_perms",
+    "gates": "_cmd_gates",
+    "allow-permission": "_cmd_allow_permission",
+    "deny-permission": "_cmd_deny_permission",
+    "federation": "_cmd_federation",
+    "tree": "_cmd_tree",
+    "compile-agents": "_cmd_compile_agents",
+    "compile-persona": "_cmd_compile_persona",
+    "project": "_cmd_project",
+}
+
+
+def _build_parser():
     import argparse
     parser = argparse.ArgumentParser(prog="willow-mcp")
     parser.add_argument("--serve", action="store_true", help="Run as HTTP server with OAuth")
@@ -8522,167 +8681,19 @@ def _main():
     )
     project_p.add_argument("--dry-run", action="store_true", help="preview writes only")
 
-    args, _ = parser.parse_known_args()
+    return parser
 
-    if args.command == "setup":
-        _cmd_setup(args)
-        return
-    if args.command == "confirm-binding":
-        _cmd_confirm_binding(args)
-        return
-    if args.command == "worker":
-        _cmd_worker(args)
-        return
-    if args.command == "grove-listen":
-        from .grove_listen import main as _grove_listen_main
-        raise SystemExit(_grove_listen_main(args))
-    if args.command == "voice":
-        _cmd_voice(args)
-        return
-    if args.command == "voice-service":
-        _cmd_voice_service(args)
-        return
-    if args.command == "consent":
-        _cmd_consent(args)
-        return
-    if args.command == "grant-consent":
-        _cmd_grant_consent(args)
-        return
-    if args.command == "revoke-consent":
-        _cmd_revoke_consent(args)
-        return
-    if args.command == "consent-status":
-        _cmd_consent_status(args)
-        return
-    if args.command == "roster":
-        _cmd_roster(args)
-        return
-    if args.command == "repo-sweep":
-        _cmd_repo_sweep(args)
-        return
-    if args.command == "repo-sweep-service":
-        _cmd_repo_sweep_service(args)
-        return
-    if args.command == "worker-service":
-        _cmd_worker_service(args)
-        return
-    if args.command == "sign-net-task":
-        _cmd_sign_net_task(args)
-        return
-    if args.command == "sign-db-task":
-        _cmd_sign_db_task(args)
-        return
-    if args.command == "sign-manifest":
-        _cmd_sign_manifest(args)
-        return
-    if args.command == "attest-session":
-        _cmd_attest_session(args)
-        return
-    if args.command == "keys":
-        # cli_keys.cmd_keys returns an exit code; propagate it.
-        from . import cli_keys as _cli_keys
-        sys.exit(_cli_keys.cmd_keys(args))
-    if args.command == "sign-session":
-        from . import sign_session_cli as _sign_session_cli
-        sys.exit(_sign_session_cli.cmd_sign_session(args))
-    if args.command == "envelope":
-        from . import cli_envelope as _cli_envelope
-        sys.exit(_cli_envelope.cmd_envelope(args))
-    if args.command == "frank-anchor":
-        _cmd_frank_anchor(args)
-        return
-    if args.command == "setup-egress":
-        _cmd_setup_egress(args)
-        return
-    if args.command == "onboard":
-        _cmd_onboard(args)
-        return
-    if args.command == "doctor":
-        _cmd_doctor(args)
-        return
-    if args.command == "run-net":
-        _cmd_run_net(args)
-        return
-    if args.command == "register-agent":
-        _cmd_register_agent(args)
-        return
-    if args.command == "list-agents":
-        _cmd_list_agents(args)
-        return
-    if args.command == "revoke-agent":
-        _cmd_revoke_agent(args)
-        return
-    if args.command == "rotate-agent":
-        _cmd_rotate_agent(args)
-        return
-    if args.command == "grant-net":
-        _cmd_grant_net(args)
-        return
-    if args.command == "revoke-net":
-        _cmd_revoke_net(args)
-        return
-    if args.command == "net-status":
-        _cmd_net_status(args)
-        return
-    if args.command == "dev-net":
-        _cmd_dev_net(args)
-        return
-    if args.command == "grant-build":
-        _cmd_grant_build(args)
-        return
-    if args.command == "revoke-build":
-        _cmd_revoke_build(args)
-        return
-    if args.command == "build-status":
-        _cmd_build_status(args)
-        return
-    if args.command == "earn-check":
-        _cmd_earn_check(args)
-        return
-    if args.command == "harden-trust-root":
-        _cmd_harden_trust_root(args)
-        return
-    if args.command == "repair-runtime-perms":
-        _cmd_repair_runtime_perms(args)
-        return
-    if args.command == "gates":
-        _cmd_gates(args)
-        return
-    if args.command == "allow-permission":
-        _cmd_set_permission(args, granted=True)
-        return
-    if args.command == "deny-permission":
-        _cmd_set_permission(args, granted=False)
-        return
-    if args.command == "federation":
-        return _cmd_federation(args)
-    if args.command == "tree":
-        _cmd_tree(args)
-        return
-    if args.command == "compile-agents":
-        from .registry import ManifestSignError, compile_agents_main
 
-        reg = Path(args.registry).expanduser() if args.registry else None
-        try:
-            result = compile_agents_main(
-                force=args.force,
-                dry_run=args.dry_run,
-                registry_file=reg,
-            )
-        except ManifestSignError as e:
-            print(json.dumps(e.result, indent=2))
-            print(f"Error: {e}", file=sys.stderr)
-            raise SystemExit(1)
-        print(json.dumps(result, indent=2))
-        return
-    if args.command == "compile-persona":
-        from .persona_compile import compile_persona
+def _main():
+    args, _ = _build_parser().parse_known_args()
 
-        out = Path(args.out).expanduser() if args.out else None
-        print(json.dumps(compile_persona(args.agent_id, dry_run=args.dry_run, force=args.force, out_path=out), indent=2))
-        return
-    if args.command == "project":
-        _cmd_project(args)
+    # One dispatch site, one way out. A handler either returns — and `_main`
+    # returns with it — or raises SystemExit carrying its own code. No
+    # subcommand can reach the server boot below, which is exactly the path
+    # `sign-net-task` took in #458.
+    handler_name = _COMMANDS.get(args.command)
+    if handler_name is not None:
+        globals()[handler_name](args)
         return
 
     # #312 startup verify sweep: an unsigned/tampered manifest denies every
