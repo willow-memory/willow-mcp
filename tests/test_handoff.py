@@ -296,6 +296,97 @@ def test_verify_handoff_fails_on_unclean_envelope():
          patch("willow_mcp.handoff.handoff_read", return_value=hr):
         result = verify_handoff("d1")
     assert result["verified"] is False
+    assert result["reason"] == "envelope not clean"
+
+
+# ── findings shape (gaps cd337282ba63, 5805dba0ad47) ─────────────────────────
+#
+# handoff_write_v4 accepts any findings shape. The consumers must render what
+# specialists actually wrote and, when they refuse, say which finding and why.
+
+
+def _verify(handoff_data):
+    pkt = {"meta": {}, "status": {"status": "complete"}}
+    hr = {"dispatch_id": "d1", "handoff": handoff_data, "closeout_md": ""}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.handoff_read", return_value=hr), \
+         patch("willow_mcp.handoff.dispatch_set_status"):
+        return verify_handoff("d1")
+
+
+def test_verify_accepts_title_and_finding_shaped_findings():
+    """loki wrote {n, branch, file, finding}; hanuman wrote title. Both are
+    findings. D83F9739 and 3308526F were refused for the key name alone."""
+    result = _verify({
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": [
+            {"n": 1, "branch": "feat/x", "file": "a.py", "finding": "off by one"},
+            {"title": "Missing test", "severity": "low"},
+            {"summary": "docs drift"},
+        ],
+    })
+    assert result["verified"] is True
+    assert "reason" not in result
+
+
+def test_verify_false_names_the_failing_finding_and_its_keys():
+    result = _verify({
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": [
+            {"id": "F1", "text": "fine"},
+            {"id": "F2", "severity": "high", "evidence": ["x"]},
+            {"id": "F3", "text": "   "},
+        ],
+    })
+    assert result["verified"] is False
+    assert result["invalid_findings"] == [
+        {"index": 1, "keys": ["evidence", "id", "severity"]},
+        {"index": 2, "keys": ["id", "text"]},
+    ]
+    assert "indexes 1, 2" in result["reason"]
+    assert "text/title/finding/summary" in result["reason"]
+
+
+def test_verify_reason_lists_every_failing_gate():
+    result = _verify({
+        "checklist_resolved": False,
+        "envelope_clean": False,
+        "findings": [{"id": "F1"}],
+    })
+    assert result["verified"] is False
+    assert result["reason"].startswith("checklist not resolved; envelope not clean; ")
+    assert result["findings_count"] == 1
+
+
+def test_render_closeout_uses_title_or_finding_when_text_is_absent():
+    handoff = {
+        "written_at": "2026-09-10T00:00:00Z",
+        "reply_to": "willow",
+        "narrative": "n",
+        "findings": [
+            {"id": "L1", "finding": "off by one", "severity": "med", "evidence": "a.py:4"},
+            {"id": "H1", "title": "Missing test", "evidence": ["b.py", "tests/"]},
+        ],
+        "checklist_resolved": True,
+    }
+    md = _render_closeout("d3", "loki", handoff, {"meta": {}})
+    assert "| L1 | off by one | med | a.py:4 |" in md
+    assert "| H1 | Missing test |  | b.py, tests/ |" in md
+
+
+def test_render_closeout_does_not_split_string_evidence_into_characters():
+    handoff = {
+        "written_at": "2026-09-10T00:00:00Z",
+        "reply_to": "willow",
+        "narrative": "n",
+        "findings": [{"id": "F1", "text": "leak", "evidence": "file.py:42"}],
+        "checklist_resolved": True,
+    }
+    md = _render_closeout("d4", "hanuman", handoff, {"meta": {}})
+    assert "| F1 | leak |  | file.py:42 |" in md
+    assert "f, i, l, e" not in md
 
 
 def test_verify_handoff_not_complete():
