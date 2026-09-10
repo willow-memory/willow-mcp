@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.34.0](https://github.com/willow-memory/willow-mcp/compare/v2.33.2...v2.34.0) (2026-09-10)
+
+
+### Added
+
+* **push:** brokered push executor — the agent asks, the broker pushes ([840dd41](https://github.com/willow-memory/willow-mcp/commit/840dd411a5b73495d66160c7352be8fd5ddeda83))
+* **push:** brokered push executor — the agent asks, the broker pushes ([8a2b9d0](https://github.com/willow-memory/willow-mcp/commit/8a2b9d0292d2476a54b42832772e0768405282c4))
+
 ## [2.33.2](https://github.com/willow-memory/willow-mcp/compare/v2.33.1...v2.33.2) (2026-09-10)
 
 
