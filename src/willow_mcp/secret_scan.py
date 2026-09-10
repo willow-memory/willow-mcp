@@ -25,6 +25,7 @@ Design:
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -81,6 +82,44 @@ def _walk(obj: Any, found: set, depth: int) -> Any:
         walked = [_walk(v, found, depth + 1) for v in obj]
         return type(obj)(walked) if isinstance(obj, tuple) else walked
     return obj
+
+
+def is_opaque(obj: Any) -> bool:
+    """Whether `_walk` would pass `obj` through without looking inside it.
+
+    `_walk` handles str/dict/list/tuple and returns everything else untouched.
+    For scalars that is right — an int carries no secret. For a structured
+    object it is a hole: a pydantic result model (SEP-2322's
+    `InputRequiredResult`, say) would sail through the redaction funnel
+    unscanned, and "no tool ever returns a credential" would quietly stop
+    applying to whichever return type was added most recently.
+    """
+    return not isinstance(obj, (str, dict, list, tuple, bool, int, float, type(None)))
+
+
+def scan_opaque(obj: Any) -> list[str]:
+    """Kinds detected in `obj`'s serialized form, without rewriting it.
+
+    For a result this module cannot safely rebuild, detection is still
+    possible: serialize and scan the text. The caller decides what a hit
+    means — for the tool funnel it means refuse, because a credential that
+    cannot be redacted in place must not be returned at all.
+
+    Raises nothing of its own; an object that cannot be serialized at all is
+    reported as a scan failure by returning the sentinel kind
+    ``"unserializable"``, which the caller must treat as fail-closed rather
+    than as "clean".
+    """
+    try:
+        text = json.dumps(obj, default=str, sort_keys=True)
+    except Exception:
+        try:
+            text = str(obj)
+        except Exception:
+            return ["unserializable"]
+    found: set = set()
+    _redact_str(text, found)
+    return sorted(found)
 
 
 def redact_egress(result: Any) -> tuple[Any, list[str]]:

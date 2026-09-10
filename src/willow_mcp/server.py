@@ -1155,6 +1155,25 @@ def _guarded(tool_name: str, *, list_error: bool = False, paginated: bool = Fals
             # — e.g. an integration_call doing an OAuth token exchange that must
             # return the token) suppresses the redaction but is itself receipted
             # as `credential_returned`, so the exception is loud, never silent.
+            #
+            # A result this scanner cannot rebuild — a pydantic result model
+            # such as SEP-2322's InputRequiredResult — used to pass through
+            # `_walk` untouched, i.e. unscanned, because `_walk` returns
+            # anything that is not str/dict/list/tuple as-is. That was fine
+            # while every tool returned dicts and became a hole the moment one
+            # did not. Such a result is scanned in serialized form instead, and
+            # a hit REFUSES rather than redacts: a credential that cannot be
+            # redacted in place must not be returned at all.
+            if secret_scan.is_opaque(result):
+                opaque_kinds = secret_scan.scan_opaque(result)
+                if opaque_kinds:
+                    _receipt_log.record(
+                        effective_app_id, tool_name, "error",
+                        "egress_scan_refused: kinds=" + ",".join(opaque_kinds))
+                    return _shape({"error": "egress_scan_refused"})
+                # Clean: the success receipt is already recorded above.
+                return result
+
             try:
                 scanned, redacted_kinds = secret_scan.redact_egress(result)
             except Exception as e:
@@ -2342,7 +2361,7 @@ def task_submit(
         # self-granted an hour ago; a lease has a clock and an issuer.
         lease_state = lease.read_lease(app_id)
         if lease_state["status"] != "active":
-            from . import gate_request
+            from . import egress_pause, gate_request
 
             # The ask names the exact task, not the app — the operator's
             # decision of 2026-07-29, because "a lease is per-app but the
@@ -2351,6 +2370,50 @@ def task_submit(
             # denial time, so the task text's digest stands in: stable across
             # retries of the same task, which is what keeps one task retrying
             # from becoming one queue row per attempt.
+            task_digest = hashlib.sha256((task or "").encode("utf-8")).hexdigest()[:16]
+            queued = gate_request.request_lease(
+                app_id,
+                task_id=task_digest,
+                reason=(
+                    "a Kart task asked for network access and was refused for "
+                    f"want of a lease. Task: {(task or '').strip()[:300]}"
+                ),
+            )
+
+            # SEP-2322: hold the call open rather than losing it. The lease was
+            # re-read above and is still not active, so this is a refusal
+            # either way — the only question is whether this client can be
+            # asked to fetch the operator, or has to be told no.
+            #
+            # `pause_for_lease` returns None whenever it cannot be sure (no
+            # elicitation capability, no request context, anything raising),
+            # and then the ordinary denial below runs unchanged. Confirming the
+            # elicitation grants nothing: the resume re-reads the lease from
+            # disk and refuses again if `grant-net` never ran.
+            # Pause once, not forever. Reaching here on a resume means the
+            # client already fetched the operator and the lease STILL is not
+            # active — `grant-net` did not run, or ran for something else.
+            # Pausing again would hold the call open against an answer that has
+            # already come back, so a resume gets a definite denial instead.
+            paused = None
+            if not egress_pause.resuming_for(app_id):
+                paused = egress_pause.pause_for_lease(
+                    app_id,
+                    task_id=task_digest,
+                    request_id=str(queued.get("id") or queued.get("duplicate_of") or ""),
+                    detail=f"Task: {(task or '').strip()[:300]}",
+                )
+            if paused is not None:
+                return paused
+
+            note = ""
+            if queued.get("queued"):
+                note = (f" This ask has been queued for the operator as request "
+                        f"{queued.get('id')} — it appears in `willow-mcp gates` "
+                        f"and expires {queued.get('expires_at')}.")
+            elif queued.get("duplicate_of"):
+                note = (f" An open request for this is already waiting on the "
+                        f"operator (request {queued.get('duplicate_of')}).")
             return {"error": (
                 f"lease_denied: shared network access requires an unexpired egress lease for '{app_id}' "
                 f"(status: {lease_state['status']}"
@@ -2358,14 +2421,7 @@ def task_submit(
                 + "). Leases are issued only by the operator, on the host, via "
                 f"`willow-mcp grant-net {app_id or '<app_id>'} --ttl 30m --reason ...`, and they "
                 "expire. No MCP tool can mint one. Ask for a lease; do not write the file."
-                + gate_request.note_for_lease_denial(
-                    app_id,
-                    task_id=hashlib.sha256((task or "").encode("utf-8")).hexdigest()[:16],
-                    reason=(
-                        "a Kart task asked for network access and was refused for "
-                        f"want of a lease. Task: {(task or '').strip()[:300]}"
-                    ),
-                ))}
+                + note)}
         # Whichever keys are within this process's own write reach are keys it
         # could have forged. Reported always; enforced only under strict mode,
         # because on a single-uid host that is every install (B-32 residual).
