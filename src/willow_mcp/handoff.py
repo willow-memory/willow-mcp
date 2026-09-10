@@ -110,9 +110,12 @@ def _render_closeout(dispatch_id: str, app_id: str, handoff: dict, pkt: dict) ->
         lines.append("| ID | Finding | Severity | Evidence |")
         lines.append("|----|---------|----------|----------|")
         for f in findings:
-            evid = ", ".join(f.get("evidence") or [])
+            if not isinstance(f, dict):
+                lines.append(f"|  | {f} |  |  |")
+                continue
             lines.append(
-                f"| {f.get('id', '')} | {f.get('text', '')} | {f.get('severity', '')} | {evid} |"
+                f"| {f.get('id', '')} | {_finding_text(f)} | {f.get('severity', '')} "
+                f"| {', '.join(_finding_evidence(f))} |"
             )
     lines.extend([
         "",
@@ -147,6 +150,50 @@ def handoff_read(dispatch_id: str) -> dict:
     return {"dispatch_id": dispatch_id, "handoff": data, "closeout_md": closeout}
 
 
+#: The keys a finding may carry its one-line statement under, in the order
+#: they are tried. `text` is the documented shape; the others are what
+#: specialists have actually written (loki: {n, branch, file, finding};
+#: hanuman: title/summary). Gaps cd337282ba63 and 5805dba0ad47: a finding
+#: with any of these is a finding — refusing it for its key name stranded a
+#: finished packet (3308526F, eight substantive findings, verified:false, no
+#: reason) and rendered a blank closeout table.
+_FINDING_TEXT_KEYS: tuple[str, ...] = ("text", "title", "finding", "summary")
+
+
+def _finding_text(f: dict) -> str:
+    """The finding's statement under whichever accepted key it used, or ''."""
+    for key in _FINDING_TEXT_KEYS:
+        val = f.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _finding_evidence(f: dict) -> list[str]:
+    """Evidence as a list of strings. A bare string is one item — joining it
+    with ', ' used to split it into characters in the closeout table."""
+    raw = f.get("evidence")
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, (list, tuple)):
+        return [str(x) for x in raw if str(x).strip()]
+    return [str(raw)]
+
+
+def _invalid_findings(findings: list) -> list[dict]:
+    """Every finding that carries no statement under any accepted key, with
+    its index and the keys it did carry, so verified:false names its cause."""
+    bad: list[dict] = []
+    for i, f in enumerate(findings):
+        if not isinstance(f, dict):
+            bad.append({"index": i, "keys": [], "type": type(f).__name__})
+        elif not _finding_text(f):
+            bad.append({"index": i, "keys": sorted(f.keys())})
+    return bad
+
+
 def verify_handoff(dispatch_id: str) -> dict:
     pkt = dispatch_read(dispatch_id)
     if pkt.get("error"):
@@ -159,17 +206,28 @@ def verify_handoff(dispatch_id: str) -> dict:
     if hr.get("error"):
         return hr
     handoff = hr["handoff"]
-    verified = bool(handoff.get("checklist_resolved")) and bool(handoff.get("envelope_clean"))
+    checklist = bool(handoff.get("checklist_resolved"))
+    envelope = bool(handoff.get("envelope_clean"))
     findings = handoff.get("findings") or []
-    for f in findings:
-        if not f.get("text"):
-            verified = False
-            break
+    invalid = _invalid_findings(findings)
+
+    reasons: list[str] = []
+    if not checklist:
+        reasons.append("checklist not resolved")
+    if not envelope:
+        reasons.append("envelope not clean")
+    if invalid:
+        reasons.append(
+            f"{len(invalid)} finding(s) carry no statement under any of "
+            f"{'/'.join(_FINDING_TEXT_KEYS)}: indexes "
+            f"{', '.join(str(b['index']) for b in invalid)}"
+        )
+    verified = not reasons
 
     if verified:
         dispatch_set_status(dispatch_id, "verified", verified_at=_utc_now())
 
-    return {
+    out = {
         "dispatch_id": dispatch_id,
         "verified": verified,
         "checklist_resolved": handoff.get("checklist_resolved"),
@@ -177,3 +235,11 @@ def verify_handoff(dispatch_id: str) -> dict:
         "findings_count": len(findings),
         "status": "verified" if verified else "complete",
     }
+    if reasons:
+        # verified:false always says why. Before this the orchestrator saw
+        # two clean booleans, a findings count and a false, and had to open
+        # handoff.json by hand to learn which finding the gate objected to.
+        out["reason"] = "; ".join(reasons)
+        if invalid:
+            out["invalid_findings"] = invalid
+    return out
