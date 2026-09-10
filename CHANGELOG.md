@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.33.2](https://github.com/willow-memory/willow-mcp/compare/v2.33.1...v2.33.2) (2026-09-10)
+
+
+### Fixed
+
+* **fleet:** worker liveness, draining, and sandbox vantage told honestly ([a058ac4](https://github.com/willow-memory/willow-mcp/commit/a058ac462e8159f9bbd6f90028644e9d52a7adec))
+* **fleet:** worker liveness, draining, and sandbox vantage told honestly ([8495943](https://github.com/willow-memory/willow-mcp/commit/849594389942a9d9ca67d5c9cd2fb605b9ccac4a))
+
 ## [2.33.1](https://github.com/willow-memory/willow-mcp/compare/v2.33.0...v2.33.1) (2026-09-10)
 
 
