@@ -5506,6 +5506,34 @@ def _diag_keyring() -> dict:
     return check
 
 
+def _diag_trust_root_boot_problems(app_id: str) -> list[dict]:
+    """Boot-time subset of diagnostic_summary's trust-root problems (hook spec #3,
+    gap 37d44bfa1f4c): keyring, manifest, and self-writable-grant faults, computed
+    with the SAME probes and the SAME severity classification diagnostic_summary
+    reads at request time — filtered down to error-severity trust-root problems so
+    SessionStart can fail closed instead of surfacing this as a mid-task denial.
+
+    Reuses _diag_keyring / _diag_manifest / _diag_net_lease and _derive_problems
+    verbatim rather than re-deriving any of their fix text. store/postgres are
+    passed as healthy stubs so an unrelated outage (Postgres down, an empty SOIL
+    store) never leaks into the boot fault — those still surface at their own
+    place (diagnostic_summary / doctor), not here. Only error severity is
+    returned: a self-writable grant with no WILLOW_MCP_STRICT_TRUST_ROOT set is
+    B-32's normal single-uid resting state, not a boot-blocking defect."""
+    keyring = _diag_keyring()
+    manifest = _diag_manifest(app_id)
+    net_lease = _diag_net_lease(app_id)
+    healthy_store = {"status": "ok"}
+    healthy_postgres = {"status": "ok", "reachable": True, "missing": []}
+    problems = _derive_problems(
+        healthy_store, healthy_postgres, manifest, "stdio",
+        net_lease=net_lease,
+        severity_checks={"keyring": keyring},
+    )
+    return [p for p in problems
+            if p.get("severity") == "error" and p.get("check") in ("keyring", "manifest", "net_lease")]
+
+
 # ── Verdict coverage registry (gap 37d44bfa1f4c) ─────────────────────────────
 # ONE authoritative account of how the verdict treats every sub-check
 # diagnostic_summary reports under `checks`. A sub-check computed but not wired

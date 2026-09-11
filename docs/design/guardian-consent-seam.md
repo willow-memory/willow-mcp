@@ -43,10 +43,28 @@ each expose an optional `subject_id` (tests:
   quarantined `PERSON_CLAIM_TYPES` bar); a `kb_promotion` grant does **not** open it.
 
 `subject_id` stays empty for the owner's own data (every call today), so the gate
-is a no-op there and nothing existing changed. The remaining convergence is
-external: **corpus-lens and UTETY consuming this shared core** instead of each
-carrying their own — the reason it was built stdlib-only. That is their import to
-make, not a willow-mcp change.
+is a no-op there and nothing existing changed. The convergence this was built
+for — **corpus-lens and UTETY consuming this shared core** instead of each
+carrying their own, the reason it is stdlib-only — is now half done:
+
+- **corpus-lens consumes it** (`willow-memory/corpus-lens`, `corpuslens/consent/core.py`).
+  Vendored from THIS repo's copy byte-for-byte from the `from __future__` line
+  onward, with its own provenance header; its `tests/test_consent.py` pins the
+  code body to the same hash `tests/test_subject_consent.py` pins here, so the
+  two copies check each other without either repo importing the other. Its
+  binding (`corpuslens/subject_consent.py`) wires exactly one scope:
+  `corpuslens run --subject ID --consent-store DIR` verifies a `process_analysis`
+  grant *before* the adapter opens anything, fail-closed on every path the core
+  names, and appends a counts-only row to the subject's disclosure chain after
+  the report clears its egress scan. `corpuslens consent grant|revoke|status` is
+  its operator seat. It deliberately does **not** wire `person_inference` to its
+  Guard capability of the same name: a grant is necessary for a person-shaped
+  claim and not sufficient, and its default profile still never grants that.
+  Owner == subject (no `--subject`) is unchanged there, as here.
+- **UTETY** still carries its own; that import remains theirs to make.
+
+When this copy is re-synced from safe-app-store, corpus-lens's pinned hash goes
+stale on purpose and its test says so — re-vendor there from here.
 
 What the shipped core provides (and what it pointedly leaves out):
 
