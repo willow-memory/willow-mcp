@@ -5,6 +5,7 @@ case — Postgres reachable but pointed at a database without willow-mcp's table
 (the empty-DB / wrong-WILLOW_PG_DB footgun) — is tested without a live DB.
 """
 import json
+import os
 
 from willow_mcp import server
 
@@ -464,8 +465,6 @@ def test_diagnostic_summary_is_registered_and_the_probe_helper_is_not():
 # ── keyring probe + verdict coverage (gap 37d44bfa1f4c) ──────────────────────
 # The five computed sub-checks + a new keyring probe now move the verdict. A
 # keyring the seat cannot read blocks session_enter but used to read as `ok`.
-
-import os
 
 
 def _keyring_broken():
