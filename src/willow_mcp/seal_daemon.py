@@ -1,30 +1,19 @@
 """Wires ``seal_handler.on_seal`` to the ratatosk seal-watch daemon.
 
-The watch itself (``ratatosk.daemon.SeatDaemon`` / ``JsonlTailWatcher``)
-lives in ``willow-ratatosk``, on the held ``feat/ratatosk-listener-daemon``
-branch — it is generic on purpose and knows nothing about Nestor, seals, or
-SOIL. This module is the willow-mcp-specific launcher: it supplies the real
-ledger path, the willow-mcp seal handler, and — critically — the *correct*
-predicate for what a seal record looks like on the real Nestor ledger.
+The watch itself (``ratatosk.daemon.SeatDaemon``) lives in
+``willow-ratatosk`` — it is generic on purpose and knows nothing about
+Nestor, seals, or SOIL. This module is the willow-mcp-specific launcher: it
+supplies the real ledger path, the willow-mcp seal handler, and the
+*correct* predicate for what a seal record looks like on the real Nestor
+ledger.
 
-Predicate seam, verified against the installed ``SeatDaemon``: its
-constructor builds its own ``JsonlTailWatcher`` internally and hardcodes::
-
-    op_predicate=lambda record: record.get("op") == "seal"
-
-with no parameter to override it. The real ledger's seal records use
-``kind``, not ``op`` — so ``SeatDaemon``'s own default predicate never
-fires against the real ledger. There is no constructor seam to pass a
-different predicate through. That is a real gap in ``SeatDaemon`` and
-belongs in a fix to the held ratatosk branch (see the seal_handler
-dispatch's findings) — it is not fixed here.
-
-Workaround used here rather than reimplementing the daemon: construct
-``SeatDaemon`` with no ``seal_ledger_path`` (so it builds no watcher of its
-own), then replace ``daemon.seal_watcher`` with a ``JsonlTailWatcher`` built
-directly against the correct predicate. This keeps ``SeatDaemon``'s
-heartbeat / run_forever / stop-signal machinery — none of that is wrong —
-and only replaces the one piece that hardcodes the wrong field name.
+willow-ratatosk 1.7.0 added a ``seal_predicate`` constructor parameter to
+``SeatDaemon`` (default ``kind == "seal"``), so this module now constructs
+the daemon directly with the ledger path, offset path, seal handler, and
+predicate it needs. Earlier builds, against the pre-1.7.0 daemon that
+hardcoded ``op == "seal"`` with no override, had to construct a bare
+``SeatDaemon`` and then replace ``daemon.seal_watcher`` post-construction
+with a correctly-predicated watcher — that workaround is gone.
 """
 from __future__ import annotations
 
@@ -39,11 +28,10 @@ from . import seal_handler
 logger = logging.getLogger(__name__)
 
 try:
-    from ratatosk.daemon import JsonlTailWatcher, SeatDaemon
+    from ratatosk.daemon import SeatDaemon
     RATATOSK_AVAILABLE = True
     _IMPORT_ERROR: Optional[BaseException] = None
 except ImportError as exc:  # pragma: no cover - exercised via the guard test
-    JsonlTailWatcher = None  # type: ignore[assignment,misc]
     SeatDaemon = None  # type: ignore[assignment,misc]
     RATATOSK_AVAILABLE = False
     _IMPORT_ERROR = exc
@@ -127,38 +115,28 @@ def build_seal_daemon(
     governance-decision seals and hand each one to ``on_seal``.
 
     Raises ``ImportError`` — with a message telling the operator what to do
-    about it — if ``willow-ratatosk`` is not installed, or is installed but
-    predates the seal-watch daemon (``ratatosk.daemon`` with ``SeatDaemon``/
-    ``JsonlTailWatcher``). That is the real, current state of the released
-    package: the daemon lives on the held ``feat/ratatosk-listener-daemon``
-    branch and is not yet in any release.
+    about it — if ``willow-ratatosk`` is not installed (or is installed but
+    predates 1.7.0's ``seal_predicate`` constructor parameter on
+    ``SeatDaemon``).
     """
     if not RATATOSK_AVAILABLE:
         raise ImportError(
-            "willow-ratatosk is not installed with the seal-watch daemon "
-            "(ratatosk.daemon.SeatDaemon / JsonlTailWatcher). Install or "
-            "release willow-ratatosk's feat/ratatosk-listener-daemon branch "
-            "before building the seal daemon."
+            "willow-ratatosk is not installed, or predates 1.7.0's "
+            "SeatDaemon(seal_predicate=...) parameter. Install "
+            "willow-ratatosk>=1.7.0 before building the seal daemon."
         ) from _IMPORT_ERROR
 
     ledger = Path(ledger_path) if ledger_path is not None else default_ledger_path()
     offset = Path(offset_path) if offset_path is not None else default_offset_path()
     _seed_offset_at_eof_if_absent(ledger, offset)
 
-    daemon = SeatDaemon(
+    return SeatDaemon(
         node=node,
         channel=channel,
         mcp_call=mcp_call,
+        seal_ledger_path=ledger,
+        seal_offset_path=offset,
+        on_seal=on_seal,
+        seal_predicate=seal_predicate,
         **daemon_kwargs,
     )
-    # Replace whatever seal_watcher SeatDaemon may have built for itself
-    # (None, since we did not pass it seal_ledger_path) with one carrying
-    # the correct predicate. See module docstring for why this cannot be
-    # done through SeatDaemon's constructor.
-    daemon.seal_watcher = JsonlTailWatcher(
-        ledger_path=ledger,
-        op_predicate=seal_predicate,
-        callback=on_seal,
-        offset_store_path=offset,
-    )
-    return daemon
