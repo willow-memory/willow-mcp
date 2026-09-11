@@ -942,99 +942,58 @@ def test_main_stays_silent_for_the_sanctioned_web_tool():
     assert stdout == ""
 
 
-# ── grant-aware native-web redirect ─────────────────────────────────────────
+# ── grant-aware native-web redirect, without a second reader of grant state ──
 #
-# check_native_web always blocks the native tool; web_net_grant_active() only
-# changes which message it names. This section pins: (1) the redirect always
-# names the willow_web_* verb; (2) when the seat provably lacks the grant, the
-# message says to ask the operator instead of implying the door is open; (3)
-# a fault in the probe degrades to "not granted" rather than crashing; (4) the
-# willow_web_* verbs themselves are never redirected onto themselves (already
-# covered above, re-asserted here for locality).
-
-def _write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data), encoding="utf-8")
-
-
-@pytest.fixture
-def granted_seat(tmp_path, monkeypatch):
-    """A seat holding all three web_net keys: manifest permission, standing
-    consent, and a live (far-future, tz-aware) lease."""
-    home = tmp_path / ".willow"
-    monkeypatch.setenv("WILLOW_HOME", str(home))
-    monkeypatch.setenv("WILLOW_APP_ID", "ada")
-    _write_json(home / "mcp_apps" / "ada" / "manifest.json",
-                {"app_id": "ada", "permissions": ["web_net", "store_read"]})
-    _write_json(home / "settings.global.json", {"consent": {"internet": True}})
-    _write_json(home / "mcp_apps" / "_net_leases" / "ada.json",
-                {"app_id": "ada", "expires_at": "2999-01-01T00:00:00+00:00"})
-    return home
+# An earlier revision probed WILLOW_HOME directly to decide whether to name
+# willow_web_* outright or say "ask the operator" instead. Cross-model audit
+# found that probe was a split-brain: it read the wrong consent path (not the
+# canonical config/settings.global.json the real gate prefers, and not
+# WILLOW_SETTINGS_GLOBAL), skipped ttl_seconds validation on the lease, didn't
+# deny on a corrupt canonical consent file the way the real gate does, and
+# didn't know about strict_trust_root/PGP/deny_tools/WILLOW_MCP_APPS_ROOT —
+# every one of those gaps could make the probe say "granted" when
+# web_egress.egress_denial() would actually refuse. Per the fleet's standing
+# rule to eliminate split-brains rather than keep re-syncing two copies of one
+# state, check_native_web no longer probes grant state at all: the message is
+# unconditional, naming the willow_web_* verb AND noting that an ungranted
+# seat should ask the operator, regardless of ambient environment. These tests
+# pin that: (1) the redirect always names the verb; (2) it always includes the
+# ask-the-operator note, independent of any WILLOW_HOME/WILLOW_APP_ID state;
+# (3) willow_web_* is never redirected onto itself.
 
 
-def test_web_net_grant_active_true_when_all_three_keys_present(granted_seat):
-    assert pre_tool_use.web_net_grant_active() is True
-
-
-@pytest.mark.parametrize("mutate", [
-    lambda home: _write_json(home / "mcp_apps" / "ada" / "manifest.json",
-                              {"app_id": "ada", "permissions": ["store_read"]}),  # no web_net
-    lambda home: _write_json(home / "settings.global.json", {"consent": {"internet": False}}),
-    lambda home: _write_json(home / "mcp_apps" / "_net_leases" / "ada.json",
-                              {"app_id": "ada", "expires_at": "2000-01-01T00:00:00+00:00"}),  # expired
-    lambda home: (home / "mcp_apps" / "_net_leases" / "ada.json").unlink(),  # no lease
-])
-def test_web_net_grant_active_false_when_any_key_missing(granted_seat, mutate):
-    mutate(granted_seat)
-    assert pre_tool_use.web_net_grant_active() is False
-
-
-def test_web_net_grant_active_false_without_app_id_or_home():
-    # The autouse fixture already clears WILLOW_APP_ID/WILLOW_HOME is untouched
-    # by it, so this pins the "can't resolve either" branch explicitly.
-    assert pre_tool_use.web_net_grant_active() is False
-
-
-def test_web_net_grant_active_fail_safe_on_probe_fault(granted_seat, monkeypatch):
-    """A fault inside the probe (e.g. a helper raising) must degrade to
-    'not granted', never propagate and crash the hook."""
-    def _boom(*a, **k):
-        raise RuntimeError("disk exploded")
-    monkeypatch.setattr(pre_tool_use, "_manifest_has_web_net", _boom)
-    assert pre_tool_use.web_net_grant_active() is False
-
-
-def test_check_native_web_names_the_verb_regardless_of_grant():
-    """Redirect always names the willow_web_* verb — granted or not."""
-    assert "willow_web_search" in pre_tool_use.check_native_web("WebSearch")[1]
-    assert "willow_web_fetch" in pre_tool_use.check_native_web("WebFetch")[1]
-
-
-def test_check_native_web_says_ask_the_operator_when_grant_absent():
-    """Default test environment holds no web_net grant (no app_id/home wired) —
-    the message must say to ask the operator, not imply willow_web_* just works."""
+def test_check_native_web_names_the_verb_and_asks_the_operator():
+    """The redirect names the willow_web_* verb AND tells an ungranted seat to
+    ask the operator, in a single unconditional message — no probe, so no
+    ambient env can change whether the ask-the-operator note appears."""
     decision, reason = pre_tool_use.check_native_web("WebSearch")
     assert decision == "block"
-    assert "ask the operator" in reason.lower()
-    decision, reason = pre_tool_use.check_native_web("WebFetch")
-    assert decision == "block"
-    assert "ask the operator" in reason.lower()
-
-
-def test_check_native_web_omits_ask_operator_when_grant_is_active(granted_seat):
-    """When the seat provably holds the grant, the message names the verb
-    without steering the seat to ask the operator for something it has."""
-    decision, reason = pre_tool_use.check_native_web("WebSearch")
-    assert decision == "block"
-    assert "ask the operator" not in reason.lower()
     assert "willow_web_search" in reason
+    assert "ask the operator" in reason.lower()
     decision, reason = pre_tool_use.check_native_web("WebFetch")
     assert decision == "block"
-    assert "ask the operator" not in reason.lower()
     assert "willow_web_fetch" in reason
+    assert "ask the operator" in reason.lower()
 
 
-def test_main_web_search_block_names_operator_ask_end_to_end():
+@pytest.mark.parametrize("env", [
+    {},
+    {"WILLOW_HOME": "/tmp/does-not-exist-anywhere", "WILLOW_APP_ID": "ada"},
+])
+def test_check_native_web_wording_is_independent_of_ambient_env(env, monkeypatch):
+    """No grant probe means no ambient WILLOW_HOME/WILLOW_APP_ID state can
+    change the message — pinned against the exact split-brain the audit found
+    (a probe reading stale/wrong files and claiming 'granted')."""
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    for tool_name, verb in (("WebSearch", "willow_web_search"), ("WebFetch", "willow_web_fetch")):
+        decision, reason = pre_tool_use.check_native_web(tool_name)
+        assert decision == "block"
+        assert verb in reason
+        assert "ask the operator" in reason.lower()
+
+
+def test_main_web_search_block_names_verb_and_operator_ask_end_to_end():
     code, stdout = _run_hook({
         "tool_name": "WebSearch",
         "tool_input": {"search_term": "latest news"},
@@ -1043,12 +1002,13 @@ def test_main_web_search_block_names_operator_ask_end_to_end():
     assert code == 0
     decision = json.loads(stdout)
     assert decision["decision"] == "block"
+    assert "willow_web_search" in decision["reason"]
     assert "ask the operator" in decision["reason"].lower()
 
 
 def test_check_native_web_never_fires_on_the_governed_verb_itself():
-    """The governed call is never redirected onto itself, granted or not —
-    re-asserted here alongside the grant-aware tests for locality."""
+    """The governed call is never redirected onto itself — re-asserted here
+    alongside the grant-aware wording tests for locality."""
     assert pre_tool_use.check_native_web("willow_web_search") is None
     assert pre_tool_use.check_native_web("mcp__willow-mcp__willow_web_fetch") is None
 

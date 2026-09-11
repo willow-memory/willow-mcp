@@ -286,121 +286,45 @@ def check_bash_routing(command: str) -> Optional[tuple[str, str]]:
     return None
 
 
-_WEB_SEARCH_GRANTED = (
-    "Use willow_web_search (MCP) for open-web search — not native WebSearch."
+_WEB_SEARCH_REDIRECT = (
+    "Use willow_web_search (MCP) for open-web search — not native WebSearch. "
+    "Requires the 'web_net' manifest permission + operator consent.internet + "
+    "a live egress lease; if this seat doesn't hold one, ask the operator to "
+    "grant it (willow-mcp grant-net <app_id> --ttl 30m --reason ...) rather "
+    "than retrying the native tool."
 )
-_WEB_SEARCH_UNGRANTED = (
-    "willow_web_search (MCP) is the governed path for open-web search, but this "
-    "seat does not currently hold the web_net grant (manifest 'web_net' "
-    "permission + operator consent.internet + a live egress lease). Ask the "
-    "operator to grant it (willow-mcp grant-net <app_id> --ttl 30m --reason "
-    "...) — do not retry with the native WebSearch tool."
-)
-_WEB_FETCH_GRANTED = (
+_WEB_FETCH_REDIRECT = (
     "WebFetch is blocked — use willow_web_fetch (MCP) for guarded URL fetch "
-    "with external-guard scan."
-)
-_WEB_FETCH_UNGRANTED = (
-    "WebFetch is blocked. willow_web_fetch (MCP) is the governed path, but "
-    "this seat does not currently hold the web_net grant (manifest 'web_net' "
-    "permission + operator consent.internet + a live egress lease). Ask the "
-    "operator to grant it (willow-mcp grant-net <app_id> --ttl 30m --reason "
-    "...) — do not retry with the native WebFetch tool."
+    "with external-guard scan. Requires the 'web_net' manifest permission + "
+    "operator consent.internet + a live egress lease; if this seat doesn't "
+    "hold one, ask the operator to grant it (willow-mcp grant-net <app_id> "
+    "--ttl 30m --reason ...) rather than retrying the native tool."
 )
 
-# ── grant-aware redirect ─────────────────────────────────────────────────
+# ── grant-aware wording, without a second reader of grant state ────────────
 #
-# Naming willow_web_* as "the" replacement is only good advice when this seat
-# can actually reach it. web_egress.egress_denial() gates willow_web_search/
-# willow_web_fetch on three keys: the 'web_net' manifest permission, the
-# operator's standing consent.internet, and a live egress lease (see
-# src/willow_mcp/web_egress.py). A seat missing any of those would trade one
-# blocked tool for another — naming a door it can't open — so the redirect
-# probes the same three keys and, when they aren't all held, says to ask the
-# operator instead of pointing at willow_web_* as if it just works.
+# An earlier version of this redirect probed WILLOW_HOME directly (manifest
+# permission, consent file, lease file) to decide whether to name willow_web_*
+# outright or say "ask the operator" instead. Cross-model audit found that
+# probe was a split-brain in the making: it read $WILLOW_HOME/settings.global.json
+# while the real gate (consent.read_consent) prefers the canonical
+# $WILLOW_HOME/config/settings.global.json and honors WILLOW_SETTINGS_GLOBAL;
+# it didn't validate lease ttl_seconds the way lease.read_lease does; it never
+# denied on a corrupt canonical file the way the real gate does; and it didn't
+# know about the 4th key (strict_trust_root), PGP manifest verification,
+# deny_tools, or WILLOW_MCP_APPS_ROOT. Every one of those gaps could make the
+# probe say "granted" when web_egress.egress_denial() would actually refuse —
+# naming a door that then 401s, exactly the failure this guard exists to avoid.
 #
-# The hook cannot import willow_mcp — it runs in the agent's own harness,
-# stdlib only (see the _SEAT_PRIV_RE note above) — so this re-reads the same
-# three files gate.permitted() / consent.internet_permitted() / lease.read_lease()
-# read, directly and read-only. Deliberately conservative: an unresolved
-# app_id or WILLOW_HOME, or any missing/unparseable/expired file, reads as
-# NOT granted, never as granted — a wrong guess must cost "ask the operator"
-# unnecessarily, not tell an ungranted seat the call will work. Fail-safe:
-# wrapped in try/except so a probe fault degrades to "not granted" rather than
-# crashing the hook (a stricter message, never a dropped decision).
-_WEB_NET_PERMISSION = "web_net"
-
-
-def _willow_home_dir() -> Optional[str]:
-    home = os.environ.get("WILLOW_HOME")
-    return home.strip() if home and home.strip() else None
-
-
-def _read_json_object(path: str) -> Optional[dict]:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _manifest_has_web_net(home: str, app_id: str) -> bool:
-    manifest = _read_json_object(os.path.join(home, "mcp_apps", app_id, "manifest.json"))
-    if manifest is None:
-        return False
-    perms = manifest.get("permissions")
-    return isinstance(perms, list) and _WEB_NET_PERMISSION in perms
-
-
-def _consent_internet_granted(home: str) -> bool:
-    # Canonical settings.global.json wins when present; consent.json (the
-    # flat mirror) is consulted only when the canonical file is absent —
-    # same precedence as consent.read_consent(), reimplemented read-only.
-    for name in ("settings.global.json", "consent.json"):
-        data = _read_json_object(os.path.join(home, name))
-        if data is None:
-            continue
-        block = data.get("consent") if isinstance(data.get("consent"), dict) else data
-        if isinstance(block, dict) and "internet" in block:
-            return block.get("internet") is True
-        return False  # file present but declares no consent keys → not granted
-    return False
-
-
-def _lease_active(home: str, app_id: str) -> bool:
-    record = _read_json_object(os.path.join(home, "mcp_apps", "_net_leases", f"{app_id}.json"))
-    if record is None or record.get("app_id") != app_id:
-        return False
-    expires_at = record.get("expires_at")
-    if not isinstance(expires_at, str):
-        return False
-    try:
-        from datetime import datetime, timezone
-        deadline = datetime.fromisoformat(expires_at)
-        if deadline.tzinfo is None:
-            return False  # a naive deadline is not a deadline (mirrors lease.py)
-        return deadline > datetime.now(timezone.utc)
-    except ValueError:
-        return False
-
-
-def web_net_grant_active() -> bool:
-    """Best-effort, read-only probe: does this seat currently hold all three
-    keys of the web_net egress gate? See the module note above for the
-    conservative-on-uncertainty and fail-safe rules. Never raises."""
-    try:
-        home = _willow_home_dir()
-        app_id = os.environ.get("WILLOW_APP_ID", "").strip()
-        if not home or not app_id:
-            return False
-        return (
-            _manifest_has_web_net(home, app_id)
-            and _consent_internet_granted(home)
-            and _lease_active(home, app_id)
-        )
-    except Exception:
-        return False
+# The fix is not a more faithful re-implementation (the hook cannot import
+# willow_mcp and runs in the agent's own harness — see the _SEAT_PRIV_RE note
+# above — so any second reader here WILL drift from the real gate again as it
+# grows PGP checks, a 5th key, etc). Per the fleet's standing rule to eliminate
+# split-brains rather than keep re-syncing two copies of one state, the redirect
+# no longer probes grant state at all: it always names willow_web_* (the
+# guidance is correct whether or not the grant is held) and always notes that
+# an ungranted seat should ask the operator rather than retry the native tool.
+# This can never claim "granted" falsely, because it never claims it at all.
 
 
 def check_native_web(tool_name: str) -> Optional[tuple[str, str]]:
@@ -418,17 +342,14 @@ def check_native_web(tool_name: str) -> Optional[tuple[str, str]]:
     a warn would let an agent route around egress governance and SSRF
     protection with one more tool call, not just a less-preferred one.
 
-    Grant-aware (2026-09-11): which message accompanies the block depends on
-    whether this seat currently holds the web_net three-key gate — see
-    web_net_grant_active(). Either way the native tool is still blocked; only
-    the wording changes, so a probe fault can never let a call through it
-    shouldn't."""
+    Grant-aware without a grant probe (2026-09-11, revised): the message
+    always names the willow_web_* verb AND always tells an ungranted seat to
+    ask the operator — see the module note above for why this hook does not
+    (and should not) maintain its own reader of grant state."""
     if tool_name == "WebSearch":
-        msg = _WEB_SEARCH_GRANTED if web_net_grant_active() else _WEB_SEARCH_UNGRANTED
-        return "block", f"willow-mcp: {msg}"
+        return "block", f"willow-mcp: {_WEB_SEARCH_REDIRECT}"
     if tool_name == "WebFetch":
-        msg = _WEB_FETCH_GRANTED if web_net_grant_active() else _WEB_FETCH_UNGRANTED
-        return "block", f"willow-mcp: {msg}"
+        return "block", f"willow-mcp: {_WEB_FETCH_REDIRECT}"
     return None
 
 
