@@ -39,6 +39,11 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 * add willow-mcp seal handler that upgrades governance decisions on seal ([a309578](https://github.com/willow-memory/willow-mcp/commit/a309578e6cf7893d8f7ada73b8ae8f117731d825))
 
 
+### Fixed
+
+* **nest:** fail-closed the autointake secret gate ([97ecf88](https://github.com/willow-memory/willow-mcp/commit/97ecf88182329f76ad1a766333a271aea0591689))
+
+
 ### Build
 
 * take willow-ratatosk as a dependency for the seal daemon wiring ([74233fd](https://github.com/willow-memory/willow-mcp/commit/74233fdec73719e76646c63824c938514b0a1e84))
