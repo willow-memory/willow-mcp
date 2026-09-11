@@ -758,15 +758,31 @@ def _find_git_commit_token_index(tokens: list[str]) -> Optional[int]:
     return None
 
 
-# A live-execution operator: if the region a carve-out is about to blank
-# contains one of these, the shell evaluates it BEFORE the outer command
-# runs, so blanking it would delete the very text carrying a live grant
-# while leaving the raw scan with nothing to find. Refuse to blank in that
-# case — the denial from the raw scan stands. `$(`, a backtick, or `<(`
-# anywhere in the would-be-blanked span is disqualifying; no attempt is
-# made to distinguish a "safe" occurrence from a "live" one — ambiguity
-# denies.
-_LIVE_EXEC_OPERATOR_RE = re.compile(r"\$\(|`|<\(")
+# ALLOWLIST, not a blocklist (round-5 rework, closing Opus re-audit
+# 5701FFBD): round-4's `_LIVE_EXEC_OPERATOR_RE` named the live-execution
+# shapes it knew about ($(, backtick, <() and missed the ones it didn't —
+# `>(` (output process substitution) and `${ cmd; }` (bash 5.3 funsub) both
+# slip a real self-grant through undetected, and a blocklist of shell
+# operators is never complete; the next one is just another name away.
+#
+# So invert it: a carve-out may only blank a region that is INERT — one
+# that contains NONE of the characters a shell gives special evaluated
+# meaning to. Command substitution ($(), backticks), process substitution
+# (<(), >()), brace/funsub groups ({ ;}), pipelines (|), sequencing (;, &),
+# redirection (<, >), and escaping (\) all REQUIRE one of these characters
+# to exist at all — so refusing to blank whenever ANY of them is present
+# closes the whole class of "the shell evaluates this before the outer
+# command sees it" bypasses at once, including operators nobody has named
+# yet. A bare literal newline is included too: it is a command separator
+# exactly like `;`.
+#
+# This is deliberately conservative, not merely sufficient: a message that
+# both names a grant verb in prose AND contains, say, `$(date)` for an
+# unrelated reason still gets denied, because the whole region is refused
+# once any of these characters appears — there is no attempt to distinguish
+# a "safe" occurrence of one of these characters from a "live" one.
+# Ambiguity denies. See test_ambiguous_commit_message_with_prose_and_subst_denies.
+_UNSAFE_CHARS_RE = re.compile(r"[$`(){}<>|;&\\\n]")
 
 
 def _split_subcommands_with_spans(command: str) -> list[tuple[int, int]]:
@@ -833,25 +849,30 @@ def _mask_subcommand_if_safe(sub: str) -> str:
     head = os.path.basename(tokens[0])
     if head in _READ_ONLY_COMMANDS:
         # The keyword this subcommand contains, if any, is an argument the
-        # reader scans — never something it runs, UNLESS the argument itself
-        # contains a live-execution operator ($(...), `...`, <(...)) that the
-        # shell evaluates before this command ever sees its arguments. In
-        # that case blanking would delete the live grant text and leave the
-        # re-scan with nothing to find, so refuse to blank: let the denial
+        # reader scans — never something it runs — UNLESS the region isn't
+        # inert: it contains a shell-evaluated character ($, `, (, ), <, >,
+        # {, }, |, ;, &, \, or a newline). Any of those means the shell may
+        # evaluate part of this text before the outer command ever sees its
+        # arguments, so blanking would delete the live grant text and leave
+        # the re-scan with nothing to find. Refuse to blank: let the denial
         # from the raw scan stand.
-        if _LIVE_EXEC_OPERATOR_RE.search(sub):
+        if _UNSAFE_CHARS_RE.search(sub):
             return sub
         return " " * len(sub)
     if os.path.basename(tokens[0]) == "git" and _find_git_commit_token_index(tokens) is not None:
         # Only the quoted -m/-F message text is data; the rest of the
         # invocation (git, any global options, commit, any other flags) is
-        # left as-is. As above, if the region that would be blanked carries
-        # a live-execution operator, refuse to blank it — the operator runs
-        # before the outer `git commit` does, so blanking would erase the
-        # only text carrying the live grant.
+        # left as-is. As above, if the message region that would be blanked
+        # is not inert (contains a shell-evaluated character), refuse to
+        # blank it — the shell evaluates that part before the outer `git
+        # commit` does, so blanking would erase the only text carrying the
+        # live grant. This is the ambiguity-denies case: a message that both
+        # names a grant verb in prose AND contains e.g. `$(date)` is denied,
+        # on purpose — no attempt is made to tell a "safe" occurrence of
+        # these characters from a "live" one.
         def _blank_message(m: "re.Match[str]") -> str:
             msg = m.group("msg")
-            if _LIVE_EXEC_OPERATOR_RE.search(msg):
+            if _UNSAFE_CHARS_RE.search(msg):
                 return m.group(0)
             return m.group("flag") + m.group("q") + " " * len(msg) + m.group("q")
 
