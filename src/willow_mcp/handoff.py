@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -194,6 +195,57 @@ def _invalid_findings(findings: list) -> list[dict]:
     return bad
 
 
+# Pre-handoff verify (wave-2 hook, dispatch F06C0BD0): a handoff can declare
+# checklist_resolved=True — "I'm done, tests pass" — without carrying anything
+# that makes the claim checkable. verify_handoff already refuses on
+# malformed findings (_invalid_findings above); this closes the sibling gap
+# for the completion claim itself. It is the dispatch-handoff analogue of the
+# Stop-hook green-claim gate (hooks/stop_lint_gate.py): that hook actually
+# re-runs ruff rather than trusting "lint is clean" in a session's own words.
+# There is no equivalent generic command to re-run here (every dispatch's
+# test suite differs), so the check instead requires the claim to be
+# *checkable*: a number tied to a test/check word ("42 passed", "12/12
+# tests", "0 violations"), or a finding that already carries its own
+# `evidence` (the per-finding field _finding_evidence reads). A bare
+# assertion ("tests pass", "all done") satisfies neither and is refused by
+# name — this never fabricates the missing evidence or auto-passes, it only
+# names what's absent so the specialist supplies it.
+#
+# Deliberately does NOT fire when checklist_resolved is False: an honest
+# blocker/partial report is a valid handoff, not a claim, and carries no
+# obligation to show test evidence for work it says it did not finish.
+_EVIDENCE_RE = re.compile(
+    r"\d+\s*(?:/\s*\d+)?\s*(?:passed|failed|failing|errors?|tests?|checks?|violations?)"
+    r"|(?:passed|failed|tests?|checks?)\s*[:=]?\s*\d+",
+    re.IGNORECASE,
+)
+
+
+def _narrative_has_test_evidence(narrative: str) -> bool:
+    """True when the narrative ties a number to a test/check word — "42
+    passed", "12/12 tests", "0 violations". A word alone ("tests pass",
+    "green", "done") is an assertion, not a count, and does not match."""
+    return bool(narrative) and bool(_EVIDENCE_RE.search(narrative))
+
+
+def _findings_carry_evidence(findings: list) -> bool:
+    """True when at least one finding supplies its own `evidence` field
+    (the same field _finding_evidence renders into the closeout table)."""
+    for f in findings:
+        if isinstance(f, dict) and _finding_evidence(f):
+            return True
+    return False
+
+
+def _has_completion_evidence(handoff: dict) -> bool:
+    """The gate for a checklist_resolved=True claim: some checkable backing
+    exists somewhere in the handoff, either a counted result in the
+    narrative or evidence attached to a finding."""
+    narrative = handoff.get("narrative") or ""
+    findings = handoff.get("findings") or []
+    return _narrative_has_test_evidence(narrative) or _findings_carry_evidence(findings)
+
+
 def verify_handoff(dispatch_id: str) -> dict:
     pkt = dispatch_read(dispatch_id)
     if pkt.get("error"):
@@ -221,6 +273,13 @@ def verify_handoff(dispatch_id: str) -> dict:
             f"{len(invalid)} finding(s) carry no statement under any of "
             f"{'/'.join(_FINDING_TEXT_KEYS)}: indexes "
             f"{', '.join(str(b['index']) for b in invalid)}"
+        )
+    if checklist and not _has_completion_evidence(handoff):
+        reasons.append(
+            "checklist_resolved claims completion but no evidence backs it: "
+            "narrative carries no counted test/check result (e.g. '42 "
+            "passed', '0 violations') and no finding carries an `evidence` "
+            "field — a bare assertion is not evidence"
         )
     verified = not reasons
 

@@ -245,6 +245,7 @@ def test_verify_handoff_verified():
         "checklist_resolved": True,
         "envelope_clean": True,
         "findings": [{"id": "F1", "text": "Found something"}],
+        "narrative": "Full suite green: 42 passed, 0 failed.",
     }
     hr = {"dispatch_id": "d1", "handoff": handoff_data, "closeout_md": ""}
     with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
@@ -290,6 +291,7 @@ def test_verify_handoff_fails_on_unclean_envelope():
         "checklist_resolved": True,
         "envelope_clean": False,
         "findings": [],
+        "narrative": "42 passed, 0 failed.",
     }
     hr = {"dispatch_id": "d1", "handoff": handoff_data, "closeout_md": ""}
     with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
@@ -325,6 +327,7 @@ def test_verify_accepts_title_and_finding_shaped_findings():
             {"title": "Missing test", "severity": "low"},
             {"summary": "docs drift"},
         ],
+        "narrative": "Ran the suite: 17/17 tests passing, ruff clean.",
     })
     assert result["verified"] is True
     assert "reason" not in result
@@ -401,3 +404,81 @@ def test_verify_handoff_dispatch_error():
                return_value={"error": "not_found"}):
         result = verify_handoff("d1")
     assert result["error"] == "not_found"
+
+
+# ── pre-handoff verify: unbacked completion claims (dispatch F06C0BD0) ──────
+#
+# checklist_resolved=True is a claim ("I finished, tests pass"). A handoff
+# whose findings are bare strings instead of {summary, severity}-shaped
+# objects, or whose completion claim carries no checkable evidence, is
+# caught here rather than taken on faith by the orchestrator.
+
+
+def test_verify_fails_on_bare_string_findings():
+    """Findings as plain strings, not objects, are not a shape verify_handoff
+    accepts under any of its recognized keys — refused, not silently kept."""
+    result = _verify({
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": ["Fixed the bug", "Added a test"],
+        "narrative": "42 passed, 0 failed.",
+    })
+    assert result["verified"] is False
+    assert result["invalid_findings"] == [
+        {"index": 0, "keys": [], "type": "str"},
+        {"index": 1, "keys": [], "type": "str"},
+    ]
+
+
+def test_verify_fails_on_complete_claim_without_evidence():
+    """checklist_resolved=True with a narrative that only asserts success
+    ("all tests pass") and no counted result anywhere is refused: an
+    assertion is not evidence."""
+    result = _verify({
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": [{"id": "F1", "text": "Found something"}],
+        "narrative": "All tests pass and the suite is green.",
+    })
+    assert result["verified"] is False
+    assert "no evidence backs it" in result["reason"]
+
+
+def test_verify_passes_complete_claim_with_narrative_test_count():
+    result = _verify({
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": [{"id": "F1", "text": "Found something"}],
+        "narrative": "Ran the suite: 12/12 tests passing.",
+    })
+    assert result["verified"] is True
+    assert "reason" not in result
+
+
+def test_verify_passes_complete_claim_with_finding_evidence():
+    """No countable narrative, but a finding carries its own evidence field
+    — that is enough backing without also requiring narrative prose."""
+    result = _verify({
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": [{"id": "F1", "text": "Fixed it", "evidence": ["test_x.py::test_y"]}],
+        "narrative": "Done.",
+    })
+    assert result["verified"] is True
+    assert "reason" not in result
+
+
+def test_verify_honest_blocker_report_not_penalized_for_missing_evidence():
+    """checklist_resolved=False is not a completion claim — the evidence
+    gate must not compound onto an honest blocker/partial report. The
+    pre-existing "checklist not resolved" gate still applies (unfinished
+    work is not verified), but the reason must not also complain about
+    missing test evidence — that complaint only applies to a claim."""
+    result = _verify({
+        "checklist_resolved": False,
+        "envelope_clean": True,
+        "findings": [{"id": "F1", "text": "Blocked: missing credentials"}],
+        "narrative": "Could not proceed past the auth step.",
+    })
+    assert result["verified"] is False
+    assert result["reason"] == "checklist not resolved"
