@@ -16,6 +16,7 @@ test_bundled_hook_is_identical_to_the_repo_copy already has, extended to
 the wiring configs the hook file's own docstring points at.
 """
 import json
+import re
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -34,6 +35,75 @@ def _pre_tool_use_matchers(config: dict) -> set[str]:
 
 def _has_session_start(config: dict) -> bool:
     return bool(config.get("hooks", {}).get("SessionStart"))
+
+
+# ── wiring-level: the willow_web_search corpus-first warn must be REACHABLE ──
+#
+# Found live (audit, corpus-first-jeles-nestor hook): pre_tool_use.py's
+# check_corpus_first() warns on a direct willow_web_search call, and that
+# logic was fully unit-tested — but Claude Code's PreToolUse matcher is a
+# regex tested against the tool name (see project_wiring.py's own
+# "mcp__memory__.*"-shaped abstraction and the "mcp__" wildcard tool
+# matcher), matched from the start of the string, not a substring search.
+# "WebSearch|WebFetch" never starts a match against "willow_web_search" (a
+# different literal string) or "mcp__willow-mcp__willow_web_search" (starts
+# with "mcp__", not "WebSearch"). So on a Claude Code seat the hook body
+# never even ran for that tool name — logic tests that call
+# check_corpus_first()/main() directly can't see this at all, because they
+# skip the matcher entirely. This test compiles each config's actual
+# PreToolUse matcher and checks it the way Claude Code would: does it match
+# at the START of a real willow_web_search tool_name, bare or
+# MCP-server-qualified. Wired to _CONFIGS so it runs against all three
+# surfaces and can't silently regress on just one.
+_WEB_SEARCH_TOOL_NAMES = [
+    "willow_web_search",
+    "mcp__willow-mcp__willow_web_search",
+    "mcp__willow-mcp-serve__willow_web_search",
+]
+
+
+def _web_search_matcher(config: dict) -> str | None:
+    for entry in config.get("hooks", {}).get("PreToolUse", []):
+        matcher = entry.get("matcher", "")
+        if "WebSearch" in matcher:
+            return matcher
+    return None
+
+
+def test_pre_tool_use_web_matcher_selects_willow_web_search():
+    for name, path in _CONFIGS.items():
+        config = json.loads(path.read_text())
+        matcher = _web_search_matcher(config)
+        assert matcher, f"{name} has no WebSearch/WebFetch-family PreToolUse matcher"
+        pattern = re.compile(matcher)
+        for tool_name in _WEB_SEARCH_TOOL_NAMES:
+            assert pattern.match(tool_name), (
+                f"{name}'s PreToolUse matcher {matcher!r} does not select "
+                f"{tool_name!r} — the corpus-first warn would never fire "
+                "for a direct willow_web_search call on this deploy surface"
+            )
+
+
+def test_pre_tool_use_web_matcher_does_not_swallow_unrelated_mcp_tools():
+    """The wildcard added for willow_web_search (mcp__.*__willow_web_search)
+    must stay scoped to that one tool — not broaden into matching every MCP
+    call, which would be a much bigger behavior change than this fix intends."""
+    unrelated = [
+        "knowledge_search",
+        "store_get",
+        "mcp__willow-mcp__knowledge_search",
+        "mcp__willow-mcp__willow_web_fetch",
+    ]
+    for name, path in _CONFIGS.items():
+        config = json.loads(path.read_text())
+        matcher = _web_search_matcher(config)
+        assert matcher
+        pattern = re.compile(matcher)
+        for tool_name in unrelated:
+            assert not pattern.match(tool_name), (
+                f"{name}'s PreToolUse matcher {matcher!r} unexpectedly "
+                f"selects unrelated tool {tool_name!r}"
+            )
 
 
 def test_pre_tool_use_matchers_agree_across_every_wiring_config():
