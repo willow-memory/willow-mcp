@@ -143,6 +143,59 @@ def test_boot_lines_gaps_degrade_cleanly_when_backlog_denied(monkeypatch):
     assert "[GAPS]" not in "\n".join(lines)
 
 
+def test_boot_lines_gaps_degrade_cleanly_on_malformed_row(monkeypatch):
+    """Regression for audit AC5F367C MEDIUM: a malformed gap row (None
+    instead of a dict) must degrade to no gap section, never raise past
+    _gap_lines/build_boot_lines."""
+    _quiet_boot(monkeypatch)
+    monkeypatch.setattr(bc, "_blocker_lines", lambda *a, **k: [])
+    monkeypatch.setattr(gaps_mod, "list_gaps", lambda status=None, limit=50: {"items": [None]})
+    lines = bc.build_boot_lines("hanuman", "sess-gaps-malformed", "startup", {"orientation": {}})
+    assert "[GAPS]" not in "\n".join(lines)
+
+
+def test_boot_lines_blockers_degrade_cleanly_on_non_dict_records(monkeypatch):
+    """Regression for audit AC5F367C LOW: orientation["records"] being a
+    truthy non-dict (e.g. a string) must degrade _blocker_lines cleanly
+    rather than raising on .items()."""
+    _quiet_boot(monkeypatch)
+    monkeypatch.setattr(bc, "_gap_lines", lambda *a, **k: [])
+    enter_result = {
+        "orientation": {
+            "blockers": {"count": 0, "items": []},
+            "records": "not-a-dict",
+        }
+    }
+    lines = bc.build_boot_lines("hanuman", "sess-blockers-bad-records", "startup", enter_result)
+    assert "[BLOCKERS]" not in "\n".join(lines)
+
+
+def test_session_start_handle_survives_boot_context_fault(monkeypatch):
+    """Belt-and-suspenders regression: a fault anywhere in build_boot_lines
+    must degrade the boot_context section, not blow up handle() and get
+    caught by main()'s top-level except (which would falsely report
+    "session_enter FAILED" even though session_enter succeeded)."""
+    from willow_mcp import session_start_hook as ssh
+    from willow_mcp import server
+
+    monkeypatch.setenv("WILLOW_APP_ID", "hanuman")
+    monkeypatch.setattr(
+        server,
+        "session_enter",
+        lambda **kwargs: {"entry_mode": "human", "orientation": {}},
+    )
+    monkeypatch.setattr(sl, "seed_corpus_corrections", lambda: 0)
+
+    def boom(*a, **k):
+        raise AttributeError("simulated boot_context fault")
+
+    monkeypatch.setattr(ssh, "build_boot_lines", boom)
+    out = ssh.handle({"session_id": "s1", "source": "startup"})
+    payload = json.loads(out["additional_context"])
+    assert "boot_context" in payload
+    assert "degraded" in payload["boot_context"]
+
+
 def test_boot_lines_healthy_seat_no_false_alarms(monkeypatch):
     _quiet_boot(monkeypatch)
     monkeypatch.setattr(gaps_mod, "list_gaps", lambda status=None, limit=50: {"items": []})
