@@ -74,6 +74,7 @@ from . import kb_curate as kbc
 from . import kb_verify
 from . import postgres_lifecycle
 from . import secret_scan
+from . import split_brain
 
 _store = Store()
 _receipt_log = ReceiptLog()
@@ -5537,6 +5538,11 @@ _VERDICT_SEVERITY_SUBCHECKS: dict[str, dict[str, str]] = {
     "store_db_perms": {},
     # A keyring the seat cannot read blocks session_enter — broken, verdict-moving.
     "keyring": {"broken": "error"},
+    # Two divergent resolvable copies of a trust-critical artifact — report,
+    # don't repair (feedback_eliminate-split-brains). Degrades, never errors:
+    # the resolver itself still returns a value, so this is a warning to the
+    # operator, not an outage.
+    "split_brain": {"warn": "warn"},
 }
 
 # Deliberately exempt from the verdict (informational, B-18): a dry roster or a
@@ -5557,6 +5563,12 @@ _SUBCHECK_PROBLEM_TEXT: dict[str, dict[str, str]] = {
     "identity_bindings": {
         "detail": "the identity-bindings directory could not be read",
         "fix": "check the _identity_bindings directory under WILLOW_MCP_APPS_ROOT is readable",
+    },
+    "split_brain": {
+        "detail": "a trust-critical artifact has two or more divergent resolvable copies",
+        "fix": ("inspect `checks.split_brain.artifacts` for the affected artifact's candidate "
+                "paths, confirm which is canonical with the operator, and remove or "
+                "relocate the stale copy by hand — this check does not pick one for you"),
     },
 }
 
@@ -6008,6 +6020,26 @@ def whoami(app_id: str = "") -> dict:
     }
 
 
+def _diag_split_brain() -> dict:
+    """Split-brain surface across trust-critical artifacts (hook spec #4;
+    gaps 006e0144da95, 01cbac265490, feedback_eliminate-split-brains).
+
+    The envelope/constitutional registry, the keyring, the charter repo, and
+    WILLOW_HOME/WILLOW_STORE_ROOT all resolve from ambient env with more than
+    one candidate source (an explicit env var, a fleet default, a vault-box
+    copy) — and the resolver only ever looks at one of them. Two existing,
+    divergent, resolvable copies are invisible to the resolver even though
+    one of them is stale. This is exactly the shape of the 2026-09-07 keyring
+    split-brain and the charter-pointer that emptied the registry.
+
+    Delegates entirely to `split_brain.scan()` (read-only: it only stats
+    candidate paths). Report only — never resolves, picks, or repairs."""
+    try:
+        return split_brain.scan()
+    except Exception as exc:  # resolution itself failed — report, never raise
+        return {"status": "could_not_run", "error": str(exc)[:200]}
+
+
 def _diag_envelope_registry() -> dict:
     """The Article III.2 envelope registry: does it resolve to a file holding at
     least one usable active grant? An empty, missing, or all-malformed registry
@@ -6088,6 +6120,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
     store_db_perms = _diag_store_db_perms(eff)
     keyring = _diag_keyring()
     envelope_registry = _diag_envelope_registry()
+    split_brain_check = _diag_split_brain()
     env = _diag_env()
 
     checks = {"store": store, "postgres": postgres, "rings": rings,
@@ -6096,7 +6129,8 @@ def diagnostic_summary(app_id: str = "") -> dict:
               "build_leases": build_leases,
               "severance": severance, "uid_separation": uid_separation,
               "store_db_perms": store_db_perms, "keyring": keyring,
-              "envelope_registry": envelope_registry, "env": env}
+              "envelope_registry": envelope_registry, "split_brain": split_brain_check,
+              "env": env}
     # Construction-time completeness guard: every computed sub-check must be
     # wired into the verdict (or explicitly exempt) — gap 37d44bfa1f4c.
     _assert_verdict_considers(checks)
@@ -6107,7 +6141,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
     severity_checks = {
         "rings": rings, "schema": schema, "identity_bindings": bindings,
         "uid_separation": uid_separation, "store_db_perms": store_db_perms,
-        "keyring": keyring,
+        "keyring": keyring, "split_brain": split_brain_check,
     }
     problems = _derive_problems(store, postgres, manifest, mode, worker, consent,
                                 net_lease, severance, envelope_registry,
