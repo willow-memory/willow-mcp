@@ -885,9 +885,10 @@ def visible_tools(
     entry here reads `{"git_push_execute": "envelope_apply"}`. Building
     `tools_allowed` by calling `permitted(app_id, gate_name)` for each
     registered name — rather than expanding `PERMISSION_GROUPS` and
-    subtracting `deny_tools` a second time — is what makes this listing
-    unable to disagree with enforcement: whoever calls this asks the exact
-    question `_guarded` asks, over the exact catalogue that's registered.
+    subtracting `deny_tools` a second time — matches enforcement at tool-name
+    granularity. Parameter- and mode-level checks (e.g., task_submit's
+    allow_net→NET_PERMISSION and allow_db→DB_PERMISSION, store_* collection
+    scope) are enforced at call time and are not reflected here.
 
     `name_gated_orphans` names every tool in `tools_allowed` whose registered
     name is not itself a member of any `PERMISSION_GROUPS` entry — a tool
