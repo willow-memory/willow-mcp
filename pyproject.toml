@@ -177,12 +177,25 @@ gcal = [
 # jeles stays named in tests.yml rather than here: it is a runtime dependency
 # `pip install -e "."` already brings, and two test files importorskip on it —
 # see the comment on that step for why it is restated explicitly.
+# ruff is pinned here to match the lint job's `pip install ruff==0.15.0`
+# (.github/workflows/tests.yml): tests/test_stop_lint_gate.py exercises the
+# Stop-hook green-claim gate against a REAL ruff subprocess (F401 output,
+# timeout handling, etc). CI's test-matrix job only ever ran
+# `pip install -e ".[test]"`, never the lint job's ruff install, so those
+# assertions passed locally (a dev .venv commonly has ruff already) and
+# failed in CI's test-matrix with "no ruff executable or module was found" —
+# the gate under test degrading exactly the way it is supposed to detect.
+# The one test that wants ruff genuinely ABSENT
+# (test_ruff_missing_blocks_with_an_explanatory_reason) monkeypatches
+# `_resolve_ruff` rather than depending on the environment, so declaring
+# ruff here does not weaken it.
 test = [
     "pytest",
     "pytest-timeout",
     "coverage",
     "PyYAML>=6.0,<7.0",
     "jsonschema>=4.0,<5.0",
+    "ruff==0.15.0",
 ]
 
 [project.scripts]

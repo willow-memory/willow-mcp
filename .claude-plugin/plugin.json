@@ -1,7 +1,7 @@
 {
   "name": "willow-mcp",
   "description": "Willow sovereign agent platform — SQLite store, Postgres knowledge base, Kart task queue, plus the hooks and skills that keep them used correctly.",
-  "version": "2.34.0",
+  "version": "2.34.1",
   "hooks": {
     "SessionStart": [
       {
@@ -57,6 +57,16 @@
           {
             "type": "command",
             "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/sean-campbell/sean-data-vault/willow-operator-box/venvs/willow-mcp/bin/python3 ${CLAUDE_PLUGIN_ROOT}/hooks/stop_lint_gate.py"
           }
         ]
       }

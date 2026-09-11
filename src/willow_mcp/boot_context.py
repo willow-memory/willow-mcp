@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from .boot_health import degraded_boot_line, postgres_status
+from .boot_health import degraded_boot_line, postgres_status, split_brain_boot_line
 from .nest import autointake as nest_autointake
 from .seed_loader import load_corpus_lanes
 from .session_inject import (
@@ -19,6 +20,119 @@ from .session_inject import (
     utc_clock_line,
 )
 from .stack_snapshot import read_stack_snapshot
+
+
+def _trust_root_fault_lines(app_id: str) -> list[str]:
+    """Fail-closed at SessionStart (hook spec #3, gap 37d44bfa1f4c): a broken
+    keyring, an unsigned/invalid manifest, or a self-writable grant under strict
+    enforcement must block loudly at boot rather than surface as a mid-task
+    denial. Reuses the exact probes/severity classification diagnostic_summary
+    already computes (`server._diag_trust_root_boot_problems`) — no duplicated
+    logic here. A healthy trust root returns [] and this stays silent."""
+    if not app_id:
+        return []
+    try:
+        from .server import _diag_trust_root_boot_problems
+        problems = _diag_trust_root_boot_problems(app_id)
+    except Exception:
+        logging.getLogger("willow_mcp.boot_context").debug(
+            "trust-root boot probe failed", exc_info=True)
+        return []
+    if not problems:
+        return []
+    lines = ["[BOOT FAULT] TRUST ROOT BROKEN — do not proceed until resolved:"]
+    for p in problems:
+        check = p.get("check", "?")
+        detail = p.get("detail") or "broken"
+        lines.append(f"  · {check}: {detail}")
+        fix = p.get("fix")
+        if fix:
+            lines.append(f"    FIX: {fix}")
+    lines.append("")
+    return lines
+
+
+#: Cap on how many open gaps get surfaced at boot — enough to be useful,
+#: small enough that a busy backlog doesn't crowd out the rest of orient.
+MAX_BOOT_GAPS = 3
+
+
+def _blocker_lines(orientation: dict[str, Any]) -> list[str]:
+    """Surface what `session_enter` already found this seat blocked on.
+
+    Reuses `orientation["blockers"]` verbatim (computed by `blockers.collect`
+    in server.py) rather than re-deriving attestation/lease state here — this
+    module must never diverge from what session_enter already decided.
+
+    `orientation["records"]` is also consulted, read-only, for the
+    collection-denied signal: that error lives on each standing-record read
+    (`_collection_denied` in server.py), not inside `blockers.collect`, so it
+    is folded in here rather than invented as a second blocker computation.
+    """
+    try:
+        blockers = orientation.get("blockers") or {}
+        items = list(blockers.get("items") or [])
+
+        records = orientation.get("records") or {}
+        if isinstance(records, dict):
+            for logical, record in records.items():
+                if isinstance(record, dict) and "collection_denied" in str(
+                    record.get("error") or ""
+                ):
+                    items.append({
+                        "id": "collection_denied",
+                        "summary": f"'{logical}' orientation read denied: {record['error']}",
+                        "fix": "widen this app's store_scope, or ignore if intentional",
+                    })
+
+        items = [item for item in items if isinstance(item, dict)]
+        if not items:
+            return []
+
+        lines: list[str] = [f"[BLOCKERS] {len(items)} at seat entry:"]
+        for item in items:
+            summary = str(item.get("summary") or item.get("id") or "?")
+            fix = item.get("fix")
+            line = f"  · {summary}"
+            if fix:
+                line += f" — fix: {fix}"
+            lines.append(line)
+        return lines
+    except Exception:
+        return []
+
+
+def _gap_lines(limit: int = MAX_BOOT_GAPS) -> list[str]:
+    """Top open gaps by asked_count, via the same backlog gap_list reads.
+
+    Read-only and best-effort: an empty backlog, a denied read, or any other
+    failure all degrade to "no gap section" rather than an error or a false
+    alarm at boot.
+    """
+    try:
+        from . import gaps as gap_backlog
+
+        result = gap_backlog.list_gaps(status="open", limit=limit)
+
+        items = (result or {}).get("items") or []
+        if not items:
+            return []
+
+        lines = [f"[GAPS] top {len(items)} open (by asked_count):"]
+        for gap in items:
+            if not isinstance(gap, dict):
+                continue
+            topic = gap.get("topic", "?")
+            question = str(gap.get("question", ""))[:80]
+            asked = gap.get("asked_count", 0)
+            lines.append(f"  · [{topic}] {question} (asked {asked}×)")
+        if len(lines) == 1:
+            # Every row was malformed — degrade to no gap section rather
+            # than emitting a header with nothing under it.
+            return []
+        return lines
+    except Exception:
+        return []
 
 
 def build_boot_lines(
@@ -84,6 +198,10 @@ def build_boot_lines(
     if degraded:
         lines.append(degraded)
 
+    split_brain_line = split_brain_boot_line()
+    if split_brain_line:
+        lines.append(split_brain_line)
+
     # Drop-zone auto-intake join (the nest was never wired to run on its own —
     # a dropped file sat staged until someone worked the queue by hand). This
     # runs the pipeline end-to-end on every boot so the next session at latest
@@ -92,6 +210,10 @@ def build_boot_lines(
     nest_line = nest_autointake.boot_line(app_id)
     if nest_line:
         lines.append(nest_line)
+
+    lines.extend(_blocker_lines(orientation))
+    if not lite_inject:
+        lines.extend(_gap_lines())
 
     if lite_inject:
         lines.append("[SESSION] compact/resume — trimmed boot injection.")
@@ -103,5 +225,12 @@ def build_boot_lines(
         record_injection(session_id, fingerprint, lite=True)
     else:
         record_injection(session_id, fingerprint, lite=lite_inject)
+
+    # Trust-root fault is never deduped/trimmed away — a broken keyring, an
+    # unsigned manifest, or a self-writable grant under strict enforcement must
+    # be loud on every single boot line, continuation or not (hook spec #3).
+    fault_lines = _trust_root_fault_lines(app_id)
+    if fault_lines:
+        lines = fault_lines + lines
 
     return lines

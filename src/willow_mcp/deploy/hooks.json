@@ -26,6 +26,13 @@
         "timeout": 15,
         "failClosed": false
       }
+    ],
+    "stop": [
+      {
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.stop_lint_hook",
+        "timeout": 30,
+        "failClosed": false
+      }
     ]
   }
 }
