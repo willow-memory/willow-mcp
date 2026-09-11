@@ -1277,3 +1277,78 @@ def test_task_submit_text_hiding_a_grant_is_denied():
     grant smuggled into Kart task text must be refused exactly like Bash."""
     tool_input = {"task": "echo setting up\nwillow-mcp grant-net loki --ttl 30m"}
     assert pre_tool_use.check_task_submit_self_grant(tool_input) is not None
+
+
+# ── the mask must not swallow a live-execution operator (re-audit F72E96E1) ──
+#
+# The two carve-outs above blank a region and re-scan; if that region is
+# reached at all, the masking is fine. But `$(...)`, backticks, and `<(...)`
+# inside a `git commit -m/-F` message or a read-only command's argument are
+# NOT inert data — the shell evaluates them before the outer command runs.
+# Blanking that region deletes the only text carrying the live grant, so the
+# re-scan finds nothing and the guard wrongly ALLOWs a real self-grant. Every
+# case below must DENY. These fail on the pre-fix tree (ALLOW) and pass after.
+
+
+@pytest.mark.parametrize("command", [
+    'git commit -m "$(willow-mcp grant-net loki)"',
+    "git commit -m \"$(willow-mcp allow-permission loki task_net)\"",
+], ids=["dollar_paren_in_commit_message", "allow_permission_dollar_paren_in_commit_message"])
+def test_command_substitution_inside_commit_message_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+def test_backtick_substitution_inside_commit_message_is_denied():
+    command = 'git commit -m "`willow-mcp grant-net loki`"'
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "cat $(willow-mcp grant-net loki)",
+    "head $(willow-mcp grant-net loki)",
+    'grep "$(willow-mcp grant-net loki)" f',
+    "cat <(willow-mcp grant-net loki)",
+], ids=["cat_dollar_paren", "head_dollar_paren", "grep_dollar_paren_arg", "cat_process_substitution"])
+def test_live_execution_operator_inside_read_only_argument_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+# The two measured false positives the carve-outs exist for must still ALLOW
+# — the fix must refuse to blank ONLY when a live-execution operator is
+# present, not regress the plain prose/argument cases.
+
+
+def test_commit_message_naming_the_verb_in_plain_prose_still_allowed():
+    assert pre_tool_use.check_bash_self_grant(
+        'git commit -m "grant-net is a scary phrase"'
+    ) is None
+
+
+def test_read_command_naming_the_verb_in_a_plain_argument_still_allowed():
+    assert pre_tool_use.check_bash_self_grant('grep "grant-net" README.md') is None
+
+
+# ── LOW: `git commit` recognition must survive leading git global options ──
+#
+# Recognition keyed on tokens[1] == "commit", so `git -C /path commit` and
+# `git --no-pager commit` were unrecognised as `git commit` invocations —
+# a false-positive DENY when the commit message merely named a guarded verb
+# in prose. Recognise `git commit` past global options, conservatively.
+
+
+def test_git_dash_c_commit_with_plain_message_is_allowed():
+    assert pre_tool_use.check_bash_self_grant(
+        'git -C /path/to/repo commit -m "plain text"'
+    ) is None
+
+
+def test_git_dash_c_commit_naming_the_verb_in_prose_is_allowed():
+    cmd = ('git -C /path/to/repo commit -m '
+           "'note: task_net stays operator-only; never willow-mcp allow-permission app task_net'")
+    assert pre_tool_use.check_bash_self_grant(cmd) is None
+
+
+def test_git_no_pager_commit_naming_the_verb_in_prose_is_allowed():
+    cmd = ('git --no-pager commit -m '
+           "'note: never willow-mcp grant-net anyone'")
+    assert pre_tool_use.check_bash_self_grant(cmd) is None

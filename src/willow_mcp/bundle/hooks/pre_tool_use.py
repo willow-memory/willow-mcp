@@ -723,6 +723,51 @@ _GIT_COMMIT_MSG_ARG_RE = re.compile(
     re.DOTALL,
 )
 
+# A leading `git` global option or two before the `commit` subcommand — e.g.
+# `git -C /path commit`, `git --no-pager commit`. Conservative on purpose:
+# only options that take no further inline argument (or a small enumerated
+# set that takes one token, like -C/-c) are walked past, so this never
+# mistakes an unrelated `git <verb>` for `git commit`.
+_GIT_GLOBAL_OPT_WITH_ARG = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+
+
+def _find_git_commit_token_index(tokens: list[str]) -> Optional[int]:
+    """Return the index of the `commit` token in a `git ...` invocation's
+    token list, walking past leading git global options, or None if this
+    is not recognisably a `git commit` invocation."""
+    if not tokens or os.path.basename(tokens[0]) != "git":
+        return None
+    i = 1
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok == "commit":
+            return i
+        if tok.startswith("--") and "=" in tok:
+            i += 1
+            continue
+        if tok in _GIT_GLOBAL_OPT_WITH_ARG:
+            i += 2
+            continue
+        if tok.startswith("-") and tok != "-":
+            i += 1
+            continue
+        # First non-option token that isn't "commit" — this isn't a
+        # `git commit` invocation (e.g. `git -C /path log`).
+        return None
+    return None
+
+
+# A live-execution operator: if the region a carve-out is about to blank
+# contains one of these, the shell evaluates it BEFORE the outer command
+# runs, so blanking it would delete the very text carrying a live grant
+# while leaving the raw scan with nothing to find. Refuse to blank in that
+# case — the denial from the raw scan stands. `$(`, a backtick, or `<(`
+# anywhere in the would-be-blanked span is disqualifying; no attempt is
+# made to distinguish a "safe" occurrence from a "live" one — ambiguity
+# denies.
+_LIVE_EXEC_OPERATOR_RE = re.compile(r"\$\(|`|<\(")
+
 
 def _split_subcommands_with_spans(command: str) -> list[tuple[int, int]]:
     """Split on top-level `;`, `|`, `||`, `&&`, and newlines — the same set a
@@ -788,15 +833,29 @@ def _mask_subcommand_if_safe(sub: str) -> str:
     head = os.path.basename(tokens[0])
     if head in _READ_ONLY_COMMANDS:
         # The keyword this subcommand contains, if any, is an argument the
-        # reader scans — never something it runs. Blank the whole thing.
+        # reader scans — never something it runs, UNLESS the argument itself
+        # contains a live-execution operator ($(...), `...`, <(...)) that the
+        # shell evaluates before this command ever sees its arguments. In
+        # that case blanking would delete the live grant text and leave the
+        # re-scan with nothing to find, so refuse to blank: let the denial
+        # from the raw scan stand.
+        if _LIVE_EXEC_OPERATOR_RE.search(sub):
+            return sub
         return " " * len(sub)
-    if head == "git" and len(tokens) > 1 and tokens[1] == "commit":
+    if os.path.basename(tokens[0]) == "git" and _find_git_commit_token_index(tokens) is not None:
         # Only the quoted -m/-F message text is data; the rest of the
-        # invocation (git commit, any other flags) is left as-is.
-        return _GIT_COMMIT_MSG_ARG_RE.sub(
-            lambda m: m.group("flag") + m.group("q") + " " * len(m.group("msg")) + m.group("q"),
-            sub,
-        )
+        # invocation (git, any global options, commit, any other flags) is
+        # left as-is. As above, if the region that would be blanked carries
+        # a live-execution operator, refuse to blank it — the operator runs
+        # before the outer `git commit` does, so blanking would erase the
+        # only text carrying the live grant.
+        def _blank_message(m: "re.Match[str]") -> str:
+            msg = m.group("msg")
+            if _LIVE_EXEC_OPERATOR_RE.search(msg):
+                return m.group(0)
+            return m.group("flag") + m.group("q") + " " * len(msg) + m.group("q")
+
+        return _GIT_COMMIT_MSG_ARG_RE.sub(_blank_message, sub)
     return sub
 
 
