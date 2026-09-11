@@ -38,6 +38,7 @@ an app a human operator has explicitly trusted to relay.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional
 
 from . import gate
@@ -153,6 +154,263 @@ def _msgs_to_dicts(msgs: list[dict]) -> list[dict]:
         }
         for m in msgs
     ]
+
+
+# ── Activation rail: post a dispatch wake ───────────────────────────────────
+#
+# Grove activation rail, slice 1 (surface-only): dispatch_send writes a
+# packet to disk but has never told the target seat's Grove bus listener
+# (ratatosk's BusListener/SeatDaemon) that a packet is waiting — a dispatched
+# seat only ever noticed by polling. This is the in-process poster
+# dispatch.dispatch_send calls after the packet write: it builds a real
+# ratatosk Intent.WAKE envelope and posts it to the target's own Grove
+# channel, the SAME channel convention grove_tools/grove_listen already use
+# for a seat's dedicated inbox (`#<agent>` — see grove_inbox's docstring and
+# grove_listen.classify's INBOX branch). A per-seat SeatDaemon (willow_mcp's
+# seat_daemon.py, built with node=<that app_id>) polls exactly that channel,
+# so an envelope addressed `to=<to_app>` on channel `<to_app>` is picked up
+# on the next poll tick and handed to BusListener.validate_envelope, which
+# this shape is built to satisfy: v=PROTOCOL_VERSION, a non-empty prompt,
+# `to` matching the seat's node (case-insensitively), a fresh nonce (minted
+# by build_envelope), an unexpired `expires_at`, and WAKE is not a
+# HIGH_RISK_INTENT so no `requires_confirm` is demanded.
+#
+# Best-effort, exactly like dispatch._pg_mirror_upsert: this NEVER raises.
+# ratatosk missing, the gate denying the sender, Postgres being unreachable,
+# or any other failure is reported back as `{"posted": False, "reason": ...}`
+# for logging, and dispatch_send's return contract is unaffected either way
+# — the filesystem packet is already written and stays canonical.
+def post_wake_envelope(
+    from_app: str,
+    to_app: str,
+    *,
+    dispatch_id: str,
+    summary: str = "",
+    reply_to: str = "",
+    trace_id: str = "",
+) -> dict:
+    """Post an Intent.WAKE envelope to `to_app`'s Grove channel.
+
+    `trace_id` defaults to a value derived from `dispatch_id` so a wake's
+    trace can be tied back to the packet even when the caller does not pass
+    one explicitly — `activation.build_activate` logs this trace verbatim.
+    `reply_to` (typically the dispatch's own `reply_to` field, e.g. the
+    orchestrator) decides which channel the seat's BusListener posts its
+    activation acknowledgement to; it defaults to the dispatching app's own
+    channel when omitted.
+    """
+    try:
+        from ratatosk.protocol.envelope import build_envelope, Capability, Intent
+    except ImportError as exc:
+        return {"posted": False, "reason": f"ratatosk unavailable: {exc}"}
+
+    # Cheap check first — no DB connection is opened for a sender the
+    # manifest gate would refuse anyway.
+    if not gate.permitted(from_app, "grove_bus_send"):
+        return {"posted": False, "reason": "gate denied grove_bus_send for sender"}
+
+    pg = get_pg()
+    if not pg:
+        return {"posted": False, "reason": "postgres unavailable"}
+
+    who = resolve_grove_sender(from_app)
+    target_channel = grove.normalize_channel_name(to_app)
+    reply_channel = grove.normalize_channel_name(reply_to or from_app)
+    envelope = build_envelope(
+        to=to_app,
+        prompt=(summary or "").strip() or f"dispatch {dispatch_id} is waiting for you",
+        from_agent=who,
+        intent=Intent.WAKE.value,
+        reply_channel=reply_channel,
+        capabilities=[Capability.WAKE.value],
+        trace_id=trace_id or f"tr-{dispatch_id.lower()}",
+        extra={"dispatch_id": dispatch_id},
+    )
+    try:
+        channels = grove.list_channels(pg)
+        ch = grove.find_channel_in(channels, target_channel)
+        if not ch:
+            ch = grove.create_channel(pg, name=target_channel, channel_type="group")
+        msg = grove.bus_send(
+            pg,
+            channel_id=ch["id"],
+            sender=who,
+            content=envelope.to_json(),
+            to_agent=to_app,
+            bus_type="COMMAND",
+            priority=1,
+        )
+    except grove.GroveUnavailable as e:
+        return {"posted": False, "reason": f"grove unavailable: {e.detail}"}
+    except Exception as exc:  # noqa: BLE001 - best-effort, must never raise
+        return {"posted": False, "reason": str(exc)}
+    return {
+        "posted": True,
+        "channel": ch["name"],
+        "message_id": msg["id"],
+        "trace_id": envelope.trace_id,
+    }
+
+
+# ── Activation rail: the in-process mcp_call shim ───────────────────────────
+#
+# ratatosk's BusListener/SeatDaemon are written against an `mcp_call(name,
+# params) -> result` transport — normally a real MCP round-trip out to a
+# *separate* willow-mcp server process. willow_mcp.seat_daemon runs a
+# SeatDaemon INSIDE willow-mcp's own process, so there is no second
+# transport to round-trip through: this shim answers the same four tool
+# calls BusListener/SeatDaemon actually make (`grove_get_history`,
+# `grove_heartbeat`, `grove_send_message`, `grove_ack` — see
+# `ratatosk.listener.BusListener.fetch_messages`/`emit_heartbeat`/
+# `process_message`/`run_once`) by calling straight through to the same
+# `grove.py` functions and gate checks the registered MCP tools above use,
+# for ONE fixed `app_id` baked in at build time.
+def _shim_resolve_sender(app_id: str, raw_sender: str) -> tuple[Optional[str], Optional[dict]]:
+    """Resolve the identity the SHIM's own automated posts (heartbeat,
+    wake-ack, any chat reply `BusListener`'s default handlers produce) are
+    stored under.
+
+    This is deliberately NOT `_resolve_sender_checked` + `resolve_grove_sender`
+    (the friendly persona display name a REAL, live agent session's own
+    Grove tool call resolves to). Two identities are in play here that a
+    naive "always show the nice name" rule conflates:
+
+    * `node` — `willow_mcp.seat_daemon.build_full_seat_daemon` sets this to
+      the seat's raw `app_id`. It is what `validate_envelope` checks a
+      WAKE's `to` field against, what casual `"app_id: message"` chat
+      addressing resolves to, AND — the part that matters here — what
+      ratatosk's own `BusListener.is_own_post` compares a fetched message's
+      stored `sender` against, to decide "is this my own post talking to
+      itself".
+    * the resolved `grove_sender` persona name — what a live human/agent
+      MCP session's OWN tool calls post as, via the registered
+      `grove_send_message`/`grove_heartbeat` tools below (unchanged by this
+      function).
+
+    An earlier fix made this shim's automated posts resolve to the persona
+    name too (to stop them being refused as `sender_forbidden` — a real
+    seat's persona differs from its `app_id` in the normal case). That
+    closed one bug and opened a worse one: once the persona-named reply
+    landed on the bus, it no longer matched `node` (`app_id`), so
+    `is_own_post` stopped recognizing it — the seat started answering its
+    own posts, with no error and no natural stop (nonce-based replay
+    detection cannot catch a self-authored reply either; it mints a fresh
+    nonce on every parse). See docs/design/grove-activation-rail.md's
+    "self-post loop closure" section.
+
+    The fix that closes BOTH bugs at once: this shim's own automated posts
+    are stored under `app_id` (matching `node`) — not the persona, and not
+    refused either. A sender that is empty or already equals `app_id` is
+    free (no `grove_relay` needed) and resolves to `app_id` itself. A
+    genuinely different sender still requires `grove_relay`, exactly like
+    `_resolve_sender_checked`, and — unlike the self case — is passed
+    through UNRESOLVED: relaying on someone else's behalf is not this
+    shim's identity to rename.
+    """
+    explicit = (raw_sender or "").strip()
+    if not explicit or explicit.lower() == app_id.strip().lower():
+        return app_id, None
+    if gate.grove_relay_permitted(app_id):
+        return explicit, None
+    return None, _sender_forbidden(explicit, app_id)
+
+
+def build_mcp_call(app_id: str) -> Callable[[str, dict], Any]:
+    """Build an in-process `mcp_call` for `app_id`'s SeatDaemon.
+
+    `params["app_id"]`, if a caller sets it, is ignored — this shim always
+    acts as the `app_id` it was built for, never whatever a message
+    payload claims. That is the same posture as every real Grove tool:
+    identity comes from the manifest-checked caller, never from request
+    data.
+    """
+
+    def _call(tool_name: str, params: Optional[dict] = None) -> Any:
+        params = params or {}
+
+        if tool_name == "grove_get_history":
+            denied = _gate_denied(app_id, "grove_get_history")
+            if denied:
+                return {"error": denied}
+            pg = get_pg()
+            if not pg:
+                return _pg_unavailable()
+            try:
+                channels = grove.list_channels(pg)
+                ch = grove.find_channel_in(channels, str(params.get("channel_name", "")))
+                if not ch:
+                    return []
+                limit = min(int(params.get("limit") or 50), 200)
+                msgs = grove.get_history(pg, ch["id"], limit=limit)
+                return _msgs_to_dicts(list(reversed(msgs)))
+            except grove.GroveUnavailable as e:
+                return _grove_error(e)
+
+        if tool_name == "grove_heartbeat":
+            denied = _gate_denied(app_id, "grove_heartbeat")
+            if denied:
+                return {"error": denied}
+            pg = get_pg()
+            if not pg:
+                return _pg_unavailable()
+            who, sender_err = _shim_resolve_sender(app_id, str(params.get("sender", "")))
+            if sender_err:
+                return sender_err
+            try:
+                channels = grove.list_channels(pg)
+                ch = grove.find_channel_in(channels, "general")
+                if not ch:
+                    ch = grove.create_channel(pg, name="general", channel_type="group")
+                msg = grove.bus_send(
+                    pg, channel_id=ch["id"], sender=who, content=f"{who} online",
+                    bus_type="HEARTBEAT", priority=6, to_agent=grove.BUS_BROADCAST,
+                )
+            except grove.GroveUnavailable as e:
+                return _grove_error(e)
+            return {"id": msg["id"], "sender": who, "bus_type": "HEARTBEAT"}
+
+        if tool_name == "grove_send_message":
+            denied = _gate_denied(app_id, "grove_send_message")
+            if denied:
+                return {"error": denied}
+            pg = get_pg()
+            if not pg:
+                return _pg_unavailable()
+            who, sender_err = _shim_resolve_sender(app_id, str(params.get("sender", "")))
+            if sender_err:
+                return sender_err
+            try:
+                channel_name = str(params.get("channel_name", ""))
+                channels = grove.list_channels(pg)
+                ch = grove.find_channel_in(channels, channel_name)
+                if not ch:
+                    ch = grove.create_channel(pg, name=channel_name, channel_type="group")
+                msg = grove.send_message(
+                    pg, channel_id=ch["id"], sender=who, content=str(params.get("content", "")),
+                )
+                if "error" in msg:
+                    return msg
+            except grove.GroveUnavailable as e:
+                return _grove_error(e)
+            return {"id": msg["id"], "channel": ch["name"], "sent": True}
+
+        if tool_name == "grove_ack":
+            denied = _gate_denied(app_id, "grove_ack")
+            if denied:
+                return {"error": denied}
+            pg = get_pg()
+            if not pg:
+                return _pg_unavailable()
+            try:
+                message_id = int(params.get("message_id") or 0)
+                grove.clear_flag(pg, message_id=message_id, sender="__system__", flag="needs-reply")
+            except grove.GroveUnavailable as e:
+                return _grove_error(e)
+            return {"acked": message_id}
+
+        return {"error": f"unsupported tool for in-process shim: {tool_name!r}"}
+
+    return _call
 
 
 # ── Tool registration ─────────────────────────────────────────────────────────

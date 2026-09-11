@@ -1,0 +1,109 @@
+# systemd --user unit template for the full per-seat Grove activation rail
+# daemon (`python -m willow_mcp.seat_daemon`) — Grove bus + seal watch +
+# surface-only wake activation, together, for ONE seat.
+#
+# Not used directly — fill in the {{PLACEHOLDERS}} before installing, e.g.:
+#
+#   sed -e "s#{{WILLOW_MCP_PYTHON}}#$(pwd)/.venv/bin/python#g" \
+#       -e "s#{{APP_ID}}#vishwakarma#g" \
+#       -e "s#{{WILLOW_HOME}}#$HOME/sean-data-vault/willow-operator-box#g" \
+#       -e "s#{{WILLOW_STORE_ROOT}}#$HOME/sean-data-vault/willow-operator-box/store#g" \
+#       -e "s#{{WILLOW_NESTOR_DB}}#$HOME/sean-data-vault/willow-operator-box/nestor.db#g" \
+#       -e "s#{{WILLOW_PG_DB}}#willow_20#g" \
+#       -e "s#{{WILLOW_PG_USER}}#$(whoami)#g" \
+#       deploy/willow-seat-daemon.service.template \
+#       > ~/.config/systemd/user/willow-seat-daemon@{{APP_ID}}.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now willow-seat-daemon@{{APP_ID}}
+#
+# This is the fuller sibling of willow-seal-watch.service.template, not a
+# replacement for it: that unit runs ONLY the seal watch, with no Grove bus
+# at all, and remains the right choice for a box with no activation rail
+# wired up. This unit runs the real thing — one SeatDaemon per seat, with a
+# live Grove channel, a real `activate` (surface-only: it NOTICEs the seat
+# via its grove-listen log, it does not spawn a process or agent — see
+# docs/design/grove-activation-rail.md), and the same seal-ledger watch
+# folded in.
+#
+# Environment names below are read verbatim by the code this unit runs:
+#   - WILLOW_HOME        -> willow_mcp.paths.willow_home() and
+#                            willow_mcp.grove_listen.default_log_path() (the
+#                            activation log this daemon's `activate` writes
+#                            to lives at $WILLOW_HOME/logs/
+#                            grove-listen-{{APP_ID}}.log).
+#   - WILLOW_STORE_ROOT   -> willow_mcp.paths.store_root(), the default
+#                            offset-file path and the SOIL store
+#                            seal_handler.on_seal writes governance
+#                            upgrades into.
+#   - WILLOW_NESTOR_DB    -> willow_mcp.seal_handler._nestor_db_path(), same
+#                            as willow-seal-watch.service.template.
+#   - WILLOW_PG_DB        -> willow_mcp.paths.pg_db(), which is what
+#                            willow_mcp.db.get_pg() (and therefore
+#                            grove_tools.build_mcp_call, which is this
+#                            daemon's ONLY path to Grove) actually reads for
+#                            the database name — REQUIRED here (unlike the
+#                            seal-watch-only unit) and MUST be `willow_20`,
+#                            not the willow-mcp default (`willow`). Grove's
+#                            tables live in `willow_20` (see grove.py's own
+#                            "DB-name trap" docstring); get this wrong and
+#                            the daemon starts, heartbeats, and logs nothing
+#                            obviously broken — every grove_* call just
+#                            silently finds no tables, comes back
+#                            `grove_unavailable` (best-effort, swallowed by
+#                            design — see docs/design/
+#                            grove-activation-rail.md), and the seat sees
+#                            and posts zero wakes while looking alive.
+#                            NOTE: there is no `WILLOW_DB_URL` here —
+#                            `db.get_pg()` connects over a Unix socket via
+#                            `dbname`/`user` only and has no DSN-url reader
+#                            at all; `WILLOW_DB_URL` is read exclusively by
+#                            `grove_listen.py`'s own dedicated LISTEN
+#                            connection, a separate code path this daemon
+#                            never touches. Setting it here would do
+#                            nothing.
+#   - WILLOW_PG_USER      -> also read by willow_mcp.db.get_pg(); falls back
+#                            to `$USER` when unset, which a systemd --user
+#                            unit is not guaranteed to have in its own
+#                            environment — set it explicitly so the daemon
+#                            doesn't connect as an empty/wrong role.
+#
+# Manifest note: {{APP_ID}}'s manifest (`$WILLOW_MCP_APPS_ROOT/{{APP_ID}}/
+# manifest.json`) needs BOTH `grove_read` AND `grove_write` in its
+# `permissions`, not just one — `grove_read` alone lets the daemon poll
+# (`grove_get_history`) but every heartbeat/ack/reply the bus needs to post
+# is gated on `grove_write` and comes back `sender_forbidden`/`gate denied`;
+# `grove_write` alone (unlikely, but the gate checks each tool
+# independently) never sees a WAKE at all, because `grove_get_history`
+# itself is denied. Either gap alone makes the seat LOOK alive
+# (heartbeat/process start with no crash) while never actually completing
+# the wake -> activate loop — grant both.
+#
+# {{APP_ID}} is this seat's own identity: it becomes the SeatDaemon's Grove
+# node AND channel, the mcp_call shim's fixed acting identity, and the
+# suffix of the grove-listen log this daemon's activate writes to. It is
+# deliberately NOT "willow" — per session_start_hook.py, that app_id names
+# the human-orchestrator seat specifically, which an unattended background
+# daemon is not; give each specialist seat its own {{APP_ID}} instance of
+# this unit (systemd template unit syntax, `@{{APP_ID}}`, is why the
+# ExecStart line below takes it from the unit's instance name).
+#
+# Deploy note: this unit is meant to run against the OPERATOR-BOX venv,
+# WILLOW_HOME, WILLOW_STORE_ROOT, and Nestor ledger/db — not a worktree or a
+# developer checkout.
+[Unit]
+Description=willow-mcp Grove activation rail (bus + seal watch) for %i
+After=network.target
+
+[Service]
+Type=simple
+Environment=WILLOW_HOME={{WILLOW_HOME}}
+Environment=WILLOW_STORE_ROOT={{WILLOW_STORE_ROOT}}
+Environment=WILLOW_NESTOR_DB={{WILLOW_NESTOR_DB}}
+Environment=WILLOW_PG_DB={{WILLOW_PG_DB}}
+Environment=WILLOW_PG_USER={{WILLOW_PG_USER}}
+ExecStart={{WILLOW_MCP_PYTHON}} -m willow_mcp.seat_daemon --app-id %i
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

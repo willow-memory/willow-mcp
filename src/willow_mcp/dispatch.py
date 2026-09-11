@@ -117,6 +117,29 @@ def _pg_mirror_upsert(meta: dict) -> None:
         logger.debug("dispatch: PG mirror upsert skipped", exc_info=True)
 
 
+def _post_dispatch_wake(meta: dict) -> None:
+    """Best-effort: wake the target seat's Grove bus listener for a fresh
+    dispatch. Same posture as `_pg_mirror_upsert` right above it — a bus
+    failure (ratatosk missing, gate denial, Postgres down, anything else) is
+    logged and swallowed here, never raised, so a dead or unconfigured Grove
+    bus can never break a dispatch that has already written its packet to
+    disk. See `grove_tools.post_wake_envelope` for the envelope shape and why
+    `BusListener.validate_envelope` accepts it."""
+    try:
+        from . import grove_tools
+        result = grove_tools.post_wake_envelope(
+            meta.get("from_app", ""),
+            meta.get("to_app", ""),
+            dispatch_id=meta.get("dispatch_id", ""),
+            summary=meta.get("summary", ""),
+            reply_to=meta.get("reply_to", ""),
+        )
+        if not result.get("posted"):
+            logger.debug("dispatch: wake not posted: %s", result.get("reason"))
+    except Exception:  # best-effort: a wake fault must never break a written packet
+        logger.debug("dispatch: wake post skipped", exc_info=True)
+
+
 def _pg_mirror_status(dispatch_id: str, status: str) -> None:
     """Best-effort: reflect a status transition into `dispatch_tasks`. A row that
     doesn't exist (mirror enabled after the packet was created) is a no-op UPDATE,
@@ -281,6 +304,7 @@ def dispatch_send(
     (root / "assignment.md").write_text(assignment_text, encoding="utf-8")
     _write_json(root / "status.json", status)
     _pg_mirror_upsert(meta)  # best-effort fleet mirror; filesystem is canonical
+    _post_dispatch_wake(meta)  # best-effort Grove wake; filesystem is canonical
 
     return {
         "dispatch_id": did,
