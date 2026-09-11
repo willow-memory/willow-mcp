@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .boot_health import degraded_boot_line, postgres_status
@@ -18,6 +19,36 @@ from .session_inject import (
     utc_clock_line,
 )
 from .stack_snapshot import read_stack_snapshot
+
+
+def _trust_root_fault_lines(app_id: str) -> list[str]:
+    """Fail-closed at SessionStart (hook spec #3, gap 37d44bfa1f4c): a broken
+    keyring, an unsigned/invalid manifest, or a self-writable grant under strict
+    enforcement must block loudly at boot rather than surface as a mid-task
+    denial. Reuses the exact probes/severity classification diagnostic_summary
+    already computes (`server._diag_trust_root_boot_problems`) — no duplicated
+    logic here. A healthy trust root returns [] and this stays silent."""
+    if not app_id:
+        return []
+    try:
+        from .server import _diag_trust_root_boot_problems
+        problems = _diag_trust_root_boot_problems(app_id)
+    except Exception:
+        logging.getLogger("willow_mcp.boot_context").debug(
+            "trust-root boot probe failed", exc_info=True)
+        return []
+    if not problems:
+        return []
+    lines = ["[BOOT FAULT] TRUST ROOT BROKEN — do not proceed until resolved:"]
+    for p in problems:
+        check = p.get("check", "?")
+        detail = p.get("detail") or "broken"
+        lines.append(f"  · {check}: {detail}")
+        fix = p.get("fix")
+        if fix:
+            lines.append(f"    FIX: {fix}")
+    lines.append("")
+    return lines
 
 
 def build_boot_lines(
@@ -93,5 +124,12 @@ def build_boot_lines(
         record_injection(session_id, fingerprint, lite=True)
     else:
         record_injection(session_id, fingerprint, lite=lite_inject)
+
+    # Trust-root fault is never deduped/trimmed away — a broken keyring, an
+    # unsigned manifest, or a self-writable grant under strict enforcement must
+    # be loud on every single boot line, continuation or not (hook spec #3).
+    fault_lines = _trust_root_fault_lines(app_id)
+    if fault_lines:
+        lines = fault_lines + lines
 
     return lines
