@@ -29,7 +29,7 @@ EXPECTED_SHA256 = {
     "embed.py": "25f15ee7b1d589c0a694636356a282c7c00cc086ec7d4526149ce5b2e39ec50a",
     "ingest.py": "bb244baf2b7d1500da494b1b98cc86b0591fe823caa7be53618db3d34ecf29fc",
     "llm.py": "628a3f58b11087b07ff9b5c096e3899c1ba468e6bc3849a71fddff03df738bfc",
-    "secrets.py": "d45ae110a0fa0dfc30308316696a1e1b7d8b3d49465f682f4822e330dcab48cb",
+    "secrets.py": "7c6335f883ad80a3d323bc8f2b151ba9748db444eacb32306e8fbca5ec4e28f8",
     "selflearn.py": "bde962fa401816681572da1e74805a1789e42e402498bc4c87df7c8fec2657fd",
     "taxonomy.py": "60d44d1c1d9a74dc23389feac7dce4600085ea408fb08ab528739559562d4f46",
     "classify.py": "7e81f75d98011aea824317e8fc977e16777fae1f6b7730b51bcfb93ab32748ca",
