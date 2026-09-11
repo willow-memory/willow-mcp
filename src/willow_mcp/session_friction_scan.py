@@ -5,30 +5,47 @@ were both real and tested, but DARK — nothing on any real lifecycle ever calle
 SessionEnd, run it through the existing (unmodified, still-calibrated) watcher,
 and let it persist a flag, scoped to THIS session, when it trips.
 
-Everything here is a wrapper around already-correct pieces, plus two fixes
-found in audit:
+Two audit rounds shaped what this module does with tool activity — worth
+stating plainly because the "obvious" fix in each direction is wrong:
+
+  * Round 1 (MEDIUM): dropping tool_use/tool_result text entirely made a
+    genuinely grounded agent (ran a test, got a short answer back, said little
+    about it in prose) read as a content-free mirror and false-trip.
+  * Round 2 (HIGH, this round): folding that tool text INTO the scored agent
+    turn "fixed" round 1 by feeding `friction_score` — which is STANCE-BLIND
+    and credits grounding/novelty from ANY text — enough digits and JSON
+    punctuation that a single routine tool call per turn silently suppressed
+    a genuinely sycophantic session's trip. That is a worse failure than
+    round 1: it defeats the detector exactly where it matters most (tool-using
+    coding sessions), and a flatterer can trigger the suppression on purpose
+    just by calling a tool.
+
+  The property that actually holds both halves at once: a sycophantic session
+  trips REGARDLESS of whether it called tools (stance is scored from the
+  agent's own prose, full stop — no tool text is ever handed to the scorer),
+  and tool activity is carried instead as a separate, non-scoring `tool_active`
+  flag per turn that `FrictionWatcher.scan` surfaces on the persisted flag as
+  `tool_active_turns` (see friction.py). That annotation can tell a human
+  reviewer "this window ran tools" so they can weigh a likely false positive
+  faster — but, by construction, it has no path into mean_friction or
+  escalation, so it can never inflate OR suppress the trip itself. A flatterer
+  gets no lever here: calling a tool changes nothing about whether it trips.
+
+Everything else is a wrapper around already-correct pieces:
   * `_read_transcript_turns` turns a Claude Code transcript JSONL into the
-    `[{role, text, ts}]` shape `FrictionWatcher.scan` already accepts. An
-    assistant turn's `tool_use` blocks (name + input) and the `tool_result`
-    relayed back for it are folded into that same agent turn's text as
-    grounding evidence — NOT dropped, and NOT treated as a second human
-    turn — so an agent that grounds itself by actually running something
-    (tests, greps, file reads) doesn't read as a content-free mirror just
-    because the substance of what it did lived in a tool block instead of
-    prose. Capped in length so raw tool noise (a huge diff, a long log)
-    can't itself swamp the scorer the other direction.
+    `[{role, text, ts, tool_active}]` shape `FrictionWatcher.scan` accepts.
+    `text` is prose only (the message's own `type: "text"` blocks) — tool
+    payloads are never joined into it, so there is no unbounded string to cap
+    in the first place.
   * `scan_session_for_friction` calls that scan and NEVER raises — SessionEnd
     is not a gate, so a bad transcript, a missing file, or a scorer surprise
     degrades to a named skip/error, not a blocked session close.
   * Idempotent AND attributable, per session: `session_id` is passed through
     to `FrictionWatcher.scan`, which folds it into both the dedup key and the
-    stored flag (`friction.py`). Two different sessions that each produce the
-    same-shaped low-friction episode now persist as two distinct flags, each
-    naming which session tripped; replaying the SAME session's transcript
-    still upserts the same record instead of stacking a duplicate.
-  * No new false positives: the window/floor defaults and the scorer itself
-    are untouched — this module only supplies turns (now including the
-    grounding fix above), it does not retune calibration.
+    stored flag. Two different sessions that each produce the same-shaped
+    low-friction episode persist as two distinct flags, each naming which
+    session tripped; replaying the SAME session's transcript still upserts
+    the same record instead of stacking a duplicate.
 """
 from __future__ import annotations
 
@@ -44,17 +61,12 @@ from .friction import FrictionWatcher
 # error, just not a turn.
 _TEXT_RECORD_TYPES = {"user", "assistant"}
 
-# Caps keep tool grounding evidence legible to the scorer (which only needs a
-# few digits/words/punctuation marks to register grounding) without letting a
-# huge tool payload (a full diff, a long test log) dominate the turn's text
-# or blow up what's persisted.
-_TOOL_USE_REPR_CAP = 200
-_TOOL_RESULT_TEXT_CAP = 500
-
 
 def _extract_text(content: Any) -> str:
     """Join the `type: "text"` blocks of a Claude Code message `content`
-    field. A plain string content is returned as-is."""
+    field. A plain string content is returned as-is. Deliberately ignores
+    `tool_use`/`tool_result` blocks — see the module docstring for why tool
+    payload text must never reach the scorer through here."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -68,49 +80,11 @@ def _extract_text(content: Any) -> str:
     return ""
 
 
-def _tool_use_snippets(content: Any) -> list[str]:
-    """Compact `[tool_use:<name> <input>]` snippets for each tool_use block in
-    an assistant message — the grounding evidence of what the agent actually
-    DID (ran a command, read a file, greped a path), kept short enough that it
-    adds signal without becoming the whole turn."""
-    if not isinstance(content, list):
-        return []
-    out = []
-    for block in content:
-        if not isinstance(block, dict) or block.get("type") != "tool_use":
-            continue
-        name = block.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        try:
-            input_repr = json.dumps(block.get("input"), sort_keys=True, default=str)
-        except (TypeError, ValueError):
-            input_repr = str(block.get("input"))
-        out.append(f"[tool_use:{name} {input_repr}]"[:_TOOL_USE_REPR_CAP])
-    return out
-
-
-def _tool_result_snippets(content: Any) -> list[str]:
-    """Compact `[tool_result: <text>]` snippets for each tool_result block in
-    a user-role message — what came back from a tool the agent invoked. This
-    is mechanical relay, not a human utterance, so it is never turned into a
-    standalone user turn; the caller folds it into the agent turn that
-    triggered it instead."""
-    if not isinstance(content, list):
-        return []
-    out = []
-    for block in content:
-        if not isinstance(block, dict) or block.get("type") != "tool_result":
-            continue
-        text = _extract_text(block.get("content"))
-        if text:
-            out.append(f"[tool_result: {text}]"[:_TOOL_RESULT_TEXT_CAP])
-    return out
-
-
-def _has_tool_result(content: Any) -> bool:
+def _has_block_type(content: Any, block_type: str) -> bool:
+    """Cheap presence check — never extracts or joins the block's text, so
+    there is nothing here to cap or to leak into the scorer."""
     return isinstance(content, list) and any(
-        isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        isinstance(b, dict) and b.get("type") == block_type for b in content
     )
 
 
@@ -127,17 +101,17 @@ def _parse_ts(raw: Any) -> Optional[float]:
 
 def _read_transcript_turns(transcript_path: str) -> list[dict]:
     """Best-effort parse of a Claude Code transcript JSONL into
-    `[{role, text, ts}]`. Any read/parse failure — missing file, bad
-    encoding, a malformed line — degrades to an empty list rather than
+    `[{role, text, ts, tool_active}]`. Any read/parse failure — missing file,
+    bad encoding, a malformed line — degrades to an empty list rather than
     raising; a transcript this hook can't read is a signal absence, not a
     reason to interrupt SessionEnd.
 
-    An assistant turn's text is its `text` blocks PLUS a compact rendering of
-    its `tool_use` blocks (what it actually ran). The `tool_result` a tool
-    invocation returns arrives as its own `user`-type record in the raw
-    transcript, but it is not a human turn — it's folded into the preceding
-    agent turn's text as grounding evidence instead of becoming a second,
-    fabricated user utterance."""
+    An assistant turn's scored `text` is its `type: "text"` blocks ONLY.
+    `tool_active` is a plain boolean: True if that assistant message itself
+    contains a `tool_use` block, OR if the `tool_result` message relayed back
+    for it follows immediately (a `tool_result`-carrying `user`-type record is
+    mechanical relay, never a human turn, so it is folded as that boolean onto
+    the preceding agent turn instead of becoming a fabricated user turn)."""
     turns: list[dict] = []
     try:
         with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
@@ -158,20 +132,20 @@ def _read_transcript_turns(transcript_path: str) -> list[dict]:
                 ts = _parse_ts(rec.get("timestamp"))
 
                 if rec["type"] == "assistant":
-                    parts = [_extract_text(content), *_tool_use_snippets(content)]
-                    text = "\n".join(p for p in parts if p)
+                    text = _extract_text(content)
                     if text:
-                        turns.append({"role": "agent", "text": text, "ts": ts})
+                        turns.append({
+                            "role": "agent", "text": text, "ts": ts,
+                            "tool_active": _has_block_type(content, "tool_use"),
+                        })
                     continue
 
                 # rec["type"] == "user"
-                if _has_tool_result(content):
-                    relay = "\n".join(_tool_result_snippets(content))
-                    if relay and turns and turns[-1]["role"] == "agent":
-                        turns[-1]["text"] = turns[-1]["text"] + "\n" + relay
-                    # A tool_result-carrying message is a mechanical relay, not
-                    # a human turn, whether or not it also folded anywhere —
-                    # never appended as its own "user" turn.
+                if _has_block_type(content, "tool_result"):
+                    if turns and turns[-1]["role"] == "agent":
+                        turns[-1]["tool_active"] = True
+                    # Mechanical relay, not a human turn — never appended as
+                    # its own "user" turn regardless of whether it folded.
                     continue
                 text = _extract_text(content)
                 if text:

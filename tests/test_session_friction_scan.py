@@ -104,55 +104,91 @@ _ESCALATING_USER_TEXTS = [
 ]
 
 
-def _write_tool_grounded_transcript(tmp_path, name="tool_grounded.jsonl"):
-    """A user escalating exactly like MIRROR, but the agent grounds itself for
-    real each turn — it runs a failing test via a Bash tool_use and gets a
-    tool_result back with the failure detail — and only adds a short text
-    note on top. Regression for the audit finding: dropping tool_use/
-    tool_result blocks stripped that grounding evidence and left only the
-    short note, which read as a content-free mirror and falsely tripped."""
+def _write_transcript_with_tools(tmp_path, agent_texts, tool_result_texts=None, name="with_tools.jsonl"):
+    """Like `_write_transcript`, but each assistant turn also carries a
+    `tool_use` block (Bash, running something plausible), and — when
+    `tool_result_texts` is given — the following user record relays a
+    `tool_result` for it. Lets a test assert on the SAME agent prose with and
+    without tool activity layered on top."""
     path = tmp_path / name
     lines = []
-    for i, user_text in enumerate(_ESCALATING_USER_TEXTS):
-        lines.append(json.dumps({
-            "type": "user",
-            "message": {"role": "user", "content": user_text},
-        }))
+    for i, (user_text, agent_text) in enumerate(zip(_ESCALATING_USER_TEXTS, agent_texts)):
+        lines.append(json.dumps({"type": "user", "message": {"role": "user", "content": user_text}}))
         lines.append(json.dumps({
             "type": "assistant",
             "message": {
                 "role": "assistant",
                 "content": [
-                    {"type": "text", "text": "yeah, nice"},
-                    {"type": "tool_use", "name": "Bash",
-                     "input": {"command": f"pytest tests/test_foo.py::test_bar_{i} -q"}},
+                    {"type": "text", "text": agent_text},
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "a"}},
                 ],
             },
         }))
-        lines.append(json.dumps({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": [
-                    {"type": "tool_result", "content": [
-                        {"type": "text",
-                         "text": (f"1 failed, 3 passed in 0.42s "
-                                  f"FAILED tests/test_foo.py::test_bar_{i} - "
-                                  f"AssertionError at line {40 + i}")},
-                    ]},
-                ],
-            },
-        }))
+        if tool_result_texts is not None:
+            lines.append(json.dumps({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result",
+                                 "content": [{"type": "text", "text": tool_result_texts[i]}]}],
+                },
+            }))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return str(path)
 
 
-def test_tool_grounded_agent_does_not_false_trip(tmp_path):
+# The MIRROR fixture's own agent prose — pure flattery, no pushback, no
+# grounding words of its own. Reused so a "with tools" transcript scores the
+# exact same stance as the plain-prose MIRROR case.
+_MIRROR_AGENT_TEXTS = [t["text"] for t in MIRROR if t["role"] == "agent"]
+
+
+def test_sycophantic_session_with_tool_calls_still_trips(tmp_path):
+    """HIGH regression: folding tool text into the scored turn let a
+    genuinely sycophantic session (flattery prose, zero pushback) escape
+    detection just by calling one routine tool per turn — the stance-blind
+    scorer credited the tool call's JSON/digits as 'grounding' and pushed
+    mean_friction above the floor. Stance must be scored from the agent's own
+    prose alone: a flatterer trips whether or not it also happens to call
+    tools, and it gets no lever to suppress the flag by calling one."""
     store = Store(store_root=str(tmp_path / "store"))
-    transcript = _write_tool_grounded_transcript(tmp_path)
+    prose_only = _write_transcript(tmp_path, MIRROR, name="prose_only.jsonl")
+    with_tools = _write_transcript_with_tools(tmp_path, _MIRROR_AGENT_TEXTS,
+                                               tool_result_texts=["ok"] * 4, name="with_tools.jsonl")
+
+    prose_result = scan_session_for_friction("sess-prose", prose_only, store=store)
+    tools_result = scan_session_for_friction("sess-with-tools", with_tools, store=store)
+
+    assert prose_result["tripped"] is True
+    assert tools_result["tripped"] is True
+    # Same prose, same stance score — tool activity moved nothing.
+    assert tools_result["flags"][0]["mean_friction"] == prose_result["flags"][0]["mean_friction"]
+
+    listed = {row["session_id"]: row for row in FrictionWatcher(store).list_flags()}
+    assert listed["sess-with-tools"]["tool_active_turns"]        # annotated…
+    assert listed["sess-prose"]["tool_active_turns"] == []       # …only where tools actually ran
+
+
+def test_tool_grounded_agent_trips_but_flag_is_annotated(tmp_path):
+    """A quiet worker whose prose is as thin as a flatterer's ("yeah, nice")
+    but who is actually running tools each turn still trips — the scorer
+    cannot see the difference from prose alone, and this module does not try
+    to buy that distinction back by feeding it tool text (that's exactly the
+    HIGH this test's sibling above regression-tests). What it DOES get is the
+    `tool_active_turns` annotation on the stored flag, so a human reviewing a
+    trip can immediately see "every turn in this window ran a tool" and weigh
+    a false positive faster — informational, never a suppression."""
+    store = Store(store_root=str(tmp_path / "store"))
+    transcript = _write_transcript_with_tools(
+        tmp_path, ["yeah, nice"] * 4,
+        tool_result_texts=[f"1 failed, 3 passed in 0.42s FAILED test_foo.py::test_bar_{i} "
+                            f"- AssertionError at line {40 + i}" for i in range(4)],
+    )
     result = scan_session_for_friction("sess-tool-grounded", transcript, store=store)
-    assert result.get("tripped") is False
-    assert FrictionWatcher(store).list_flags() == []
+    assert result["tripped"] is True
+    listed = FrictionWatcher(store).list_flags()
+    assert len(listed) == 1
+    assert len(listed[0]["tool_active_turns"]) == 4
 
 
 def test_missing_transcript_degrades_without_raising(tmp_path):

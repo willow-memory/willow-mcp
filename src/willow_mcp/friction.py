@@ -13,6 +13,22 @@ to a SOIL collection (the durable trace a human can review later, deduped by
 content so re-scanning an overlapping window doesn't pile up copies), and it
 exposes a list verb.
 
+`friction_score` (what `FrictionFloor.scan` actually calls) is STANCE-BLIND:
+it credits an agent turn's own pushback lexicon, grounding lexicon/digits/code
+punctuation, and novelty — whatever text it's handed, regardless of whose
+position it opposes. That is exactly why tool output must never be folded
+into the text this module scores: a single routine tool call injects digits,
+JSON punctuation, and unechoed tokens that read as "grounding" to a blind
+scorer, so a caller that stuffs tool_use/tool_result text into an agent
+turn's `text` lets a genuinely sycophantic agent hide behind any tool call at
+all (willow-mcp#audit-E6EB3B12). `scan()` therefore only ever scores the
+`text` it's given — a caller (session_friction_scan.py) is responsible for
+keeping that to the agent's own prose — and instead accepts an optional,
+side-channel `tool_active` flag per turn purely for the *stored flag's*
+`tool_active_turns` annotation: reviewer context that can tell a quiet,
+tool-grounded worker from a flatterer, but that never feeds the scorer and
+therefore can never move a trip decision either direction.
+
 Two honest constraints carried from upstream:
   * It is DETERMINISTIC and MODEL-FREE — no LLM, no egress. Safe to run anywhere;
     it cannot leak and it cannot be gamed by the model it watches at runtime.
@@ -65,6 +81,15 @@ class FrictionWatcher:
             return {"error": "bad_floor", "detail": "floor must be in [0,1]"}
 
         norm = []
+        # Parallel to `norm`, index-for-index: whether that turn's *source*
+        # (a caller like session_friction_scan.py) marked it as carrying tool
+        # activity. This NEVER reaches friction_score/escalation_score — it is
+        # attached to a flag only after FrictionFloor has already decided to
+        # raise it, purely as a reviewer aid (see the note below the scan
+        # call). A turn dict with no "tool_active" key behaves exactly as
+        # before (False) — existing callers that don't know this key are
+        # unaffected.
+        tool_active = []
         for t in turns or []:
             if not isinstance(t, dict):
                 continue
@@ -73,11 +98,13 @@ class FrictionWatcher:
                 continue
             norm.append(Turn(role=role, text=text,
                              ts=ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None))
+            tool_active.append(bool(t.get("tool_active")))
         if not norm:
             return {"error": "no_valid_turns",
                     "detail": "turns must be a list of {role:'user'|'agent', text:str, ts?:number}"}
 
         flags = FrictionFloor(window=window, floor=floor).scan(norm)
+        agent_indices = [i for i, t in enumerate(norm) if t.role == "agent"]
         out = []
         for f in flags:
             fd = {"at_turn": f.at_turn, "streak": f.streak,
@@ -85,6 +112,20 @@ class FrictionWatcher:
                   "low_turns": list(f.low_turns), "message": f.message}
             if session_id:
                 fd["session_id"] = session_id
+            # Tool-activity annotation — informational only. It is computed
+            # from the SAME window FrictionFloor already flagged (the trailing
+            # `streak` agent turns ending at `at_turn`), strictly AFTER
+            # mean_friction/escalation decided this is a flag. It cannot
+            # inflate or suppress that decision because it plays no part in
+            # computing it: this is metadata a human reviewer uses to tell a
+            # quiet, tool-grounded worker from a flatterer, never a lever a
+            # flatterer can pull by calling a tool.
+            try:
+                pos = agent_indices.index(f.at_turn)
+                window_idxs = agent_indices[max(0, pos - f.streak + 1): pos + 1]
+            except ValueError:
+                window_idxs = []
+            fd["tool_active_turns"] = [i for i in window_idxs if tool_active[i]]
             # Dedupe by content so a monitor re-scanning an overlapping window
             # doesn't record the same alarm twice — scoped by session_id (when
             # known) so two different sessions with the same-shaped episode
@@ -107,5 +148,6 @@ class FrictionWatcher:
                         "session_id": r.get("session_id"),
                         "escalation": r.get("escalation"),
                         "mean_friction": r.get("mean_friction"),
-                        "low_turns": r.get("low_turns", []), "message": r.get("message")})
+                        "low_turns": r.get("low_turns", []), "message": r.get("message"),
+                        "tool_active_turns": r.get("tool_active_turns", [])})
         return out
