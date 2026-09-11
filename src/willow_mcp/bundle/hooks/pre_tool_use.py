@@ -1,6 +1,6 @@
 """willow-mcp Claude Code hook — PreToolUse.
 
-Seven guards:
+Eight guards:
 - Bash reaching for raw psql/psycopg2/sqlite3 against a database or store
   willow-mcp owns, instead of going through the MCP tools (blocks).
 - A Write/Edit/MultiEdit whose target file *is* a willow-mcp-owned SQLite
@@ -24,6 +24,16 @@ Seven guards:
   WebFetch are blocked with a redirect, so a fetch goes through the seat that
   records it rather than around it (blocks). Wired by its own
   `WebSearch|WebFetch` matcher in deploy/claude-settings.json.
+- Corpus-first (gap corpus-first-jeles-nestor / 38a0351f2527): a seat about to
+  search the web — native WebSearch or the governed willow_web_search, the
+  tool the guard above redirects native traffic onto — is reminded to try the
+  fleet's own verified organs first (knowledge_search, the jeles-corpus
+  federation, nestor for a sealed answer) and to say which tier answered.
+  Composes with the guard above rather than replacing it: on native
+  WebSearch, which is hard-blocked, the reminder is appended to that same
+  block; on a direct willow_web_search call it is the sole decision, and it
+  is always a warn — the corpus can miss, and web is then a fine, if
+  unverified, fallback (warns/composes, never blocks on its own).
 - Any tool call that would write the keys authorizing this agent's own egress
   or re-grant its own write seat: minting a lease under `mcp_apps/_net_leases/`,
   running `willow-mcp grant-net` or `dev-net` (the local/dev one-command
@@ -314,6 +324,67 @@ def check_native_web(tool_name: str) -> Optional[tuple[str, str]]:
         return "block", f"willow-mcp: {_WEB_SEARCH_REDIRECT}"
     if tool_name == "WebFetch":
         return "block", f"willow-mcp: {_WEB_FETCH_REDIRECT}"
+    return None
+
+
+# gap corpus-first-jeles-nestor / 38a0351f2527: nothing today prompts a seat to
+# consult the fleet's own verified organs — knowledge_search, the
+# operator-ratified jeles-corpus federation (federation server 8cae3d1dcdf4),
+# and nestor for a sealed answer — before it reaches for the open web or
+# answers from model recall. Ties to the sealed rule "ask Nestor, then the
+# box, then remote, and say which tier answered."
+#
+# The hookable surface: a "factual question" is not itself a tool call, so
+# there is nothing to hang a check on until the seat actually reaches for the
+# web. The concrete, catchable moment is a web-search PreToolUse — native
+# WebSearch (this repo already hard-blocks that channel via check_native_web,
+# redirecting to willow_web_search) and willow_web_search itself, the governed
+# tool the redirect lands on and the one an agent may call directly. That is
+# the last point before the corpus gets skipped, on either channel.
+#
+# WebFetch/willow_web_fetch are deliberately NOT covered: fetching a URL the
+# caller already has in hand is not the "I need a fact, where do I look first"
+# decision this hook targets — check_native_web's channel guard still applies
+# to it unchanged.
+_CORPUS_FIRST_REMINDER = (
+    "willow-mcp: before searching the open web, consult the fleet's own "
+    "verified organs first — knowledge_search (local knowledge base), the "
+    "jeles-corpus federation (federation_call to server 8cae3d1dcdf4), and "
+    "nestor_ask / nestor_resolve for a sealed answer. Order: nestor (sealed) "
+    "-> box (knowledge_search / jeles federation) -> remote (web) — and say "
+    "which tier answered. The corpus can miss; web search is a fine fallback "
+    "then, but say the result is unverified. This is a reminder, not a block."
+)
+
+
+def _is_web_search_tool(tool_name: str) -> bool:
+    """True for the native WebSearch tool or the governed willow_web_search MCP
+    tool, bare or MCP-qualified (e.g. mcp__willow-mcp__willow_web_search) —
+    the two shapes a web search can arrive in. Matched the same way
+    _is_task_submit matches task_submit below."""
+    return (
+        tool_name == "WebSearch"
+        or tool_name == "willow_web_search"
+        or tool_name.endswith("__willow_web_search")
+    )
+
+
+def check_corpus_first(tool_name: str) -> Optional[tuple[str, str]]:
+    """Remind — never block — a seat about to search the web to try the
+    fleet's verified organs first. Always a warn: the corpus can genuinely
+    miss, so hard-blocking the web fallback would be wrong (unlike
+    check_native_web's block, which governs the *channel*, not the *order*,
+    and is not softened by this). Composes with check_native_web in main():
+    on native WebSearch (which check_native_web already hard-blocks and
+    redirects to willow_web_search), this reminder is appended to that same
+    block reason rather than issuing a second, conflicting decision; on a
+    direct willow_web_search call — the tool the redirect lands on, and the
+    one an agent may call without ever touching native WebSearch — it is the
+    sole (warn) decision. Fail-safe by construction: a plain string compare
+    with no external state, so a hook fault here cannot hard-block a caller
+    that reaches this function at all."""
+    if _is_web_search_tool(tool_name):
+        return "warn", _CORPUS_FIRST_REMINDER
     return None
 
 
@@ -1017,9 +1088,19 @@ def main() -> None:
     tool_input = payload.get("tool_input", {}) or {}
 
     native = check_native_web(tool_name)
+    corpus = check_corpus_first(tool_name)
     if native:
         decision, route_reason = native
+        # compose, don't clobber: check_native_web already hard-blocks native
+        # WebSearch and redirects to willow_web_search — append the
+        # corpus-first reminder to that same decision instead of emitting a
+        # second, conflicting one (only one decision reaches the caller).
+        if corpus:
+            route_reason = f"{route_reason} {corpus[1]}"
         print(json.dumps({"decision": decision, "reason": route_reason}))
+    elif corpus:
+        decision, reason = corpus
+        print(json.dumps({"decision": decision, "reason": reason}))
     elif tool_name == "Bash":
         command = tool_input.get("command", "")
         reason = (

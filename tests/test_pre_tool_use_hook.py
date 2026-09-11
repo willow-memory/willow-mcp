@@ -942,6 +942,100 @@ def test_main_stays_silent_for_the_sanctioned_web_tool():
     assert stdout == ""
 
 
+# ── check_corpus_first: consult the fleet's verified organs before the web ──
+#
+# gap corpus-first-jeles-nestor / 38a0351f2527. The reminder names the three
+# organs to try first (knowledge_search, the jeles-corpus federation, nestor)
+# and is a warn, never a block, on either the tool it fires on alone.
+
+
+@pytest.mark.parametrize("tool_name", [
+    "willow_web_search",
+    "mcp__willow-mcp__willow_web_search",
+])
+def test_check_corpus_first_warns_on_the_governed_search_tool(tool_name):
+    routed = pre_tool_use.check_corpus_first(tool_name)
+    assert routed is not None
+    decision, reason = routed
+    assert decision == "warn"
+    assert "knowledge_search" in reason
+    assert "nestor" in reason
+    assert "jeles" in reason.lower()
+
+
+def test_check_corpus_first_warns_on_native_websearch_too():
+    routed = pre_tool_use.check_corpus_first("WebSearch")
+    assert routed is not None
+    assert routed[0] == "warn"
+
+
+@pytest.mark.parametrize("tool_name", [
+    "WebFetch",
+    "willow_web_fetch",
+    "mcp__willow-mcp__willow_web_fetch",
+    "Bash",
+    "Read",
+    "task_submit",
+    "",
+])
+def test_check_corpus_first_allows_every_non_search_tool(tool_name):
+    """WebFetch/willow_web_fetch are deliberately excluded: fetching a URL the
+    caller already has is not the "where do I look first" decision this hook
+    targets, and check_native_web's channel guard already covers WebFetch."""
+    assert pre_tool_use.check_corpus_first(tool_name) is None
+
+
+def test_main_never_hard_blocks_on_corpus_first_alone():
+    """Calling willow_web_search directly (no native-web hard block in play)
+    must never come back as a block — the corpus can genuinely miss, so this
+    guard only ever reminds."""
+    code, stdout = _run_hook({
+        "tool_name": "willow_web_search",
+        "tool_input": {"query": "what is the current release version"},
+        "session_id": "s1",
+    })
+    assert code == 0
+    decision = json.loads(stdout)
+    assert decision["decision"] == "warn"
+    assert "knowledge_search" in decision["reason"]
+    assert "nestor" in decision["reason"]
+
+
+def test_main_composes_corpus_first_with_the_native_web_block():
+    """Native WebSearch is still hard-blocked (check_native_web's channel
+    guard, unchanged) — but the corpus-first reminder rides along in the same
+    decision rather than being silently dropped or emitted as a second,
+    conflicting decision."""
+    code, stdout = _run_hook({
+        "tool_name": "WebSearch",
+        "tool_input": {"search_term": "latest news"},
+        "session_id": "s1",
+    })
+    assert code == 0
+    decision = json.loads(stdout)
+    assert decision["decision"] == "block"
+    assert "willow_web_search" in decision["reason"]
+    assert "knowledge_search" in decision["reason"]
+    assert "nestor" in decision["reason"]
+
+
+def test_main_corpus_first_reminder_absent_for_websearch_would_be_a_regression():
+    """Mutation-style pin (same intent as test_check_native_web_blocks_webfetch
+    above): if check_corpus_first were ever narrowed to skip "WebSearch" — e.g.
+    a stray rename — main() would silently stop composing and this test would
+    catch it even though the block-only assertions above still pass."""
+    assert pre_tool_use.check_corpus_first("WebSearch") is not None
+
+
+def test_check_corpus_first_is_fail_safe_on_odd_string_input():
+    """No external state — a malformed/odd but still-string tool_name (the
+    only shape main() ever passes, via payload.get("tool_name", "")) resolves
+    to a plain None or a warn, never a raise and never a block."""
+    for odd in ("WebSearch\x00", "🤖", "mcp__x__willow_web_search__extra", ""):
+        result = pre_tool_use.check_corpus_first(odd)
+        assert result is None or result[0] == "warn"
+
+
 # ── seat guard vs gate.PERMISSION_GROUPS: the drift this class of list invites ─
 #
 # The hook is stdlib-only by design — it runs inside the agent's harness, where
