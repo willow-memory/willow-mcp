@@ -146,7 +146,9 @@ def test_b51_orchestrator_can_still_verify_and_clear(home, monkeypatch):
     sent = server.dispatch_send("hanuman", "loki", "# Assignment\n\nAudit x.\n")
     did = sent["dispatch_id"]
     server.dispatch_accept("loki", did)
-    server.handoff_write_v4("loki", did, narrative="done", findings=[])
+    server.handoff_write_v4(
+        "loki", did, narrative="Audited x: 5 checks, 0 issues.", findings=[],
+    )
 
     verified = server.verify_handoff("willow", did)
     assert verified["verified"] is True
