@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .boot_health import degraded_boot_line, postgres_status
+from .nest import autointake as nest_autointake
 from .seed_loader import load_corpus_lanes
 from .session_inject import (
     MAX_CORRECTIONS,
@@ -82,6 +83,15 @@ def build_boot_lines(
     degraded = degraded_boot_line(app_id)
     if degraded:
         lines.append(degraded)
+
+    # Drop-zone auto-intake join (the nest was never wired to run on its own —
+    # a dropped file sat staged until someone worked the queue by hand). This
+    # runs the pipeline end-to-end on every boot so the next session at latest
+    # sees a filed item, not a stale queue. Best-effort: any failure here
+    # degrades to a one-line note, never a broken boot.
+    nest_line = nest_autointake.boot_line(app_id)
+    if nest_line:
+        lines.append(nest_line)
 
     if lite_inject:
         lines.append("[SESSION] compact/resume — trimmed boot injection.")
