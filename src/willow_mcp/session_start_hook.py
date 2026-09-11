@@ -189,7 +189,17 @@ def handle(payload: dict) -> dict:
     if seal_sig and not result.get("error"):
         from . import human_session as _human_session
         _human_session._remember_attributed(session_id)
-    boot_lines = build_boot_lines(app_id, session_id, source, result)
+    try:
+        boot_lines = build_boot_lines(app_id, session_id, source, result)
+    except Exception as exc:
+        # Belt-and-suspenders: a fault in any one boot-line section must
+        # degrade that section, never discard an orientation that
+        # session_enter already succeeded at building. main()'s top-level
+        # except would otherwise report a false "session_enter FAILED".
+        logging.getLogger("willow_mcp.session_start_hook").warning(
+            "build_boot_lines failed", exc_info=True,
+        )
+        boot_lines = [f"[boot_context] degraded ({exc.__class__.__name__}: {exc})"]
     # Hoist auto_sign_note into the boot_context prose so the LLM inside
     # the client sees the attribution status as part of orient, not
     # buried in a JSON field the client renderer may or may not surface.
