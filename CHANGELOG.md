@@ -36,8 +36,7 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* decision_propose — bridge a governance decision to a sealable Nestor draft ([b4e4961](https://github.com/willow-memory/willow-mcp/commit/b4e4961808cbe744029066d2ec0d7851984e6573))
-* Grove activation rail slice 1 — dispatch posts a wake, seat daemon surfaces it ([f2374c2](https://github.com/willow-memory/willow-mcp/commit/f2374c2baf5faeff14f7c0707047697b9949db60))
+* decision_propose — bridge a governance decision to a sealable Nestor draft ([abf88a6](https://github.com/willow-memory/willow-mcp/commit/abf88a68e051b185840a71caf6bb420c16309753))
 * Grove activation rail slice 1 — dispatch posts a wake, seat daemon surfaces it ([e16642b](https://github.com/willow-memory/willow-mcp/commit/e16642b2ef998b55ee9a1ef715c09ef2f42bb876))
 
 ## [2.35.1](https://github.com/willow-memory/willow-mcp/compare/v2.35.0...v2.35.1) (2026-09-11)
