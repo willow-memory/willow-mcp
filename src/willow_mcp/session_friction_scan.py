@@ -111,8 +111,18 @@ def _read_transcript_turns(transcript_path: str) -> list[dict]:
     contains a `tool_use` block, OR if the `tool_result` message relayed back
     for it follows immediately (a `tool_result`-carrying `user`-type record is
     mechanical relay, never a human turn, so it is folded as that boolean onto
-    the preceding agent turn instead of becoming a fabricated user turn)."""
+    the preceding agent turn instead of becoming a fabricated user turn).
+
+    A prose-less assistant message (a `tool_use` block with no `text` block)
+    is correctly dropped from scoring — it never becomes a turn. Its
+    `tool_result` relay must NOT then fold `tool_active=True` onto whatever
+    agent turn happens to be last in `turns`: that turn may be an unrelated,
+    earlier turn that never issued this tool_use at all. So the fold below is
+    gated on `last_assistant_appended` — whether the assistant record
+    immediately preceding this relay was itself the one that produced
+    `turns[-1]` — rather than merely on `turns[-1]["role"] == "agent"`."""
     turns: list[dict] = []
+    last_assistant_appended = False
     try:
         with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -138,11 +148,17 @@ def _read_transcript_turns(transcript_path: str) -> list[dict]:
                             "role": "agent", "text": text, "ts": ts,
                             "tool_active": _has_block_type(content, "tool_use"),
                         })
+                    # Track whether THIS assistant record is the one that
+                    # produced turns[-1] — a prose-less tool_use record
+                    # (text == "") leaves this False, so its later
+                    # tool_result relay cannot misattribute onto an earlier,
+                    # unrelated agent turn.
+                    last_assistant_appended = bool(text)
                     continue
 
                 # rec["type"] == "user"
                 if _has_block_type(content, "tool_result"):
-                    if turns and turns[-1]["role"] == "agent":
+                    if turns and turns[-1]["role"] == "agent" and last_assistant_appended:
                         turns[-1]["tool_active"] = True
                     # Mechanical relay, not a human turn — never appended as
                     # its own "user" turn regardless of whether it folded.
