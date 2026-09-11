@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .boot_health import degraded_boot_line, postgres_status
+from .boot_health import degraded_boot_line, postgres_status, split_brain_boot_line
 from .seed_loader import load_corpus_lanes
 from .session_inject import (
     MAX_CORRECTIONS,
@@ -196,6 +196,10 @@ def build_boot_lines(
     degraded = degraded_boot_line(app_id)
     if degraded:
         lines.append(degraded)
+
+    split_brain_line = split_brain_boot_line()
+    if split_brain_line:
+        lines.append(split_brain_line)
 
     lines.extend(_blocker_lines(orientation))
     if not lite_inject:
