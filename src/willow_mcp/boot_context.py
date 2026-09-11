@@ -37,31 +37,37 @@ def _blocker_lines(orientation: dict[str, Any]) -> list[str]:
     (`_collection_denied` in server.py), not inside `blockers.collect`, so it
     is folded in here rather than invented as a second blocker computation.
     """
-    lines: list[str] = []
+    try:
+        blockers = orientation.get("blockers") or {}
+        items = list(blockers.get("items") or [])
 
-    blockers = orientation.get("blockers") or {}
-    items = list(blockers.get("items") or [])
+        records = orientation.get("records") or {}
+        if isinstance(records, dict):
+            for logical, record in records.items():
+                if isinstance(record, dict) and "collection_denied" in str(
+                    record.get("error") or ""
+                ):
+                    items.append({
+                        "id": "collection_denied",
+                        "summary": f"'{logical}' orientation read denied: {record['error']}",
+                        "fix": "widen this app's store_scope, or ignore if intentional",
+                    })
 
-    for logical, record in (orientation.get("records") or {}).items():
-        if isinstance(record, dict) and "collection_denied" in str(record.get("error") or ""):
-            items.append({
-                "id": "collection_denied",
-                "summary": f"'{logical}' orientation read denied: {record['error']}",
-                "fix": "widen this app's store_scope, or ignore if intentional",
-            })
+        items = [item for item in items if isinstance(item, dict)]
+        if not items:
+            return []
 
-    if not items:
+        lines: list[str] = [f"[BLOCKERS] {len(items)} at seat entry:"]
+        for item in items:
+            summary = str(item.get("summary") or item.get("id") or "?")
+            fix = item.get("fix")
+            line = f"  · {summary}"
+            if fix:
+                line += f" — fix: {fix}"
+            lines.append(line)
+        return lines
+    except Exception:
         return []
-
-    lines.append(f"[BLOCKERS] {len(items)} at seat entry:")
-    for item in items:
-        summary = str(item.get("summary") or item.get("id") or "?")
-        fix = item.get("fix")
-        line = f"  · {summary}"
-        if fix:
-            line += f" — fix: {fix}"
-        lines.append(line)
-    return lines
 
 
 def _gap_lines(limit: int = MAX_BOOT_GAPS) -> list[str]:
@@ -75,20 +81,26 @@ def _gap_lines(limit: int = MAX_BOOT_GAPS) -> list[str]:
         from . import gaps as gap_backlog
 
         result = gap_backlog.list_gaps(status="open", limit=limit)
+
+        items = (result or {}).get("items") or []
+        if not items:
+            return []
+
+        lines = [f"[GAPS] top {len(items)} open (by asked_count):"]
+        for gap in items:
+            if not isinstance(gap, dict):
+                continue
+            topic = gap.get("topic", "?")
+            question = str(gap.get("question", ""))[:80]
+            asked = gap.get("asked_count", 0)
+            lines.append(f"  · [{topic}] {question} (asked {asked}×)")
+        if len(lines) == 1:
+            # Every row was malformed — degrade to no gap section rather
+            # than emitting a header with nothing under it.
+            return []
+        return lines
     except Exception:
         return []
-
-    items = (result or {}).get("items") or []
-    if not items:
-        return []
-
-    lines = [f"[GAPS] top {len(items)} open (by asked_count):"]
-    for gap in items:
-        topic = gap.get("topic", "?")
-        question = str(gap.get("question", ""))[:80]
-        asked = gap.get("asked_count", 0)
-        lines.append(f"  · [{topic}] {question} (asked {asked}×)")
-    return lines
 
 
 def build_boot_lines(
