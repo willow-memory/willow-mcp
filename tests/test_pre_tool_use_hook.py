@@ -942,6 +942,117 @@ def test_main_stays_silent_for_the_sanctioned_web_tool():
     assert stdout == ""
 
 
+# ── grant-aware native-web redirect ─────────────────────────────────────────
+#
+# check_native_web always blocks the native tool; web_net_grant_active() only
+# changes which message it names. This section pins: (1) the redirect always
+# names the willow_web_* verb; (2) when the seat provably lacks the grant, the
+# message says to ask the operator instead of implying the door is open; (3)
+# a fault in the probe degrades to "not granted" rather than crashing; (4) the
+# willow_web_* verbs themselves are never redirected onto themselves (already
+# covered above, re-asserted here for locality).
+
+def _write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+@pytest.fixture
+def granted_seat(tmp_path, monkeypatch):
+    """A seat holding all three web_net keys: manifest permission, standing
+    consent, and a live (far-future, tz-aware) lease."""
+    home = tmp_path / ".willow"
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+    monkeypatch.setenv("WILLOW_APP_ID", "ada")
+    _write_json(home / "mcp_apps" / "ada" / "manifest.json",
+                {"app_id": "ada", "permissions": ["web_net", "store_read"]})
+    _write_json(home / "settings.global.json", {"consent": {"internet": True}})
+    _write_json(home / "mcp_apps" / "_net_leases" / "ada.json",
+                {"app_id": "ada", "expires_at": "2999-01-01T00:00:00+00:00"})
+    return home
+
+
+def test_web_net_grant_active_true_when_all_three_keys_present(granted_seat):
+    assert pre_tool_use.web_net_grant_active() is True
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda home: _write_json(home / "mcp_apps" / "ada" / "manifest.json",
+                              {"app_id": "ada", "permissions": ["store_read"]}),  # no web_net
+    lambda home: _write_json(home / "settings.global.json", {"consent": {"internet": False}}),
+    lambda home: _write_json(home / "mcp_apps" / "_net_leases" / "ada.json",
+                              {"app_id": "ada", "expires_at": "2000-01-01T00:00:00+00:00"}),  # expired
+    lambda home: (home / "mcp_apps" / "_net_leases" / "ada.json").unlink(),  # no lease
+])
+def test_web_net_grant_active_false_when_any_key_missing(granted_seat, mutate):
+    mutate(granted_seat)
+    assert pre_tool_use.web_net_grant_active() is False
+
+
+def test_web_net_grant_active_false_without_app_id_or_home():
+    # The autouse fixture already clears WILLOW_APP_ID/WILLOW_HOME is untouched
+    # by it, so this pins the "can't resolve either" branch explicitly.
+    assert pre_tool_use.web_net_grant_active() is False
+
+
+def test_web_net_grant_active_fail_safe_on_probe_fault(granted_seat, monkeypatch):
+    """A fault inside the probe (e.g. a helper raising) must degrade to
+    'not granted', never propagate and crash the hook."""
+    def _boom(*a, **k):
+        raise RuntimeError("disk exploded")
+    monkeypatch.setattr(pre_tool_use, "_manifest_has_web_net", _boom)
+    assert pre_tool_use.web_net_grant_active() is False
+
+
+def test_check_native_web_names_the_verb_regardless_of_grant():
+    """Redirect always names the willow_web_* verb — granted or not."""
+    assert "willow_web_search" in pre_tool_use.check_native_web("WebSearch")[1]
+    assert "willow_web_fetch" in pre_tool_use.check_native_web("WebFetch")[1]
+
+
+def test_check_native_web_says_ask_the_operator_when_grant_absent():
+    """Default test environment holds no web_net grant (no app_id/home wired) —
+    the message must say to ask the operator, not imply willow_web_* just works."""
+    decision, reason = pre_tool_use.check_native_web("WebSearch")
+    assert decision == "block"
+    assert "ask the operator" in reason.lower()
+    decision, reason = pre_tool_use.check_native_web("WebFetch")
+    assert decision == "block"
+    assert "ask the operator" in reason.lower()
+
+
+def test_check_native_web_omits_ask_operator_when_grant_is_active(granted_seat):
+    """When the seat provably holds the grant, the message names the verb
+    without steering the seat to ask the operator for something it has."""
+    decision, reason = pre_tool_use.check_native_web("WebSearch")
+    assert decision == "block"
+    assert "ask the operator" not in reason.lower()
+    assert "willow_web_search" in reason
+    decision, reason = pre_tool_use.check_native_web("WebFetch")
+    assert decision == "block"
+    assert "ask the operator" not in reason.lower()
+    assert "willow_web_fetch" in reason
+
+
+def test_main_web_search_block_names_operator_ask_end_to_end():
+    code, stdout = _run_hook({
+        "tool_name": "WebSearch",
+        "tool_input": {"search_term": "latest news"},
+        "session_id": "s1",
+    })
+    assert code == 0
+    decision = json.loads(stdout)
+    assert decision["decision"] == "block"
+    assert "ask the operator" in decision["reason"].lower()
+
+
+def test_check_native_web_never_fires_on_the_governed_verb_itself():
+    """The governed call is never redirected onto itself, granted or not —
+    re-asserted here alongside the grant-aware tests for locality."""
+    assert pre_tool_use.check_native_web("willow_web_search") is None
+    assert pre_tool_use.check_native_web("mcp__willow-mcp__willow_web_fetch") is None
+
+
 # ── seat guard vs gate.PERMISSION_GROUPS: the drift this class of list invites ─
 #
 # The hook is stdlib-only by design — it runs inside the agent's harness, where
