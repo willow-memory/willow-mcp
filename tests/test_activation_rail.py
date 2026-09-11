@@ -412,12 +412,30 @@ def test_mcp_call_shim_send_message_posts_as_app_id_even_with_a_different_person
 def test_mcp_call_shim_still_refuses_a_genuine_third_party_sender(tmp_path, monkeypatch):
     """The FINDING 2 fix only reconciles the seat's OWN raw node name — a
     request to post as some genuinely different identity must still be
-    refused without grove_relay."""
+    refused without grove_relay.
+
+    `grove_send_message`'s shim branch checks the gate, THEN opens a
+    Postgres connection, THEN checks the sender — same order the real
+    registered `grove_send_message` MCP tool uses (see `_gate_denied` ->
+    `get_pg()` -> `_resolve_sender_checked` in `register()` above), which
+    this shim deliberately mirrors rather than diverging from. That means
+    this assertion is reachable only past a truthy `get_pg()` — patched
+    here to a dummy in-memory connection, same DB-isolation discipline
+    every other shim test in this file already follows, so the outcome
+    never depends on whether a live Postgres happens to be reachable as
+    the OS user. Without this, the test passed locally by accident (peer
+    auth trusts the dev box's own user) and failed in CI (the Postgres
+    service only knows `postgres`, not the runner's OS user, so `get_pg()`
+    itself failed auth and the shim returned `postgres_unavailable` before
+    ever reaching the sender check it exists to exercise) — a real
+    local-vs-CI parity gap, not a flake. The fake is never actually
+    queried: the sender check short-circuits before any cursor use."""
     _grant(tmp_path, monkeypatch, "hanuman", ["grove_read", "grove_write"])
     monkeypatch.setattr(
         grove_tools, "resolve_grove_sender",
         lambda app_id: "Hanuman-of-the-Forge" if app_id == "hanuman" else app_id,
     )
+    monkeypatch.setattr(grove_tools, "get_pg", lambda: _FakePg([]))
     call = grove_tools.build_mcp_call("hanuman")
     out = call("grove_send_message", {"channel_name": "willow", "content": "hi",
                                        "sender": "someone-else"})
