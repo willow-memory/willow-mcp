@@ -172,15 +172,22 @@ def _finding_text(f: dict) -> str:
 
 def _finding_evidence(f: dict) -> list[str]:
     """Evidence as a list of strings. A bare string is one item — joining it
-    with ', ' used to split it into characters in the closeout table."""
+    with ', ' used to split it into characters in the closeout table.
+
+    A whitespace-only value is empty in either shape: the list branch
+    already filtered `["   "]` out via its `str(x).strip()` check; the
+    string branch used to only reject the exact empty string, so
+    `evidence="   "` passed while `evidence=["   "]` did not. Both now use
+    the same strip-and-check test for "is there anything here" — content is
+    still returned unstripped, only the emptiness test changed."""
     raw = f.get("evidence")
-    if raw is None or raw == "":
+    if raw is None:
         return []
     if isinstance(raw, str):
-        return [raw]
+        return [raw] if raw.strip() else []
     if isinstance(raw, (list, tuple)):
         return [str(x) for x in raw if str(x).strip()]
-    return [str(raw)]
+    return [str(raw)] if str(raw).strip() else []
 
 
 def _invalid_findings(findings: list) -> list[dict]:
@@ -223,6 +230,14 @@ def _invalid_findings(findings: list) -> list[dict]:
 # uses. All three require a digit immediately adjacent (word boundary
 # enforced) so a digit-free "tests pass" still does not match.
 #
+# "pass"/"passing" only appear in the digit-THEN-word alternative below, not
+# in the word-THEN-digit one: "42 pass" and "11/11 pass." are real test
+# counts, but "pass 3 items to review" / "will pass 5 to Sean" is the verb
+# "pass" used transitively — the word-then-digit shape false-accepted those
+# as evidence (audit finding, dispatch F06C0BD0 follow-up). "N pass"/"N
+# passing" is already fully covered by the first alternative, so dropping
+# them from the second loses no real phrasing and closes the false-accept.
+#
 # Non-test changes (docs-only, config-only — no test count exists to cite):
 # the finding-`evidence` field is the documented escape hatch, not a
 # separate exemption path. A docs-only claim still names, in a finding's
@@ -250,7 +265,7 @@ def _invalid_findings(findings: list) -> list[dict]:
 _EVIDENCE_RE = re.compile(
     r"\d+\s*(?:/\s*\d+)?\s*(?:passed|passing|pass|failed|failing|errors?|"
     r"tests?|checks?|violations?)\b"
-    r"|\b(?:passed|passing|pass|failed|tests?|checks?)\s*[:=]?\s*\d+",
+    r"|\b(?:passed|failed|tests?|checks?)\s*[:=]?\s*\d+",
     re.IGNORECASE,
 )
 

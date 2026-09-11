@@ -10,6 +10,7 @@ import json
 from unittest.mock import patch
 
 from willow_mcp.handoff import (
+    _finding_evidence,
     _render_closeout,
     _utc_now,
     handoff_read,
@@ -492,6 +493,61 @@ def test_verify_still_refuses_bare_pass_with_no_digit():
     })
     assert result["verified"] is False
     assert "no evidence backs it" in result["reason"]
+
+
+def test_verify_refuses_bare_verb_pass_as_evidence():
+    """Audit finding, dispatch F06C0BD0 follow-up: the word-then-digit
+    alternative used to match the transitive verb "pass" followed by any
+    unrelated number — "I'll pass 3 items to review" wrongly satisfied the
+    evidence gate. "N pass"/"N passing" (a real count) is fully covered by
+    the digit-then-word alternative and must still work; only the
+    word-then-digit reading of bare "pass" is dropped."""
+    for narrative in [
+        "I'll pass 3 items to review.",
+        "Please pass 2 messages along.",
+        "will pass 5 to Sean",
+        "pass 1 note to the builder",
+    ]:
+        result = _verify({
+            "checklist_resolved": True,
+            "envelope_clean": True,
+            "findings": [{"id": "F1", "text": "Found something"}],
+            "narrative": narrative,
+        })
+        assert result["verified"] is False, f"wrongly accepted: {narrative!r}"
+        assert "no evidence backs it" in result["reason"]
+
+    for narrative in ["42 pass.", "3402/3402 passing."]:
+        result = _verify({
+            "checklist_resolved": True,
+            "envelope_clean": True,
+            "findings": [{"id": "F1", "text": "Found something"}],
+            "narrative": narrative,
+        })
+        assert result["verified"] is True, f"wrongly refused: {narrative!r}"
+
+
+def test_finding_evidence_treats_whitespace_only_string_as_empty():
+    """evidence="   " (a whitespace-only string) used to pass while
+    evidence=["   "] was correctly filtered out — both shapes now use the
+    same strip-and-check emptiness test."""
+    assert _finding_evidence({"evidence": "   "}) == []
+    assert _finding_evidence({"evidence": ["   "]}) == []
+    assert _finding_evidence({"evidence": ["  ", "real.py:1"]}) == ["real.py:1"]
+    assert _finding_evidence({"evidence": "file.py:1"}) == ["file.py:1"]
+
+
+def test_verify_refuses_complete_claim_with_only_whitespace_evidence():
+    """A finding whose evidence is whitespace-only must not satisfy the
+    completion-evidence gate in either shape."""
+    for evidence in ["   ", ["   "]]:
+        result = _verify({
+            "checklist_resolved": True,
+            "envelope_clean": True,
+            "findings": [{"id": "F1", "text": "Found something", "evidence": evidence}],
+            "narrative": "Done.",
+        })
+        assert result["verified"] is False, f"wrongly accepted evidence={evidence!r}"
 
 
 def test_verify_passes_docs_only_claim_via_finding_evidence():
