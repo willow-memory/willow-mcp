@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -171,15 +172,22 @@ def _finding_text(f: dict) -> str:
 
 def _finding_evidence(f: dict) -> list[str]:
     """Evidence as a list of strings. A bare string is one item — joining it
-    with ', ' used to split it into characters in the closeout table."""
+    with ', ' used to split it into characters in the closeout table.
+
+    A whitespace-only value is empty in either shape: the list branch
+    already filtered `["   "]` out via its `str(x).strip()` check; the
+    string branch used to only reject the exact empty string, so
+    `evidence="   "` passed while `evidence=["   "]` did not. Both now use
+    the same strip-and-check test for "is there anything here" — content is
+    still returned unstripped, only the emptiness test changed."""
     raw = f.get("evidence")
-    if raw is None or raw == "":
+    if raw is None:
         return []
     if isinstance(raw, str):
-        return [raw]
+        return [raw] if raw.strip() else []
     if isinstance(raw, (list, tuple)):
         return [str(x) for x in raw if str(x).strip()]
-    return [str(raw)]
+    return [str(raw)] if str(raw).strip() else []
 
 
 def _invalid_findings(findings: list) -> list[dict]:
@@ -192,6 +200,103 @@ def _invalid_findings(findings: list) -> list[dict]:
         elif not _finding_text(f):
             bad.append({"index": i, "keys": sorted(f.keys())})
     return bad
+
+
+# Pre-handoff verify (wave-2 hook, dispatch F06C0BD0): a handoff can declare
+# checklist_resolved=True — "I'm done, tests pass" — without carrying anything
+# that makes the claim checkable. verify_handoff already refuses on
+# malformed findings (_invalid_findings above); this closes the sibling gap
+# for the completion claim itself. It is the dispatch-handoff analogue of the
+# Stop-hook green-claim gate (hooks/stop_lint_gate.py): that hook actually
+# re-runs ruff rather than trusting "lint is clean" in a session's own words.
+# There is no equivalent generic command to re-run here (every dispatch's
+# test suite differs), so the check instead requires the claim to be
+# *checkable*: a number tied to a test/check word ("42 passed", "301
+# passing", "938 passed, 0 failed", "11/11 pass", "0 violations"), or a
+# finding that already carries its own `evidence` (the per-finding field
+# _finding_evidence reads). A bare assertion ("tests pass", "all done")
+# satisfies neither and is refused by name — this never fabricates the
+# missing evidence or auto-passes, it only names what's absent so the
+# specialist supplies it.
+#
+# Wordlist: grepped this repo's own docs/handoffs for how the fleet actually
+# phrases a count (docs/BUGS.md "301 passing", docs/design/mcp-sdk-2-
+# migration.md "1497 passed, 43 skipped, 8 xfailed", docs/design/guardian-
+# consent-seam.md "25 passing"/"19 passing"/"9 passing", tests/
+# test_calendar_source_gcal.py "11/11 pass.", docs/repatriation/
+# THE_COLLABORATION.md "938 passed, 0 failed.") — present-tense "passing" and
+# the bare verb "pass" are as common as "passed" and were missing from the
+# first cut, which wrongly refused ordinary phrasing this fleet already
+# uses. All three require a digit immediately adjacent (word boundary
+# enforced) so a digit-free "tests pass" still does not match.
+#
+# "pass"/"passing" only appear in the digit-THEN-word alternative below, not
+# in the word-THEN-digit one: "42 pass" and "11/11 pass." are real test
+# counts, but "pass 3 items to review" / "will pass 5 to Sean" is the verb
+# "pass" used transitively — the word-then-digit shape false-accepted those
+# as evidence (audit finding, dispatch F06C0BD0 follow-up). "N pass"/"N
+# passing" is already fully covered by the first alternative, so dropping
+# them from the second loses no real phrasing and closes the false-accept.
+#
+# Non-test changes (docs-only, config-only — no test count exists to cite):
+# the finding-`evidence` field is the documented escape hatch, not a
+# separate exemption path. A docs-only claim still names, in a finding's
+# `evidence`, what was actually checked (e.g. "diff reviewed: docs/README.md
+# +12/-3, no src/ touched") — sniffing "this is docs-only" out of free-text
+# narrative would let a specialist claim the exemption in prose with nothing
+# behind it, which is exactly the unbacked-claim failure mode this hook
+# exists to catch. One structured path (narrative count OR finding
+# evidence), not two, keeps the gate from being talked around.
+#
+# Deliberately does NOT fire when checklist_resolved is False: an honest
+# blocker/partial report is a valid handoff, not a claim, and carries no
+# obligation to show test evidence for work it says it did not finish.
+#
+# Shape, not truth: this matches a digit adjacent to a test/check word — it
+# cannot tell "42 passed" (a real run) from "added 5 tests" (a plan) or a
+# fabricated number. Actually running the claim would need a fixed test
+# command, and there isn't one that's valid across every dispatch's repo and
+# language (unlike the Stop-hook's ruff, which is one fixed tool this repo
+# declares). Left as a documented shape check, matching the rest of
+# verify_handoff (which also checks findings are dict-shaped, not that they
+# are true) and the "deterministic, no model cost" constraint — tightening
+# it into a truth check is future work if a fleet-wide reporting convention
+# to hook into ever exists.
+_EVIDENCE_RE = re.compile(
+    r"\d+\s*(?:/\s*\d+)?\s*(?:passed|passing|pass|failed|failing|errors?|"
+    r"tests?|checks?|violations?)\b"
+    r"|\b(?:passed|failed|tests?|checks?)\s*[:=]?\s*\d+",
+    re.IGNORECASE,
+)
+
+
+def _narrative_has_test_evidence(narrative: str) -> bool:
+    """True when the narrative ties a number to a test/check word — "42
+    passed", "301 passing", "11/11 pass", "0 violations". A word alone
+    ("tests pass", "green", "done") is an assertion, not a count, and does
+    not match."""
+    return bool(narrative) and bool(_EVIDENCE_RE.search(narrative))
+
+
+def _findings_carry_evidence(findings: list) -> bool:
+    """True when at least one finding supplies its own `evidence` field
+    (the same field _finding_evidence renders into the closeout table).
+    This is the documented path for a completion claim with no test count
+    to cite — a docs-only or config-only change names what it checked here
+    instead of the narrative needing a fabricated number."""
+    for f in findings:
+        if isinstance(f, dict) and _finding_evidence(f):
+            return True
+    return False
+
+
+def _has_completion_evidence(handoff: dict) -> bool:
+    """The gate for a checklist_resolved=True claim: some checkable backing
+    exists somewhere in the handoff, either a counted result in the
+    narrative or evidence attached to a finding."""
+    narrative = handoff.get("narrative") or ""
+    findings = handoff.get("findings") or []
+    return _narrative_has_test_evidence(narrative) or _findings_carry_evidence(findings)
 
 
 def verify_handoff(dispatch_id: str) -> dict:
@@ -221,6 +326,13 @@ def verify_handoff(dispatch_id: str) -> dict:
             f"{len(invalid)} finding(s) carry no statement under any of "
             f"{'/'.join(_FINDING_TEXT_KEYS)}: indexes "
             f"{', '.join(str(b['index']) for b in invalid)}"
+        )
+    if checklist and not _has_completion_evidence(handoff):
+        reasons.append(
+            "checklist_resolved claims completion but no evidence backs it: "
+            "narrative carries no counted test/check result (e.g. '42 "
+            "passed', '0 violations') and no finding carries an `evidence` "
+            "field — a bare assertion is not evidence"
         )
     verified = not reasons
 
