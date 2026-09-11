@@ -942,6 +942,77 @@ def test_main_stays_silent_for_the_sanctioned_web_tool():
     assert stdout == ""
 
 
+# ── grant-aware native-web redirect, without a second reader of grant state ──
+#
+# An earlier revision probed WILLOW_HOME directly to decide whether to name
+# willow_web_* outright or say "ask the operator" instead. Cross-model audit
+# found that probe was a split-brain: it read the wrong consent path (not the
+# canonical config/settings.global.json the real gate prefers, and not
+# WILLOW_SETTINGS_GLOBAL), skipped ttl_seconds validation on the lease, didn't
+# deny on a corrupt canonical consent file the way the real gate does, and
+# didn't know about strict_trust_root/PGP/deny_tools/WILLOW_MCP_APPS_ROOT —
+# every one of those gaps could make the probe say "granted" when
+# web_egress.egress_denial() would actually refuse. Per the fleet's standing
+# rule to eliminate split-brains rather than keep re-syncing two copies of one
+# state, check_native_web no longer probes grant state at all: the message is
+# unconditional, naming the willow_web_* verb AND noting that an ungranted
+# seat should ask the operator, regardless of ambient environment. These tests
+# pin that: (1) the redirect always names the verb; (2) it always includes the
+# ask-the-operator note, independent of any WILLOW_HOME/WILLOW_APP_ID state;
+# (3) willow_web_* is never redirected onto itself.
+
+
+def test_check_native_web_names_the_verb_and_asks_the_operator():
+    """The redirect names the willow_web_* verb AND tells an ungranted seat to
+    ask the operator, in a single unconditional message — no probe, so no
+    ambient env can change whether the ask-the-operator note appears."""
+    decision, reason = pre_tool_use.check_native_web("WebSearch")
+    assert decision == "block"
+    assert "willow_web_search" in reason
+    assert "ask the operator" in reason.lower()
+    decision, reason = pre_tool_use.check_native_web("WebFetch")
+    assert decision == "block"
+    assert "willow_web_fetch" in reason
+    assert "ask the operator" in reason.lower()
+
+
+@pytest.mark.parametrize("env", [
+    {},
+    {"WILLOW_HOME": "/tmp/does-not-exist-anywhere", "WILLOW_APP_ID": "ada"},
+])
+def test_check_native_web_wording_is_independent_of_ambient_env(env, monkeypatch):
+    """No grant probe means no ambient WILLOW_HOME/WILLOW_APP_ID state can
+    change the message — pinned against the exact split-brain the audit found
+    (a probe reading stale/wrong files and claiming 'granted')."""
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    for tool_name, verb in (("WebSearch", "willow_web_search"), ("WebFetch", "willow_web_fetch")):
+        decision, reason = pre_tool_use.check_native_web(tool_name)
+        assert decision == "block"
+        assert verb in reason
+        assert "ask the operator" in reason.lower()
+
+
+def test_main_web_search_block_names_verb_and_operator_ask_end_to_end():
+    code, stdout = _run_hook({
+        "tool_name": "WebSearch",
+        "tool_input": {"search_term": "latest news"},
+        "session_id": "s1",
+    })
+    assert code == 0
+    decision = json.loads(stdout)
+    assert decision["decision"] == "block"
+    assert "willow_web_search" in decision["reason"]
+    assert "ask the operator" in decision["reason"].lower()
+
+
+def test_check_native_web_never_fires_on_the_governed_verb_itself():
+    """The governed call is never redirected onto itself — re-asserted here
+    alongside the grant-aware wording tests for locality."""
+    assert pre_tool_use.check_native_web("willow_web_search") is None
+    assert pre_tool_use.check_native_web("mcp__willow-mcp__willow_web_fetch") is None
+
+
 # ── seat guard vs gate.PERMISSION_GROUPS: the drift this class of list invites ─
 #
 # The hook is stdlib-only by design — it runs inside the agent's harness, where
