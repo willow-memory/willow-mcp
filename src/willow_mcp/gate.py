@@ -869,6 +869,54 @@ def permitted(app_id: str, tool_name: str) -> bool:
     return True
 
 
+def visible_tools(
+    app_id: str, tool_gate_names: dict[str, str]
+) -> tuple[list[str], list[str]]:
+    """`(tools_allowed, name_gated_orphans)` for `app_id`, derived by asking
+    `permitted()` — the exact predicate `_guarded` enforces — about every
+    registered tool, instead of re-deriving a set from `PERMISSION_GROUPS`.
+
+    `tool_gate_names` maps each registered MCP tool name to the literal name
+    the gate actually checks for it — the string a caller of `_guarded()`
+    passed. For nearly every tool these are identical (`store_get` is gated
+    as `store_get`). They diverge when a tool is gated as a stand-in for a
+    different capability: `git_push_execute` is gated as `envelope_apply`
+    (pushing is an envelope-apply act, not its own capability line), so its
+    entry here reads `{"git_push_execute": "envelope_apply"}`. Building
+    `tools_allowed` by calling `permitted(app_id, gate_name)` for each
+    registered name — rather than expanding `PERMISSION_GROUPS` and
+    subtracting `deny_tools` a second time — is what makes this listing
+    unable to disagree with enforcement: whoever calls this asks the exact
+    question `_guarded` asks, over the exact catalogue that's registered.
+
+    `name_gated_orphans` names every tool in `tools_allowed` whose registered
+    name is not itself a member of any `PERMISSION_GROUPS` entry — a tool
+    reachable only because *some other* name's grant happens to also gate it
+    (the `git_push_execute`/`envelope_apply` case above). Before this
+    function existed, the old group-expansion derivation could never surface
+    such a tool at all: `git_push_execute` is not a member of any group, so
+    it never appeared in `tools_allowed`, even though `permitted()` admitted
+    it. Listing it here — in its own section, not silently folded into
+    `tools_allowed` unlabeled — makes that drift visible instead of hiding
+    it a second time under a different derivation. Membership here does not
+    change what is granted; every orphan is already included in
+    `tools_allowed` too.
+    """
+    all_named_in_groups: set = {
+        name for group in PERMISSION_GROUPS.values() for name in group
+    }
+    allowed: list[str] = []
+    orphans: list[str] = []
+    for registered_name in sorted(tool_gate_names):
+        gate_name = tool_gate_names[registered_name]
+        if not permitted(app_id, gate_name):
+            continue
+        allowed.append(registered_name)
+        if registered_name not in all_named_in_groups:
+            orphans.append(registered_name)
+    return allowed, orphans
+
+
 def grove_relay_permitted(app_id: str) -> bool:
     """True only if `app_id`'s manifest explicitly lists the `grove_relay`
     capability (`GROVE_RELAY_PERMISSION`) in its "permissions" — the flag
