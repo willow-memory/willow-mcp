@@ -17,8 +17,12 @@ with a correctly-predicated watcher — that workaround is gone.
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import os
+import signal
+import sys
+import threading
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -28,11 +32,12 @@ from . import seal_handler
 logger = logging.getLogger(__name__)
 
 try:
-    from ratatosk.daemon import SeatDaemon
+    from ratatosk.daemon import SeatDaemon, JsonlTailWatcher
     RATATOSK_AVAILABLE = True
     _IMPORT_ERROR: Optional[BaseException] = None
 except ImportError as exc:  # pragma: no cover - exercised via the guard test
     SeatDaemon = None  # type: ignore[assignment,misc]
+    JsonlTailWatcher = None  # type: ignore[assignment,misc]
     RATATOSK_AVAILABLE = False
     _IMPORT_ERROR = exc
 
@@ -140,3 +145,102 @@ def build_seal_daemon(
         seal_predicate=seal_predicate,
         **daemon_kwargs,
     )
+
+
+def run_seal_watch_forever(
+    *,
+    ledger_path: Optional[Path] = None,
+    offset_path: Optional[Path] = None,
+    poll_interval: float = 2.0,
+    on_status: Optional[Callable[[str], None]] = None,
+    stop: Optional[threading.Event] = None,
+) -> None:
+    """Run the seal watch alone, with NO Grove bus involved.
+
+    This is the seal-watch-only deployment path: it builds a bare
+    ``JsonlTailWatcher`` directly (no ``SeatDaemon``, no ``BusListener``, no
+    Grove ``channel``/``mcp_call``) and polls it in a stoppable loop. Use
+    this to run the seal watcher as a standalone systemd service on a box
+    that has no Grove activation rail wired up — that wiring
+    (``build_seal_daemon`` / ``SeatDaemon``) is a separate, unbuilt
+    follow-on and is untouched by this function.
+
+    ``stop`` is a ``threading.Event``; one is created if not supplied. A
+    caller that wants to stop this loop from another thread (or a signal
+    handler, via ``main`` below) calls ``stop.set()`` — the loop exits at
+    the next ``stop.wait(poll_interval)`` wake, same shape as
+    ``SeatDaemon.run_forever``.
+
+    Each ``watcher.poll()`` call is individually guarded: an exception is
+    logged with ``exc_info`` (and, if present, reported through
+    ``on_status``) but never allowed to kill the loop — a permanently
+    failing record surfaces on every poll rather than silently wedging the
+    watch forever.
+    """
+    if not RATATOSK_AVAILABLE:
+        raise ImportError(
+            "willow-ratatosk is not installed, or predates 1.7.0's "
+            "SeatDaemon(seal_predicate=...) parameter. Install "
+            "willow-ratatosk>=1.7.0 before running the seal watch."
+        ) from _IMPORT_ERROR
+
+    ledger = Path(ledger_path) if ledger_path is not None else default_ledger_path()
+    offset = Path(offset_path) if offset_path is not None else default_offset_path()
+    _seed_offset_at_eof_if_absent(ledger, offset)
+
+    if stop is None:
+        stop = threading.Event()
+
+    watcher = JsonlTailWatcher(
+        ledger_path=str(ledger),
+        op_predicate=seal_predicate,
+        callback=seal_handler.on_seal,
+        offset_store_path=str(offset),
+    )
+
+    if on_status:
+        on_status(f"watching {ledger} as seal-watch")
+
+    while not stop.is_set():
+        try:
+            watcher.poll()
+        except Exception as exc:  # noqa: BLE001 - never let one bad poll kill the watch
+            logger.error("seal watch: poll failed", exc_info=True)
+            if on_status:
+                on_status(f"seal watch error: {exc}")
+        stop.wait(poll_interval)
+
+    if on_status:
+        on_status("stopped")
+
+
+def main(argv: Optional[list] = None) -> None:
+    """Console entrypoint: `python -m willow_mcp.seal_daemon`.
+
+    Runs ONLY the seal watch — no Grove bus, no channel, no mcp_call. SIGTERM
+    and SIGINT both set the stop event so a process manager (systemd) can
+    stop this cleanly.
+    """
+    parser = argparse.ArgumentParser(
+        prog="willow-mcp-seal-watch",
+        description=(
+            "Run the willow-mcp seal watch as a standalone service "
+            "(no Grove bus required)."
+        ),
+    )
+    parser.add_argument("--poll-interval", type=float, default=2.0)
+    args = parser.parse_args(argv)
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+
+    run_seal_watch_forever(
+        poll_interval=args.poll_interval,
+        on_status=print,
+        stop=stop,
+    )
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

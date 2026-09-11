@@ -21,9 +21,13 @@ against actual constructor behavior, not a stand-in for it.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from willow_mcp import seal_daemon
+from willow_mcp import seal_handler
 
 
 # --- predicate correctness -------------------------------------------------
@@ -172,3 +176,127 @@ def test_build_seal_daemon_binds_on_seal_from_seal_handler(tmp_path):
 
     from willow_mcp import seal_handler
     assert daemon.seal_watcher.callback is seal_handler.on_seal
+
+
+# --- run_seal_watch_forever: the seal-watch-only (no Grove bus) path -------
+
+def test_run_seal_watch_forever_fires_on_seal_once_for_a_new_seal(tmp_path, monkeypatch):
+    """A NEW seal appended to the ledger fires seal_handler.on_seal exactly
+    once, and setting `stop` exits the loop promptly — no SeatDaemon, no
+    BusListener, no Grove channel anywhere in this path."""
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("", encoding="utf-8")
+    offset = tmp_path / "offset"
+
+    stop = threading.Event()
+    ready = threading.Event()
+    seen = []
+
+    def record_and_stop(record):
+        seen.append(record)
+        stop.set()
+
+    monkeypatch.setattr(seal_handler, "on_seal", record_and_stop)
+
+    thread = threading.Thread(
+        target=seal_daemon.run_seal_watch_forever,
+        kwargs=dict(
+            ledger_path=ledger,
+            offset_path=offset,
+            poll_interval=0.05,
+            stop=stop,
+            on_status=lambda _msg: ready.set(),
+        ),
+        daemon=True,
+    )
+    thread.start()
+    # Wait for the "watching ..." status (fired once, after EOF-seeding and
+    # before the watcher is built) so the ledger is still empty when the
+    # offset gets seeded — otherwise this seal would look pre-existing.
+    assert ready.wait(timeout=5)
+
+    with open(ledger, "a", encoding="utf-8") as fh:
+        fh.write('{"kind": "seal", "pair_id": "p1", "source_lang": "decision"}\n')
+
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert seen == [{"kind": "seal", "pair_id": "p1", "source_lang": "decision"}]
+
+
+def test_run_seal_watch_forever_eof_seeds_and_skips_preexisting_seals(tmp_path, monkeypatch):
+    """A pre-populated ledger with no offset file seeds at EOF: the
+    pre-existing seals never fire, only a seal appended afterward does."""
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text(
+        '{"kind": "seal", "pair_id": "old-1", "source_lang": "decision"}\n'
+        '{"kind": "seal", "pair_id": "old-2", "source_lang": "decision"}\n',
+        encoding="utf-8",
+    )
+    offset = tmp_path / "offset"
+    assert not offset.exists()
+
+    seen = []
+    monkeypatch.setattr(seal_handler, "on_seal", lambda record: seen.append(record))
+
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=seal_daemon.run_seal_watch_forever,
+        kwargs=dict(
+            ledger_path=ledger,
+            offset_path=offset,
+            poll_interval=0.05,
+            stop=stop,
+        ),
+        daemon=True,
+    )
+    thread.start()
+    # Give the watcher a couple of poll ticks to prove the pre-existing
+    # seals do NOT fire before we append a new one.
+    time.sleep(0.2)
+    assert seen == []
+
+    with open(ledger, "a", encoding="utf-8") as fh:
+        fh.write('{"kind": "seal", "pair_id": "new-1", "source_lang": "decision"}\n')
+
+    deadline = time.monotonic() + 5
+    while not seen and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    stop.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert seen == [{"kind": "seal", "pair_id": "new-1", "source_lang": "decision"}]
+
+
+def test_run_seal_watch_forever_uses_jsonltailwatcher_directly(tmp_path, monkeypatch):
+    """No SeatDaemon, no BusListener/channel ValueError anywhere in this
+    path — asserted by making SeatDaemon itself explode if constructed."""
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("", encoding="utf-8")
+    offset = tmp_path / "offset"
+
+    def boom(*args, **kwargs):
+        raise AssertionError("SeatDaemon must not be constructed by run_seal_watch_forever")
+
+    monkeypatch.setattr(seal_daemon, "SeatDaemon", boom)
+
+    stop = threading.Event()
+    stop.set()  # exit after the first (only) loop check
+
+    # Should complete without ever touching the patched-to-explode SeatDaemon.
+    seal_daemon.run_seal_watch_forever(
+        ledger_path=ledger,
+        offset_path=offset,
+        poll_interval=0.01,
+        stop=stop,
+    )
+
+
+def test_run_seal_watch_forever_raises_clear_importerror_when_ratatosk_absent(monkeypatch):
+    monkeypatch.setattr(seal_daemon, "RATATOSK_AVAILABLE", False)
+    monkeypatch.setattr(seal_daemon, "JsonlTailWatcher", None)
+
+    with pytest.raises(ImportError, match="willow-ratatosk"):
+        seal_daemon.run_seal_watch_forever(stop=threading.Event())

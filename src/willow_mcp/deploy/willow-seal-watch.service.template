@@ -1,0 +1,43 @@
+# systemd --user unit template for the willow-mcp seal-watch-only daemon.
+#
+# Not used directly — fill in the {{PLACEHOLDERS}} before installing, e.g.:
+#
+#   sed -e "s#{{WILLOW_MCP_PYTHON}}#$(pwd)/.venv/bin/python#g" \
+#       -e "s#{{WILLOW_HOME}}#$HOME/sean-data-vault/willow-operator-box#g" \
+#       -e "s#{{WILLOW_STORE_ROOT}}#$HOME/sean-data-vault/willow-operator-box/store#g" \
+#       -e "s#{{NESTOR_DB}}#$HOME/sean-data-vault/willow-operator-box/nestor.db#g" \
+#       deploy/willow-seal-watch.service.template \
+#       > ~/.config/systemd/user/willow-seal-watch.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now willow-seal-watch
+#
+# This runs ONLY the seal watch (`python -m willow_mcp.seal_daemon`) — the
+# bare ratatosk.daemon.JsonlTailWatcher wired to seal_handler.on_seal, with
+# NO Grove bus, channel, or mcp_call involved. That is a deliberate scope
+# limit: `build_seal_daemon`'s SeatDaemon (which DOES require a live Grove
+# channel) is the separate, unbuilt "dispatch-posts-a-wake" activation-rail
+# path and is not what this unit runs.
+#
+# Deploy note: this unit is meant to run against the OPERATOR-BOX venv,
+# WILLOW_HOME, WILLOW_STORE_ROOT, and Nestor ledger/db — not a worktree or a
+# developer checkout. {{WILLOW_MCP_PYTHON}} should resolve to the operator
+# box's installed willow-mcp venv interpreter, and the WILLOW_HOME/
+# WILLOW_STORE_ROOT/NESTOR_DB values below should point at that same box's
+# real ledger and store, so the watch it runs sees the seals that actually
+# land there.
+[Unit]
+Description=willow-mcp seal watch (standalone, no Grove bus)
+After=network.target
+
+[Service]
+Type=simple
+Environment=WILLOW_HOME={{WILLOW_HOME}}
+Environment=WILLOW_STORE_ROOT={{WILLOW_STORE_ROOT}}
+Environment=NESTOR_DB={{NESTOR_DB}}
+Environment=WILLOW_APP_ID=willow
+ExecStart={{WILLOW_MCP_PYTHON}} -m willow_mcp.seal_daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
