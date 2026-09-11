@@ -10,7 +10,7 @@ import json
 from willow_mcp import session_stop_hook as hook
 from willow_mcp.db import Store
 from willow_mcp.friction import FrictionWatcher
-from willow_mcp.session_friction_scan import scan_session_for_friction
+from willow_mcp.session_friction_scan import _read_transcript_turns, scan_session_for_friction
 
 # Same fixture willow_mcp's own friction watcher tests use: the agent echoes
 # the user back, smoothed, while the user escalates — the failure mode the
@@ -189,6 +189,102 @@ def test_tool_grounded_agent_trips_but_flag_is_annotated(tmp_path):
     listed = FrictionWatcher(store).list_flags()
     assert len(listed) == 1
     assert len(listed[0]["tool_active_turns"]) == 4
+
+
+def test_prose_less_tool_use_does_not_stamp_preceding_unrelated_turn(tmp_path):
+    """Regression for gap 0651900d3ea5: an assistant message that carries a
+    `tool_use` block but NO `text` block is correctly dropped from scoring
+    (it never becomes a turn) — but its `tool_result` relay must not then
+    fold `tool_active=True` onto whatever agent turn happens to be last in
+    `turns`. That turn (turn A below) never issued this tool_use at all; the
+    turn that actually did (the prose-less one) was dropped, so nothing
+    should be stamped."""
+    path = tmp_path / "prose_less.jsonl"
+    lines = [
+        json.dumps({"type": "user", "message": {"role": "user", "content": "go"}}),
+        # Turn A: a genuine prose turn with NO tool_use of its own.
+        json.dumps({"type": "assistant",
+                    "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": "turn A: unrelated prose"}]}}),
+        # A later, separate assistant message: tool_use only, no text — this
+        # is the one that ACTUALLY issued the tool, but it is prose-less so
+        # it is dropped from scoring entirely.
+        json.dumps({"type": "assistant",
+                    "message": {"role": "assistant",
+                                "content": [{"type": "tool_use", "name": "Bash", "input": {}}]}}),
+        # Its tool_result relay — must NOT fold onto turn A.
+        json.dumps({"type": "user",
+                    "message": {"role": "user",
+                                "content": [{"type": "tool_result",
+                                             "content": [{"type": "text", "text": "ok"}]}]}}),
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    turns = _read_transcript_turns(str(path))
+    agent_turns = [t for t in turns if t["role"] == "agent"]
+    assert len(agent_turns) == 1
+    assert agent_turns[0]["text"] == "turn A: unrelated prose"
+    assert agent_turns[0]["tool_active"] is False
+
+
+def test_genuine_tool_issuing_turn_is_annotated_correctly(tmp_path):
+    """The turn that actually carries the `tool_use` block (with prose in the
+    same message) is still annotated `tool_active=True`, and the follow-on
+    `tool_result` relay folds onto that SAME turn — the fix must not disturb
+    the case that already worked."""
+    path = tmp_path / "genuine.jsonl"
+    lines = [
+        json.dumps({"type": "user", "message": {"role": "user", "content": "go"}}),
+        json.dumps({"type": "assistant",
+                    "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": "running the test now"},
+                                            {"type": "tool_use", "name": "Bash", "input": {}}]}}),
+        json.dumps({"type": "user",
+                    "message": {"role": "user",
+                                "content": [{"type": "tool_result",
+                                             "content": [{"type": "text", "text": "3 passed"}]}]}}),
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    turns = _read_transcript_turns(str(path))
+    agent_turns = [t for t in turns if t["role"] == "agent"]
+    assert len(agent_turns) == 1
+    assert agent_turns[0]["text"] == "running the test now"
+    assert agent_turns[0]["tool_active"] is True
+
+
+def test_trip_decision_byte_identical_with_and_without_tool_active_annotation(tmp_path):
+    """The invariant this whole module rests on: tool_active is strictly
+    post-decision. Scanning the SAME MIRROR episode once with every agent
+    turn annotated tool_active=True and once with the annotation stripped
+    entirely must produce byte-identical trip decisions — same tripped,
+    same mean_friction, same escalation, same streak/at_turn/low_turns/
+    message for every flag. Only `tool_active_turns` may differ."""
+    store_with = Store(store_root=str(tmp_path / "store_with"))
+    store_without = Store(store_root=str(tmp_path / "store_without"))
+
+    turns_with = [dict(t, tool_active=(t["role"] == "agent")) for t in MIRROR]
+    turns_without = [dict(t) for t in MIRROR]  # no "tool_active" key at all
+
+    result_with = FrictionWatcher(store_with).scan(turns_with, session_id="sess-annotated")
+    result_without = FrictionWatcher(store_without).scan(turns_without, session_id="sess-bare")
+
+    assert result_with["tripped"] == result_without["tripped"] is True
+    assert result_with["agent_turns"] == result_without["agent_turns"]
+    assert result_with["scanned_turns"] == result_without["scanned_turns"]
+    assert len(result_with["flags"]) == len(result_without["flags"]) == 1
+
+    flag_with = dict(result_with["flags"][0])
+    flag_without = dict(result_without["flags"][0])
+    flag_with.pop("tool_active_turns")
+    flag_without.pop("tool_active_turns")
+    flag_with.pop("session_id")
+    flag_without.pop("session_id")
+    assert flag_with == flag_without
+
+    # And the annotation itself is exactly what each input asked for.
+    assert result_with["flags"][0]["tool_active_turns"] != []
+    assert result_without["flags"][0]["tool_active_turns"] == []
 
 
 def test_missing_transcript_degrades_without_raising(tmp_path):
