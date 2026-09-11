@@ -1196,9 +1196,84 @@ def test_guarded_invocation_at_command_position_is_still_refused(command):
     assert pre_tool_use.check_bash_self_grant(command) is not None
 
 
-def test_heredoc_body_with_a_guarded_word_does_not_trigger_but_a_real_command_does():
-    """A guarded verb inside a heredoc body is document text, not an invocation;
-    the same verb run as a command still is."""
-    heredoc = "cat <<'EOF'\nwillow-mcp grant-net willow --ttl 3h\nEOF"
-    assert pre_tool_use.check_bash_self_grant(heredoc) is None
-    assert pre_tool_use.check_bash_self_grant("willow-mcp grant-net willow --ttl 3h") is not None
+# ── fail-closed carve-out regression lock (audit 2AA60817) ──────────────────
+#
+# The shape-checking parser above (command-position-only matching) is exactly
+# what let a real grant invocation through when it reached the guard by any
+# shape OTHER than a bare command-position word — cross-model audit 2AA60817.
+# The operator ruled: restore the raw substring scan as the primary denier and
+# use parsing ONLY to suppress the two measured false positives above. Every
+# case below must DENY — each pins one bypass vector the old parser missed.
+
+
+@pytest.mark.parametrize("command", [
+    "ls\nwillow-mcp grant-net loki",
+], ids=["newline_separated"])
+def test_newline_separated_grant_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "bash <<'EOF'\nwillow-mcp grant-net loki\nEOF",
+    "python <<'EOF'\nfrom willow_mcp import lease\nlease.grant('loki', 60)\nEOF",
+    "cat <<EOF | bash\nwillow-mcp grant-net loki\nEOF",
+], ids=["bash_heredoc", "python_heredoc", "cat_heredoc_piped_to_bash"])
+def test_executed_heredoc_grant_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+@pytest.mark.parametrize("command", [
+    'echo "$(willow-mcp grant-net loki)"',
+    "echo `willow-mcp grant-net loki`",
+], ids=["dollar_paren_subst", "backtick_subst"])
+def test_command_substitution_grant_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+def test_subshell_grant_is_denied():
+    assert pre_tool_use.check_bash_self_grant("(willow-mcp grant-net loki)") is not None
+
+
+def test_group_command_grant_is_denied():
+    assert pre_tool_use.check_bash_self_grant("{ willow-mcp grant-net loki; }") is not None
+
+
+def test_leading_assignment_grant_is_denied():
+    assert pre_tool_use.check_bash_self_grant("FOO=bar willow-mcp grant-net loki") is not None
+
+
+@pytest.mark.parametrize("command", [
+    "echo 'willow-mcp grant-net loki' | bash",
+    "printf 'willow-mcp grant-net loki' | sh",
+], ids=["echo_pipe_bash", "printf_pipe_sh"])
+def test_pipe_into_executor_grant_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "timeout 10 willow-mcp grant-net loki",
+    "xargs willow-mcp grant-net loki </dev/null",
+    "nohup willow-mcp grant-net loki &",
+    "setsid willow-mcp grant-net loki",
+    "doas willow-mcp grant-net loki",
+    "ssh host willow-mcp grant-net loki",
+    "uv run willow-mcp grant-net loki",
+    "uvx willow-mcp grant-net loki",
+    "poetry run willow-mcp grant-net loki",
+    "npx willow-mcp grant-net loki",
+], ids=["timeout", "xargs", "nohup", "setsid", "doas", "ssh", "uv_run", "uvx", "poetry_run", "npx"])
+def test_unstripped_wrapper_grant_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+def test_python_module_invocation_allow_permission_is_denied():
+    assert pre_tool_use.check_bash_self_grant(
+        "python -m willow_mcp allow-permission loki task_net"
+    ) is not None
+
+
+def test_task_submit_text_hiding_a_grant_is_denied():
+    """check_bash_self_grant also gates task_submit text (server.py ~:510) — a
+    grant smuggled into Kart task text must be refused exactly like Bash."""
+    tool_input = {"task": "echo setting up\nwillow-mcp grant-net loki --ttl 30m"}
+    assert pre_tool_use.check_task_submit_self_grant(tool_input) is not None

@@ -682,77 +682,66 @@ _ALLOW_PERMISSION_REASON = (
 )
 
 
-# ── shell-aware invocation parsing (gaps 3cc11d282b4a, 7ede165e5a29) ─────────
+# ── fail-closed carve-out (operator ruling, closes audit 2AA60817) ──────────
 #
-# The grant-command guards used to run their regexes against the raw command
-# string, so a grant verb *named* in prose — a commit message, a grep pattern,
-# a heredoc body, a manifest _note describing an EXCLUDED permission — read as
-# the act itself. The two measured false positives:
-#   3cc11d282b4a — a description naming an excluded permission, read as granting it.
-#   7ede165e5a29 — a pure-read command (grep/cat) refused for containing a keyword.
-# The fix is a precision fix, not a relaxation: tokenise the command with a
-# shell-aware splitter, look at the COMMAND-POSITION word of each subcommand
-# (after stripping env/sudo/nice/time wrappers), and match the grant verbs
-# only against an actual invocation — never against quoted data or a heredoc
-# body. On a parse failure or too-complex input we fall BACK to the old
-# substring scan so a hard deny still fires; we never allow on unparseable
-# input. The write-verb/path/keystore/manifest branches below are unchanged and
-# still run on the raw command, so no currently-intended refusal is lost.
-_INVOCATION_WRAPPERS = frozenset({"env", "sudo", "nice", "time", "command", "exec"})
-# Commands whose ARGUMENTS are executed code, so a grant verb inside them is a
-# real invocation, not data. Everything else (grep/cat/echo/git/sed/…) treats
-# its arguments as data.
-_CODE_EXECUTORS = frozenset({
-    "python", "python2", "python3", "bash", "sh", "zsh", "eval", "node",
-    "perl", "ruby",
+# REWORK of the shape-checking parser this replaced: that parser looked ONLY at
+# a parsed command-position invocation, which means anything that reaches the
+# grant verb WITHOUT putting it at command position — a newline-separated
+# command, an executed heredoc body, `$(...)`/backticks, a `(...)` subshell or
+# `{ ...; }` group, a leading `FOO=bar` assignment, `echo '...' | bash`, an
+# unstripped wrapper (`timeout`, `xargs`, `doas`, `ssh`, `uv run`, …), or
+# `python -m willow_mcp allow-permission ...` — slipped straight through.
+# Cross-model audit 2AA60817 confirmed a real grant invocation got through
+# every one of those shapes. The operator ruled: do not chase the exhaustive
+# parser; invert it.
+#
+# The design is now inverted:
+#   1. The raw substring scan (_GRANT_CMD_RE / _ALLOW_PERMISSION_GRANT_RE) is
+#      the PRIMARY denier again, run unconditionally against the whole raw
+#      command text — no tokenising, no heredoc stripping, no command-position
+#      requirement. A `.search()` over the raw string does not care what shape
+#      carried the verb to it, so every bypass above still trips it.
+#   2. Parsing is used ONLY to SUPPRESS that denial, and only for the two
+#      shapes actually measured as false positives:
+#        3cc11d282b4a — the verb/permission lives inside the quoted message
+#                        argument of a `git commit -m`/`-F` invocation.
+#        7ede165e5a29 — the verb/permission is an argument to a read-only
+#                        command (grep/rg/cat/less/head/tail/…), not something
+#                        that command runs.
+#      Suppression only fires when, after masking exactly those two shapes out
+#      of the command, the raw scan no longer matches at all. Anything left
+#      over — a grant elsewhere in the same command, an unrecognised shape, a
+#      parse failure — leaves the denial standing. Ambiguity denies.
+_READ_ONLY_COMMANDS = frozenset({
+    "grep", "egrep", "fgrep", "rg", "cat", "less", "more", "head", "tail",
+    "zcat", "zless", "bat",
 })
-# The willow CLI, direct. `grant-net`, `dev-net`, … are one-token subcommands;
-# `consent set/reconcile` and `roster sync` are two-token.
-_WILLOW_CLIS = frozenset({"willow-mcp", "willow_mcp"})
-_GRANT_SUBCOMMANDS = frozenset({
-    "grant-net", "dev-net", "grant-build", "sign-net-task",
-    "register-agent", "revoke-agent", "rotate-agent",
-})
-_GRANT_TWO_TOKEN = {"consent": {"set", "reconcile"}, "roster": {"sync"}}
-
-_HEREDOC_RE = re.compile(r"<<-?\s*([\"']?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# -m/-F (and their long forms) on a `git commit` invocation: the only place a
+# grant verb is data, not code, in a shape worth carving out.
+_GIT_COMMIT_MSG_ARG_RE = re.compile(
+    r"(?P<flag>-{1,2}(?:m|message|F|file)\s*=?\s*)(?P<q>[\"'])(?P<msg>.*?)(?P=q)",
+    re.DOTALL,
+)
 
 
-def _strip_heredoc_bodies(command: str) -> str:
-    """Drop heredoc bodies (`<<EOF … EOF`) so a guarded word inside one is not
-    read as an invocation. Here-strings (`<<<`) are left alone — they are a
-    single-line argument handled by ordinary quote-aware tokenisation."""
-    if "<<" not in command:
-        return command
-    out: list[str] = []
-    delimiter: Optional[str] = None
-    for line in command.split("\n"):
-        if delimiter is None:
-            out.append(line)
-            m = _HEREDOC_RE.search(line)
-            if m:
-                delimiter = m.group(2)
-        else:
-            if line.strip() == delimiter:
-                out.append(line)
-                delimiter = None
-            # else: a body line — dropped
-    return "\n".join(out)
+def _split_subcommands_with_spans(command: str) -> list[tuple[int, int]]:
+    """Split on top-level `;`, `|`, `||`, `&&`, and newlines — the same set a
+    shell treats as a command boundary — while respecting quotes, and return
+    (start, end) offsets into `command` for each subcommand span so callers
+    can rebuild the string with only specific spans altered.
 
-
-def _split_subcommands(command: str) -> list[str]:
-    """Split on `;`, `|`, `||`, `&&` while respecting quotes — so an operator
-    inside a quoted string does not start a new subcommand."""
-    parts: list[str] = []
-    buf: list[str] = []
+    Splitting is precision-only here: it decides which spans are eligible for
+    the two recognised safe shapes below. It is never used to decide whether
+    the raw scan fires — that always runs against the untouched whole string.
+    """
+    spans: list[tuple[int, int]] = []
     quote: Optional[str] = None
     i, n = 0, len(command)
+    start = 0
     while i < n:
         c = command[i]
         if quote:
-            buf.append(c)
             if c == "\\" and quote == '"' and i + 1 < n:
-                buf.append(command[i + 1])
                 i += 2
                 continue
             if c == quote:
@@ -761,100 +750,85 @@ def _split_subcommands(command: str) -> list[str]:
             continue
         if c in ("'", '"'):
             quote = c
-            buf.append(c)
-        elif c == ";":
-            parts.append("".join(buf))
-            buf = []
-        elif c == "&" and i + 1 < n and command[i + 1] == "&":
-            parts.append("".join(buf))
-            buf = []
-            i += 2
-            continue
-        elif c == "|":
-            parts.append("".join(buf))
-            buf = []
-            if i + 1 < n and command[i + 1] == "|":
-                i += 2
-                continue
-        else:
-            buf.append(c)
-        i += 1
-    parts.append("".join(buf))
-    return parts
-
-
-def _strip_wrappers(tokens: list[str]) -> list[str]:
-    """Drop leading env/sudo/nice/time wrappers (and their options / VAR=VAL
-    assignments) so the command-position word is the real command."""
-    i = 0
-    while i < len(tokens):
-        base = os.path.basename(tokens[i])
-        if base not in _INVOCATION_WRAPPERS:
-            break
-        i += 1
-        while i < len(tokens) and (
-            tokens[i].startswith("-")
-            or (base == "env" and "=" in tokens[i] and not tokens[i].startswith("/"))
-        ):
             i += 1
-    return tokens[i:]
+            continue
+        if c in ("\n", ";"):
+            spans.append((start, i))
+            i += 1
+            start = i
+            continue
+        if c == "&" and i + 1 < n and command[i + 1] == "&":
+            spans.append((start, i))
+            i += 2
+            start = i
+            continue
+        if c == "|":
+            spans.append((start, i))
+            i += 2 if (i + 1 < n and command[i + 1] == "|") else 1
+            start = i
+            continue
+        i += 1
+    spans.append((start, n))
+    return spans
 
 
-def _subcommand_self_grant(tokens: list[str]) -> Optional[str]:
-    """Return a self-grant reason if this single subcommand's command-position
-    invocation mints a grant, else None. Quoted data has already been collapsed
-    by shlex, so a grant verb only appears here as an actual command word."""
-    tokens = _strip_wrappers(tokens)
-    if not tokens:
-        return None
-    cmd = os.path.basename(tokens[0])
-    rest = tokens[1:]
-    if cmd in _WILLOW_CLIS:
-        if not rest:
-            return None
-        sub = rest[0]
-        if sub in _GRANT_SUBCOMMANDS:
-            return _SELF_GRANT_REASON
-        if sub in _GRANT_TWO_TOKEN and len(rest) >= 2 and rest[1] in _GRANT_TWO_TOKEN[sub]:
-            return _SELF_GRANT_REASON
-        if sub == "allow-permission" and len(rest) >= 3:
-            perm = rest[2]
-            if (_NET_CAP_RE.fullmatch(perm) or _SEAT_PRIV_RE.fullmatch(perm)
-                    or perm in _ALLOW_PERMISSION_SEAT_BARE):
-                return _ALLOW_PERMISSION_REASON
-        return None
-    if cmd in _CODE_EXECUTORS:
-        # The arguments are executed code (`python -c …`, `python -m willow_mcp
-        # grant-net`, `bash -c …`) — scan them the way the raw guard would.
-        code = " ".join(rest)
-        if _GRANT_CMD_RE.search(code):
-            return _SELF_GRANT_REASON
-    return None
-
-
-def _scan_invocations_for_self_grant(command: str) -> Optional[str]:
-    """Match the grant-command guards against parsed invocations, not the raw
-    string. Falls back to the raw substring scan on a parse failure so a hard
-    deny still fires (never allow on unparseable input)."""
-    stripped = _strip_heredoc_bodies(command)
+def _mask_subcommand_if_safe(sub: str) -> str:
+    """Return `sub` with a recognised safe shape's data blanked out (same
+    length, so offsets are irrelevant to the caller), or `sub` unchanged if it
+    is not recognisably one of the two carve-out shapes. Unchanged is the
+    fail-closed default — anything that doesn't parse cleanly into one of
+    these two shapes stays exactly as written, so the raw scan still sees it.
+    """
     try:
-        token_lists = [
-            shlex.split(sub) for sub in _split_subcommands(stripped) if sub.strip()
-        ]
+        tokens = shlex.split(sub)
     except ValueError:
-        # Unbalanced quotes / too complex → conservative raw scan, hard denies on.
-        if _GRANT_CMD_RE.search(command):
-            return _SELF_GRANT_REASON
-        for _m in _ALLOW_PERMISSION_GRANT_RE.finditer(command):
-            perm = _m.group(1)
-            if (_NET_CAP_RE.fullmatch(perm) or _SEAT_PRIV_RE.fullmatch(perm)
-                    or perm in _ALLOW_PERMISSION_SEAT_BARE):
-                return _ALLOW_PERMISSION_REASON
-        return None
-    for tokens in token_lists:
-        reason = _subcommand_self_grant(tokens)
-        if reason:
-            return reason
+        return sub
+    if not tokens:
+        return sub
+    head = os.path.basename(tokens[0])
+    if head in _READ_ONLY_COMMANDS:
+        # The keyword this subcommand contains, if any, is an argument the
+        # reader scans — never something it runs. Blank the whole thing.
+        return " " * len(sub)
+    if head == "git" and len(tokens) > 1 and tokens[1] == "commit":
+        # Only the quoted -m/-F message text is data; the rest of the
+        # invocation (git commit, any other flags) is left as-is.
+        return _GIT_COMMIT_MSG_ARG_RE.sub(
+            lambda m: m.group("flag") + m.group("q") + " " * len(m.group("msg")) + m.group("q"),
+            sub,
+        )
+    return sub
+
+
+def _mask_recognised_safe_shapes(command: str) -> str:
+    """Blank out exactly the two recognised false-positive shapes (git commit
+    -m/-F message text; a read-only command's arguments) subcommand by
+    subcommand, leaving everything else — including anything unrecognised —
+    untouched."""
+    pieces: list[str] = []
+    prev_end = 0
+    for start, end in _split_subcommands_with_spans(command):
+        pieces.append(command[prev_end:start])
+        pieces.append(_mask_subcommand_if_safe(command[start:end]))
+        prev_end = end
+    pieces.append(command[prev_end:])
+    return "".join(pieces)
+
+
+def _raw_self_grant_scan(command: str) -> Optional[str]:
+    """The primary denier: an unconditional substring/regex scan of the whole
+    raw command text for a grant-minting invocation. This is master's
+    pre-parser behavior, restored — it does not care what shape (newline,
+    heredoc, `$()`, backticks, subshell, group, leading assignment, pipe into
+    an executor, or an unstripped wrapper) carried the verb into the string;
+    if the verb is anywhere in the text, it fires."""
+    if _GRANT_CMD_RE.search(command):
+        return _SELF_GRANT_REASON
+    for _m in _ALLOW_PERMISSION_GRANT_RE.finditer(command):
+        perm = _m.group(1)
+        if (_NET_CAP_RE.fullmatch(perm) or _SEAT_PRIV_RE.fullmatch(perm)
+                or perm in _ALLOW_PERMISSION_SEAT_BARE):
+            return _ALLOW_PERMISSION_REASON
     return None
 
 
@@ -866,17 +840,24 @@ def check_bash_self_grant(command: str) -> Optional[str]:
     all fine — reading a key is not holding one, and giving one up is never
     escalation.
 
-    The grant-command guards match a parsed command-position invocation, so a
-    grant verb merely *named* in a commit message, a grep pattern, a heredoc
-    body, or a manifest _note is no longer read as the act itself (gaps
-    3cc11d282b4a, 7ede165e5a29). The write-verb/path/keystore/manifest branches
-    below still scan the raw command and are unchanged.
+    The grant-command guards run the raw substring scan unconditionally
+    (fail-closed carve-out, audit 2AA60817) and suppress that denial only when
+    masking out exactly the two measured false-positive shapes — a git commit
+    -m/-F message, or a read-only command's argument (gaps 3cc11d282b4a,
+    7ede165e5a29) — makes the scan stop matching entirely. Any grant text left
+    over after masking, or any shape the masker doesn't recognise, leaves the
+    denial standing. The write-verb/path/keystore/manifest branches below still
+    scan the raw command and are unchanged.
     """
     if not command:
         return None
-    invocation = _scan_invocations_for_self_grant(command)
-    if invocation:
-        return invocation
+    reason = _raw_self_grant_scan(command)
+    if reason is not None:
+        masked = _mask_recognised_safe_shapes(command)
+        if masked != command and _raw_self_grant_scan(masked) is None:
+            reason = None
+    if reason is not None:
+        return reason
     if not _WRITE_VERB_RE.search(command):
         return None
     if _LEASE_DIR_RE.search(command):
