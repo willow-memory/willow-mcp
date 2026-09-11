@@ -288,12 +288,43 @@ def check_bash_routing(command: str) -> Optional[tuple[str, str]]:
 
 _WEB_SEARCH_REDIRECT = (
     "Use willow_web_search (MCP) for open-web search — not native WebSearch. "
-    "Requires web_net + consent.internet + operator egress lease."
+    "Requires the 'web_net' manifest permission + operator consent.internet + "
+    "a live egress lease; if this seat doesn't hold one, ask the operator to "
+    "grant it (willow-mcp grant-net <app_id> --ttl 30m --reason ...) rather "
+    "than retrying the native tool."
 )
 _WEB_FETCH_REDIRECT = (
     "WebFetch is blocked — use willow_web_fetch (MCP) for guarded URL fetch "
-    "with external-guard scan. Requires web_net + consent.internet + lease."
+    "with external-guard scan. Requires the 'web_net' manifest permission + "
+    "operator consent.internet + a live egress lease; if this seat doesn't "
+    "hold one, ask the operator to grant it (willow-mcp grant-net <app_id> "
+    "--ttl 30m --reason ...) rather than retrying the native tool."
 )
+
+# ── grant-aware wording, without a second reader of grant state ────────────
+#
+# An earlier version of this redirect probed WILLOW_HOME directly (manifest
+# permission, consent file, lease file) to decide whether to name willow_web_*
+# outright or say "ask the operator" instead. Cross-model audit found that
+# probe was a split-brain in the making: it read $WILLOW_HOME/settings.global.json
+# while the real gate (consent.read_consent) prefers the canonical
+# $WILLOW_HOME/config/settings.global.json and honors WILLOW_SETTINGS_GLOBAL;
+# it didn't validate lease ttl_seconds the way lease.read_lease does; it never
+# denied on a corrupt canonical file the way the real gate does; and it didn't
+# know about the 4th key (strict_trust_root), PGP manifest verification,
+# deny_tools, or WILLOW_MCP_APPS_ROOT. Every one of those gaps could make the
+# probe say "granted" when web_egress.egress_denial() would actually refuse —
+# naming a door that then 401s, exactly the failure this guard exists to avoid.
+#
+# The fix is not a more faithful re-implementation (the hook cannot import
+# willow_mcp and runs in the agent's own harness — see the _SEAT_PRIV_RE note
+# above — so any second reader here WILL drift from the real gate again as it
+# grows PGP checks, a 5th key, etc). Per the fleet's standing rule to eliminate
+# split-brains rather than keep re-syncing two copies of one state, the redirect
+# no longer probes grant state at all: it always names willow_web_* (the
+# guidance is correct whether or not the grant is held) and always notes that
+# an ungranted seat should ask the operator rather than retry the native tool.
+# This can never claim "granted" falsely, because it never claims it at all.
 
 
 def check_native_web(tool_name: str) -> Optional[tuple[str, str]]:
@@ -309,7 +340,12 @@ def check_native_web(tool_name: str) -> Optional[tuple[str, str]]:
     sandwich-defense wrap against prompt injection in fetched content. Native
     WebFetch/WebSearch run entirely outside willow-mcp and get none of that —
     a warn would let an agent route around egress governance and SSRF
-    protection with one more tool call, not just a less-preferred one."""
+    protection with one more tool call, not just a less-preferred one.
+
+    Grant-aware without a grant probe (2026-09-11, revised): the message
+    always names the willow_web_* verb AND always tells an ungranted seat to
+    ask the operator — see the module note above for why this hook does not
+    (and should not) maintain its own reader of grant state."""
     if tool_name == "WebSearch":
         return "block", f"willow-mcp: {_WEB_SEARCH_REDIRECT}"
     if tool_name == "WebFetch":
