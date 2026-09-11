@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 121 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 122 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -1607,6 +1607,36 @@ def nestor_tool_pending(app_id: str, limit: int = 20) -> list:
     the oracle learns them. Empty when every routed intent has a sealed home."""
     from . import tool_oracle
     return tool_oracle.pending(limit=limit)
+
+
+# ── Nestor propose bridge (governance decisions -> Nestor drafts) ────────────────
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("decision_propose")
+def decision_propose(app_id: str, record_id: str, question: str = "",
+                      conclusion: str = "", rationale: str = "",
+                      origin: str = "") -> dict:
+    """Propose a recorded governance decision (a SOIL record in
+    projects_willow_governance_decisions) as a DRAFT in the vault's Nestor
+    database, so a human can seal it there and close the loop back to SOIL
+    (seal_handler.on_seal upgrades the record once that seal is ledgered).
+
+    This is a GOVERNANCE WRITE, but propose is not seal: it lands an unsigned
+    draft only — the counter-verb that ratifies it (nestor's own seal, which
+    needs a human's signing key) is deliberately out of this tool's reach.
+
+    question/conclusion/rationale/origin default from the record's
+    title/ruling/rationale (and a willow-seat-scoped origin) when left blank;
+    an explicit argument always overrides the default. Idempotent: a record
+    that already carries a nestor_pair_id is never proposed again — returns
+    the existing pair_id with status='already_linked' instead. Returns
+    {error: record_not_found} for an unknown record_id, or
+    {error: nestor_unavailable} when the optional Nestor engine isn't
+    installed. On success: {pair_id, record_id, status: 'draft'}."""
+    from . import decision_bridge
+    return decision_bridge.propose(app_id, record_id, question=question,
+                                    conclusion=conclusion, rationale=rationale,
+                                    origin=origin)
 
 
 # ── Identity binding (willow-gate seam — check-in / check-out) ───────────────────

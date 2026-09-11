@@ -92,6 +92,10 @@ TOOL_CLASS: dict[str, str] = {
     # nestor_tool_route persists a ledger passage + teach-queue entry; seal writes
     # a verified pair; pending is a pure read. (docs/design/nestor-tool-route.md)
     "nestor_tool_route": WRITE, "nestor_tool_seal": WRITE, "nestor_tool_pending": READ,
+    # decision_propose lands an unsigned draft in Nestor and stamps the SOIL
+    # record's nestor_pair_id — a write, but never a seal (docs/design/
+    # nestor-propose-bridge.md).
+    "decision_propose": WRITE,
     "context_save": WRITE, "context_expire": WRITE,
     "frank_append": WRITE,
     # nest_scan writes a local SQLite Nest DB; nest_promote writes structure-only
