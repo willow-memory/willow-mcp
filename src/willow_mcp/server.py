@@ -3248,6 +3248,70 @@ def agent_dispatch_result(
 VERB_LEVEL_ENFORCED_VERBS = frozenset({"dispatch"})
 
 
+# dispatch-EAMBIG-blocker: making the "bounds mismatch" / "multiple active
+# envelopes" refusal actionable belongs in THIS gate, not a PreToolUse guard
+# in front of dispatch_send. Two reasons, both about single-sourcing the
+# match:
+#   1. The gate already performs the one authoritative registry read that
+#      decides ambiguity (`governing_envelopes`, right above). A PreToolUse
+#      hook runs as a separate pass over the call and would have to
+#      re-implement that same verb+actor+bounds resolution against the same
+#      registry file to say anything concrete — two readers of one
+#      registry that can drift (a stale hook vs. a patched gate) is exactly
+#      the split-brain this fix is supposed to retire, not add.
+#   2. "Names the real matched envelope ids from the actual registry state"
+#      (not a canned hint) is only guaranteed by construction if the
+#      message is built from the SAME lookup that will actually run the
+#      check — i.e. inside the gate, using `governing_rows` it already
+#      holds — rather than a guard's own best-effort re-derivation.
+# A PreToolUse guard is also the wrong place to plant a machine "propose",
+# since guards run before the verb has resolved anything to name; letting
+# the verb itself return the detail keeps disambiguation entirely the
+# caller's explicit follow-up call, never a hook silently retrying for it.
+def _ambiguous_envelope_detail(rows: list) -> list:
+    """Per-envelope detail for an EAMBIG "more than one governs this verb"
+    refusal: each matched row's id plus the bound(s) that tell it apart from
+    the others (dispatch-EAMBIG-blocker — naming ids alone left the caller
+    to guess which id fit their call).
+
+    Reports only the bounds keys whose value actually differs across the
+    matched rows — the distinguishing ones — falling back to each row's
+    full bounds when every key happens to agree (e.g. two rows that differ
+    only by id/expiry) so the caller is never handed an empty distinction.
+    Built straight from the same rows `governing_envelopes` already
+    resolved for this verb+actor; it does not re-read the registry, so it
+    can never disagree with `envelope_ids` about what matched."""
+    def _bounds(row: dict) -> dict:
+        # A row's "bounds" can be present-but-null (malformed grant, not just
+        # absent) -- `.get("bounds", {})`'s default only fires when the key
+        # is missing, so a present `null` still yields `None` and blows up
+        # the next `.get(key)`. Route every read through this so a null
+        # never reaches a `.get` call.
+        b = row.get("bounds")
+        return b if isinstance(b, dict) else {}
+
+    keys: set = set()
+    for row in rows:
+        keys |= set(_bounds(row))
+    differing = {
+        key for key in keys
+        if len({json.dumps(_bounds(row).get(key), sort_keys=True)
+                for row in rows}) > 1
+    }
+    wanted = differing or keys
+    return [
+        {
+            "envelope_id": row.get("id"),
+            "bounds": {
+                key: _bounds(row)[key]
+                for key in wanted
+                if key in _bounds(row)
+            },
+        }
+        for row in rows
+    ]
+
+
 def _enveloped_verb_gate(
     app_id: str, verb: str, call_args: dict, *, project: str, session: str = "",
     envelope_id: str = "",
@@ -3301,9 +3365,10 @@ def _enveloped_verb_gate(
     #333 closes the "held a grant, cited nothing" bypass, not "the
     environment is broken in a way that predates this fix" cases."""
     try:
-        from .envelopes import governing_envelope_ids
+        from .envelopes import governing_envelopes
 
-        matches = governing_envelope_ids(verb, app_id)
+        governing_rows = governing_envelopes(verb, app_id)
+        matches = [row["id"] for row in governing_rows]
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     if not matches:
@@ -3335,11 +3400,19 @@ def _enveloped_verb_gate(
         # Two legitimate grants covering one verb is a normal registry state,
         # not a corrupt one — but the gate cannot say which would be charged,
         # and guessing would meter the wrong envelope. Name one to proceed.
+        #
+        # dispatch-EAMBIG-blocker: naming just the ids left the caller to
+        # guess which one fit their call, and (once) to revoke a perfectly
+        # valid grant while trying to fix it. `_ambiguous_envelope_detail`
+        # names the actual matched rows' distinguishing bounds too, straight
+        # from the same registry read that produced `matches` — never a
+        # generic hint, never re-derived, never auto-picked.
         return {
             "error": "EAMBIG",
             "reason": ("multiple active envelopes govern this verb for actor — "
                        "pass envelope_id to name which one to cite"),
             "envelope_ids": matches,
+            "envelopes": _ambiguous_envelope_detail(governing_rows),
         }
     pg = get_pg()
     if not pg:
@@ -3587,6 +3660,20 @@ def dispatch_send(
         envelope_id=envelope_id,
     )
     if gate_err:
+        if gate_err.get("error") == "EAMBIG" and gate_err.get("envelope_ids"):
+            # dispatch-EAMBIG-blocker: the generic gate already names which
+            # envelope ids matched (and, via `envelopes`, what distinguishes
+            # them); `dispatch_send` is the one call site that knows the
+            # concrete retry shape for ITS OWN tool signature — envelope_id
+            # plus the same `role` this call resolved. `retry` is a
+            # documentation template, not a choice: it never fills in one of
+            # `envelope_ids` for the caller, so the caller still names it.
+            gate_err = dict(gate_err)
+            gate_err["retry"] = {
+                "tool": "dispatch_send",
+                "envelope_id": "<one of envelope_ids above>",
+                "role": resolved_role,
+            }
         return gate_err
     # Envelope-accrual PR9: propagate the operator's identity onto the
     # dispatch packet so the specialist can inherit attribution. The

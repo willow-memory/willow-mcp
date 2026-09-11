@@ -303,6 +303,110 @@ def test_eambig_names_the_parameter_that_resolves_it(home, monkeypatch, tmp_path
     assert set(result["envelope_ids"]) >= {"env-dispatch-2"}
 
 
+def test_eambig_names_the_matched_envelope_ids_and_distinguishing_bounds(
+    home, monkeypatch, tmp_path
+):
+    """dispatch-EAMBIG-blocker: the ambiguous refusal now names not just which
+    envelope ids matched but what tells them apart -- their bounds -- pulled
+    from the real registry rows the gate itself just resolved, not a canned
+    hint."""
+    _write_manifest(home, "loki")
+    extra = [{
+        "id": "env-dispatch-2", "verb_id": 11, "verb": "dispatch", "grantee": "loki",
+        "bounds": {"to_agents": ["hanuman"], "task_class": ["builder"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }]
+    _set_charter(monkeypatch, tmp_path, maximum=None, extra_active=extra)
+    monkeypatch.setattr(server, "get_pg", lambda: _FakeGovernancePg())
+
+    result = server.dispatch_send("loki", "hanuman", "# One\n")
+
+    assert result.get("error") == "EAMBIG"
+    detail = {row["envelope_id"]: row["bounds"] for row in result["envelopes"]}
+    assert set(detail) == {"env-dispatch-1", "env-dispatch-2"}
+    # task_class is the bound that differs between the two real grants
+    # (["hanuman"] vs ["builder"]) -- it must show up, distinguishing them.
+    assert detail["env-dispatch-1"]["task_class"] == ["hanuman"]
+    assert detail["env-dispatch-2"]["task_class"] == ["builder"]
+
+
+def test_eambig_detail_survives_a_present_but_null_bounds_grant(home, monkeypatch, tmp_path):
+    """A malformed grant can carry an explicit "bounds": null rather than
+    omitting the key -- `.get("bounds", {})`'s default only fires when the
+    key is ABSENT, so a present null still yields None and a bare
+    `.get(key)` on it throws. The whole point of this hook is to turn a
+    cryptic EAMBIG into a legible one; on this edge it must not regress to
+    an uncaught AttributeError."""
+    _write_manifest(home, "loki")
+    extra = [{
+        "id": "env-dispatch-2", "verb_id": 11, "verb": "dispatch", "grantee": "loki",
+        "bounds": None,
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }]
+    _set_charter(monkeypatch, tmp_path, maximum=None, extra_active=extra)
+    monkeypatch.setattr(server, "get_pg", lambda: _FakeGovernancePg())
+
+    result = server.dispatch_send("loki", "hanuman", "# One\n")
+
+    assert result.get("error") == "EAMBIG"
+    detail = {row["envelope_id"]: row["bounds"] for row in result["envelopes"]}
+    assert set(detail) == {"env-dispatch-1", "env-dispatch-2"}
+    assert detail["env-dispatch-2"] == {}  # null bounds contributes nothing, crashes nothing
+    assert detail["env-dispatch-1"]  # the well-formed row's bounds still surface
+
+
+def test_eambig_names_the_exact_retry_shape_for_dispatch_send(home, monkeypatch, tmp_path):
+    """The caller should not have to reverse-engineer dispatch_send's own
+    signature to retry: the refusal names the tool, the parameter
+    (envelope_id), and the exact role value this call resolved -- without
+    ever picking one of the real envelope_ids FOR the caller."""
+    _write_manifest(home, "loki")
+    extra = [{
+        "id": "env-dispatch-2", "verb_id": 11, "verb": "dispatch", "grantee": "loki",
+        "bounds": {"to_agents": ["hanuman"], "task_class": ["hanuman"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }]
+    _set_charter(monkeypatch, tmp_path, maximum=None, extra_active=extra)
+    monkeypatch.setattr(server, "get_pg", lambda: _FakeGovernancePg())
+
+    result = server.dispatch_send("loki", "hanuman", "# One\n")
+
+    assert result.get("error") == "EAMBIG"
+    retry = result["retry"]
+    assert retry["tool"] == "dispatch_send"
+    assert retry["role"] == "hanuman"  # resolved_role fallback: role or to_app, lowercased
+    # The retry shape documents the parameter to pass -- it never fills in
+    # one of the real matched ids itself.
+    assert retry["envelope_id"] not in result["envelope_ids"]
+
+
+def test_eambig_never_auto_selects_an_envelope(home, monkeypatch, tmp_path):
+    """However legible the message gets, the gate still refuses rather than
+    guessing: no citation is written and no packet is created on an
+    ambiguous match."""
+    _write_manifest(home, "loki")
+    extra = [{
+        "id": "env-dispatch-2", "verb_id": 11, "verb": "dispatch", "grantee": "loki",
+        "bounds": {"to_agents": ["hanuman"], "task_class": ["hanuman"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }]
+    _set_charter(monkeypatch, tmp_path, maximum=None, extra_active=extra)
+    pg = _FakeGovernancePg()
+    monkeypatch.setattr(server, "get_pg", lambda: pg)
+
+    before = server.dispatch_list("loki", from_app="loki")
+    result = server.dispatch_send("loki", "hanuman", "# One\n")
+    after = server.dispatch_list("loki", from_app="loki")
+
+    assert result.get("error") == "EAMBIG"
+    assert pg.rows == []
+    assert after["total"] == before["total"]
+
+
 # ── (c) non-enveloped verbs / actors are unaffected ─────────────────────────
 
 def test_dispatch_send_unaffected_when_no_envelope_governs_this_actor(home, monkeypatch, tmp_path):
