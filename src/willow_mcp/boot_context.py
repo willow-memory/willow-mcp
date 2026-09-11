@@ -20,6 +20,77 @@ from .session_inject import (
 from .stack_snapshot import read_stack_snapshot
 
 
+#: Cap on how many open gaps get surfaced at boot — enough to be useful,
+#: small enough that a busy backlog doesn't crowd out the rest of orient.
+MAX_BOOT_GAPS = 3
+
+
+def _blocker_lines(orientation: dict[str, Any]) -> list[str]:
+    """Surface what `session_enter` already found this seat blocked on.
+
+    Reuses `orientation["blockers"]` verbatim (computed by `blockers.collect`
+    in server.py) rather than re-deriving attestation/lease state here — this
+    module must never diverge from what session_enter already decided.
+
+    `orientation["records"]` is also consulted, read-only, for the
+    collection-denied signal: that error lives on each standing-record read
+    (`_collection_denied` in server.py), not inside `blockers.collect`, so it
+    is folded in here rather than invented as a second blocker computation.
+    """
+    lines: list[str] = []
+
+    blockers = orientation.get("blockers") or {}
+    items = list(blockers.get("items") or [])
+
+    for logical, record in (orientation.get("records") or {}).items():
+        if isinstance(record, dict) and "collection_denied" in str(record.get("error") or ""):
+            items.append({
+                "id": "collection_denied",
+                "summary": f"'{logical}' orientation read denied: {record['error']}",
+                "fix": "widen this app's store_scope, or ignore if intentional",
+            })
+
+    if not items:
+        return []
+
+    lines.append(f"[BLOCKERS] {len(items)} at seat entry:")
+    for item in items:
+        summary = str(item.get("summary") or item.get("id") or "?")
+        fix = item.get("fix")
+        line = f"  · {summary}"
+        if fix:
+            line += f" — fix: {fix}"
+        lines.append(line)
+    return lines
+
+
+def _gap_lines(limit: int = MAX_BOOT_GAPS) -> list[str]:
+    """Top open gaps by asked_count, via the same backlog gap_list reads.
+
+    Read-only and best-effort: an empty backlog, a denied read, or any other
+    failure all degrade to "no gap section" rather than an error or a false
+    alarm at boot.
+    """
+    try:
+        from . import gaps as gap_backlog
+
+        result = gap_backlog.list_gaps(status="open", limit=limit)
+    except Exception:
+        return []
+
+    items = (result or {}).get("items") or []
+    if not items:
+        return []
+
+    lines = [f"[GAPS] top {len(items)} open (by asked_count):"]
+    for gap in items:
+        topic = gap.get("topic", "?")
+        question = str(gap.get("question", ""))[:80]
+        asked = gap.get("asked_count", 0)
+        lines.append(f"  · [{topic}] {question} (asked {asked}×)")
+    return lines
+
+
 def build_boot_lines(
     app_id: str,
     session_id: str,
@@ -82,6 +153,10 @@ def build_boot_lines(
     degraded = degraded_boot_line(app_id)
     if degraded:
         lines.append(degraded)
+
+    lines.extend(_blocker_lines(orientation))
+    if not lite_inject:
+        lines.extend(_gap_lines())
 
     if lite_inject:
         lines.append("[SESSION] compact/resume — trimmed boot injection.")

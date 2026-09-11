@@ -1,6 +1,15 @@
 import json
 
+from willow_mcp import boot_context as bc
+from willow_mcp import gaps as gaps_mod
 from willow_mcp import seed_loader as sl
+
+
+def _quiet_boot(monkeypatch):
+    """Strip every other boot section so tests assert on blockers/gaps alone."""
+    monkeypatch.setattr(bc, "load_corpus_lanes", lambda: {})
+    monkeypatch.setattr(bc, "read_stack_snapshot", lambda app_id: None)
+    monkeypatch.setattr(bc, "degraded_boot_line", lambda app_id: None)
 
 
 def test_seed_corpus_corrections_idempotent(tmp_path, monkeypatch):
@@ -37,3 +46,109 @@ def test_session_start_includes_boot_context(tmp_path, monkeypatch):
     payload = json.loads(out["additional_context"])
     assert "boot_context" in payload
     assert "[CLOCK]" in payload["boot_context"]
+
+
+def test_boot_lines_include_blockers_section_when_present(monkeypatch):
+    _quiet_boot(monkeypatch)
+    monkeypatch.setattr(bc, "_gap_lines", lambda *a, **k: [])
+    enter_result = {
+        "orientation": {
+            "blockers": {
+                "count": 1,
+                "items": [
+                    {
+                        "id": "no_egress_lease",
+                        "summary": "no active egress lease for 'hanuman' — no lease on disk",
+                        "fix": "willow-mcp grant-net hanuman --ttl 30m",
+                    }
+                ],
+            }
+        }
+    }
+    lines = bc.build_boot_lines("hanuman", "sess-blockers-present", "startup", enter_result)
+    joined = "\n".join(lines)
+    assert "[BLOCKERS]" in joined
+    assert "no active egress lease" in joined
+    assert "grant-net" in joined
+
+
+def test_boot_lines_omit_blockers_section_when_absent(monkeypatch):
+    _quiet_boot(monkeypatch)
+    monkeypatch.setattr(bc, "_gap_lines", lambda *a, **k: [])
+    for orientation in ({"blockers": {"count": 0, "items": []}}, {}):
+        lines = bc.build_boot_lines(
+            "hanuman", "sess-blockers-absent", "startup", {"orientation": orientation}
+        )
+        assert "[BLOCKERS]" not in "\n".join(lines)
+
+
+def test_boot_lines_surface_collection_denied_as_blocker(monkeypatch):
+    _quiet_boot(monkeypatch)
+    monkeypatch.setattr(bc, "_gap_lines", lambda *a, **k: [])
+    enter_result = {
+        "orientation": {
+            "blockers": {"count": 0, "items": []},
+            "records": {
+                "stack": {
+                    "error": "collection_denied: 'projects_willow_stack' is outside "
+                    "this app's store_scope"
+                }
+            },
+        }
+    }
+    lines = bc.build_boot_lines("hanuman", "sess-blockers-denied", "startup", enter_result)
+    joined = "\n".join(lines)
+    assert "[BLOCKERS]" in joined
+    assert "collection_denied" in joined
+
+
+def test_boot_lines_include_top_gaps_by_asked_count(monkeypatch):
+    _quiet_boot(monkeypatch)
+    monkeypatch.setattr(bc, "_blocker_lines", lambda *a, **k: [])
+
+    def fake_list_gaps(status=None, limit=50):
+        assert status == "open"
+        return {
+            "items": [
+                {"topic": "hanuman", "question": "what color is the accent?", "asked_count": 5},
+                {"topic": "hanuman", "question": "what is the border radius?", "asked_count": 2},
+            ]
+        }
+
+    monkeypatch.setattr(gaps_mod, "list_gaps", fake_list_gaps)
+    lines = bc.build_boot_lines("hanuman", "sess-gaps-present", "startup", {"orientation": {}})
+    joined = "\n".join(lines)
+    assert "[GAPS]" in joined
+    assert "accent" in joined
+    assert "asked 5" in joined
+
+
+def test_boot_lines_gaps_degrade_cleanly_when_backlog_empty(monkeypatch):
+    _quiet_boot(monkeypatch)
+    monkeypatch.setattr(bc, "_blocker_lines", lambda *a, **k: [])
+    monkeypatch.setattr(gaps_mod, "list_gaps", lambda status=None, limit=50: {"items": []})
+    lines = bc.build_boot_lines("hanuman", "sess-gaps-empty", "startup", {"orientation": {}})
+    assert "[GAPS]" not in "\n".join(lines)
+
+
+def test_boot_lines_gaps_degrade_cleanly_when_backlog_denied(monkeypatch):
+    _quiet_boot(monkeypatch)
+    monkeypatch.setattr(bc, "_blocker_lines", lambda *a, **k: [])
+
+    def raises(status=None, limit=50):
+        raise RuntimeError("gap_read denied")
+
+    monkeypatch.setattr(gaps_mod, "list_gaps", raises)
+    lines = bc.build_boot_lines("hanuman", "sess-gaps-denied", "startup", {"orientation": {}})
+    assert "[GAPS]" not in "\n".join(lines)
+
+
+def test_boot_lines_healthy_seat_no_false_alarms(monkeypatch):
+    _quiet_boot(monkeypatch)
+    monkeypatch.setattr(gaps_mod, "list_gaps", lambda status=None, limit=50: {"items": []})
+    enter_result = {"orientation": {"blockers": {"count": 0, "items": []}, "records": {}}}
+    lines = bc.build_boot_lines("hanuman", "sess-healthy", "startup", enter_result)
+    joined = "\n".join(lines)
+    assert "[BLOCKERS]" not in joined
+    assert "[GAPS]" not in joined
+    assert "BOOT DEGRADED" not in joined
