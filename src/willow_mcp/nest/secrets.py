@@ -9,6 +9,31 @@ value out of the text before anything else embeds or stores it.
 
 Detection is conservative and pattern-based — high-precision shapes only, plus
 placeholder filtering — so it flags real credentials, not every long string.
+
+Anchoring: earlier versions bounded each shape with `\\b` (a transition
+between `\\w` and non-`\\w`). That is a WORD boundary, not a credential
+boundary — a live key glued directly to adjacent letters on either side
+(`wrapAKIAABCDEFGHIJKLMNOPwrap`) has no `\\w`/non-`\\w` transition immediately
+before "AKIA", so `\\bAKIA...` never even attempts a match there and the key
+sails through both the body and filename scans untouched. Every shape below
+now matches on the credential's own structure instead — literal prefix +
+fixed charset + length — with no boundary requirement, so gluing arbitrary
+text on either side can no longer hide it.
+
+A trailing negative-lookahead was tried on the AWS shape to reject a
+truncated slice of a longer same-charset run, but that reopened the exact
+evasion it was meant to close: a real 20-char AWS key immediately followed
+by same-charset glue (one more uppercase letter or digit — the kind of
+glue that shows up in filenames, base64-ish blobs, or a pasted block with
+no separator) made the lookahead fail and the whole key evade detection.
+The AWS shape now has no trailing anchor at all — `AKIA[0-9A-Z]{16,}`
+greedily consumes the key plus any trailing same-charset run, exactly like
+GitHub PAT / Google API key already did. A bare 20-char key still matches
+in full; a key glued to more uppercase/digits matches the whole run (still
+HELD/redacted as one value — over-matching a same-charset run costs
+nothing since it is never a real ordinary-prose shape); a key followed by
+a lowercase letter stops at 20 chars as before. Leading glue is still
+caught by substring/finditer search regardless of anchor.
 """
 from __future__ import annotations
 
@@ -17,13 +42,13 @@ import re
 # Ordered: specific shapes first, broad JWT last (so redaction labels are precise).
 _PATTERNS: list[tuple[str, "re.Pattern"]] = [
     ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
-    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    ("github_pat", re.compile(r"\bghp_[A-Za-z0-9]{36}\b")),
-    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")),
-    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
-    ("openai_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
-    ("discord_token", re.compile(r"\b[MN][A-Za-z0-9_-]{23,26}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}")),
+    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16,}")),
+    ("github_pat", re.compile(r"ghp_[A-Za-z0-9]{36}")),
+    ("google_api_key", re.compile(r"AIza[0-9A-Za-z\-_]{35}")),
+    ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{20,}")),
+    ("discord_token", re.compile(r"[MN][A-Za-z0-9_-]{23,26}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}")),
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}")),
 ]
 
 # key = value style, with placeholder rejection

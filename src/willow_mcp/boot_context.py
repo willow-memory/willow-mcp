@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from .boot_health import degraded_boot_line, postgres_status, split_brain_boot_line
+from .nest import autointake as nest_autointake
 from .seed_loader import load_corpus_lanes
 from .session_inject import (
     MAX_CORRECTIONS,
@@ -200,6 +201,15 @@ def build_boot_lines(
     split_brain_line = split_brain_boot_line()
     if split_brain_line:
         lines.append(split_brain_line)
+
+    # Drop-zone auto-intake join (the nest was never wired to run on its own —
+    # a dropped file sat staged until someone worked the queue by hand). This
+    # runs the pipeline end-to-end on every boot so the next session at latest
+    # sees a filed item, not a stale queue. Best-effort: any failure here
+    # degrades to a one-line note, never a broken boot.
+    nest_line = nest_autointake.boot_line(app_id)
+    if nest_line:
+        lines.append(nest_line)
 
     lines.extend(_blocker_lines(orientation))
     if not lite_inject:
