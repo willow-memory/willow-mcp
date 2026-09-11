@@ -1151,3 +1151,262 @@ def test_allow_permission_self_grant_forms_blocked(command):
 ])
 def test_deny_permission_and_prose_are_not_blocked(command):
     assert pre_tool_use.check_bash_self_grant(command) is None
+
+
+# ── parse the invocation, not the command text (gaps 3cc11d282b4a, 7ede165e5a29) ─
+#
+# The self-grant guard used to run its grant-verb regexes against the raw
+# command string, so a verb or permission merely NAMED in prose, a quoted
+# argument, or a heredoc body was read as the act itself. These four pin the
+# precision fix: a named permission/verb is not an invocation, but a real
+# invocation at command position still is. The first three fail on the current
+# tree (the false positive is present) and pass after the parse-aware fix.
+
+
+def test_commit_message_naming_an_excluded_permission_is_not_a_self_grant():
+    """gap 3cc11d282b4a: a commit body describing an EXCLUDED permission was read
+    as granting it. The grant token lives inside the quoted -m argument, not at
+    command position, so it is prose — the command is `git commit`.
+
+    Round-5 rework (5701FFBD, blocklist → allowlist): this message contains a
+    literal `;`, which is one of the disqualifying characters for the inert-
+    content check — regardless of the surrounding quote style. The old named-
+    operator blocklist didn't check for `;` at all, so this used to blank
+    cleanly and ALLOW; the new allowlist has no special case for "it's inside
+    single quotes so the shell won't act on it" — ambiguity denies, on
+    purpose, so this now DENIES."""
+    cmd = ("git commit -m "
+           "'note: task_net stays operator-only; never willow-mcp allow-permission app task_net'")
+    assert pre_tool_use.check_bash_self_grant(cmd) is not None
+
+
+@pytest.mark.parametrize("command", [
+    'grep -rn "willow-mcp grant-net" docs/',
+    "cat notes.md | grep 'willow-mcp allow-permission app web_net'",
+])
+def test_read_command_containing_a_guarded_keyword_is_not_a_self_grant(command):
+    """gap 7ede165e5a29: a pure-read command (grep/cat) was refused for merely
+    containing a guarded keyword in its argument. The keyword is data the reader
+    scans, not a command it runs."""
+    assert pre_tool_use.check_bash_self_grant(command) is None
+
+
+@pytest.mark.parametrize("command", [
+    "willow-mcp grant-net willow --ttl 3h",
+    "sudo willow-mcp grant-net willow --ttl 3h",          # wrapper stripped
+    "willow-mcp allow-permission app web_net",
+    'python -c "from willow_mcp import lease; lease.grant(\'x\', 60)"',  # executor code
+])
+def test_guarded_invocation_at_command_position_is_still_refused(command):
+    """The precision fix must not relax a real self-grant: a grant verb at the
+    command-position word (through env/sudo wrappers, or inside an executor's
+    code) is still refused."""
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+# ── fail-closed carve-out regression lock (audit 2AA60817) ──────────────────
+#
+# The shape-checking parser above (command-position-only matching) is exactly
+# what let a real grant invocation through when it reached the guard by any
+# shape OTHER than a bare command-position word — cross-model audit 2AA60817.
+# The operator ruled: restore the raw substring scan as the primary denier and
+# use parsing ONLY to suppress the two measured false positives above. Every
+# case below must DENY — each pins one bypass vector the old parser missed.
+
+
+@pytest.mark.parametrize("command", [
+    "ls\nwillow-mcp grant-net loki",
+], ids=["newline_separated"])
+def test_newline_separated_grant_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "bash <<'EOF'\nwillow-mcp grant-net loki\nEOF",
+    "python <<'EOF'\nfrom willow_mcp import lease\nlease.grant('loki', 60)\nEOF",
+    "cat <<EOF | bash\nwillow-mcp grant-net loki\nEOF",
+], ids=["bash_heredoc", "python_heredoc", "cat_heredoc_piped_to_bash"])
+def test_executed_heredoc_grant_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+@pytest.mark.parametrize("command", [
+    'echo "$(willow-mcp grant-net loki)"',
+    "echo `willow-mcp grant-net loki`",
+], ids=["dollar_paren_subst", "backtick_subst"])
+def test_command_substitution_grant_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+def test_subshell_grant_is_denied():
+    assert pre_tool_use.check_bash_self_grant("(willow-mcp grant-net loki)") is not None
+
+
+def test_group_command_grant_is_denied():
+    assert pre_tool_use.check_bash_self_grant("{ willow-mcp grant-net loki; }") is not None
+
+
+def test_leading_assignment_grant_is_denied():
+    assert pre_tool_use.check_bash_self_grant("FOO=bar willow-mcp grant-net loki") is not None
+
+
+@pytest.mark.parametrize("command", [
+    "echo 'willow-mcp grant-net loki' | bash",
+    "printf 'willow-mcp grant-net loki' | sh",
+], ids=["echo_pipe_bash", "printf_pipe_sh"])
+def test_pipe_into_executor_grant_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "timeout 10 willow-mcp grant-net loki",
+    "xargs willow-mcp grant-net loki </dev/null",
+    "nohup willow-mcp grant-net loki &",
+    "setsid willow-mcp grant-net loki",
+    "doas willow-mcp grant-net loki",
+    "ssh host willow-mcp grant-net loki",
+    "uv run willow-mcp grant-net loki",
+    "uvx willow-mcp grant-net loki",
+    "poetry run willow-mcp grant-net loki",
+    "npx willow-mcp grant-net loki",
+], ids=["timeout", "xargs", "nohup", "setsid", "doas", "ssh", "uv_run", "uvx", "poetry_run", "npx"])
+def test_unstripped_wrapper_grant_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+def test_python_module_invocation_allow_permission_is_denied():
+    assert pre_tool_use.check_bash_self_grant(
+        "python -m willow_mcp allow-permission loki task_net"
+    ) is not None
+
+
+def test_task_submit_text_hiding_a_grant_is_denied():
+    """check_bash_self_grant also gates task_submit text (server.py ~:510) — a
+    grant smuggled into Kart task text must be refused exactly like Bash."""
+    tool_input = {"task": "echo setting up\nwillow-mcp grant-net loki --ttl 30m"}
+    assert pre_tool_use.check_task_submit_self_grant(tool_input) is not None
+
+
+# ── the mask must not swallow a live-execution operator (re-audit F72E96E1) ──
+#
+# The two carve-outs above blank a region and re-scan; if that region is
+# reached at all, the masking is fine. But `$(...)`, backticks, and `<(...)`
+# inside a `git commit -m/-F` message or a read-only command's argument are
+# NOT inert data — the shell evaluates them before the outer command runs.
+# Blanking that region deletes the only text carrying the live grant, so the
+# re-scan finds nothing and the guard wrongly ALLOWs a real self-grant. Every
+# case below must DENY. These fail on the pre-fix tree (ALLOW) and pass after.
+
+
+@pytest.mark.parametrize("command", [
+    'git commit -m "$(willow-mcp grant-net loki)"',
+    "git commit -m \"$(willow-mcp allow-permission loki task_net)\"",
+], ids=["dollar_paren_in_commit_message", "allow_permission_dollar_paren_in_commit_message"])
+def test_command_substitution_inside_commit_message_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+def test_backtick_substitution_inside_commit_message_is_denied():
+    command = 'git commit -m "`willow-mcp grant-net loki`"'
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+@pytest.mark.parametrize("command", [
+    "cat $(willow-mcp grant-net loki)",
+    "head $(willow-mcp grant-net loki)",
+    'grep "$(willow-mcp grant-net loki)" f',
+    "cat <(willow-mcp grant-net loki)",
+], ids=["cat_dollar_paren", "head_dollar_paren", "grep_dollar_paren_arg", "cat_process_substitution"])
+def test_live_execution_operator_inside_read_only_argument_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+# ── round-5 rework: blocklist → allowlist (closing Opus re-audit 5701FFBD) ──
+#
+# Round-4's carve-out named three live-execution operators ($(, backtick,
+# <() ) and missed two more real ones: `>(` (output process substitution)
+# and `${ cmd; }` (bash 5.3 funsub). Both blank cleanly under the old
+# regex — the read-only command's whole argument list is whitespace, the
+# raw scan finds nothing left, and a live grant is wrongly suppressed. The
+# fix replaces the named-operator blocklist with an inert-content
+# allowlist: a region may be blanked only when it contains NONE of
+# $ ` ( ) < > { } | ; & \ or a newline. These fail (wrongly ALLOW) on the
+# pre-fix tree and DENY after.
+
+
+@pytest.mark.parametrize("command", [
+    "cat >(willow-mcp grant-net loki)",
+    "head >(willow-mcp grant-net loki)",
+], ids=["cat_output_process_substitution", "head_output_process_substitution"])
+def test_output_process_substitution_inside_read_only_argument_is_denied(command):
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+def test_output_process_substitution_allow_permission_variant_is_denied():
+    assert pre_tool_use.check_bash_self_grant(
+        "cat >(willow-mcp allow-permission loki task_net)"
+    ) is not None
+
+
+def test_funsub_inside_read_only_argument_is_denied():
+    assert pre_tool_use.check_bash_self_grant(
+        "cat ${ willow-mcp grant-net loki; }"
+    ) is not None
+
+
+def test_ambiguous_commit_message_with_prose_and_subst_denies():
+    """Accepted conservative behavior, not a bug to defeat: a commit message
+    that BOTH names the grant verb in prose (so the raw scan fires) AND
+    contains an unrelated command substitution ($(date)) is denied. The
+    masker cannot tell a "safe" use of the special characters from a "live"
+    one, so it refuses to blank the whole region and the raw scan's denial
+    stands — ambiguity denies, even though the grant text here is only
+    prose."""
+    assert pre_tool_use.check_bash_self_grant(
+        'git commit -m "note: never run willow-mcp grant-net anyone, timestamp $(date)"'
+    ) is not None
+
+
+# The two measured false positives the carve-outs exist for must still ALLOW
+# — the fix must refuse to blank ONLY when a live-execution operator is
+# present, not regress the plain prose/argument cases.
+
+
+def test_commit_message_naming_the_verb_in_plain_prose_still_allowed():
+    assert pre_tool_use.check_bash_self_grant(
+        'git commit -m "grant-net is a scary phrase"'
+    ) is None
+
+
+def test_read_command_naming_the_verb_in_a_plain_argument_still_allowed():
+    assert pre_tool_use.check_bash_self_grant('grep "grant-net" README.md') is None
+
+
+# ── LOW: `git commit` recognition must survive leading git global options ──
+#
+# Recognition keyed on tokens[1] == "commit", so `git -C /path commit` and
+# `git --no-pager commit` were unrecognised as `git commit` invocations —
+# a false-positive DENY when the commit message merely named a guarded verb
+# in prose. Recognise `git commit` past global options, conservatively.
+
+
+def test_git_dash_c_commit_with_plain_message_is_allowed():
+    assert pre_tool_use.check_bash_self_grant(
+        'git -C /path/to/repo commit -m "plain text"'
+    ) is None
+
+
+def test_git_dash_c_commit_naming_the_verb_in_prose_is_denied_by_the_semicolon():
+    """Same round-5 policy change as
+    test_commit_message_naming_an_excluded_permission_is_not_a_self_grant: the
+    literal `;` in this message is disqualifying under the inert-content
+    allowlist regardless of `git -C` recognition, so this now DENIES."""
+    cmd = ('git -C /path/to/repo commit -m '
+           "'note: task_net stays operator-only; never willow-mcp allow-permission app task_net'")
+    assert pre_tool_use.check_bash_self_grant(cmd) is not None
+
+
+def test_git_no_pager_commit_naming_the_verb_in_prose_is_allowed():
+    cmd = ('git --no-pager commit -m '
+           "'note: never willow-mcp grant-net anyone'")
+    assert pre_tool_use.check_bash_self_grant(cmd) is None
