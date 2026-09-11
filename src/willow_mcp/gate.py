@@ -216,6 +216,15 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     "tool_oracle_seal": frozenset({
         "nestor_tool_seal",
     }),
+    # Nestor propose bridge (docs/design/nestor-propose-bridge.md) — proposing
+    # a recorded governance decision as a draft in Nestor's own database.
+    # Deliberately its own group, not folded into store_write or full_access:
+    # the tool only ever touches projects_willow_governance_decisions and a
+    # human still has to seal the draft in Nestor before it means anything —
+    # propose != seal, same reasoning as tool_oracle_route vs tool_oracle_seal.
+    "governance_propose": frozenset({
+        "decision_propose",
+    }),
     # Cryptographic identity binding (willow-gate seam, Phase 2). The security is
     # the HMAC signature, not this ACL; the group just lets a manifest opt an app
     # into calling check-in. Registration stays operator/CLI-only.

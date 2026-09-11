@@ -1121,6 +1121,7 @@ _WRITE_CAPABLE_GROUPS = {
     "federation_call", "fork_write",
     "frank_write",
     "friction_write", "full_access", "gap_promote", "gap_purge", "gap_write",
+    "governance_propose",
     "grove_all", "grove_write",
     "human_loop_write", "integration_call", "knowledge_curate", "knowledge_write",
     "lineage_write", "markdownai_directives", "markdownai_write", "nest_write",

@@ -130,6 +130,7 @@ FRIENDLY_LABELS: dict[str, str] = {
     "tool_oracle_read": "See unanswered tool-routing requests",
     "tool_oracle_route": "Find the right tool from a description",
     "tool_oracle_seal": "Teach it which tool a phrase means",
+    "governance_propose": "Propose a recorded decision as a draft for a human to seal",
     "envelope_apply": "Apply a pre-approved authority envelope",
     "envelope_read": "See pre-approved authority envelopes and pending proposals",
     "envelope_write": "Propose, ratify, and reject authority envelopes",

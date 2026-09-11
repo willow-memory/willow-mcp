@@ -935,7 +935,7 @@ needs a manifest at `$WILLOW_HOME/mcp_apps/<app_id>/manifest.json`:
 
 `permissions` is a list of group names and/or literal tool names —
 see `PERMISSION_GROUPS` in `src/willow_mcp/gate.py` for the authoritative set
-(54 groups). Common ones: `store_read`, `store_write`, `knowledge_read`,
+(55 groups). Common ones: `store_read`, `store_write`, `knowledge_read`,
 `knowledge_write`, `schema_admin`, `task_queue`, `agent_dispatch`,
 `dispatch_read`, `dispatch_write`, `fleet_read`, `context`, `audit`,
 `gap_read`, `gap_write`, `gap_promote`, `fork_read`, `fork_write`, `nest_read`,
