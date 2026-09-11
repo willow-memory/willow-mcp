@@ -331,6 +331,32 @@ def test_eambig_names_the_matched_envelope_ids_and_distinguishing_bounds(
     assert detail["env-dispatch-2"]["task_class"] == ["builder"]
 
 
+def test_eambig_detail_survives_a_present_but_null_bounds_grant(home, monkeypatch, tmp_path):
+    """A malformed grant can carry an explicit "bounds": null rather than
+    omitting the key -- `.get("bounds", {})`'s default only fires when the
+    key is ABSENT, so a present null still yields None and a bare
+    `.get(key)` on it throws. The whole point of this hook is to turn a
+    cryptic EAMBIG into a legible one; on this edge it must not regress to
+    an uncaught AttributeError."""
+    _write_manifest(home, "loki")
+    extra = [{
+        "id": "env-dispatch-2", "verb_id": 11, "verb": "dispatch", "grantee": "loki",
+        "bounds": None,
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }]
+    _set_charter(monkeypatch, tmp_path, maximum=None, extra_active=extra)
+    monkeypatch.setattr(server, "get_pg", lambda: _FakeGovernancePg())
+
+    result = server.dispatch_send("loki", "hanuman", "# One\n")
+
+    assert result.get("error") == "EAMBIG"
+    detail = {row["envelope_id"]: row["bounds"] for row in result["envelopes"]}
+    assert set(detail) == {"env-dispatch-1", "env-dispatch-2"}
+    assert detail["env-dispatch-2"] == {}  # null bounds contributes nothing, crashes nothing
+    assert detail["env-dispatch-1"]  # the well-formed row's bounds still surface
+
+
 def test_eambig_names_the_exact_retry_shape_for_dispatch_send(home, monkeypatch, tmp_path):
     """The caller should not have to reverse-engineer dispatch_send's own
     signature to retry: the refusal names the tool, the parameter

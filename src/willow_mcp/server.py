@@ -3281,14 +3281,21 @@ def _ambiguous_envelope_detail(rows: list) -> list:
     Built straight from the same rows `governing_envelopes` already
     resolved for this verb+actor; it does not re-read the registry, so it
     can never disagree with `envelope_ids` about what matched."""
+    def _bounds(row: dict) -> dict:
+        # A row's "bounds" can be present-but-null (malformed grant, not just
+        # absent) -- `.get("bounds", {})`'s default only fires when the key
+        # is missing, so a present `null` still yields `None` and blows up
+        # the next `.get(key)`. Route every read through this so a null
+        # never reaches a `.get` call.
+        b = row.get("bounds")
+        return b if isinstance(b, dict) else {}
+
     keys: set = set()
     for row in rows:
-        bounds = row.get("bounds")
-        if isinstance(bounds, dict):
-            keys |= set(bounds)
+        keys |= set(_bounds(row))
     differing = {
         key for key in keys
-        if len({json.dumps(row.get("bounds", {}).get(key), sort_keys=True)
+        if len({json.dumps(_bounds(row).get(key), sort_keys=True)
                 for row in rows}) > 1
     }
     wanted = differing or keys
@@ -3296,9 +3303,9 @@ def _ambiguous_envelope_detail(rows: list) -> list:
         {
             "envelope_id": row.get("id"),
             "bounds": {
-                key: row.get("bounds", {}).get(key)
+                key: _bounds(row)[key]
                 for key in wanted
-                if isinstance(row.get("bounds"), dict) and key in row["bounds"]
+                if key in _bounds(row)
             },
         }
         for row in rows
