@@ -8,7 +8,7 @@ never mutates any file it looks at.
 
 import os
 
-from willow_mcp import split_brain, server
+from willow_mcp import paths, split_brain, server
 
 
 def test_two_divergent_copies_reported_with_both_paths(tmp_path, monkeypatch):
@@ -40,7 +40,7 @@ def test_two_divergent_copies_reported_with_both_paths(tmp_path, monkeypatch):
     # The resolved (in-effect) copy is named, and it is one of the two —
     # never a silent pick that hides which copy is actually live.
     assert report["resolved"] == str(env_reg)
-    assert "distinct resolvable copies" in report["detail"]
+    assert "distinct copies are each reachable" in report["detail"]
 
 
 def test_scan_flags_divergent_artifact_and_leaves_others_clean(tmp_path, monkeypatch):
@@ -160,6 +160,128 @@ def test_check_never_mutates_any_file(tmp_path, monkeypatch):
     assert not (vault / "keyring.json").exists()
     assert not (vault / "constitutional").exists()
     assert not (home / "keyring.json").exists()
+
+
+def test_operator_box_shape_is_clean(tmp_path, monkeypatch):
+    """WILLOW_HOME set + ~/.willow merely existing (e.g. a migrated home) must
+    not warn: paths.willow_home() only falls back to ~/.willow when WILLOW_HOME
+    is unset, so a set WILLOW_HOME shadows it outright — nobody ever reads it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    fake_home_dir = tmp_path / "fake_home"
+    legacy_willow = fake_home_dir / ".willow"
+    legacy_willow.mkdir(parents=True)
+
+    monkeypatch.setenv("HOME", str(fake_home_dir))
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(home / "store"))
+    for var in ("WILLOW_ENVELOPE_REGISTRY", "WILLOW_CHARTER_REPO",
+                "WILLOW_VAULT_BOX", "WILLOW_KEYRING"):
+        monkeypatch.delenv(var, raising=False)
+
+    report = split_brain.scan()
+
+    assert report["status"] == "ok"
+    assert report["artifacts"]["willow_home"]["status"] == "ok"
+    assert report["artifacts"]["willow_home"]["divergent"] is False
+    # The leftover is still surfaced for visibility, just not as divergent.
+    implicit = [c for c in report["artifacts"]["willow_home"]["candidates"]
+                if c["source"] == "implicit_default"][0]
+    assert implicit["exists"] is True
+    assert implicit["reachable"] is False
+
+
+def test_env_set_plus_leftover_keyring_is_clean(tmp_path, monkeypatch):
+    """keyring.keyring_path() is WILLOW_KEYRING-or-nothing with no fallback.
+    Leftover keyring.json files under the vault box and $WILLOW_HOME must not
+    make a correctly configured WILLOW_KEYRING report as divergent."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "keyring.json").write_text("{}")
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "keyring.json").write_text("{}")
+
+    real_keyring = tmp_path / "elsewhere" / "keyring.json"
+    real_keyring.parent.mkdir(parents=True)
+    real_keyring.write_text("{}")
+
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+    monkeypatch.setenv("WILLOW_VAULT_BOX", str(vault))
+    monkeypatch.setenv("WILLOW_KEYRING", str(real_keyring))
+
+    report = split_brain._artifact_report(
+        "keyring", split_brain.keyring_candidates(), split_brain._env_path("WILLOW_KEYRING"))
+
+    assert report["status"] == "ok"
+    assert report["divergent"] is False
+    assert "detail" not in report
+    # Only the env candidate is enumerated at all — the leftovers are not
+    # invented candidates in the first place.
+    assert len(report["candidates"]) == 1
+    assert report["candidates"][0]["source"] == "env:WILLOW_KEYRING"
+
+
+def test_unset_charter_with_leftover_dirs_is_clean(tmp_path, monkeypatch):
+    """charter_repo() is WILLOW_CHARTER_REPO-or-None with no fallback. Leftover
+    charter directories under $WILLOW_HOME and the vault box, with the env var
+    unset, must not report a split-brain against an unresolvable None."""
+    home = tmp_path / "home"
+    (home / "charter").mkdir(parents=True)
+
+    vault = tmp_path / "vault"
+    (vault / "charter").mkdir(parents=True)
+
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+    monkeypatch.setenv("WILLOW_VAULT_BOX", str(vault))
+    monkeypatch.delenv("WILLOW_CHARTER_REPO", raising=False)
+
+    report = split_brain._artifact_report(
+        "charter_repo", split_brain.charter_candidates(), paths.charter_repo())
+
+    assert report["status"] == "ok"
+    assert report["divergent"] is False
+    assert "detail" not in report
+    assert report["resolved"] is None
+    # No candidates at all are reported — the env-only resolver has no
+    # fallback, so there is nothing to enumerate when it is unset.
+    assert report["candidates"] == []
+
+
+def test_two_genuinely_in_effect_divergent_copies_still_report(tmp_path, monkeypatch):
+    """envelope_registry can genuinely have two live candidates at once: the
+    WILLOW_ENVELOPE_REGISTRY override (honoured by envelopes.registry_path, the
+    grant-matching authority) and the charter-or-home default (honoured by
+    paths.envelope_registry_path, which home_init seeds independently of the
+    override). Both are real, currently-executing code paths — this must keep
+    reporting even after the false-positive fixes above."""
+    home = tmp_path / "home"
+    (home / "constitutional").mkdir(parents=True)
+    home_reg = home / "constitutional" / "pre-approved.json"
+    home_reg.write_text("{}")
+
+    env_reg = tmp_path / "elsewhere" / "pre-approved.json"
+    env_reg.parent.mkdir(parents=True)
+    env_reg.write_text("{}")
+
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+    monkeypatch.setenv("WILLOW_ENVELOPE_REGISTRY", str(env_reg))
+    monkeypatch.delenv("WILLOW_CHARTER_REPO", raising=False)
+    monkeypatch.delenv("WILLOW_VAULT_BOX", raising=False)
+
+    report = split_brain._artifact_report(
+        "envelope_registry",
+        split_brain.envelope_registry_candidates(),
+        split_brain._resolved_envelope_registry(),
+    )
+
+    assert report["status"] == "warn"
+    assert report["divergent"] is True
+    reported_paths = {c["path"] for c in report["candidates"] if c["exists"] and c["reachable"]}
+    assert str(home_reg) in reported_paths
+    assert str(env_reg) in reported_paths
+    assert report["resolved"] == str(env_reg)
 
 
 def test_diagnostic_summary_wires_split_brain_into_checks_and_verdict(tmp_path, monkeypatch):
