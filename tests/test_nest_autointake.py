@@ -146,6 +146,58 @@ def test_filename_secret_is_held_even_with_clean_body(env, store):
     assert len(intake.get_queue(store)) == 1
 
 
+def test_embedded_key_glued_to_letters_is_held_not_filed(env, store):
+    """The word-boundary evasion from the re-audit: a live AWS key with no
+    separator on either side (`wrapAKIA...wrap`) must still trip the gate —
+    the old `\\b`-anchored scan let this sail through classified and
+    auto-filed with the key intact."""
+    _tmp, drop = env
+    glued = "wrap" + "AKIA" + "Q" * 16 + "wrap"
+    leaky = drop / "journal_entry.md"
+    leaky.write_text(f"dear diary, today I saw {glued} on a screen")
+
+    result = autointake.run(store, app_id="hook", folders=[drop])
+
+    assert result["status"] == "ok"
+    assert result["filed"] == []
+    held = next(h for h in result["held"] if h["filename"] == "journal_entry.md")
+    assert "secrets:" in held["reason"]
+    assert "aws_access_key" in held["reason"]
+    assert leaky.exists()
+    assert len(intake.get_queue(store)) == 1
+
+
+def test_secret_kinds_catches_a_credential_in_a_parent_directory_name(tmp_path):
+    """Unit-level regression for the LOW: `_secret_kinds` used to scan only
+    `path.name`, though its own comment claimed "the path travels" — a
+    credential riding a PARENT directory component (e.g. a folder named
+    after a leaked key) sailed through unscanned. It now scans every path
+    component. (intake.scan's drop zone itself is flat/non-recursive, so
+    this is exercised directly against `_secret_kinds` rather than through
+    the full `autointake.run` pipeline.)"""
+    leaky_dir = tmp_path / f"AKIA{'Q' * 16}-backup"
+    leaky_dir.mkdir()
+    clean_file = leaky_dir / "notes.md"
+    clean_file.write_text("nothing sensitive in the body")
+
+    kinds = autointake._secret_kinds(clean_file)
+
+    assert "aws_access_key" in kinds
+
+
+def test_secret_kinds_is_quiet_on_an_ordinary_parent_directory_name(tmp_path):
+    """Non-regression: a normal parent directory name must not trip the
+    gate just because path components are now scanned."""
+    plain_dir = tmp_path / "invoices_2026"
+    plain_dir.mkdir()
+    clean_file = plain_dir / "march.md"
+    clean_file.write_text("total due: 42.00")
+
+    kinds = autointake._secret_kinds(clean_file)
+
+    assert kinds == []
+
+
 def test_oversized_file_is_held_not_filed_uninspected(env, store):
     """A file too large for the sniff cap cannot be affirmatively cleared —
     it must be HELD, never filed on the strength of an unread tail, even

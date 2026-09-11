@@ -9,6 +9,25 @@ value out of the text before anything else embeds or stores it.
 
 Detection is conservative and pattern-based — high-precision shapes only, plus
 placeholder filtering — so it flags real credentials, not every long string.
+
+Anchoring: earlier versions bounded each shape with `\\b` (a transition
+between `\\w` and non-`\\w`). That is a WORD boundary, not a credential
+boundary — a live key glued directly to adjacent letters on either side
+(`wrapAKIAABCDEFGHIJKLMNOPwrap`) has no `\\w`/non-`\\w` transition immediately
+before "AKIA", so `\\bAKIA...` never even attempts a match there and the key
+sails through both the body and filename scans untouched. Every shape below
+now matches on the credential's own structure instead — literal prefix +
+fixed charset + length — with no boundary requirement, so gluing arbitrary
+text on either side can no longer hide it. The AWS shape additionally
+carries a trailing negative-lookahead: its post-prefix charset is
+uppercase+digit only, which ordinary prose glue never is, so the lookahead
+blocks a truncated slice of a longer same-charset run without costing any
+real-world recall. GitHub PAT / Google API key intentionally do NOT carry
+that lookahead — their charset includes lowercase letters, i.e. exactly
+what ordinary glue text is made of, so a trailing anchor there would
+recreate the same evasion for those shapes; the cost is a purely
+theoretical truncation of an incidentally-longer same-charset run, which is
+not a real key shape.
 """
 from __future__ import annotations
 
@@ -17,13 +36,13 @@ import re
 # Ordered: specific shapes first, broad JWT last (so redaction labels are precise).
 _PATTERNS: list[tuple[str, "re.Pattern"]] = [
     ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
-    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    ("github_pat", re.compile(r"\bghp_[A-Za-z0-9]{36}\b")),
-    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")),
-    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
-    ("openai_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
-    ("discord_token", re.compile(r"\b[MN][A-Za-z0-9_-]{23,26}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}")),
+    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}(?![0-9A-Z])")),
+    ("github_pat", re.compile(r"ghp_[A-Za-z0-9]{36}")),
+    ("google_api_key", re.compile(r"AIza[0-9A-Za-z\-_]{35}")),
+    ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{20,}")),
+    ("discord_token", re.compile(r"[MN][A-Za-z0-9_-]{23,26}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}")),
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}")),
 ]
 
 # key = value style, with placeholder rejection

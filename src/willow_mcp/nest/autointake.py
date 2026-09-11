@@ -72,10 +72,13 @@ def _secret_kinds(path: Path) -> list[str]:
     back with the synthetic "uninspectable" kind so the caller HOLDS it
     rather than treating an uninspected file as evidence of nothing."""
     kinds: set[str] = set()
-    # The filename/path travels with the file wherever it's filed, so it is
-    # scanned unconditionally — a credential in the name is a live leak even
-    # when the body is clean.
-    kinds.update(kind for kind, _ in secrets.find_secrets(path.name))
+    # The path travels with the file wherever it's filed — every component,
+    # not just the leaf filename, so a credential riding a PARENT directory
+    # name (e.g. a folder named after a leaked token) is scanned unconditionally
+    # too. A credential in any path component is a live leak even when the
+    # body is clean.
+    for part in path.parts:
+        kinds.update(kind for kind, _ in secrets.find_secrets(part))
 
     try:
         if not path.is_file():
