@@ -34,10 +34,15 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Callable, Optional
 
-_TIMEOUT_S = 120
+# Must stay well under the outer harness's own timeout for a hook invocation
+# (~30-60s observed) so a genuinely slow lint always fails loud from inside
+# this process (the TimeoutExpired branch below), never gets silently
+# SIGKILLed by the harness before it can print a block reason.
+_TIMEOUT_S = 20
 
 
 def _project_dir() -> Path:
@@ -51,17 +56,23 @@ def _ruff_configured(root: Path) -> bool:
     """True when the repo declares ruff config: a ruff.toml/.ruff.toml file,
     or a `[tool.ruff]` table (or a `[tool.ruff.*]` sub-table) in
     pyproject.toml. Absence of all three means ruff is not this repo's
-    linter — a clean no-op, not a guess."""
+    linter — a clean no-op, not a guess.
+
+    Parses the TOML properly rather than substring-matching `"[tool.ruff"` —
+    a naive substring check would false-positive on a commented-out table
+    (`# [tool.ruff]`) or the literal text showing up inside an unrelated
+    string value."""
     if (root / "ruff.toml").is_file() or (root / ".ruff.toml").is_file():
         return True
     pyproject = root / "pyproject.toml"
     if not pyproject.is_file():
         return False
     try:
-        text = pyproject.read_text(encoding="utf-8")
-    except OSError:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
         return False
-    return "[tool.ruff" in text
+    tool = data.get("tool")
+    return isinstance(tool, dict) and "ruff" in tool
 
 
 def _ruff_targets(root: Path) -> list[str]:

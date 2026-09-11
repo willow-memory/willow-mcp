@@ -152,6 +152,71 @@ def test_ruff_missing_blocks_with_an_explanatory_reason(tmp_path, monkeypatch):
     assert "not" in reason.lower() or "no" in reason.lower()
 
 
+def test_internal_timeout_is_well_under_the_outer_harness_budget():
+    """Audit 56C746EB (timeout silent-pass): the internal ruff timeout used
+    to be 120s, comfortably longer than the outer harness's own timeout for
+    a hook invocation (~30-60s observed) — a slow lint got the whole hook
+    process SIGKILLed by the harness before the internal timeout could ever
+    fire and print a block reason, so it degraded to a silent pass. The
+    internal timeout must stay well under that budget so the fail-loud path
+    below always wins the race."""
+    assert stop_lint_gate._TIMEOUT_S <= 25
+
+
+def test_ruff_timeout_blocks_loud_not_silent(tmp_path, monkeypatch):
+    """A ruff invocation that times out must block with a reason naming the
+    timeout — never a silent pass. This is the fail-loud half of the
+    timeout fix: even though lowering _TIMEOUT_S is the harness-race fix,
+    the in-process handling of TimeoutExpired must still surface a reason
+    rather than swallowing it."""
+    _write_ruff_project(tmp_path)
+
+    def _fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="ruff", timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(stop_lint_gate.subprocess, "run", _fake_run)
+
+    reason = stop_lint_gate.check_lint(tmp_path)
+
+    assert reason is not None
+    assert "timed out" in reason.lower() or "timeout" in reason.lower() or "did not finish" in reason.lower()
+
+
+def test_ruff_configured_ignores_a_commented_out_table(tmp_path):
+    """Nit fix: `_ruff_configured` parses the TOML instead of doing a naive
+    substring match on `"[tool.ruff"` — a commented-out table must not
+    false-positive as configured."""
+    (tmp_path / "pyproject.toml").write_text(
+        "# [tool.ruff]\n# line-length = 120\n\n[project]\nname = \"x\"\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src").mkdir()
+
+    assert stop_lint_gate._ruff_configured(tmp_path) is False
+
+
+def test_ruff_configured_ignores_a_string_mention(tmp_path):
+    """A `[tool.ruff` substring appearing inside an unrelated string value
+    (not a real table header) must not false-positive as configured."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndescription = "mentions [tool.ruff] in prose"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "src").mkdir()
+
+    assert stop_lint_gate._ruff_configured(tmp_path) is False
+
+
+def test_ruff_configured_still_true_for_a_real_table(tmp_path):
+    """Sanity check the parse-based detection still recognizes a genuine
+    `[tool.ruff]` table (and a `[tool.ruff.lint]` sub-table)."""
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.ruff.lint]\nselect = [\"E\"]\n", encoding="utf-8"
+    )
+
+    assert stop_lint_gate._ruff_configured(tmp_path) is True
+
+
 def test_bundled_hook_is_identical_to_the_repo_copy():
     """src/willow_mcp/bundle/hooks/stop_lint_gate.py is what ships to an
     agent's harness; hooks/stop_lint_gate.py is what these tests exercise —
