@@ -459,3 +459,140 @@ def test_diagnostic_summary_is_registered_and_the_probe_helper_is_not():
     names = {t.name for t in server.mcp._tool_manager.list_tools()}
     assert "diagnostic_summary" in names, "diagnostic_summary must be a registered MCP tool"
     assert "_diag_envelope_registry" not in names, "the private probe helper must not be exposed as a tool"
+
+
+# ── keyring probe + verdict coverage (gap 37d44bfa1f4c) ──────────────────────
+# The five computed sub-checks + a new keyring probe now move the verdict. A
+# keyring the seat cannot read blocks session_enter but used to read as `ok`.
+
+import os
+
+
+def _keyring_broken():
+    return {"backend": "willow-keyring", "status": "broken",
+            "path": "/x/config/verifiers.json",
+            "detail": "the keyring exists but this process cannot read it",
+            "fix": "chown it to the uid the seat runs as, then re-run"}
+
+
+def test_unreadable_keyring_is_a_named_error_and_breaks_verdict():
+    # The gap itself: the verdict must consume the keyring sub-check. On the
+    # unmodified tree _derive_problems has no severity_checks arg and emits no
+    # keyring problem, so this fails there and passes after.
+    problems = server._derive_problems(
+        _store_ok(), _pg_ok(), _manifest_ok(), "stdio",
+        severity_checks={"keyring": _keyring_broken()})
+    kp = [p for p in problems if p["check"] == "keyring"]
+    assert len(kp) == 1
+    assert kp[0]["severity"] == "error"
+    assert kp[0]["detail"] and kp[0]["fix"]
+    assert server._derive_verdict(problems) == "broken"
+
+
+def test_diag_keyring_not_enabled_when_unset(monkeypatch):
+    monkeypatch.delenv("WILLOW_KEYRING", raising=False)
+    from willow_mcp import keyring as _keyring
+    monkeypatch.setattr(_keyring, "_injected", None, raising=False)
+    check = server._diag_keyring()
+    assert check["status"] == "not_enabled"
+    assert check["configured"] is False
+
+
+def test_diag_keyring_refuses_group_readable_secret_keyring(tmp_path, monkeypatch):
+    # A keyring holding secret material at a group/world-readable mode is exactly
+    # what the loader refuses — tonight's case (owned at a mode session_enter
+    # rejects). The probe must call it `broken` with a fix.
+    kr = tmp_path / "verifiers.json"
+    kr.write_text(json.dumps({"legacy_key": "ab" * 16}))
+    os.chmod(kr, 0o644)
+    monkeypatch.setenv("WILLOW_KEYRING", str(kr))
+    from willow_mcp import keyring as _keyring
+    monkeypatch.setattr(_keyring, "_injected", None, raising=False)
+    monkeypatch.setattr(_keyring, "_from_env", None, raising=False)
+    monkeypatch.setattr(_keyring, "_loaded_from", None, raising=False)
+    check = server._diag_keyring()
+    assert check["status"] == "broken"
+    assert check["configured"] is True
+    assert check["fix"]
+
+
+def test_keyring_broken_drives_diagnostic_summary_off_ok(tmp_path, monkeypatch):
+    # End to end: a keyring the loader refuses drives the whole self-check off
+    # `ok` with a named keyring problem — the tonight outage, now visible.
+    kr = tmp_path / "verifiers.json"
+    kr.write_text(json.dumps({"legacy_key": "cd" * 16}))
+    os.chmod(kr, 0o644)
+    monkeypatch.setenv("WILLOW_KEYRING", str(kr))
+    from willow_mcp import keyring as _keyring
+    monkeypatch.setattr(_keyring, "_injected", None, raising=False)
+    monkeypatch.setattr(_keyring, "_from_env", None, raising=False)
+    monkeypatch.setattr(_keyring, "_loaded_from", None, raising=False)
+    fn = getattr(server.diagnostic_summary, "fn", server.diagnostic_summary)
+    rep = fn(app_id="hanuman")
+    assert rep["checks"]["keyring"]["status"] == "broken"
+    kp = [p for p in rep["problems"] if p["check"] == "keyring"]
+    assert len(kp) == 1 and kp[0]["severity"] == "error"
+    assert rep["verdict"] == "broken"
+
+
+# ── completeness assertion (gap 37d44bfa1f4c) ────────────────────────────────
+
+def test_completeness_assertion_passes_for_the_real_check_set():
+    fn = getattr(server.diagnostic_summary, "fn", server.diagnostic_summary)
+    rep = fn(app_id="hanuman")
+    # If this raised, diagnostic_summary itself would have; assert the guard is
+    # actually satisfied by the shipped `checks`.
+    server._assert_verdict_considers(set(rep["checks"]))
+
+
+def test_completeness_assertion_fails_on_unwired_subcheck():
+    # Simulate a future probe added to `checks` but wired into none of the three
+    # verdict sets — it must raise, not silently never move the verdict.
+    names = (set(server._VERDICT_INLINE_SUBCHECKS)
+             | set(server._VERDICT_SEVERITY_SUBCHECKS)
+             | set(server._VERDICT_INFORMATIONAL_SUBCHECKS))
+    names.add("newly_added_probe")
+    import pytest
+    with pytest.raises(RuntimeError) as ei:
+        server._assert_verdict_considers(names)
+    assert "newly_added_probe" in str(ei.value)
+
+
+# ── could-not-run is never counted clean; healthy box stays ok ───────────────
+
+def test_could_not_run_subcheck_degrades_and_is_flagged():
+    problems = server._derive_problems(
+        _store_ok(), _pg_ok(), _manifest_ok(), "stdio",
+        severity_checks={"schema": {"status": "could_not_run",
+                                    "error": "postgres unavailable"}})
+    sp_probs = [p for p in problems if p["check"] == "schema"]
+    assert len(sp_probs) == 1
+    assert sp_probs[0]["could_not_run"] is True
+    assert server._derive_verdict(problems) == "degraded"
+
+
+def test_informational_subchecks_at_rest_add_no_false_problem():
+    # A healthy box: every severity sub-check ok / at its resting state, keyring
+    # not enabled. No problems, verdict ok.
+    healthy = {
+        "rings": {"status": "ok"},
+        "schema": {"status": "ok"},
+        "identity_bindings": {"status": "ok"},
+        "uid_separation": {"separated": False, "targets": [], "same_owner_paths": []},
+        "store_db_perms": {"files": [], "exposure": [], "enforced": False},
+        "keyring": {"status": "not_enabled", "configured": False},
+    }
+    problems = server._derive_problems(
+        _store_ok(), _pg_ok(), _manifest_ok(), "stdio",
+        severity_checks=healthy)
+    assert problems == []
+    assert server._derive_verdict(problems) == "ok"
+
+
+def test_degraded_rings_probe_moves_verdict_via_severity_pipeline():
+    problems = server._derive_problems(
+        _store_ok(), _pg_ok(), _manifest_ok(), "stdio",
+        severity_checks={"rings": {"status": "fail", "error": "rings.json unreadable"}})
+    rp = [p for p in problems if p["check"] == "rings"]
+    assert len(rp) == 1 and rp[0]["severity"] == "warn"
+    assert server._derive_verdict(problems) == "degraded"
