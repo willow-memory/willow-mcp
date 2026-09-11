@@ -126,14 +126,14 @@ dependencies = [
     # seals (seal_handler.on_seal is the consumer). Moved off
     # [tool.willow.fleet].unconsumed in the same commit that takes this pin —
     # test_unconsumed_members_are_not_actually_depended_on enforces that a
-    # package cannot be both. Floor is 1.2.9, the version installed and
-    # verified against at the time this dependency was taken; the seal-watch
-    # daemon itself (SeatDaemon/JsonlTailWatcher) ships on the held
-    # feat/ratatosk-listener-daemon branch and is import-guarded in
-    # seal_daemon.py until a release carries it. Cap at the next major per
-    # Rule 1; willow-ratatosk is pre-1.0 elsewhere in this fleet's pattern, so
+    # package cannot be both. Floor is 1.7.0: that release put a
+    # `seal_predicate` parameter on SeatDaemon, letting seal_daemon.py
+    # construct the daemon directly against the filter it needs instead of
+    # replacing `daemon.seal_watcher` after construction to work around the
+    # old hardcoded `op == "seal"` check. Cap at the next major per Rule 1;
+    # willow-ratatosk is pre-1.0 elsewhere in this fleet's pattern, so
     # <2.0.0 is the honest range once it sets bump-minor-pre-major false.
-    "willow-ratatosk>=1.2.9,<2.0.0",
+    "willow-ratatosk>=1.7.0,<2.0.0",
     "requests>=2.31,<3.0",
 ]
 
@@ -257,7 +257,9 @@ packages = [
 # hand seals to seal_handler.on_seal, a real caller rather than a roster entry
 # looking tidier. It now carries a dependency pin above (Rule 1 applies) and
 # has come off this list in the same commit — see
-# test_unconsumed_members_are_not_actually_depended_on.
+# test_unconsumed_members_are_not_actually_depended_on. willow-ratatosk 1.7.0
+# is the released version this repo builds against; seal_daemon.py constructs
+# SeatDaemon directly rather than patching it post-construction.
 #
 # Rule 2 still applies to everything on the roster — a released package owes
 # callers a defined surface whether or not this repo imports it. Only the pin
