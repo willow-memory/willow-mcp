@@ -1,0 +1,68 @@
+# systemd --user unit template for the willow-mcp seal-watch-only daemon.
+#
+# Not used directly — fill in the {{PLACEHOLDERS}} before installing, e.g.:
+#
+#   sed -e "s#{{WILLOW_MCP_PYTHON}}#$(pwd)/.venv/bin/python#g" \
+#       -e "s#{{WILLOW_HOME}}#$HOME/sean-data-vault/willow-operator-box#g" \
+#       -e "s#{{WILLOW_STORE_ROOT}}#$HOME/sean-data-vault/willow-operator-box/store#g" \
+#       -e "s#{{WILLOW_NESTOR_DB}}#$HOME/sean-data-vault/willow-operator-box/nestor.db#g" \
+#       deploy/willow-seal-watch.service.template \
+#       > ~/.config/systemd/user/willow-seal-watch.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now willow-seal-watch
+#
+# This runs ONLY the seal watch (`python -m willow_mcp.seal_daemon`) — the
+# bare ratatosk.daemon.JsonlTailWatcher wired to seal_handler.on_seal, with
+# NO Grove bus, channel, or mcp_call involved. That is a deliberate scope
+# limit: `build_seal_daemon`'s SeatDaemon (which DOES require a live Grove
+# channel) is the separate, unbuilt "dispatch-posts-a-wake" activation-rail
+# path and is not what this unit runs.
+#
+# Environment names below are read verbatim by the code this unit runs, not
+# invented for this template:
+#   - WILLOW_HOME        -> willow_mcp.paths.willow_home(), used to derive
+#                            the default ledger path (WILLOW_HOME/ledger.jsonl).
+#   - WILLOW_STORE_ROOT   -> willow_mcp.paths.store_root(), used to derive
+#                            the default offset-file path and the SOIL
+#                            store seal_handler.on_seal writes governance
+#                            upgrades into.
+#   - WILLOW_NESTOR_DB    -> willow_mcp.seal_handler._nestor_db_path(), the
+#                            SQLite DB (table tm_pairs) the handler reads
+#                            the seal_sig prefix from. A missing/wrong value
+#                            here does not crash the watch — a sealed
+#                            governance record just comes back without its
+#                            seal_sig prefix, and only a log warning marks
+#                            it — so getting this name right matters even
+#                            though nothing here will loudly tell you it's
+#                            wrong.
+# WILLOW_APP_ID is deliberately NOT set here. Nothing on this code path
+# (seal_daemon.py, paths.py, seal_handler.py, db.Store) reads it — it has no
+# effect on the watch. Setting it to "willow" would also be semantically
+# wrong: per session_start_hook.py, WILLOW_APP_ID=willow specifically means
+# "the human-orchestrator seat," which this unattended background service is
+# not. Leave it unset unless a future change actually starts reading it for
+# this path, and if so, give this daemon its own app_id rather than
+# borrowing the orchestrator's.
+#
+# Deploy note: this unit is meant to run against the OPERATOR-BOX venv,
+# WILLOW_HOME, WILLOW_STORE_ROOT, and Nestor ledger/db — not a worktree or a
+# developer checkout. {{WILLOW_MCP_PYTHON}} should resolve to the operator
+# box's installed willow-mcp venv interpreter, and the WILLOW_HOME/
+# WILLOW_STORE_ROOT/WILLOW_NESTOR_DB values below should point at that same
+# box's real ledger and store, so the watch it runs sees the seals that
+# actually land there.
+[Unit]
+Description=willow-mcp seal watch (standalone, no Grove bus)
+After=network.target
+
+[Service]
+Type=simple
+Environment=WILLOW_HOME={{WILLOW_HOME}}
+Environment=WILLOW_STORE_ROOT={{WILLOW_STORE_ROOT}}
+Environment=WILLOW_NESTOR_DB={{WILLOW_NESTOR_DB}}
+ExecStart={{WILLOW_MCP_PYTHON}} -m willow_mcp.seal_daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
