@@ -54,6 +54,7 @@ code. No output means allow, no comment.
 import json
 import os
 import re
+import shlex
 import sys
 from typing import Optional
 
@@ -681,6 +682,182 @@ _ALLOW_PERMISSION_REASON = (
 )
 
 
+# ── shell-aware invocation parsing (gaps 3cc11d282b4a, 7ede165e5a29) ─────────
+#
+# The grant-command guards used to run their regexes against the raw command
+# string, so a grant verb *named* in prose — a commit message, a grep pattern,
+# a heredoc body, a manifest _note describing an EXCLUDED permission — read as
+# the act itself. The two measured false positives:
+#   3cc11d282b4a — a description naming an excluded permission, read as granting it.
+#   7ede165e5a29 — a pure-read command (grep/cat) refused for containing a keyword.
+# The fix is a precision fix, not a relaxation: tokenise the command with a
+# shell-aware splitter, look at the COMMAND-POSITION word of each subcommand
+# (after stripping env/sudo/nice/time wrappers), and match the grant verbs
+# only against an actual invocation — never against quoted data or a heredoc
+# body. On a parse failure or too-complex input we fall BACK to the old
+# substring scan so a hard deny still fires; we never allow on unparseable
+# input. The write-verb/path/keystore/manifest branches below are unchanged and
+# still run on the raw command, so no currently-intended refusal is lost.
+_INVOCATION_WRAPPERS = frozenset({"env", "sudo", "nice", "time", "command", "exec"})
+# Commands whose ARGUMENTS are executed code, so a grant verb inside them is a
+# real invocation, not data. Everything else (grep/cat/echo/git/sed/…) treats
+# its arguments as data.
+_CODE_EXECUTORS = frozenset({
+    "python", "python2", "python3", "bash", "sh", "zsh", "eval", "node",
+    "perl", "ruby",
+})
+# The willow CLI, direct. `grant-net`, `dev-net`, … are one-token subcommands;
+# `consent set/reconcile` and `roster sync` are two-token.
+_WILLOW_CLIS = frozenset({"willow-mcp", "willow_mcp"})
+_GRANT_SUBCOMMANDS = frozenset({
+    "grant-net", "dev-net", "grant-build", "sign-net-task",
+    "register-agent", "revoke-agent", "rotate-agent",
+})
+_GRANT_TWO_TOKEN = {"consent": {"set", "reconcile"}, "roster": {"sync"}}
+
+_HEREDOC_RE = re.compile(r"<<-?\s*([\"']?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _strip_heredoc_bodies(command: str) -> str:
+    """Drop heredoc bodies (`<<EOF … EOF`) so a guarded word inside one is not
+    read as an invocation. Here-strings (`<<<`) are left alone — they are a
+    single-line argument handled by ordinary quote-aware tokenisation."""
+    if "<<" not in command:
+        return command
+    out: list[str] = []
+    delimiter: Optional[str] = None
+    for line in command.split("\n"):
+        if delimiter is None:
+            out.append(line)
+            m = _HEREDOC_RE.search(line)
+            if m:
+                delimiter = m.group(2)
+        else:
+            if line.strip() == delimiter:
+                out.append(line)
+                delimiter = None
+            # else: a body line — dropped
+    return "\n".join(out)
+
+
+def _split_subcommands(command: str) -> list[str]:
+    """Split on `;`, `|`, `||`, `&&` while respecting quotes — so an operator
+    inside a quoted string does not start a new subcommand."""
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: Optional[str] = None
+    i, n = 0, len(command)
+    while i < n:
+        c = command[i]
+        if quote:
+            buf.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                buf.append(command[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            buf.append(c)
+        elif c == ";":
+            parts.append("".join(buf))
+            buf = []
+        elif c == "&" and i + 1 < n and command[i + 1] == "&":
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        elif c == "|":
+            parts.append("".join(buf))
+            buf = []
+            if i + 1 < n and command[i + 1] == "|":
+                i += 2
+                continue
+        else:
+            buf.append(c)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def _strip_wrappers(tokens: list[str]) -> list[str]:
+    """Drop leading env/sudo/nice/time wrappers (and their options / VAR=VAL
+    assignments) so the command-position word is the real command."""
+    i = 0
+    while i < len(tokens):
+        base = os.path.basename(tokens[i])
+        if base not in _INVOCATION_WRAPPERS:
+            break
+        i += 1
+        while i < len(tokens) and (
+            tokens[i].startswith("-")
+            or (base == "env" and "=" in tokens[i] and not tokens[i].startswith("/"))
+        ):
+            i += 1
+    return tokens[i:]
+
+
+def _subcommand_self_grant(tokens: list[str]) -> Optional[str]:
+    """Return a self-grant reason if this single subcommand's command-position
+    invocation mints a grant, else None. Quoted data has already been collapsed
+    by shlex, so a grant verb only appears here as an actual command word."""
+    tokens = _strip_wrappers(tokens)
+    if not tokens:
+        return None
+    cmd = os.path.basename(tokens[0])
+    rest = tokens[1:]
+    if cmd in _WILLOW_CLIS:
+        if not rest:
+            return None
+        sub = rest[0]
+        if sub in _GRANT_SUBCOMMANDS:
+            return _SELF_GRANT_REASON
+        if sub in _GRANT_TWO_TOKEN and len(rest) >= 2 and rest[1] in _GRANT_TWO_TOKEN[sub]:
+            return _SELF_GRANT_REASON
+        if sub == "allow-permission" and len(rest) >= 3:
+            perm = rest[2]
+            if (_NET_CAP_RE.fullmatch(perm) or _SEAT_PRIV_RE.fullmatch(perm)
+                    or perm in _ALLOW_PERMISSION_SEAT_BARE):
+                return _ALLOW_PERMISSION_REASON
+        return None
+    if cmd in _CODE_EXECUTORS:
+        # The arguments are executed code (`python -c …`, `python -m willow_mcp
+        # grant-net`, `bash -c …`) — scan them the way the raw guard would.
+        code = " ".join(rest)
+        if _GRANT_CMD_RE.search(code):
+            return _SELF_GRANT_REASON
+    return None
+
+
+def _scan_invocations_for_self_grant(command: str) -> Optional[str]:
+    """Match the grant-command guards against parsed invocations, not the raw
+    string. Falls back to the raw substring scan on a parse failure so a hard
+    deny still fires (never allow on unparseable input)."""
+    stripped = _strip_heredoc_bodies(command)
+    try:
+        token_lists = [
+            shlex.split(sub) for sub in _split_subcommands(stripped) if sub.strip()
+        ]
+    except ValueError:
+        # Unbalanced quotes / too complex → conservative raw scan, hard denies on.
+        if _GRANT_CMD_RE.search(command):
+            return _SELF_GRANT_REASON
+        for _m in _ALLOW_PERMISSION_GRANT_RE.finditer(command):
+            perm = _m.group(1)
+            if (_NET_CAP_RE.fullmatch(perm) or _SEAT_PRIV_RE.fullmatch(perm)
+                    or perm in _ALLOW_PERMISSION_SEAT_BARE):
+                return _ALLOW_PERMISSION_REASON
+        return None
+    for tokens in token_lists:
+        reason = _subcommand_self_grant(tokens)
+        if reason:
+            return reason
+    return None
+
+
 def check_bash_self_grant(command: str) -> Optional[str]:
     """Block a command that mints a lease/envelope, grants itself task_net, or
     edits a manifest to retake a write-capable seat.
@@ -688,16 +865,18 @@ def check_bash_self_grant(command: str) -> Optional[str]:
     Writes only. `cat`ting a lease, `willow-mcp net-status`, and `revoke-net` are
     all fine — reading a key is not holding one, and giving one up is never
     escalation.
+
+    The grant-command guards match a parsed command-position invocation, so a
+    grant verb merely *named* in a commit message, a grep pattern, a heredoc
+    body, or a manifest _note is no longer read as the act itself (gaps
+    3cc11d282b4a, 7ede165e5a29). The write-verb/path/keystore/manifest branches
+    below still scan the raw command and are unchanged.
     """
     if not command:
         return None
-    if _GRANT_CMD_RE.search(command):
-        return _SELF_GRANT_REASON
-    for _m in _ALLOW_PERMISSION_GRANT_RE.finditer(command):
-        perm = _m.group(1)
-        if (_NET_CAP_RE.fullmatch(perm) or _SEAT_PRIV_RE.fullmatch(perm)
-                or perm in _ALLOW_PERMISSION_SEAT_BARE):
-            return _ALLOW_PERMISSION_REASON
+    invocation = _scan_invocations_for_self_grant(command)
+    if invocation:
+        return invocation
     if not _WRITE_VERB_RE.search(command):
         return None
     if _LEASE_DIR_RE.search(command):

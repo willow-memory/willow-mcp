@@ -1151,3 +1151,54 @@ def test_allow_permission_self_grant_forms_blocked(command):
 ])
 def test_deny_permission_and_prose_are_not_blocked(command):
     assert pre_tool_use.check_bash_self_grant(command) is None
+
+
+# ── parse the invocation, not the command text (gaps 3cc11d282b4a, 7ede165e5a29) ─
+#
+# The self-grant guard used to run its grant-verb regexes against the raw
+# command string, so a verb or permission merely NAMED in prose, a quoted
+# argument, or a heredoc body was read as the act itself. These four pin the
+# precision fix: a named permission/verb is not an invocation, but a real
+# invocation at command position still is. The first three fail on the current
+# tree (the false positive is present) and pass after the parse-aware fix.
+
+
+def test_commit_message_naming_an_excluded_permission_is_not_a_self_grant():
+    """gap 3cc11d282b4a: a commit body describing an EXCLUDED permission was read
+    as granting it. The grant token lives inside the quoted -m argument, not at
+    command position, so it is prose — the command is `git commit`."""
+    cmd = ("git commit -m "
+           "'note: task_net stays operator-only; never willow-mcp allow-permission app task_net'")
+    assert pre_tool_use.check_bash_self_grant(cmd) is None
+
+
+@pytest.mark.parametrize("command", [
+    'grep -rn "willow-mcp grant-net" docs/',
+    "cat notes.md | grep 'willow-mcp allow-permission app web_net'",
+])
+def test_read_command_containing_a_guarded_keyword_is_not_a_self_grant(command):
+    """gap 7ede165e5a29: a pure-read command (grep/cat) was refused for merely
+    containing a guarded keyword in its argument. The keyword is data the reader
+    scans, not a command it runs."""
+    assert pre_tool_use.check_bash_self_grant(command) is None
+
+
+@pytest.mark.parametrize("command", [
+    "willow-mcp grant-net willow --ttl 3h",
+    "sudo willow-mcp grant-net willow --ttl 3h",          # wrapper stripped
+    "willow-mcp allow-permission app web_net",
+    'python -c "from willow_mcp import lease; lease.grant(\'x\', 60)"',  # executor code
+])
+def test_guarded_invocation_at_command_position_is_still_refused(command):
+    """The precision fix must not relax a real self-grant: a grant verb at the
+    command-position word (through env/sudo wrappers, or inside an executor's
+    code) is still refused."""
+    assert pre_tool_use.check_bash_self_grant(command) is not None
+
+
+def test_heredoc_body_with_a_guarded_word_does_not_trigger_but_a_real_command_does():
+    """A guarded verb inside a heredoc body is document text, not an invocation;
+    the same verb run as a command still is."""
+    heredoc = "cat <<'EOF'\nwillow-mcp grant-net willow --ttl 3h\nEOF"
+    assert pre_tool_use.check_bash_self_grant(heredoc) is None
+    assert pre_tool_use.check_bash_self_grant("willow-mcp grant-net willow --ttl 3h") is not None
