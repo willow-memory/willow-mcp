@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from .boot_health import degraded_boot_line, postgres_status, split_brain_boot_line
+from .commitments.boot import commitment_boot_lines
 from .nest import autointake as nest_autointake
 from .seed_loader import load_corpus_lanes
 from .session_inject import (
@@ -210,6 +211,13 @@ def build_boot_lines(
     nest_line = nest_autointake.boot_line(app_id)
     if nest_line:
         lines.append(nest_line)
+
+    # Commitment membrane join (the dew rule was built and MCP-exposed but
+    # never wired to run itself at SessionStart — a seat opened blind to a
+    # commitment coming due or a conflict it was about to walk into).
+    # Silent unless something is imminent/conflicting/unacknowledged;
+    # degrades to no line on any fault (see commitments/boot.py).
+    lines.extend(commitment_boot_lines(app_id))
 
     lines.extend(_blocker_lines(orientation))
     if not lite_inject:
