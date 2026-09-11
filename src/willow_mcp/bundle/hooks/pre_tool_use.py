@@ -54,6 +54,7 @@ code. No output means allow, no comment.
 import json
 import os
 import re
+import shlex
 import sys
 from typing import Optional
 
@@ -681,16 +682,226 @@ _ALLOW_PERMISSION_REASON = (
 )
 
 
-def check_bash_self_grant(command: str) -> Optional[str]:
-    """Block a command that mints a lease/envelope, grants itself task_net, or
-    edits a manifest to retake a write-capable seat.
+# ── fail-closed carve-out (operator ruling, closes audit 2AA60817) ──────────
+#
+# REWORK of the shape-checking parser this replaced: that parser looked ONLY at
+# a parsed command-position invocation, which means anything that reaches the
+# grant verb WITHOUT putting it at command position — a newline-separated
+# command, an executed heredoc body, `$(...)`/backticks, a `(...)` subshell or
+# `{ ...; }` group, a leading `FOO=bar` assignment, `echo '...' | bash`, an
+# unstripped wrapper (`timeout`, `xargs`, `doas`, `ssh`, `uv run`, …), or
+# `python -m willow_mcp allow-permission ...` — slipped straight through.
+# Cross-model audit 2AA60817 confirmed a real grant invocation got through
+# every one of those shapes. The operator ruled: do not chase the exhaustive
+# parser; invert it.
+#
+# The design is now inverted:
+#   1. The raw substring scan (_GRANT_CMD_RE / _ALLOW_PERMISSION_GRANT_RE) is
+#      the PRIMARY denier again, run unconditionally against the whole raw
+#      command text — no tokenising, no heredoc stripping, no command-position
+#      requirement. A `.search()` over the raw string does not care what shape
+#      carried the verb to it, so every bypass above still trips it.
+#   2. Parsing is used ONLY to SUPPRESS that denial, and only for the two
+#      shapes actually measured as false positives:
+#        3cc11d282b4a — the verb/permission lives inside the quoted message
+#                        argument of a `git commit -m`/`-F` invocation.
+#        7ede165e5a29 — the verb/permission is an argument to a read-only
+#                        command (grep/rg/cat/less/head/tail/…), not something
+#                        that command runs.
+#      Suppression only fires when, after masking exactly those two shapes out
+#      of the command, the raw scan no longer matches at all. Anything left
+#      over — a grant elsewhere in the same command, an unrecognised shape, a
+#      parse failure — leaves the denial standing. Ambiguity denies.
+_READ_ONLY_COMMANDS = frozenset({
+    "grep", "egrep", "fgrep", "rg", "cat", "less", "more", "head", "tail",
+    "zcat", "zless", "bat",
+})
+# -m/-F (and their long forms) on a `git commit` invocation: the only place a
+# grant verb is data, not code, in a shape worth carving out.
+_GIT_COMMIT_MSG_ARG_RE = re.compile(
+    r"(?P<flag>-{1,2}(?:m|message|F|file)\s*=?\s*)(?P<q>[\"'])(?P<msg>.*?)(?P=q)",
+    re.DOTALL,
+)
 
-    Writes only. `cat`ting a lease, `willow-mcp net-status`, and `revoke-net` are
-    all fine — reading a key is not holding one, and giving one up is never
-    escalation.
-    """
-    if not command:
+# A leading `git` global option or two before the `commit` subcommand — e.g.
+# `git -C /path commit`, `git --no-pager commit`. Conservative on purpose:
+# only options that take no further inline argument (or a small enumerated
+# set that takes one token, like -C/-c) are walked past, so this never
+# mistakes an unrelated `git <verb>` for `git commit`.
+_GIT_GLOBAL_OPT_WITH_ARG = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+
+
+def _find_git_commit_token_index(tokens: list[str]) -> Optional[int]:
+    """Return the index of the `commit` token in a `git ...` invocation's
+    token list, walking past leading git global options, or None if this
+    is not recognisably a `git commit` invocation."""
+    if not tokens or os.path.basename(tokens[0]) != "git":
         return None
+    i = 1
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok == "commit":
+            return i
+        if tok.startswith("--") and "=" in tok:
+            i += 1
+            continue
+        if tok in _GIT_GLOBAL_OPT_WITH_ARG:
+            i += 2
+            continue
+        if tok.startswith("-") and tok != "-":
+            i += 1
+            continue
+        # First non-option token that isn't "commit" — this isn't a
+        # `git commit` invocation (e.g. `git -C /path log`).
+        return None
+    return None
+
+
+# ALLOWLIST, not a blocklist (round-5 rework, closing Opus re-audit
+# 5701FFBD): round-4's `_LIVE_EXEC_OPERATOR_RE` named the live-execution
+# shapes it knew about ($(, backtick, <() and missed the ones it didn't —
+# `>(` (output process substitution) and `${ cmd; }` (bash 5.3 funsub) both
+# slip a real self-grant through undetected, and a blocklist of shell
+# operators is never complete; the next one is just another name away.
+#
+# So invert it: a carve-out may only blank a region that is INERT — one
+# that contains NONE of the characters a shell gives special evaluated
+# meaning to. Command substitution ($(), backticks), process substitution
+# (<(), >()), brace/funsub groups ({ ;}), pipelines (|), sequencing (;, &),
+# redirection (<, >), and escaping (\) all REQUIRE one of these characters
+# to exist at all — so refusing to blank whenever ANY of them is present
+# closes the whole class of "the shell evaluates this before the outer
+# command sees it" bypasses at once, including operators nobody has named
+# yet. A bare literal newline is included too: it is a command separator
+# exactly like `;`.
+#
+# This is deliberately conservative, not merely sufficient: a message that
+# both names a grant verb in prose AND contains, say, `$(date)` for an
+# unrelated reason still gets denied, because the whole region is refused
+# once any of these characters appears — there is no attempt to distinguish
+# a "safe" occurrence of one of these characters from a "live" one.
+# Ambiguity denies. See test_ambiguous_commit_message_with_prose_and_subst_denies.
+_UNSAFE_CHARS_RE = re.compile(r"[$`(){}<>|;&\\\n]")
+
+
+def _split_subcommands_with_spans(command: str) -> list[tuple[int, int]]:
+    """Split on top-level `;`, `|`, `||`, `&&`, and newlines — the same set a
+    shell treats as a command boundary — while respecting quotes, and return
+    (start, end) offsets into `command` for each subcommand span so callers
+    can rebuild the string with only specific spans altered.
+
+    Splitting is precision-only here: it decides which spans are eligible for
+    the two recognised safe shapes below. It is never used to decide whether
+    the raw scan fires — that always runs against the untouched whole string.
+    """
+    spans: list[tuple[int, int]] = []
+    quote: Optional[str] = None
+    i, n = 0, len(command)
+    start = 0
+    while i < n:
+        c = command[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < n:
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            i += 1
+            continue
+        if c in ("\n", ";"):
+            spans.append((start, i))
+            i += 1
+            start = i
+            continue
+        if c == "&" and i + 1 < n and command[i + 1] == "&":
+            spans.append((start, i))
+            i += 2
+            start = i
+            continue
+        if c == "|":
+            spans.append((start, i))
+            i += 2 if (i + 1 < n and command[i + 1] == "|") else 1
+            start = i
+            continue
+        i += 1
+    spans.append((start, n))
+    return spans
+
+
+def _mask_subcommand_if_safe(sub: str) -> str:
+    """Return `sub` with a recognised safe shape's data blanked out (same
+    length, so offsets are irrelevant to the caller), or `sub` unchanged if it
+    is not recognisably one of the two carve-out shapes. Unchanged is the
+    fail-closed default — anything that doesn't parse cleanly into one of
+    these two shapes stays exactly as written, so the raw scan still sees it.
+    """
+    try:
+        tokens = shlex.split(sub)
+    except ValueError:
+        return sub
+    if not tokens:
+        return sub
+    head = os.path.basename(tokens[0])
+    if head in _READ_ONLY_COMMANDS:
+        # The keyword this subcommand contains, if any, is an argument the
+        # reader scans — never something it runs — UNLESS the region isn't
+        # inert: it contains a shell-evaluated character ($, `, (, ), <, >,
+        # {, }, |, ;, &, \, or a newline). Any of those means the shell may
+        # evaluate part of this text before the outer command ever sees its
+        # arguments, so blanking would delete the live grant text and leave
+        # the re-scan with nothing to find. Refuse to blank: let the denial
+        # from the raw scan stand.
+        if _UNSAFE_CHARS_RE.search(sub):
+            return sub
+        return " " * len(sub)
+    if os.path.basename(tokens[0]) == "git" and _find_git_commit_token_index(tokens) is not None:
+        # Only the quoted -m/-F message text is data; the rest of the
+        # invocation (git, any global options, commit, any other flags) is
+        # left as-is. As above, if the message region that would be blanked
+        # is not inert (contains a shell-evaluated character), refuse to
+        # blank it — the shell evaluates that part before the outer `git
+        # commit` does, so blanking would erase the only text carrying the
+        # live grant. This is the ambiguity-denies case: a message that both
+        # names a grant verb in prose AND contains e.g. `$(date)` is denied,
+        # on purpose — no attempt is made to tell a "safe" occurrence of
+        # these characters from a "live" one.
+        def _blank_message(m: "re.Match[str]") -> str:
+            msg = m.group("msg")
+            if _UNSAFE_CHARS_RE.search(msg):
+                return m.group(0)
+            return m.group("flag") + m.group("q") + " " * len(msg) + m.group("q")
+
+        return _GIT_COMMIT_MSG_ARG_RE.sub(_blank_message, sub)
+    return sub
+
+
+def _mask_recognised_safe_shapes(command: str) -> str:
+    """Blank out exactly the two recognised false-positive shapes (git commit
+    -m/-F message text; a read-only command's arguments) subcommand by
+    subcommand, leaving everything else — including anything unrecognised —
+    untouched."""
+    pieces: list[str] = []
+    prev_end = 0
+    for start, end in _split_subcommands_with_spans(command):
+        pieces.append(command[prev_end:start])
+        pieces.append(_mask_subcommand_if_safe(command[start:end]))
+        prev_end = end
+    pieces.append(command[prev_end:])
+    return "".join(pieces)
+
+
+def _raw_self_grant_scan(command: str) -> Optional[str]:
+    """The primary denier: an unconditional substring/regex scan of the whole
+    raw command text for a grant-minting invocation. This is master's
+    pre-parser behavior, restored — it does not care what shape (newline,
+    heredoc, `$()`, backticks, subshell, group, leading assignment, pipe into
+    an executor, or an unstripped wrapper) carried the verb into the string;
+    if the verb is anywhere in the text, it fires."""
     if _GRANT_CMD_RE.search(command):
         return _SELF_GRANT_REASON
     for _m in _ALLOW_PERMISSION_GRANT_RE.finditer(command):
@@ -698,6 +909,35 @@ def check_bash_self_grant(command: str) -> Optional[str]:
         if (_NET_CAP_RE.fullmatch(perm) or _SEAT_PRIV_RE.fullmatch(perm)
                 or perm in _ALLOW_PERMISSION_SEAT_BARE):
             return _ALLOW_PERMISSION_REASON
+    return None
+
+
+def check_bash_self_grant(command: str) -> Optional[str]:
+    """Block a command that mints a lease/envelope, grants itself task_net, or
+    edits a manifest to retake a write-capable seat.
+
+    Writes only. `cat`ting a lease, `willow-mcp net-status`, and `revoke-net` are
+    all fine — reading a key is not holding one, and giving one up is never
+    escalation.
+
+    The grant-command guards run the raw substring scan unconditionally
+    (fail-closed carve-out, audit 2AA60817) and suppress that denial only when
+    masking out exactly the two measured false-positive shapes — a git commit
+    -m/-F message, or a read-only command's argument (gaps 3cc11d282b4a,
+    7ede165e5a29) — makes the scan stop matching entirely. Any grant text left
+    over after masking, or any shape the masker doesn't recognise, leaves the
+    denial standing. The write-verb/path/keystore/manifest branches below still
+    scan the raw command and are unchanged.
+    """
+    if not command:
+        return None
+    reason = _raw_self_grant_scan(command)
+    if reason is not None:
+        masked = _mask_recognised_safe_shapes(command)
+        if masked != command and _raw_self_grant_scan(masked) is None:
+            reason = None
+    if reason is not None:
+        return reason
     if not _WRITE_VERB_RE.search(command):
         return None
     if _LEASE_DIR_RE.search(command):
