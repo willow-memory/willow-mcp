@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.35.0](https://github.com/willow-memory/willow-mcp/compare/v2.34.1...v2.35.0) (2026-09-11)
+
+
+### Added
+
+* add willow-mcp seal handler that upgrades governance decisions on seal ([a309578](https://github.com/willow-memory/willow-mcp/commit/a309578e6cf7893d8f7ada73b8ae8f117731d825))
+
+
+### Build
+
+* take willow-ratatosk as a dependency for the seal daemon wiring ([74233fd](https://github.com/willow-memory/willow-mcp/commit/74233fdec73719e76646c63824c938514b0a1e84))
+
 ## [2.34.1](https://github.com/willow-memory/willow-mcp/compare/v2.34.0...v2.34.1) (2026-09-11)
 
 
