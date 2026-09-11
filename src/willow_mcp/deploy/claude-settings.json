@@ -58,6 +58,16 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.stop_lint_hook"
+          }
+        ]
+      }
     ]
   }
 }
