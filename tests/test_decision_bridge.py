@@ -111,10 +111,8 @@ def test_propose_creates_draft_and_stamps_soil_record(store, nestor_db_path):
 
     # The draft really landed in the temp nestor.db, unsealed, with the
     # SOIL record's title/ruling/rationale as defaults.
-    from nestor.decision import DecisionMemory
     from nestor.sqlite_store import SqliteStore
     nstore = SqliteStore(str(nestor_db_path))
-    dm = DecisionMemory(nstore, domain="decision")
     row = nstore.memory_get(pair_id)
     assert row is not None
     assert row["id"] == pair_id
