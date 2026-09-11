@@ -57,19 +57,48 @@ CONFIDENCE_FLOOR = 0.70
 _MAX_SNIFF_BYTES = 2_000_000
 
 
+# Synthetic "kind" appended whenever the scanner could NOT fully clear a
+# file (oversized, unreadable, or any other reason the sniff had to bail).
+# It is deliberately non-empty so callers that just check `if kinds:` still
+# hold the item — "could not check" must never collapse into "clean".
+_UNINSPECTABLE = "uninspectable"
+
+
 def _secret_kinds(path: Path) -> list[str]:
-    """Best-effort content sniff for high-signal credentials. Returns [] for
-    anything unreadable/binary/oversized rather than raising — an unreadable
-    file is not evidence of a secret (it falls through to the low-confidence
-    branch on its own merits), but a decode failure must never take the boot
-    path down."""
+    """Best-effort scan for high-signal credentials in BOTH the filename and
+    the file's raw bytes. Fail closed: a drop is reported clear only when it
+    was actually, fully inspected within the sniff cap. Anything the scanner
+    cannot fully clear — oversized, unreadable, any other bail-out — comes
+    back with the synthetic "uninspectable" kind so the caller HOLDS it
+    rather than treating an uninspected file as evidence of nothing."""
+    kinds: set[str] = set()
+    # The filename/path travels with the file wherever it's filed, so it is
+    # scanned unconditionally — a credential in the name is a live leak even
+    # when the body is clean.
+    kinds.update(kind for kind, _ in secrets.find_secrets(path.name))
+
     try:
-        if not path.is_file() or path.stat().st_size > _MAX_SNIFF_BYTES:
-            return []
-        text = path.read_text(encoding="utf-8", errors="strict")
-    except (OSError, UnicodeDecodeError, ValueError):
-        return []
-    return sorted({kind for kind, _ in secrets.find_secrets(text)})
+        if not path.is_file():
+            kinds.add(_UNINSPECTABLE)
+            return sorted(kinds)
+        if path.stat().st_size > _MAX_SNIFF_BYTES:
+            # Can't fully sniff within the cap — hold it rather than silently
+            # skipping the unread tail and filing on a partial clean bill.
+            kinds.add(_UNINSPECTABLE)
+            return sorted(kinds)
+        raw = path.read_bytes()
+    except OSError:
+        kinds.add(_UNINSPECTABLE)
+        return sorted(kinds)
+
+    # Decode leniently over raw bytes rather than strict UTF-8 text: a
+    # binary carrier (PDF/DOCX/image) must still be pattern-matched instead
+    # of raising UnicodeDecodeError and sailing through clean. latin-1 is a
+    # total mapping (every byte 0-255 decodes), so no byte — and no ASCII
+    # credential shape embedded in binary — is ever dropped or skipped.
+    text = raw.decode("latin-1")
+    kinds.update(kind for kind, _ in secrets.find_secrets(text))
+    return sorted(kinds)
 
 
 def run(store: Store, app_id: str = "hook",

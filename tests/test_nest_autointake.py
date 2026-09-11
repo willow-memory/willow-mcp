@@ -107,6 +107,86 @@ def test_rerun_is_idempotent_no_double_intake(env, store):
     assert intake.get_queue(store) == []
 
 
+def test_binary_body_with_secret_is_held_not_filed(env, store):
+    """A non-UTF-8 binary carrier (a .pdf) with an embedded AWS key must not
+    slip through just because strict UTF-8 decoding of the body would raise —
+    the sniff now scans raw bytes leniently, so the secret is still caught."""
+    _tmp, drop = env
+    pdf = drop / "invoice_confidential.pdf"
+    # %PDF header + non-UTF-8 bytes (0xFF/0xFE are invalid UTF-8 continuation
+    # bytes on their own) + a live-shaped AWS key.
+    pdf.write_bytes(b"%PDF-1.4\n\xff\xfe\x00\x01 AKIAABCDEFGHIJKLMNOP \xff\xfe\n")
+
+    result = autointake.run(store, app_id="hook", folders=[drop])
+
+    assert result["status"] == "ok"
+    assert result["filed"] == []
+    held = next(h for h in result["held"] if h["filename"] == "invoice_confidential.pdf")
+    assert "secrets:" in held["reason"]
+    assert "aws_access_key" in held["reason"]
+    assert pdf.exists()
+    assert len(intake.get_queue(store)) == 1
+
+
+def test_filename_secret_is_held_even_with_clean_body(env, store):
+    """A credential riding in the FILENAME, not the body, must still trip the
+    gate — the sniff checks the name unconditionally, not just the content."""
+    _tmp, drop = env
+    leaky_name = drop / "invoice-AKIAABCDEFGHIJKLMNOP.md"
+    leaky_name.write_text("nothing sensitive in here")
+
+    result = autointake.run(store, app_id="hook", folders=[drop])
+
+    assert result["status"] == "ok"
+    assert result["filed"] == []
+    held = next(h for h in result["held"] if h["filename"] == "invoice-AKIAABCDEFGHIJKLMNOP.md")
+    assert "secrets:" in held["reason"]
+    assert "aws_access_key" in held["reason"]
+    assert leaky_name.exists()
+    assert len(intake.get_queue(store)) == 1
+
+
+def test_oversized_file_is_held_not_filed_uninspected(env, store):
+    """A file too large for the sniff cap cannot be affirmatively cleared —
+    it must be HELD, never filed on the strength of an unread tail, even
+    though it classifies cleanly by filename and carries a secret up front."""
+    _tmp, drop = env
+    big = drop / "invoice_bulk.txt"
+    padding = b"x" * (autointake._MAX_SNIFF_BYTES + 1024)
+    big.write_bytes(b"aws_key=AKIAABCDEFGHIJKLMNOP\n" + padding)
+
+    result = autointake.run(store, app_id="hook", folders=[drop])
+
+    assert result["status"] == "ok"
+    assert result["filed"] == []
+    held = next(h for h in result["held"] if h["filename"] == "invoice_bulk.txt")
+    assert "secrets:" in held["reason"]
+    assert "uninspectable" in held["reason"]
+    assert big.exists()
+    assert len(intake.get_queue(store)) == 1
+
+
+def test_unreadable_file_holds_rather_than_clears(env, store):
+    """A read failure (permission denied, etc.) must be reported as 'could
+    not clear', not misread as 'clean' — fail closed, never fail open."""
+    _tmp, drop = env
+    unreadable = drop / "invoice_locked.txt"
+    unreadable.write_text("aws_key=AKIAABCDEFGHIJKLMNOP\n")
+    unreadable.chmod(0o000)
+
+    try:
+        result = autointake.run(store, app_id="hook", folders=[drop])
+    finally:
+        unreadable.chmod(0o644)  # restore so tmp_path cleanup can remove it
+
+    assert result["status"] == "ok"
+    assert result["filed"] == []
+    held = next(h for h in result["held"] if h["filename"] == "invoice_locked.txt")
+    assert "secrets:" in held["reason"]
+    assert "uninspectable" in held["reason"]
+    assert len(intake.get_queue(store)) == 1
+
+
 def test_empty_drop_zone_is_a_clean_noop(env, store):
     """No files dropped: the hook is a clean no-op and never raises, even
     when the drop dir itself doesn't exist."""
