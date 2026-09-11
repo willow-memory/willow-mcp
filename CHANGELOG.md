@@ -37,8 +37,8 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 ### Fixed
 
 * **deps:** add ruff to the test extra so CI's test-matrix has a real linter ([8b18278](https://github.com/willow-memory/willow-mcp/commit/8b182783bb516f4b59003984649fdf1bfd31a33d))
-* **gate:** lower ruff timeout under the harness budget, parse TOML for config detection ([74c83fc](https://github.com/willow-memory/willow-mcp/commit/74c83fc0cdada92d1b9f736cc170d5f0622b31b4))
 * **hooks:** point the dev-environment green-claim gate at the venv python ([597a248](https://github.com/willow-memory/willow-mcp/commit/597a248a798dbf3e7651262de2b1d7d4b9bc72dd))
+* **gate:** lower ruff timeout under the harness budget, parse TOML for config detection ([74c83fc](https://github.com/willow-memory/willow-mcp/commit/74c83fc0cdada92d1b9f736cc170d5f0622b31b4))
 
 ## [2.34.0](https://github.com/willow-memory/willow-mcp/compare/v2.33.2...v2.34.0) (2026-09-10)
 
