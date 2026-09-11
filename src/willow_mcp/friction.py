@@ -24,6 +24,7 @@ Two honest constraints carried from upstream:
 from __future__ import annotations
 
 import hashlib
+from typing import Optional
 
 from .friction_floor import FrictionFloor, Turn
 
@@ -35,12 +36,25 @@ class FrictionWatcher:
         self.store = store
         self.collection = collection
 
-    def scan(self, turns, window: int = 4, floor: float = 0.35) -> dict:
+    def scan(self, turns, window: int = 4, floor: float = 0.35,
+              session_id: Optional[str] = None) -> dict:
         """Scan a transcript window and persist any flag it raises.
 
         `turns`: [{role: 'user'|'agent', text: str, ts?: number}, …]. Returns
         {tripped, flags, agent_turns, scanned_turns, window, floor}. A clean scan
-        writes nothing; a tripped scan persists each flag (deduped by content)."""
+        writes nothing; a tripped scan persists each flag (deduped by content).
+
+        `session_id` is optional (default None preserves the original,
+        session-agnostic behavior for callers — e.g. the ad hoc `friction_scan`
+        MCP tool — that hand it an arbitrary window with no session concept).
+        When a caller DOES know which session it is scanning, passing it here
+        makes the dedup key and the stored flag both session-scoped: two
+        different sessions that each produce the same low-friction episode
+        persist as two distinct, attributable flags, and every stored flag
+        that came from a known session carries that session_id. Without it, a
+        bare sha256(message) key means a second session with an identically
+        shaped episode silently overwrites the first session's flag, and
+        nothing on the stored record says which session tripped."""
         if not isinstance(window, int) or window < 2:
             return {"error": "bad_window", "detail": "window must be an int >= 2"}
         try:
@@ -69,9 +83,15 @@ class FrictionWatcher:
             fd = {"at_turn": f.at_turn, "streak": f.streak,
                   "mean_friction": f.mean_friction, "escalation": f.escalation,
                   "low_turns": list(f.low_turns), "message": f.message}
+            if session_id:
+                fd["session_id"] = session_id
             # Dedupe by content so a monitor re-scanning an overlapping window
-            # doesn't record the same alarm twice.
-            fid = "flag_" + hashlib.sha256(f.message.encode("utf-8", "replace")).hexdigest()[:16]
+            # doesn't record the same alarm twice — scoped by session_id (when
+            # known) so two different sessions with the same-shaped episode
+            # persist as two attributable flags rather than one overwriting
+            # the other.
+            dedupe_key = f"{session_id}:{f.message}" if session_id else f.message
+            fid = "flag_" + hashlib.sha256(dedupe_key.encode("utf-8", "replace")).hexdigest()[:16]
             self.store.put(self.collection, fd, record_id=fid)
             out.append(fd)
         return {"tripped": bool(out), "flags": out,
@@ -84,6 +104,7 @@ class FrictionWatcher:
         out = []
         for r in rows[:max(1, limit)]:
             out.append({"id": r.get("_id"), "recorded_at": r.get("_created"),
+                        "session_id": r.get("session_id"),
                         "escalation": r.get("escalation"),
                         "mean_friction": r.get("mean_friction"),
                         "low_turns": r.get("low_turns", []), "message": r.get("message")})
