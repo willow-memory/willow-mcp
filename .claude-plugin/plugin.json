@@ -60,6 +60,16 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/stop_lint_gate.py"
+          }
+        ]
+      }
     ]
   },
   "skills": [

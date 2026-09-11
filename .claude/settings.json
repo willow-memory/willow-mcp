@@ -57,6 +57,14 @@
             "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop-issue-closure-check.sh\""
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/hooks/stop_lint_gate.py\""
+          }
+        ]
       }
     ]
   }
