@@ -21,8 +21,13 @@ against actual constructor behavior, not a stand-in for it.
 """
 from __future__ import annotations
 
+import logging
+import os
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -300,3 +305,91 @@ def test_run_seal_watch_forever_raises_clear_importerror_when_ratatosk_absent(mo
 
     with pytest.raises(ImportError, match="willow-ratatosk"):
         seal_daemon.run_seal_watch_forever(stop=threading.Event())
+
+
+def test_run_seal_watch_forever_survives_a_raising_poll_and_keeps_going(
+    monkeypatch, caplog, tmp_path,
+):
+    """A poll() that raises must be logged (exc_info) and NOT kill the loop
+    — no hot-spin, no silent death. The second poll, which succeeds, still
+    runs afterward."""
+    stop = threading.Event()
+    calls = []
+
+    class FlakyWatcher:
+        def __init__(self, **_kwargs):
+            pass
+
+        def poll(self):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            stop.set()
+            return 0
+
+    monkeypatch.setattr(seal_daemon, "JsonlTailWatcher", FlakyWatcher)
+
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("", encoding="utf-8")
+    offset = tmp_path / "offset"
+    statuses = []
+
+    with caplog.at_level(logging.ERROR, logger="willow_mcp.seal_daemon"):
+        seal_daemon.run_seal_watch_forever(
+            ledger_path=ledger,
+            offset_path=offset,
+            poll_interval=0.01,
+            stop=stop,
+            on_status=statuses.append,
+        )
+
+    # The loop survived past the raising first poll and reached a second.
+    assert len(calls) >= 2
+    # The failure was logged with exc_info, not swallowed silently.
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("poll failed" in r.message for r in error_records)
+    assert any(r.exc_info for r in error_records)
+    # And on_status was told about it too, not just the log.
+    assert any("seal watch error" in s for s in statuses)
+
+
+def test_main_exits_promptly_and_cleanly_on_sigterm(tmp_path):
+    """Integration check on the real console entrypoint: SIGTERM must stop
+    it quickly and with a clean (0) exit code, not hang or crash."""
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("", encoding="utf-8")
+
+    src_dir = str(Path(__file__).resolve().parents[1] / "src")
+    env = os.environ.copy()
+    env["WILLOW_HOME"] = str(tmp_path)
+    env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "willow_mcp.seal_daemon", "--poll-interval", "0.1"],
+        cwd=src_dir,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        # Give it a moment to reach the run loop before signalling.
+        time.sleep(0.5)
+        start = time.monotonic()
+        proc.terminate()  # SIGTERM
+        try:
+            out, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate(timeout=5)
+            pytest.fail(f"process did not exit within 5s on SIGTERM; output:\n{out}")
+        elapsed = time.monotonic() - start
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+    assert elapsed < 3, f"SIGTERM took too long to take effect ({elapsed:.2f}s)"
+    assert proc.returncode == 0
+    assert "watching" in out
+    assert "stopped" in out
