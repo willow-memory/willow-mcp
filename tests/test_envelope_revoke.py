@@ -90,6 +90,19 @@ def test_revoke_requires_a_reason(register):
     assert json.loads(register.read_text())["active"][0]["status"] == "active"
 
 
+def test_governing_envelopes_returns_full_rows_and_matches_the_id_projection(register):
+    """`governing_envelopes` is the fuller sibling `_ambiguous_envelope_detail`
+    (server.py) builds its EAMBIG message from -- it must return the whole
+    row (bounds included), and its ids must always agree with
+    `governing_envelope_ids`, since the two are one resolution, not two."""
+    rows = envelopes.governing_envelopes("dispatch", "willow")
+    assert [row["id"] for row in rows] == envelopes.governing_envelope_ids("dispatch", "willow")
+    assert rows[0]["bounds"] == {"to_agents": ["loki"], "task_class": ["auditor"]}
+
+    ea.revoke("env-dispatch-1", verifier="sean", reason="redundant")
+    assert envelopes.governing_envelopes("dispatch", "willow") == []
+
+
 def test_revoking_an_unknown_envelope_is_refused(register):
     with pytest.raises(ea.EnvelopeNotFoundError):
         ea.revoke("env-nope", verifier="sean", reason="x")

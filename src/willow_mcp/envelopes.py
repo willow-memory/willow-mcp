@@ -133,10 +133,30 @@ def governing_envelope_ids(verb: str, actor: str) -> list[str]:
     (`server._enveloped_verb_gate`) instead treats it as "not governed" —
     see that function's docstring for why turning a missing/misconfigured
     registry into a hard failure for every install, enveloped or not, would
-    be the wrong tradeoff there."""
+    be the wrong tradeoff there.
+
+    A thin id-only projection of `governing_envelopes` — kept so existing
+    callers that only ever needed the id list are unaffected by the fuller
+    row shape a caller building an actionable ambiguity message needs."""
+    return [row["id"] for row in governing_envelopes(verb, actor)]
+
+
+def governing_envelopes(verb: str, actor: str) -> list[dict]:
+    """Full active-grant rows (id, bounds, ...) governing `verb` for `actor` —
+    the same resolution `governing_envelope_ids` performs, but returning the
+    whole row instead of just its id.
+
+    Exists so a caller building an EAMBIG message when more than one grant
+    matches (dispatch-EAMBIG-blocker: the raw ambiguous-match refusal named
+    no ids and no distinguishing detail, so a seat burned turns guessing —
+    or, worse, revoked a valid grant trying to fix it) can name not just
+    WHICH envelope ids matched but WHAT distinguishes them (their bounds),
+    without re-deriving the match itself and risking it drifting from this
+    one true resolution. `governing_envelope_ids` stays the id-only
+    projection of this so both never disagree about what matched."""
     registry = _load(registry_path())
     return [
-        row["id"]
+        dict(row)
         for row in usable_active_grants(registry)
         if row.get("verb") == verb
         and row.get("status") == "active"
