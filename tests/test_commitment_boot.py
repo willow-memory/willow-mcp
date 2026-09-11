@@ -96,11 +96,70 @@ def test_commitment_boot_lines_surfaces_mismatch():
     assert "mismatch" in joined
 
 
+def test_commitment_boot_lines_dedups_imminent_and_mismatch_for_same_commitment(monkeypatch):
+    # An unacknowledged commitment that is also starting within the lead
+    # window surfaces twice from dew_surface (once "imminent", once
+    # "mismatch") — the boot line must collapse that to ONE entry for the
+    # commitment, keeping the more urgent kind, not spend two cap slots on
+    # a single event.
+    ledger = _ledger_with([
+        CalendarEvent(uid="c1", title="Standup", start=BASE + timedelta(days=10),
+                      end=BASE + timedelta(days=10, minutes=15)),
+    ])
+    # A reschedule lands it inside the lead window AND clears acknowledged
+    # (moves are unacknowledged by construction) -> imminent AND mismatch
+    # both fire for this one commitment.
+    ledger.source.set_events([
+        CalendarEvent(uid="c1", title="Standup", start=BASE + timedelta(minutes=5),
+                      end=BASE + timedelta(minutes=20)),
+    ])
+    ledger.ingest()
+    monkeypatch.setattr(server, "_commitment_ledger_restored", lambda: ledger)
+
+    raw = ledger.dew_surface(BASE)
+    assert {s.kind for s in raw if s.uids == ("c1",)} == {"imminent", "mismatch"}
+
+    lines = commitment_boot.commitment_boot_lines("hanuman", now=BASE)
+    joined = "\n".join(lines)
+    assert lines[0].startswith("[COMMITMENTS] 1 need attention")
+    assert joined.count("Standup") == 1
+    assert "imminent" in joined
+
+
 def test_commitment_boot_lines_degrades_on_fault(monkeypatch):
     def boom():
         raise RuntimeError("store denied")
 
     monkeypatch.setattr(server, "_commitment_ledger_restored", boom)
+    lines = commitment_boot.commitment_boot_lines("hanuman", now=BASE)
+    assert lines == []
+
+
+class _ExplodingSurfacing:
+    """Looks enough like a Surfacing to reach the render loop, but blows up
+    reading .fact — proves the render stage, not just the restore/dew_surface
+    calls, is inside commitment_boot_lines' try/except."""
+
+    kind = "imminent"
+    uids = ("boom-uid",)
+    when = BASE
+
+    @property
+    def fact(self):
+        raise RuntimeError("boom in render")
+
+
+class _FaultyLedger:
+    def dew_surface(self, at):
+        return [_ExplodingSurfacing()]
+
+
+def test_commitment_boot_lines_degrades_on_render_fault(monkeypatch):
+    """The restore and dew_surface calls succeed; the fault is in rendering
+    a surfacing (a bad .fact). This must degrade to no line, not raise —
+    exercising the sort/header/render span, which a fault-in-restore test
+    alone never touches."""
+    monkeypatch.setattr(server, "_commitment_ledger_restored", lambda: _FaultyLedger())
     lines = commitment_boot.commitment_boot_lines("hanuman", now=BASE)
     assert lines == []
 
@@ -133,15 +192,25 @@ def test_build_boot_lines_omits_commitment_section_when_silent(monkeypatch):
     assert "[COMMITMENTS]" not in "\n".join(lines)
 
 
-def test_build_boot_lines_survives_commitment_fault(monkeypatch):
-    """Wiring-level belt-and-suspenders: even if commitment_boot_lines itself
-    somehow raised (it should not — see commitment_boot_lines_degrades_on_fault
-    above), build_boot_lines must not blow up mid-composition."""
+def test_build_boot_lines_survives_commitment_render_fault(monkeypatch):
+    """Wiring-level regression: a fault surfacing PAST the restore/dew_surface
+    calls (i.e. in commitment_boot_lines' own sort/header/render span) must
+    still degrade to no [COMMITMENTS] line and must NOT collapse the rest of
+    boot orientation into a single "[boot_context] degraded" stub — the
+    other sections (blockers, here stubbed to a sentinel) must survive
+    intact. Deliberately does NOT patch a restore-throws lambda (that only
+    exercises the try/except that already existed and proves nothing about
+    the render span — see commitment_boot_lines_degrades_on_render_fault)."""
     monkeypatch.setattr(bc, "load_corpus_lanes", lambda: {})
     monkeypatch.setattr(bc, "read_stack_snapshot", lambda app_id: None)
     monkeypatch.setattr(bc, "degraded_boot_line", lambda app_id: None)
-    monkeypatch.setattr(server, "_commitment_ledger_restored",
-                         lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(bc, "_blocker_lines", lambda *a, **k: ["[BLOCKERS] keep-me"])
+    monkeypatch.setattr(bc, "_gap_lines", lambda *a, **k: [])
+    monkeypatch.setattr(server, "_commitment_ledger_restored", lambda: _FaultyLedger())
 
-    lines = bc.build_boot_lines("hanuman", "sess-commitments-fault", "startup", {"orientation": {}})
-    assert "[COMMITMENTS]" not in "\n".join(lines)
+    lines = bc.build_boot_lines(
+        "hanuman", "sess-commitments-render-fault", "startup", {"orientation": {}}
+    )
+    joined = "\n".join(lines)
+    assert "[COMMITMENTS]" not in joined
+    assert "[BLOCKERS] keep-me" in joined
