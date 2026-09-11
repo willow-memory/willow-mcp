@@ -204,33 +204,71 @@ def _invalid_findings(findings: list) -> list[dict]:
 # re-runs ruff rather than trusting "lint is clean" in a session's own words.
 # There is no equivalent generic command to re-run here (every dispatch's
 # test suite differs), so the check instead requires the claim to be
-# *checkable*: a number tied to a test/check word ("42 passed", "12/12
-# tests", "0 violations"), or a finding that already carries its own
-# `evidence` (the per-finding field _finding_evidence reads). A bare
-# assertion ("tests pass", "all done") satisfies neither and is refused by
-# name — this never fabricates the missing evidence or auto-passes, it only
-# names what's absent so the specialist supplies it.
+# *checkable*: a number tied to a test/check word ("42 passed", "301
+# passing", "938 passed, 0 failed", "11/11 pass", "0 violations"), or a
+# finding that already carries its own `evidence` (the per-finding field
+# _finding_evidence reads). A bare assertion ("tests pass", "all done")
+# satisfies neither and is refused by name — this never fabricates the
+# missing evidence or auto-passes, it only names what's absent so the
+# specialist supplies it.
+#
+# Wordlist: grepped this repo's own docs/handoffs for how the fleet actually
+# phrases a count (docs/BUGS.md "301 passing", docs/design/mcp-sdk-2-
+# migration.md "1497 passed, 43 skipped, 8 xfailed", docs/design/guardian-
+# consent-seam.md "25 passing"/"19 passing"/"9 passing", tests/
+# test_calendar_source_gcal.py "11/11 pass.", docs/repatriation/
+# THE_COLLABORATION.md "938 passed, 0 failed.") — present-tense "passing" and
+# the bare verb "pass" are as common as "passed" and were missing from the
+# first cut, which wrongly refused ordinary phrasing this fleet already
+# uses. All three require a digit immediately adjacent (word boundary
+# enforced) so a digit-free "tests pass" still does not match.
+#
+# Non-test changes (docs-only, config-only — no test count exists to cite):
+# the finding-`evidence` field is the documented escape hatch, not a
+# separate exemption path. A docs-only claim still names, in a finding's
+# `evidence`, what was actually checked (e.g. "diff reviewed: docs/README.md
+# +12/-3, no src/ touched") — sniffing "this is docs-only" out of free-text
+# narrative would let a specialist claim the exemption in prose with nothing
+# behind it, which is exactly the unbacked-claim failure mode this hook
+# exists to catch. One structured path (narrative count OR finding
+# evidence), not two, keeps the gate from being talked around.
 #
 # Deliberately does NOT fire when checklist_resolved is False: an honest
 # blocker/partial report is a valid handoff, not a claim, and carries no
 # obligation to show test evidence for work it says it did not finish.
+#
+# Shape, not truth: this matches a digit adjacent to a test/check word — it
+# cannot tell "42 passed" (a real run) from "added 5 tests" (a plan) or a
+# fabricated number. Actually running the claim would need a fixed test
+# command, and there isn't one that's valid across every dispatch's repo and
+# language (unlike the Stop-hook's ruff, which is one fixed tool this repo
+# declares). Left as a documented shape check, matching the rest of
+# verify_handoff (which also checks findings are dict-shaped, not that they
+# are true) and the "deterministic, no model cost" constraint — tightening
+# it into a truth check is future work if a fleet-wide reporting convention
+# to hook into ever exists.
 _EVIDENCE_RE = re.compile(
-    r"\d+\s*(?:/\s*\d+)?\s*(?:passed|failed|failing|errors?|tests?|checks?|violations?)"
-    r"|(?:passed|failed|tests?|checks?)\s*[:=]?\s*\d+",
+    r"\d+\s*(?:/\s*\d+)?\s*(?:passed|passing|pass|failed|failing|errors?|"
+    r"tests?|checks?|violations?)\b"
+    r"|\b(?:passed|passing|pass|failed|tests?|checks?)\s*[:=]?\s*\d+",
     re.IGNORECASE,
 )
 
 
 def _narrative_has_test_evidence(narrative: str) -> bool:
     """True when the narrative ties a number to a test/check word — "42
-    passed", "12/12 tests", "0 violations". A word alone ("tests pass",
-    "green", "done") is an assertion, not a count, and does not match."""
+    passed", "301 passing", "11/11 pass", "0 violations". A word alone
+    ("tests pass", "green", "done") is an assertion, not a count, and does
+    not match."""
     return bool(narrative) and bool(_EVIDENCE_RE.search(narrative))
 
 
 def _findings_carry_evidence(findings: list) -> bool:
     """True when at least one finding supplies its own `evidence` field
-    (the same field _finding_evidence renders into the closeout table)."""
+    (the same field _finding_evidence renders into the closeout table).
+    This is the documented path for a completion claim with no test count
+    to cite — a docs-only or config-only change names what it checked here
+    instead of the narrative needing a fabricated number."""
     for f in findings:
         if isinstance(f, dict) and _finding_evidence(f):
             return True

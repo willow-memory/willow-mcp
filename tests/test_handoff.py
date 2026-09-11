@@ -455,6 +455,79 @@ def test_verify_passes_complete_claim_with_narrative_test_count():
     assert "reason" not in result
 
 
+def test_verify_passes_present_tense_and_bare_pass_phrasings():
+    """The fleet's own docs/handoffs phrase a count as "passing" or the bare
+    verb "pass" as often as "passed" (docs/BUGS.md "301 passing",
+    docs/design/guardian-consent-seam.md "25 passing"/"19 passing"/"9
+    passing", tests/test_calendar_source_gcal.py "11/11 pass.",
+    docs/design/mcp-sdk-2-migration.md "1497 passed, 43 skipped, 8
+    xfailed"). All must be accepted, each still requiring a digit next to
+    the word so a bare "tests pass" is not smuggled through."""
+    for narrative in [
+        "42 passing.",
+        "3402/3402 passing.",
+        "all 3402 passing, 0 failures.",
+        "42 pass.",
+        "Ran: 11/11 pass.",
+        "301 passing (developer shape).",
+        "1497 passed, 43 skipped, 8 xfailed, 0 failures.",
+    ]:
+        result = _verify({
+            "checklist_resolved": True,
+            "envelope_clean": True,
+            "findings": [{"id": "F1", "text": "Found something"}],
+            "narrative": narrative,
+        })
+        assert result["verified"] is True, f"wrongly refused: {narrative!r}"
+
+
+def test_verify_still_refuses_bare_pass_with_no_digit():
+    """Widening the wordlist to accept "passing"/"pass" must not let a
+    digit-free assertion through — "tests pass" alone still fails."""
+    result = _verify({
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": [{"id": "F1", "text": "Found something"}],
+        "narrative": "All tests pass, everything is passing now.",
+    })
+    assert result["verified"] is False
+    assert "no evidence backs it" in result["reason"]
+
+
+def test_verify_passes_docs_only_claim_via_finding_evidence():
+    """A genuinely-complete docs/config-only change has no test count to
+    cite. The documented escape hatch is a finding's `evidence` field
+    naming what was actually checked — not sniffing "docs-only" out of
+    narrative prose, which a specialist could claim with nothing behind it.
+    This does not force a docs change to fabricate a test count."""
+    result = _verify({
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": [{
+            "summary": "Updated README install instructions",
+            "severity": "low",
+            "evidence": ["diff reviewed: docs/README.md +12/-3, no src/ touched"],
+        }],
+        "narrative": "Docs-only change: updated README install steps, no code touched.",
+    })
+    assert result["verified"] is True
+    assert "reason" not in result
+
+
+def test_verify_refuses_docs_only_claim_with_no_finding_evidence():
+    """A docs-only claim asserted in narrative prose alone, with no finding
+    to back it, is still an unbacked claim — the escape hatch is the
+    finding's evidence field, not the word "docs-only" itself."""
+    result = _verify({
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": [{"id": "F1", "text": "Updated README"}],
+        "narrative": "Docs-only change, no code touched, done.",
+    })
+    assert result["verified"] is False
+    assert "no evidence backs it" in result["reason"]
+
+
 def test_verify_passes_complete_claim_with_finding_evidence():
     """No countable narrative, but a finding carries its own evidence field
     — that is enough backing without also requiring narrative prose."""
