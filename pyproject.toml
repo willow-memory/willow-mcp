@@ -121,6 +121,19 @@ dependencies = [
     # willow-gate sets bump-minor-pre-major false, so a breaking change cuts
     # 1.0.0 and <1.0.0 is a real range.
     "willow-gate>=0.1.0,<1.0.0",
+    # willow-ratatosk — the seat runtime this repo's seal_daemon.py builds a
+    # SeatDaemon against to watch the Nestor ledger for governance-decision
+    # seals (seal_handler.on_seal is the consumer). Moved off
+    # [tool.willow.fleet].unconsumed in the same commit that takes this pin —
+    # test_unconsumed_members_are_not_actually_depended_on enforces that a
+    # package cannot be both. Floor is 1.2.9, the version installed and
+    # verified against at the time this dependency was taken; the seal-watch
+    # daemon itself (SeatDaemon/JsonlTailWatcher) ships on the held
+    # feat/ratatosk-listener-daemon branch and is import-guarded in
+    # seal_daemon.py until a release carries it. Cap at the next major per
+    # Rule 1; willow-ratatosk is pre-1.0 elsewhere in this fleet's pattern, so
+    # <2.0.0 is the honest range once it sets bump-minor-pre-major false.
+    "willow-ratatosk>=1.2.9,<2.0.0",
     "requests>=2.31,<3.0",
 ]
 
@@ -236,12 +249,15 @@ packages = [
 # seat, a consumer of willow-mcp rather than a producer for it, and adding a
 # dependency here to satisfy a test would invert that.
 #
-# willow-ratatosk is the second, and the same shape: the session runtime spawns
-# `python -m willow_mcp` over stdio and holds this package's console entry point
-# and tool contract, exactly as the grove does. Nothing here imports it. That
-# could change — its permission seam (ratatosk.permission / ratatosk.capabilities)
-# is a real surface and this repo has a gate of its own — but a dependency is
-# taken when there is a caller, not to make a roster entry look tidier.
+# willow-ratatosk was the second, and used to be the same shape: the session
+# runtime spawned `python -m willow_mcp` over stdio and held this package's
+# console entry point and tool contract, exactly as the grove does, with
+# nothing here importing it. That changed with seal_daemon.py: it imports
+# ratatosk.daemon (SeatDaemon/JsonlTailWatcher) to watch the Nestor ledger and
+# hand seals to seal_handler.on_seal, a real caller rather than a roster entry
+# looking tidier. It now carries a dependency pin above (Rule 1 applies) and
+# has come off this list in the same commit — see
+# test_unconsumed_members_are_not_actually_depended_on.
 #
 # Rule 2 still applies to everything on the roster — a released package owes
 # callers a defined surface whether or not this repo imports it. Only the pin
@@ -250,7 +266,7 @@ packages = [
 # Listed explicitly, not derived. "Skip anything absent from dependencies" would
 # mean a dropped jeles pin silently stops being enforced, which is the exact
 # failure the roster comment above was written to prevent.
-unconsumed = ["willows-grove", "willow-ratatosk"]
+unconsumed = ["willows-grove"]
 
 [tool.hatch.version]
 # Derived from the git tag (hatch-vcs). At an exact tag `vX.Y.Z` the version is
