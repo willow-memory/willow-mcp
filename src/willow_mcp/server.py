@@ -1015,6 +1015,24 @@ def _check_rate(app_id: str) -> tuple[bool, int]:
 
 # ── Guarded dispatch (Phase 4a+4b+4c combined) ───────────────────────────────
 
+# Registered-tool-name -> gate-check-name, populated as each @_guarded tool is
+# decorated (i.e. at import time, before any request is served). For nearly
+# every tool these are the same string; they diverge for a tool gated as a
+# stand-in for another capability (git_push_execute is gated as
+# envelope_apply — see the docstring on that tool). whoami's tools_allowed
+# and gate.visible_tools() read this so the visible catalogue can never
+# drift from what _guarded actually enforces (gap 1f7d1d62207b): it is
+# built from the same decoration this dispatch pipeline runs through, not a
+# hand-maintained second list.
+_GATE_TOOL_NAMES: dict[str, str] = {}
+
+
+def _gate_tool_catalogue() -> dict[str, str]:
+    """A snapshot of every registered-tool-name -> gate-check-name pair. See
+    `_GATE_TOOL_NAMES` above."""
+    return dict(_GATE_TOOL_NAMES)
+
+
 def _guarded(tool_name: str, *, list_error: bool = False, paginated: bool = False):
     """Central pipeline: gate -> sanitize -> rate check -> dispatch -> receipt.
 
@@ -1032,6 +1050,12 @@ def _guarded(tool_name: str, *, list_error: bool = False, paginated: bool = Fals
     are wrapped in that same shape so callers see a consistent structure.
     """
     def decorator(fn):
+        # Record the registered-tool-name -> gate-check-name mapping at
+        # decoration time, before `@mcp.tool()` (applied above this on every
+        # call site) ever sees the wrapper — `functools.wraps` below keeps
+        # `wrapper.__name__ == fn.__name__`, which is the name `mcp.tool()`
+        # registers absent an explicit override. See `_GATE_TOOL_NAMES`.
+        _GATE_TOOL_NAMES[fn.__name__] = tool_name
         sig = inspect.signature(fn)
 
         @wraps(fn)
@@ -5764,13 +5788,16 @@ def whoami(app_id: str = "") -> dict:
         return {"app_id": app_id, "error": "no_manifest", "reason": reason,
                 "detail": f"{detail} — every call is denied"}
     perms = manifest.get("permissions", []) or []
-    allowed: set = set()
-    for p in perms:
-        g = gate.PERMISSION_GROUPS.get(p)
-        allowed.update(g if g is not None else {p})
+    # tools_allowed is a REUSE of the gate's own per-call predicate
+    # (gate.permitted), asked once per registered tool — not a second,
+    # independent expansion of PERMISSION_GROUPS. That's what keeps this
+    # listing from ever disagreeing with what _guarded actually enforces
+    # (gap 1f7d1d62207b): a tool gated by a name-level stand-in check that
+    # is a member of no permission group (git_push_execute, gated as
+    # envelope_apply) used to pass the gate while staying invisible here.
+    # It now shows up in both tools_allowed and name_gated_orphans.
+    allowed, orphans = gate.visible_tools(app_id, _gate_tool_catalogue())
     deny = manifest.get("deny_tools") or []
-    if isinstance(deny, list):
-        allowed -= set(deny)
     return {
         "app_id": app_id,
         "role": manifest.get("role", ""),
@@ -5779,6 +5806,11 @@ def whoami(app_id: str = "") -> dict:
         "tools_allowed": sorted(allowed),
         "deny_tools": deny if isinstance(deny, list) else [],
         "store_scope": manifest.get("store_scope"),
+        # Tools admitted above whose registered name is a member of no
+        # PERMISSION_GROUPS entry — reachable only via a name-level check on
+        # a different literal (e.g. git_push_execute via envelope_apply).
+        # Reporting-only: every name here is already in tools_allowed too.
+        "name_gated_orphans": sorted(orphans),
     }
 
 
