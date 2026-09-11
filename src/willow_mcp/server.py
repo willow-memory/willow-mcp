@@ -5425,10 +5425,199 @@ def _diag_env() -> dict:
     return {k: os.environ.get(k) for k in keys}
 
 
+def _diag_keyring() -> dict:
+    """Per-verifier keyring (WILLOW_KEYRING) reachability — gap 37d44bfa1f4c.
+
+    session_enter under per-verifier identity loads this file BEFORE it writes a
+    session record; a keyring the seat cannot read — wrong owner, or a mode the
+    loader refuses (config/verifiers.json owned by willow-operator at a
+    group/world-readable mode while it holds secret material) — blocks every
+    entry. The sub-checks diagnostic_summary already computed never moved the
+    verdict, so that outage read as `ok`. This probe reports the resolved path,
+    its owner uid next to this process's uid, its mode, whether the process can
+    actually read it, and whether the real loader accepts it — and calls an
+    unreadable/refused keyring `broken`, with the fix named.
+
+    Not configured (no WILLOW_KEYRING, no injected keyring) is `not_enabled`: an
+    install running without per-verifier identity is healthy, not degraded."""
+    from . import keyring as _keyring
+    check: dict = {"backend": "willow-keyring", "process_uid": os.getuid()}
+    try:
+        injected = _keyring._injected is not None
+        path = _keyring.keyring_path()
+    except Exception as e:  # resolution itself failed — report, never raise
+        return {"backend": "willow-keyring", "status": "could_not_run",
+                "error": str(e)[:160]}
+    check["configured"] = bool(path) or injected
+    check["path"] = path or None
+    if not check["configured"]:
+        check["status"] = "not_enabled"
+        return check
+    # An injected keyring (tests / explicit PR1-4 install) is in-memory and wins
+    # over the env path — there is nothing on disk to refuse.
+    if injected and not path:
+        check["status"] = "ok"
+        check["injected"] = True
+        return check
+    p = Path(path)
+    if not p.exists():
+        check["status"] = "broken"
+        check["detail"] = f"WILLOW_KEYRING points at {path} but no keyring file is there"
+        check["fix"] = ("create it as the seat's own user with `willow-mcp keys add NAME`, "
+                        "or `unset WILLOW_KEYRING` to run without per-verifier identity")
+        return check
+    try:
+        st = os.stat(p)
+        check["owner_uid"] = st.st_uid
+        check["mode"] = oct(st.st_mode & 0o777)
+        check["owned_by_process"] = st.st_uid == check["process_uid"]
+    except OSError as e:
+        check["status"] = "could_not_run"
+        check["error"] = str(e)[:160]
+        return check
+    if not os.access(p, os.R_OK):
+        check["readable"] = False
+        check["status"] = "broken"
+        check["detail"] = (f"the keyring at {path} exists (owner uid {check.get('owner_uid')}, "
+                           f"mode {check.get('mode')}) but this process (uid "
+                           f"{check['process_uid']}) cannot read it — session_enter under "
+                           "per-verifier identity is blocked until it can")
+        check["fix"] = (f"chown {path} to the uid the seat runs as (or make it readable to "
+                        "that uid), then re-run — do not re-issue; a fresh keyring written at "
+                        "the same path and owner reproduces this")
+        return check
+    check["readable"] = True
+    # Readable on disk — now ask the real loader, which refuses a keyring holding
+    # secret material at a group/world-readable mode (tonight's case).
+    try:
+        _keyring.load(path)
+    except _keyring.KeyringError as e:
+        check["status"] = "broken"
+        check["detail"] = f"the keyring at {path} is refused by the loader: {str(e)[:200]}"
+        check["fix"] = (f"`chmod 600 {path}` — a secret-bearing keyring must not be readable "
+                        "by other users — then re-run; or `unset WILLOW_KEYRING`")
+        return check
+    except Exception as e:
+        check["status"] = "could_not_run"
+        check["error"] = str(e)[:160]
+        return check
+    check["status"] = "ok"
+    return check
+
+
+# ── Verdict coverage registry (gap 37d44bfa1f4c) ─────────────────────────────
+# ONE authoritative account of how the verdict treats every sub-check
+# diagnostic_summary reports under `checks`. A sub-check computed but not wired
+# in here cannot move the verdict off `ok` — which is exactly how a keyring the
+# seat could not read read as healthy. _assert_verdict_considers() fails a test
+# if a future probe is added to `checks` but not registered in one of these
+# three sets, so the drop is caught at construction, not read off an outage.
+
+# Handled by the inline logic in _derive_problems (the pre-existing
+# true-positives — left byte-for-byte as they were).
+_VERDICT_INLINE_SUBCHECKS = frozenset({
+    "store", "postgres", "manifest", "worker", "consent",
+    "net_lease", "severance", "envelope_registry",
+})
+
+# Severity-driven: probe status value -> problem severity. A status not listed
+# (notably "ok"/"not_enabled") yields no problem, so a healthy box stays `ok`
+# and B-18's no-false-positive rule holds. "could_not_run" is handled uniformly
+# for every one of these (see _subcheck_problems) so a probe that failed to run
+# is never omitted and never counted clean, even where the map below is empty.
+_VERDICT_SEVERITY_SUBCHECKS: dict[str, dict[str, str]] = {
+    "rings": {"fail": "warn"},
+    "schema": {"fail": "warn", "skip": "could_not_run"},
+    "identity_bindings": {"fail": "warn"},
+    # Deliberately informational (B-18): `separated=False` / `enforced=False` is
+    # every single-uid install's resting state, not a defect — so only a probe
+    # that could not run at all surfaces here. The enforcement-relevant verdict
+    # for these surfaces is carried by net_lease/severance.
+    "uid_separation": {},
+    "store_db_perms": {},
+    # A keyring the seat cannot read blocks session_enter — broken, verdict-moving.
+    "keyring": {"broken": "error"},
+}
+
+# Deliberately exempt from the verdict (informational, B-18): a dry roster or a
+# bare env snapshot is not a defect.
+_VERDICT_INFORMATIONAL_SUBCHECKS = frozenset({"build_leases", "env"})
+
+# Static problem text for the severity-driven sub-checks (detail is suffixed
+# with the probe's own `error`/`detail` when present).
+_SUBCHECK_PROBLEM_TEXT: dict[str, dict[str, str]] = {
+    "rings": {
+        "detail": "the learned column->field mapping tree (schema_rings) is unreadable",
+        "fix": "check WILLOW_MCP_SCHEMA_RINGS points at a readable rings file, or remove it to reset",
+    },
+    "schema": {
+        "detail": "schema-mapping confirmation could not be read",
+        "fix": "confirm Postgres is reachable and the schema_profile mapping resolves (schema_confirm_mapping)",
+    },
+    "identity_bindings": {
+        "detail": "the identity-bindings directory could not be read",
+        "fix": "check the _identity_bindings directory under WILLOW_MCP_APPS_ROOT is readable",
+    },
+}
+
+
+def _subcheck_problems(name: str, check: dict | None) -> list[dict]:
+    """Turn one severity-driven sub-check dict into 0..1 named problems, per the
+    _VERDICT_SEVERITY_SUBCHECKS map. A probe reporting `could_not_run` always
+    yields a (degrading) warn tagged `could_not_run` — never omitted, never
+    counted clean — regardless of whether the map names that status."""
+    if not check:
+        return []
+    status = check.get("status")
+    if status == "could_not_run":
+        detail = f"the {name} probe could not run"
+        if check.get("error"):
+            detail += f": {check['error']}"
+        return [{"severity": "warn", "check": name, "could_not_run": True,
+                 "detail": detail,
+                 "fix": (f"re-run diagnostic_summary; if it persists, inspect the {name} "
+                         "sub-check inputs")}]
+    sev = _VERDICT_SEVERITY_SUBCHECKS.get(name, {}).get(status)
+    if not sev:
+        return []
+    if sev == "could_not_run":
+        detail = check.get("detail") or f"the {name} probe could not complete"
+        return [{"severity": "warn", "check": name, "could_not_run": True,
+                 "detail": detail,
+                 "fix": _SUBCHECK_PROBLEM_TEXT.get(name, {}).get(
+                     "fix", f"inspect the {name} sub-check inputs")}]
+    text = _SUBCHECK_PROBLEM_TEXT.get(name, {})
+    detail = check.get("detail") or text.get("detail", f"the {name} sub-check is degraded")
+    if check.get("error") and not check.get("detail"):
+        detail += f": {check['error']}"
+    problem = {"severity": sev, "check": name, "detail": detail,
+               "fix": check.get("fix") or text.get("fix", f"inspect the {name} sub-check")}
+    return [problem]
+
+
+def _assert_verdict_considers(check_names) -> None:
+    """Construction-time guard (gap 37d44bfa1f4c): every sub-check reported under
+    `checks` must be accounted for by the verdict — inline, severity-mapped, or
+    explicitly informational. A new probe added to `checks` but registered in
+    none of the three sets raises here, so it fails a test rather than silently
+    never moving the verdict (which is how the keyring contradiction stayed `ok`)."""
+    considered = (set(_VERDICT_INLINE_SUBCHECKS)
+                  | set(_VERDICT_SEVERITY_SUBCHECKS)
+                  | set(_VERDICT_INFORMATIONAL_SUBCHECKS))
+    unwired = set(check_names) - considered
+    if unwired:
+        raise RuntimeError(
+            "diagnostic sub-check(s) computed but not wired into the verdict: "
+            + ", ".join(sorted(unwired))
+            + " — add each to _VERDICT_INLINE_SUBCHECKS, _VERDICT_SEVERITY_SUBCHECKS, "
+              "or _VERDICT_INFORMATIONAL_SUBCHECKS (gap 37d44bfa1f4c)")
+
+
 def _derive_problems(store: dict, postgres: dict, manifest: dict, mode: str,
                      worker: dict | None = None, consent: dict | None = None,
                      net_lease: dict | None = None, severance: dict | None = None,
-                     envelope_registry: dict | None = None) -> list[dict]:
+                     envelope_registry: dict | None = None,
+                     severity_checks: dict[str, dict] | None = None) -> list[dict]:
     """Pure: turn raw check dicts into actionable problems. Unit-tested without
     a live DB — this is where the empty-DB footgun becomes a named diagnosis."""
     from . import gate
@@ -5728,6 +5917,11 @@ def _derive_problems(store: dict, postgres: dict, manifest: dict, mode: str,
                    "ratified registry")
         problems.append({"severity": "warn", "check": "envelope_registry",
                          "detail": detail, "fix": fix})
+    # Severity-driven sub-checks (gap 37d44bfa1f4c): the checks diagnostic_summary
+    # computed but the verdict never read. A degraded/broken probe here yields a
+    # named problem; a healthy one yields nothing (B-18).
+    for name, check in (severity_checks or {}).items():
+        problems.extend(_subcheck_problems(name, check))
     return problems
 
 
@@ -5892,11 +6086,32 @@ def diagnostic_summary(app_id: str = "") -> dict:
     severance = _diag_severance(store, postgres, net_lease)
     uid_separation = _diag_uid_separation(eff)
     store_db_perms = _diag_store_db_perms(eff)
+    keyring = _diag_keyring()
     envelope_registry = _diag_envelope_registry()
     env = _diag_env()
 
+    checks = {"store": store, "postgres": postgres, "rings": rings,
+              "schema": schema, "manifest": manifest, "identity_bindings": bindings,
+              "worker": worker, "consent": consent, "net_lease": net_lease,
+              "build_leases": build_leases,
+              "severance": severance, "uid_separation": uid_separation,
+              "store_db_perms": store_db_perms, "keyring": keyring,
+              "envelope_registry": envelope_registry, "env": env}
+    # Construction-time completeness guard: every computed sub-check must be
+    # wired into the verdict (or explicitly exempt) — gap 37d44bfa1f4c.
+    _assert_verdict_considers(checks)
+
+    # The severity-driven sub-checks the verdict now reads (the five named checks
+    # plus the keyring probe). Inline checks below stay routed positionally, and
+    # the informational ones (build_leases/env) are deliberately not passed.
+    severity_checks = {
+        "rings": rings, "schema": schema, "identity_bindings": bindings,
+        "uid_separation": uid_separation, "store_db_perms": store_db_perms,
+        "keyring": keyring,
+    }
     problems = _derive_problems(store, postgres, manifest, mode, worker, consent,
-                                net_lease, severance, envelope_registry)
+                                net_lease, severance, envelope_registry,
+                                severity_checks=severity_checks)
     verdict = _derive_verdict(problems)
 
     report = {
@@ -5904,13 +6119,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
         "mode": mode,
         "serve": {"host": _HOST, "port": _PORT, "base_url": _BASE_URL} if _serve_mode() else None,
         "app_id": eff or None,
-        "checks": {"store": store, "postgres": postgres, "rings": rings,
-                   "schema": schema, "manifest": manifest, "identity_bindings": bindings,
-                   "worker": worker, "consent": consent, "net_lease": net_lease,
-                   "build_leases": build_leases,
-                   "severance": severance, "uid_separation": uid_separation,
-                   "store_db_perms": store_db_perms,
-                   "envelope_registry": envelope_registry, "env": env},
+        "checks": checks,
         "problems": problems,
     }
     if redact:
