@@ -30,9 +30,9 @@ What is held, per rule:
   command a contributor runs. docs/AGENTS.md names none, so CONTRIBUTING's is
   the one: `.venv/bin/python3 -m pytest tests/ -q`.
 * `required_when_pile_exists` — this repo keeps a numbered pile
-  (`docs/ideas.md`), so `trailers.yml` is required. It does not exist yet;
-  that is Wave 3's E3-trailers, and the test is `xfail(strict=True)` so it
-  flips to a hard failure the day the workflow lands and the mark goes stale.
+  (`docs/ideas.md`), so `trailers.yml` is required. It exists since
+  E3-trailers (Wave 3); until then the test was `xfail(strict=True)`, so it
+  flipped to a hard failure the day the workflow landed and the mark came off.
 
 Every helper that scans is planted below, in the same file, as the meta-scan
 (`tests/test_scans_fire.py`, G2-meta-scans) requires.
@@ -42,7 +42,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
 
 try:
     from reconciler.conventions import conventions
@@ -148,12 +147,11 @@ def test_contributing_names_the_test_command():
     assert _names_test_command((REPO_ROOT / CONTRIBUTING).read_text(encoding="utf-8"))
 
 
-@pytest.mark.xfail(strict=True, reason="E3-trailers (fleet plan Wave 3) adds trailers.yml")
 def test_trailers_workflow_is_present_because_a_pile_exists():
-    """This repo keeps `docs/ideas.md`, so the rule applies in full; the
-    workflow it requires is Wave 3's. `strict=True`: the day trailers.yml lands
-    this test passes, the xfail becomes an XPASS failure, and the mark comes
-    off — the rule is never weakened, only dated."""
+    """This repo keeps `docs/ideas.md`, so the rule applies in full. It was
+    `xfail(strict=True)` from G2-conventions until E3-trailers landed
+    `.github/workflows/trailers.yml`; the mark came off the same day the
+    workflow did, which is what strict was for."""
     assert (REPO_ROOT / PILE).exists()
     assert _missing_when_pile_exists(REPO_ROOT, RULES["required_when_pile_exists"]) == []
 
