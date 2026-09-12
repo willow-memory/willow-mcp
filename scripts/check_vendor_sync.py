@@ -24,7 +24,7 @@ import difflib
 import sys
 from pathlib import Path
 
-from vendor_drift import annotate, classify
+from vendor_drift import annotate, classify, load_overrides, override_for, stale_override
 
 
 def vendored_path() -> Path:
@@ -59,17 +59,24 @@ def main(argv: list) -> int:
         return 0
     mine = body(vendored_path().read_text())
     theirs = body(upstream.read_text())
+    # A deliberate, recorded delta (scripts/vendor_overrides.json) is forgiven
+    # for exactly the body it hashes, and is fatal once upstream catches up.
+    overrides = load_overrides("vendor")
     if mine == theirs:
-        print("forge.friction_floor (the scorer's home, re-exported here) is in sync with willow-gate ✓")
-        return 0
-    verdict = classify(upstream, mine, body)
+        verdict = stale_override(overrides, "friction_floor.py")
+        if verdict is None:
+            print("forge.friction_floor (the scorer's home, re-exported here) is in sync with willow-gate ✓")
+            return 0
+    else:
+        verdict = override_for(overrides, "friction_floor.py", mine) or classify(upstream, mine, body)
     sys.stdout.write(annotate(
         "vendor", "forge-play/forge/friction_floor.py (via src/willow_mcp/friction_floor.py)", verdict,
         "Re-sync it in the Forge (forge-play/Forge, forge/friction_floor.py), bump the "
         "forge-play floor here, and update the pinned hash in tests/test_stance_friction.py."))
-    sys.stdout.writelines(difflib.unified_diff(
-        theirs.splitlines(True), mine.splitlines(True),
-        fromfile="willow-gate/friction_floor.py", tofile="forge-play/friction_floor.py"))
+    if mine != theirs:
+        sys.stdout.writelines(difflib.unified_diff(
+            theirs.splitlines(True), mine.splitlines(True),
+            fromfile="willow-gate/friction_floor.py", tofile="forge-play/friction_floor.py"))
     return 1 if verdict.fatal else 0
 
 

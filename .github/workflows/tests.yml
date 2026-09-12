@@ -58,17 +58,17 @@ jobs:
       # this name — a stale count is worse than none — and `|| true` is gone:
       # bandit now gates like every other lint step.
       #
-      # nest/embed.py and nest/llm.py are excluded here, not nosec'd in place:
-      # both are vendored byte-for-byte from safe-app-store's libs/nest-pipeline
-      # under a CI hash pin (tests/test_nest_pipeline_vendor.py) — "the copy is
-      # NOT a place to edit", inline nosec included, since the pin hashes the
-      # whole module body. Their two B310 sites (OLLAMA_HOST-derived urlopen
-      # calls) are the same ones tests/test_consent_toggles.py already documents
-      # as deliberately policy-free: the gate lives at willow-mcp's own tool
-      # boundary (model_egress.denial(), consulted by nest_scan et al before the
-      # vendored pipeline ever runs), not inside the shared library.
+      # nest/embed.py and nest/llm.py used to be excluded here rather than
+      # nosec'd in place, because they were vendored byte-for-byte from
+      # safe-app-store under a hash pin that made "the copy is NOT a place to
+      # edit" cover even a trailing comment. safe-app-store is archived (owner
+      # decision, 2026-09-12) and the Nest pipeline's home is this repo, so the
+      # four B310 sites (OLLAMA_HOST-derived urlopen calls) now carry a scoped
+      # `# nosec B310` reason in place like every other B310 in src: the gate
+      # lives at willow-mcp's own tool boundary (model_egress.denial(), consulted
+      # by nest_scan et al before the pipeline runs), not inside the pipeline.
       - name: Bandit
-        run: bandit -r src -ll -f txt -x src/willow_mcp/nest/embed.py,src/willow_mcp/nest/llm.py 2>&1 | tee bandit-report.txt
+        run: bandit -r src -ll -f txt 2>&1 | tee bandit-report.txt
 
       - name: Upload bandit report
         if: always()
@@ -261,12 +261,21 @@ jobs:
 
   vendor-sync:
     # Cross-repo drift-guard for the vendored copies (box audit theme ①). The
-    # in-repo hash pins (tests/test_stance_friction.py, tests/test_subject_consent.py)
+    # in-repo hash pins (tests/test_stance_friction.py, tests/test_mem_ratify.py)
     # catch LOCAL edits; this job catches the OTHER direction — an upstream
     # advancing while the vendored copy stays behind (exactly how the
     # stance_friction block went missing). Deliberately NOT in `test`'s needs,
     # so it never blocks a merge on its own: if an upstream isn't reachable
     # (private, no token) that check soft-skips with a warning.
+    #
+    # Two upstreams, not four. safe-app-store is archived and is never an
+    # origin again (owner decision, 2026-09-12: "the forge is to be vendored;
+    # safe-app-store isn't to be vendored — it's to be archived and turned into
+    # a parts bin"). The Nest pipeline core (src/willow_mcp/nest/) and
+    # subject_consent (src/willow_mcp/subject_consent/) that were vendored FROM
+    # it have their home in this repo now: no fetch, no compare, no pin — they
+    # are source like the rest of src/. The Forge (forge-play) is what this
+    # fleet vendors from; the friction scorer already lives there.
     #
     # On drift it does NOT just report "the bytes differ" — that sentence is
     # true of two opposite situations, and reporting both identically cost a
@@ -279,10 +288,9 @@ jobs:
     #              hand-edit of the vendored copy. Never forgiven.
     #   overridden → warning. The copy differs ON PURPOSE and says so:
     #              scripts/vendor_overrides.json records why and the sha256 of
-    #              the exact body it excuses (nest/secrets.py's word-boundary
-    #              hardening is the one recorded today). Only that body is
-    #              forgiven; the record goes fatal (stale override) the moment
-    #              upstream carries the change, so it cannot outlive its reason.
+    #              the exact body it excuses. Only that body is forgiven; the
+    #              record goes fatal (stale override) the moment upstream
+    #              carries the change, so it cannot outlive its reason.
     # Only a positive match against a real PR head, or a hashed and reasoned
     # record, is downgraded, so the guard is narrowed to the truth rather than
     # weakened.
@@ -301,16 +309,6 @@ jobs:
           # Fine-grained PAT with read on willow-gate if it's private; falls
           # back to the job token (works when the repo is public / same
           # installation). Set FLEET_RO_TOKEN to enforce against a private upstream.
-          token: ${{ secrets.FLEET_RO_TOKEN || github.token }}
-
-      - name: Fetch safe-app-store upstream (soft — needs read access)
-        continue-on-error: true
-        uses: actions/checkout@v7
-        with:
-          repository: rudi193-cmd/safe-app-store
-          path: .safe-app-store-upstream
-          # subject_consent (box audit A1) is vendored FROM safe-app-store's
-          # canonical libs/subject-consent. Same soft-fetch posture as willow-gate.
           token: ${{ secrets.FLEET_RO_TOKEN || github.token }}
 
       - name: Fetch willow upstream (soft — needs read access)
@@ -337,14 +335,8 @@ jobs:
       - name: Compare the friction scorer (forge-play's copy) against willow-gate upstream
         run: python scripts/check_vendor_sync.py .willow-gate-upstream/src/willow_gate/friction_floor.py
 
-      - name: Compare vendored subject_consent against upstream (A1)
-        run: python scripts/check_subject_consent_sync.py .safe-app-store-upstream/libs/subject-consent/src/subject_consent
-
       - name: Compare vendored mem_ratify against upstream (B8)
         run: python scripts/check_mem_ratify_sync.py .willow-upstream/mem_ratify
-
-      - name: Compare vendored Nest pipeline against upstream (A4)
-        run: python scripts/check_nest_pipeline_sync.py .safe-app-store-upstream/libs/nest-pipeline/src/nest_pipeline
 
   fleet-seams:
     # The joins between this package and its two siblings — jeles (a declared

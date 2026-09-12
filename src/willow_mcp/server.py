@@ -1883,9 +1883,9 @@ def nest_scan(
 
     # Before any work: classification sends fragment CONTENT to the model, so an
     # off-box host is egress out of the Nest PII zone. Checked at the tool
-    # boundary rather than in nest/embed.py — those modules are vendored
-    # byte-for-byte from safe-app-store's libs/nest-pipeline under a CI
-    # drift-guard, and are deliberately policy-free. See model_egress.
+    # boundary rather than in nest/embed.py — the pipeline is deliberately
+    # policy-free, and this tool is where the decision to invoke it is made.
+    # See model_egress.
     if use_embed or use_llm:
         denial = model_egress.denial("nest_scan")
         if denial:

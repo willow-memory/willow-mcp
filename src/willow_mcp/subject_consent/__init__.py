@@ -14,8 +14,13 @@ and `tests/` enforces that boundary — that is what lets a child-device consume
 and a stdlib-only-charter consumer both depend on it without dragging a runtime
 in behind it. Bindings may import this core; this core imports none of them.
 
-Provenance: VENDORED from rudi193-cmd/safe-app-store ``libs/subject-consent``
-(MIT). Canonical lives there; keep this copy in sync, do not diverge it in place.
+Provenance: home is THIS repo. This package was vendored from
+rudi193-cmd/safe-app-store ``libs/subject-consent`` (MIT; box audit A1) under a
+hash pin and a CI compare. safe-app-store is archived and is never an origin
+again (owner decision, 2026-09-12), so since that date this is the canonical
+copy: edit it here. The HARD CONSTRAINT above is unchanged — stdlib only, no
+network, no willow-mcp runtime imports — and tests/test_subject_consent.py holds
+it.
 """
 from __future__ import annotations
 
