@@ -43,10 +43,30 @@ It rewrites only what it fully understands, and bails out loudly otherwise:
 Bailing prints the reason and exits 2. That is deliberate: silently rewriting a
 release note it had misread would be a worse failure than the one it fixes.
 
+Two states are NOT bails, and the CLI answers them with exit 0: no CHANGELOG.md
+at all, and a CHANGELOG.md with only hand-written sections in it (no
+`## [x.y.z](…/compare/…)` header anywhere). Neither has anything to rebuild.
+`--print-section` is the exception in both — its stdout becomes a GitHub
+Release body, so it exits 2 rather than publish the explanation as the notes.
+
+WHERE THE BODY COMES FROM
+-------------------------
+This file is VENDORED. Everything from the `from __future__` line to EOF is
+forge-play/Forge's `tools/changelog_dedup.py`, byte-for-byte, as of 2026-09-12
+(Forge merge 5e55e0e); only this docstring is local. The copy is not a place to
+edit: `tests/test_vendor_pins.py` pins the body's sha256 to Forge's, so a local
+edit fails the suite until it is either upstreamed and re-synced or recorded
+there as a named override. The 2026-09-12 re-sync was a bug fix, not
+housekeeping — this copy still ended a section at `## [` alone (a generated
+section above a hand-written `## x.y — date` section swallowed it and bailed on
+its `### Docs`) and ran `main()` unguarded against a changelog with nothing
+generated in it. Both were latent here and live in a sibling.
+
 USAGE
 -----
-    python tools/changelog_dedup.py            # fix in place
-    python tools/changelog_dedup.py --check    # exit 1 if it would change anything
+    python tools/changelog_dedup.py                    # fix in place
+    python tools/changelog_dedup.py --check            # exit 1 if it would change anything
+    python tools/changelog_dedup.py --print-section V  # that version's section, verbatim
 """
 from __future__ import annotations
 
@@ -135,7 +155,7 @@ def commits_in_range(prev_tag: str, new_tag: str) -> list[dict]:
         chunk = chunk.strip("\n")
         if not chunk.strip():
             continue
-        sha, subject, body = (chunk.split("\x1f") + ["", "", ""])[:3]
+        sha, subject, body = [*chunk.split("\x1f"), "", "", ""][:3]
         m = CONVENTIONAL_RE.match(subject.strip())
         if not m:
             continue                      # not conventional -> release-please ignores it
@@ -186,8 +206,13 @@ def rebuild(text: str) -> tuple[str, str]:
         raise Bail("no '## [version](...compare/...)' section found in the changelog")
 
     header = SECTION_RE.match(lines[start])
+    # Any `## ` heading ends the section — not just `## [`. This file mixes two
+    # shapes: release-please's `## [x.y.z](…/compare/…)` and the hand-written
+    # `## 0.0.9 — date` history below it. Stopping only at `## [` made a
+    # generated section swallow the entire hand-written history, and then bail on
+    # its `### Docs` heading.
     end = next((i for i in range(start + 1, len(lines))
-                if lines[i].startswith("## [")), len(lines))
+                if lines[i].startswith("## ")), len(lines))
 
     visible, order = sections_from_config()
     body = lines[start + 1:end]
@@ -202,7 +227,7 @@ def rebuild(text: str) -> tuple[str, str]:
 
     commits = commits_in_range(header.group("prev"), header.group("new"))
     rebuilt = render(commits, visible, order, header.group("base"))
-    new_body = rebuilt + [""]
+    new_body = [*rebuilt, ""]
 
     # Normalise trailing blank lines on both sides before comparing.
     def trimmed(xs: list[str]) -> list[str]:
@@ -241,8 +266,13 @@ def section_for(text: str, version: str) -> str | None:
             break
     if start is None:
         return None
+    # Any `## ` heading ends the section — not just `## [`. This file mixes two
+    # shapes: release-please's `## [x.y.z](…/compare/…)` and the hand-written
+    # `## 0.0.9 — date` history below it. Stopping only at `## [` made a
+    # generated section swallow the entire hand-written history, and then bail on
+    # its `### Docs` heading.
     end = next((i for i in range(start + 1, len(lines))
-                if lines[i].startswith("## [")), len(lines))
+                if lines[i].startswith("## ")), len(lines))
     return "\n".join(lines[start:end]).rstrip()
 
 
@@ -256,7 +286,42 @@ def main() -> int:
                          "generates from its own parse rather than from this file")
     args = ap.parse_args()
 
+    if not CHANGELOG.exists():
+        # The normal state of this repo today: release-please has never written
+        # one. Not an error for a rebuild — there is simply nothing to correct.
+        #
+        # It IS an error for --print-section, and the distinction is load-bearing:
+        # that mode's stdout becomes a GitHub Release body, so returning 0 here
+        # would publish the sentence below as the release notes.
+        if args.print_section:
+            print(f"::error::no {CHANGELOG.name} in this repository, so there is "
+                  f"no section for {args.print_section!r} to publish",
+                  file=sys.stderr)
+            return 2
+        print(f"no {CHANGELOG.name} yet — nothing to rebuild")
+        return 0
+
     text = CHANGELOG.read_text()
+
+    # A changelog with no release-please-generated section at all. Here that is
+    # a real, temporary state rather than a malformed file: CHANGELOG.md was
+    # backfilled by hand for v0.0.1-v0.0.9, which were tagged before
+    # release-please existed, and those sections deliberately carry no
+    # `(…/compare/…)` link. That absence is exactly what distinguishes
+    # hand-written history from a generated section, so there is nothing here to
+    # rebuild until release-please writes its first one.
+    #
+    # `rebuild()` still raises for this — the tests rely on that, and in a repo
+    # whose changelog is fully generated it would mean a malformed file. Only the
+    # CLI treats it as a clean no-op.
+    if not any(SECTION_RE.match(ln) for ln in text.splitlines()):
+        if args.print_section:
+            print(f"::error::{CHANGELOG.name} has no generated section, so there "
+                  f"is none for {args.print_section!r} to publish", file=sys.stderr)
+            return 2
+        print(f"no release-please section in {CHANGELOG.name} yet — only the "
+              "hand-written history, which this does not touch")
+        return 0
 
     if args.print_section:
         section = section_for(text, args.print_section)
