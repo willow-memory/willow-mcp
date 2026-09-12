@@ -120,3 +120,17 @@ the workflow, so this list moves when that file does. Today:
 `!` or a `BREAKING CHANGE:` footer cuts a major on either side. When in doubt,
 pick a hidden type: the change still ships, in the next release that has
 something installable in it.
+
+## The Idea-Id commit-trailer convention
+
+A commit that lands an idea recorded in docs/ideas.md carries an
+`Idea-Id: <corpus>-ideas-<num>` git trailer (add `Idea-Status: partial` when a
+commit only partly lands it). It is the durable join key willow-reconciler
+reads; a wrong id is worse than no id, so never type one by hand:
+
+    reconciler id --repo ./ --doc docs/ideas.md --grep "words from the item"
+    reconciler install-hook --repo ./        # derives it from a branch named idea-NN
+
+`.github/workflows/trailers.yml` runs `reconciler verify` on every PR and fails
+on a trailer that names an item the doc does not contain. (`--repo ./`, with
+the slash: the reconciler reads a bare `.` as a repo name, not a path.)
