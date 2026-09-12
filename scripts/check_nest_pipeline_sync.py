@@ -24,7 +24,7 @@ import difflib
 import sys
 from pathlib import Path
 
-from vendor_drift import annotate, classify
+from vendor_drift import annotate, classify, load_overrides, override_for, stale_override
 
 VENDORED_DIR = Path(__file__).resolve().parents[1] / "src/willow_mcp/nest"
 # The shared-core modules whose body must stay byte-for-byte with canonical. The
@@ -50,6 +50,11 @@ def main(argv: list) -> int:
               "guard (tests/test_nest_pipeline_vendor.py) still ran.")
         return 0
 
+    # Deliberate, named deltas (scripts/vendor_overrides.json). A record forgives
+    # exactly the body it hashes; tests/test_nest_pipeline_vendor.py holds each
+    # record to the in-repo pin so the two cannot disagree.
+    overrides = load_overrides("nest-pipeline")
+
     drift = False
     for name in FILES:
         upstream = upstream_dir / name
@@ -60,18 +65,22 @@ def main(argv: list) -> int:
         mine = body((VENDORED_DIR / name).read_text())
         theirs = body(upstream.read_text())
         if mine == theirs:
-            print(f"vendored nest/{name} is in sync with safe-app-store ✓")
-            continue
-        verdict = classify(upstream, mine, body)
+            verdict = stale_override(overrides, name)
+            if verdict is None:
+                print(f"vendored nest/{name} is in sync with safe-app-store ✓")
+                continue
+        else:
+            verdict = override_for(overrides, name, mine) or classify(upstream, mine, body)
         drift = drift or verdict.fatal
         sys.stdout.write(annotate(
             "nest-pipeline", f"src/willow_mcp/nest/{name}", verdict,
             "Re-sync it (procedure in tests/test_nest_pipeline_vendor.py) and "
             "update the pinned hash there."))
-        sys.stdout.writelines(difflib.unified_diff(
-            theirs.splitlines(True), mine.splitlines(True),
-            fromfile=f"safe-app-store/nest_pipeline/{name}",
-            tofile=f"willow-mcp/nest/{name}"))
+        if mine != theirs:
+            sys.stdout.writelines(difflib.unified_diff(
+                theirs.splitlines(True), mine.splitlines(True),
+                fromfile=f"safe-app-store/nest_pipeline/{name}",
+                tofile=f"willow-mcp/nest/{name}"))
     return 1 if drift else 0
 
 

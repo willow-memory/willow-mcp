@@ -15,6 +15,7 @@ byte-for-byte (module docstring onward, header excepted) and update the
 EXPECTED_SHA256 value below to what the assertion prints.
 """
 import hashlib
+import json
 import pathlib
 
 import pytest
@@ -52,3 +53,51 @@ def test_vendored_nest_module_body_matches_pinned_hash(name):
         "If you re-synced from safe-app-store libs/nest-pipeline on purpose, update "
         f"EXPECTED_SHA256[{name!r}].\n"
         "If you edited the vendored copy directly — don't; edit the canonical and re-sync.")
+
+
+# ── the override record must tell the truth about the pin ───────────────────
+#
+# scripts/vendor_overrides.json lets a vendored file differ from upstream ON
+# PURPOSE, under a name, a reason and the sha256 of the exact body it excuses.
+# The cross-repo job honours the record; this test holds the record to the pin
+# above, so the two cannot describe different bodies, and a record can never
+# name a file this pin does not cover.
+
+OVERRIDES_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "vendor_overrides.json"
+
+
+def _override_defects(overrides: dict, pins: dict) -> list[str]:
+    """Every way a record can lie: a file the pin does not cover, a body other
+    than the pinned one, or no reason at all."""
+    defects: list[str] = []
+    for name, record in overrides.items():
+        if name not in pins:
+            defects.append(f"{name}: not a pinned nest module")
+        elif record.get("sha256") != pins[name]:
+            defects.append(f"{name}: record names sha {record.get('sha256')!r}, "
+                           f"the pin is {pins[name]!r}")
+        if not record.get("why"):
+            defects.append(f"{name}: no reason recorded")
+    return defects
+
+
+def test_every_recorded_override_names_the_pinned_body_and_a_reason():
+    overrides = json.loads(OVERRIDES_PATH.read_text(encoding="utf-8")).get("nest-pipeline") or {}
+    assert _override_defects(overrides, EXPECTED_SHA256) == []
+
+
+def test_the_override_check_catches_a_planted_record_that_lies():
+    """Planted: three records, one lie each — a wrong hash, an unpinned file,
+    a missing reason — and one honest one. Exactly the three are reported."""
+    honest = EXPECTED_SHA256["db.py"]
+    planted = {
+        "secrets.py": {"why": "x", "sha256": "0" * 64},
+        "nothing.py": {"why": "y", "sha256": honest},
+        "db.py": {"sha256": honest},
+        "llm.py": {"why": "z", "sha256": EXPECTED_SHA256["llm.py"]},
+    }
+    defects = _override_defects(planted, EXPECTED_SHA256)
+    assert len(defects) == 3, defects
+    assert any(d.startswith("secrets.py: record names sha") for d in defects)
+    assert "nothing.py: not a pinned nest module" in defects
+    assert "db.py: no reason recorded" in defects

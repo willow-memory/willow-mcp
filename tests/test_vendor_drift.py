@@ -33,7 +33,11 @@ _spec.loader.exec_module(vendor_drift)
 
 AHEAD, BEHIND = vendor_drift.AHEAD, vendor_drift.BEHIND
 DIVERGED, UNKNOWN = vendor_drift.DIVERGED, vendor_drift.UNKNOWN
+OVERRIDDEN, STALE_OVERRIDE = vendor_drift.OVERRIDDEN, vendor_drift.STALE_OVERRIDE
 classify = vendor_drift.classify
+Verdict, annotate = vendor_drift.Verdict, vendor_drift.annotate
+load_overrides, override_for = vendor_drift.load_overrides, vendor_drift.override_for
+stale_override = vendor_drift.stale_override
 
 MODULE = '"""Canonical module."""\n\nVALUE = {version!r}\n'
 
@@ -116,3 +120,72 @@ def test_non_git_upstream_is_unknown_and_fatal(tmp_path: Path):
     v = classify(f, body(MODULE.format(version="other")), body)
     assert v.kind == UNKNOWN
     assert v.fatal
+
+
+# ── a named override: forgives one body, and only while it is still true ─────
+
+
+def _sha(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_a_recorded_override_catches_the_body_it_names_and_no_other():
+    """Planted: the vendored copy carries a deliberate change (the shape of the
+    nest secret-scan hardening), recorded with its hash. That body is forgiven
+    as OVERRIDDEN and not fatal; the record's reason travels with the verdict.
+    A later edit to the same file matches nothing — the record is not a
+    blanket permission — and an empty record forgives nothing."""
+    mine = body(MODULE.format(version="fleet-only-hardening"))
+    overrides = {"mod.py": {"why": "boundary evasion fix, not yet upstream",
+                            "sha256": _sha(mine)}}
+    v = override_for(overrides, "mod.py", mine)
+    assert v is not None
+    assert v.kind == OVERRIDDEN
+    assert not v.fatal
+    assert v.detail == "boundary evasion fix, not yet upstream"
+
+    edited_again = body(MODULE.format(version="edited-once-more"))
+    assert override_for(overrides, "mod.py", edited_again) is None, (
+        "the record excuses the body it hashes and no other"
+    )
+    assert override_for({}, "mod.py", mine) is None
+    assert override_for(overrides, "other.py", mine) is None
+
+
+def test_an_override_stays_fatal_once_upstream_has_caught_up():
+    """Planted: bodies equal, record still present. The record is now a false
+    claim about the tree, and STALE_OVERRIDE is fatal so it cannot linger."""
+    v = stale_override({"mod.py": {"why": "landed upstream since", "sha256": "0" * 64}}, "mod.py")
+    assert v is not None
+    assert v.kind == STALE_OVERRIDE
+    assert v.fatal
+    assert stale_override({}, "mod.py") is None
+
+
+def test_the_override_annotations_say_which_and_where(upstream: Path):
+    """Planted: the OVERRIDDEN annotation is a warning that names the record
+    file and the reason; STALE_OVERRIDE is an error that says to remove it.
+    Neither is the DIVERGED text, which is what a reader saw before."""
+    forgiven = annotate("nest-pipeline", "src/x.py", Verdict(OVERRIDDEN, "why it differs."), "hint")
+    assert forgiven.startswith("::warning")
+    assert "why it differs." in forgiven and "vendor_overrides.json" in forgiven
+    stale = annotate("nest-pipeline", "src/x.py", Verdict(STALE_OVERRIDE, "why it differed."), "hint")
+    assert stale.startswith("::error")
+    assert "Remove that record" in stale
+    # and the guard is not weakened: an unrecorded hand-edit is still DIVERGED
+    v = classify(upstream / "src" / "mod.py", body(MODULE.format(version="hand-edit")), body)
+    assert v.kind == DIVERGED and v.fatal
+
+
+def test_load_overrides_reads_one_guards_records_and_tolerates_absence(tmp_path: Path):
+    """Planted: a record file with two guards; each guard sees only its own,
+    a guard with no entry sees {}, and a missing file is {} rather than a
+    traceback in the CI job."""
+    record = tmp_path / "vendor_overrides.json"
+    record.write_text('{"$comment": "x", "nest-pipeline": {"secrets.py": {"why": "w", "sha256": "s"}}, '
+                      '"friction": null}', encoding="utf-8")
+    assert load_overrides("nest-pipeline", record) == {"secrets.py": {"why": "w", "sha256": "s"}}
+    assert load_overrides("friction", record) == {}
+    assert load_overrides("subject-consent", record) == {}
+    assert load_overrides("nest-pipeline", tmp_path / "absent.json") == {}
