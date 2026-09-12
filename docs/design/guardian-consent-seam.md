@@ -9,10 +9,13 @@ description: "Design doc mapping how a shared subject-consent primitive lets wil
 # The guardian-consent seam: representing a subject who isn't the owner
 
 Status: **core extracted + binding shipped + gate live.** The stdlib-only core
-now has a single **canonical home** at
+had a single **canonical home** at
 [`safe-app-store` `libs/subject-consent`](https://github.com/rudi193-cmd/safe-app-store)
-(the vendor pattern `willow_mcp.nest` uses for `apps/nest-seed`, chosen over a new
-repo). willow-mcp's copy is VENDORED from there and carries a provenance header;
+(the vendor pattern `willow_mcp.nest` used for `apps/nest-seed`, chosen over a new
+repo), and willow-mcp's copy was VENDORED from there with a provenance header.
+**Since 2026-09-12 the home is this repo** (`src/willow_mcp/subject_consent/`):
+safe-app-store is archived and is never an origin again (owner decision), so
+the copy here is the canonical one and consumers vendor from here.
 UTETY and corpus-lens adopt the same canonical next — so the primitive is built
 once and single-sourced, not forked three ways. Both halves this doc maps exist:
 
@@ -63,8 +66,8 @@ carrying their own, the reason it is stdlib-only — is now half done:
   Owner == subject (no `--subject`) is unchanged there, as here.
 - **UTETY** still carries its own; that import remains theirs to make.
 
-When this copy is re-synced from safe-app-store, corpus-lens's pinned hash goes
-stale on purpose and its test says so — re-vendor there from here.
+When the core changes here (its home since 2026-09-12), corpus-lens's pinned
+hash goes stale on purpose and its test says so — re-vendor there from here.
 
 What the shipped core provides (and what it pointedly leaves out):
 
@@ -361,6 +364,11 @@ not to pretend the *unrepresentable* away.
    consumer with a provenance header (not a PyPI dependency, not three independent
    copies). No new repo; the Nest's `nest-seed` pattern. UTETY/corpus-lens vendor
    from the same canonical next.
+   **Superseded 2026-09-12 (owner): the canonical copy moved here.**
+   safe-app-store is archived and is never an origin again ("the forge is to be
+   vendored; safe-app-store isn't to be vendored — it's to be archived and
+   turned into a parts bin"); `src/willow_mcp/subject_consent/` is the home and
+   the vendor middle path continues from it.
 
 *This is the map. The wall has always had two halves — "what may leave" (built
 four times over) and "whose data is it, and did they agree" (built once, in a

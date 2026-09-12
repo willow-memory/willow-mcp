@@ -23,7 +23,7 @@ import difflib
 import sys
 from pathlib import Path
 
-from vendor_drift import annotate, classify
+from vendor_drift import annotate, classify, load_overrides, override_for, stale_override
 
 VENDORED_DIR = Path(__file__).resolve().parents[1] / "src/willow_mcp/mem_ratify"
 # Files whose body must stay byte-for-byte with upstream. The vendored tree may
@@ -47,6 +47,10 @@ def main(argv: list) -> int:
               "guard (tests/test_mem_ratify.py) still ran.")
         return 0
 
+    # A deliberate, recorded delta (scripts/vendor_overrides.json) is forgiven
+    # for exactly the body it hashes, and is fatal once upstream catches up.
+    overrides = load_overrides("mem_ratify")
+
     drift = False
     for name in FILES:
         upstream = upstream_dir / name
@@ -57,17 +61,21 @@ def main(argv: list) -> int:
         mine = body((VENDORED_DIR / name).read_text())
         theirs = body(upstream.read_text())
         if mine == theirs:
-            print(f"vendored mem_ratify/{name} is in sync with willow ✓")
-            continue
-        verdict = classify(upstream, mine, body)
+            verdict = stale_override(overrides, name)
+            if verdict is None:
+                print(f"vendored mem_ratify/{name} is in sync with willow ✓")
+                continue
+        else:
+            verdict = override_for(overrides, name, mine) or classify(upstream, mine, body)
         drift = drift or verdict.fatal
         sys.stdout.write(annotate(
             "mem_ratify", f"src/willow_mcp/mem_ratify/{name}", verdict,
             "Re-sync it (procedure in tests/test_mem_ratify.py) and update the "
             "pinned hash there."))
-        sys.stdout.writelines(difflib.unified_diff(
-            theirs.splitlines(True), mine.splitlines(True),
-            fromfile=f"willow/mem_ratify/{name}", tofile=f"willow-mcp/mem_ratify/{name}"))
+        if mine != theirs:
+            sys.stdout.writelines(difflib.unified_diff(
+                theirs.splitlines(True), mine.splitlines(True),
+                fromfile=f"willow/mem_ratify/{name}", tofile=f"willow-mcp/mem_ratify/{name}"))
     return 1 if drift else 0
 
 

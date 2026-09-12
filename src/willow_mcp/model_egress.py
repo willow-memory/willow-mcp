@@ -31,12 +31,12 @@ split. The Forge never imports willow-mcp.
 WHY THE GATE IS HERE AND NOT AT THE POST
 ----------------------------------------
 The obvious place to check is `nest/embed.py:_post` / `nest/llm.py:_http_json`,
-where the request is actually made. Those files are **vendored byte-for-byte**
-from ``safe-app-store/libs/nest-pipeline`` (box audit A4) with a hash pin and a
-CI ``vendor-sync`` job enforcing it, and the library is deliberately policy-free
-so that each consumer keeps its own layers outside the shared core. Editing them
-would fork the canonical library to carry one consumer's consent model, and
-break the drift-guard on its next run.
+where the request is actually made. Those files were vendored byte-for-byte
+from ``safe-app-store/libs/nest-pipeline`` (box audit A4) under a hash pin; their
+home is this repo now (safe-app-store is archived, owner decision 2026-09-12),
+but the reason the gate is not in them still holds: the pipeline is deliberately
+policy-free, so a consumer's consent model stays in the consumer's own layer, at
+the boundary where the decision to invoke the pipeline is made.
 
 So the gate sits at willow-mcp's own boundary — the tool that decides to invoke
 the pipeline — which is also where the false promise is written.

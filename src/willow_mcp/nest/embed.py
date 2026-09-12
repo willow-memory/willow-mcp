@@ -42,7 +42,7 @@ def installed_models() -> set[str]:
         if _installed is not None:
             return _installed
         try:
-            with urllib.request.urlopen(f"{DEFAULT_HOST}/api/tags", timeout=5) as resp:
+            with urllib.request.urlopen(f"{DEFAULT_HOST}/api/tags", timeout=5) as resp:  # nosec B310 - local Ollama host; egress gated at the tool boundary (model_egress)
                 tags = json.loads(resp.read().decode("utf-8"))
             _installed = {m.get("name", "") for m in tags.get("models", [])}
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
@@ -73,7 +73,7 @@ def _post(prompt: str, model: str) -> list[float] | None:
     data = json.dumps({"model": model, "prompt": prompt}).encode("utf-8")
     req = urllib.request.Request(f"{DEFAULT_HOST}/api/embeddings", data=data,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:  # nosec B310 - local Ollama host; egress gated at the tool boundary (model_egress)
         return json.loads(resp.read().decode("utf-8")).get("embedding")
 
 
