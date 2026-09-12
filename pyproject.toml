@@ -209,6 +209,18 @@ test = [
     "PyYAML>=6.0,<7.0",
     "jsonschema>=4.0,<5.0",
     "ruff==0.15.0",
+    # The fleet's convention set has one home — willow-reconciler publishes it
+    # (`reconciler conventions --json`, `reconciler.conventions.conventions()`)
+    # and tests/test_fleet_conventions.py READS it rather than restating it
+    # (fleet plan decision 4). A copy of the document here would be a second
+    # copy to drift, which is the failure that file exists to end. Stdlib-only,
+    # no transitive dependencies. Capped at the next major per Rule 1
+    # (docs/design/fleet-versioning.md); the contract the test consumes is the
+    # document's `schema` field, which the test asserts, so a schema bump fails
+    # loudly instead of reading a `/2` document as a `/1`. Not on the
+    # [tool.willow.fleet] roster yet: joining it means a Rule 2 row deciding
+    # the reconciler's public surface, which is the operator's call.
+    "willow-reconciler>=0.6.0,<1.0.0",
 ]
 
 [project.scripts]
