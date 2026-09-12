@@ -16,6 +16,13 @@ good and the rest are load-bearing morale.
 > do more" was actually "willow already does this." Check `the_grove.py`,
 > `friction_floor.py`, `lineage.py`, `code_graph/`, `forks.py`,
 > `governance_ledger.py`, and `federation` before proposing net-new. A Nestor similarity pass also caught 2 internal duplicates (former #103/#104), now folded into #18/#17.
+>
+> **Re-audit (2026-09-12, E3-hub-tagging):** graded again against this tree and
+> the release notes, with `reconciler run` as the hint (it inferred nothing —
+> no trailers yet, no PR mentions in the items). Four more partials, each with
+> its location inline (#27, #37, #63, #71); everything else untagged stays
+> untagged because no landing could be shown, which is the honest state, not a
+> verdict of "unbuilt". #75 added. Items are never renumbered.
 
 ---
 
@@ -56,7 +63,7 @@ good and the rest are load-bearing morale.
 24. **🌱 Federation health gossip** — servers periodically share health so `fleet_health` isn't a cold poll. — 🟡 **partial**: willow-mcp `fleet_health`/`fleet_roster.py` exist (cold poll); periodic gossip is the missing part.
 25. **🌱 Capability discovery cache** — remember what remote servers can do instead of re-discovering. — 🟡 **partial**: willow-mcp `federation_discover` exists; the caching layer is the missing part.
 26. Federated "reputation" — servers that give bad answers get down-ranked.
-27. A fleet-wide "town square" record collection every server can post to.
+27. A fleet-wide "town square" record collection every server can post to. — 🟡 **partial**: willow-mcp `grove_tools.py` — the Grove bus (`grove_send_message`, `grove_list_channels`, `grove_bus_send`/`grove_bus_receive`) is the fleet-wide post-to-a-channel surface; one designated square rather than per-agent channels is the missing part.
 28. Servers send each other postcards. The postcard is a health check with a nicer name.
 29. Leader election by rock-paper-scissors seed.
 30. Homesickness metric for federated calls that time out.
@@ -72,7 +79,7 @@ good and the rest are load-bearing morale.
 ## ⚖️ FRANK ledger & governance
 
 36. **🌱 Tamper-evidence dashboard** — surface `frank_verify` status continuously, not on demand. — 🟡 **partial**: willow-mcp `governance_ledger.py` + `frank_verify` + `frank_head_anchor.py` provide the tamper-evident chain (on-demand); continuous surfacing is the missing part.
-37. **🌱 Policy-as-record** — governance rules stored as versioned records with their own lineage.
+37. **🌱 Policy-as-record** — governance rules stored as versioned records with their own lineage. — 🟡 **partial**: willow-mcp `envelopes.py` + `envelope_propose`/`envelope_ratify`/`envelope_list` — the constitutional envelopes ARE governance rules held as records (`pre-approved.json`), with each proposal/ratification/rejection ledgered in FRANK (`docs/design/envelope-accrual.md`); per-rule versioning with its own lineage is the missing part.
 38. Ledger "receipts" that print like a store receipt, itemized. — ✅ **shipped**: willow-mcp `receipts.py` (`receipts_tail`, `bound_receipt.py`).
 39. A governance "conscience" tool that second-guesses the last decision.
 40. FRANK issues a fortune-cookie-style aphorism with each verified block.
@@ -117,7 +124,7 @@ good and the rest are load-bearing morale.
 
 61. **🌱 Lease expiry warnings** — warn before a net lease lapses mid-task.
 62. **🌱 Egress audit trail** — one queryable log of every outbound call and its three-key justification. — ✅ **shipped** in `willow-gate`: `custody.py` reconciles declared-vs-observed capabilities and treats file-checkout as egress-class, with export/exfiltrate denials.
-63. A "three keys" visualizer showing which of the trio you're missing.
+63. A "three keys" visualizer showing which of the trio you're missing. — 🟡 **partial**: willow-mcp `gates_panel.py` (`willow-mcp gates`, the live dashboard) renders every gate — manifest `task_net`, `consent.*`, the net lease with its clock — and `net-status` reads the lease back ("active, expires in Ns"); a single trio-at-a-glance view is the missing part.
 64. Egress "dry run" that shows what *would* be sent without sending.
 65. A guilt-o-meter for how much you've hit external APIs today.
 
@@ -131,10 +138,11 @@ good and the rest are load-bearing morale.
 ## 🧬 Cross-cutting / genuinely-maybe-good
 
 70. **🌱 A single `willow_status` home-screen** — Grove rings + Nest depth + fleet health + open commitments + FRANK integrity, one call. — 🟡 **partial**: willow-mcp `diagnostic_summary` + `fleet_status` cover much of it; a single unified home-screen call is the missing part.
-71. **🌱 Onboarding "first hour" flow** — a guided `session_enter` for brand-new agents.
+71. **🌱 Onboarding "first hour" flow** — a guided `session_enter` for brand-new agents. — 🟡 **partial**: willow-mcp `session_enter` returns `entry_mode`, project records and ORIENT/FRANK status, and the bundled `session-start` skill (`skills/session-start.md`) walks the lifecycle from that first call; a flow that knows the agent is brand-new and guides its first hour is the missing part.
 72. **🌱 Time-travel debugging** — reconstruct full agent state at any past receipt. — 🟡 **partial**: `lineage.py` + `receipts.py` retain the history; full state reconstruction is the missing part.
 73. **🌱 Dry-run mode for every mutating tool** (`preview=true`).
 74. **🌱 A "memory garbage collector"** report: what's safe to expire and why.
+75. **🌱 Adopt `Idea-Id` commit trailers** (fleet CONVENTION, decision-2026-09-11) — a commit that lands a pile item carries `Idea-Id: willow-ideas-NNN`, generated by `reconciler id`, never typed; `.github/workflows/trailers.yml` fails on a trailer that names an item this pile does not contain.
 
 ---
 
