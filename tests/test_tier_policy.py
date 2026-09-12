@@ -117,3 +117,26 @@ def test_store_purge_stays_write_not_admin():
 def test_bad_trust_level_fails_closed():
     assert tp.tier_permits("nonsense", "store_get") is False
     assert tp.tier_permits(None, "store_get") is False
+
+
+def test_the_guarded_tool_scan_catches_a_planted_decorator(tmp_path, monkeypatch):
+    """Planted: a server with two literal-named `@_guarded` decorators in the
+    two quote styles, and one that names its tool through a constant — the
+    exact escape `test_every_guarded_decorator_uses_a_string_literal_name`
+    exists to catch. `_guarded_tools` must return the two literals and not the
+    escapee, and the two patterns must disagree on the planted file."""
+    planted = tmp_path / "server.py"
+    planted.write_text(
+        '@_guarded("store_put")\n'
+        "def store_put(): ...\n"
+        "@_guarded('planted_tool')\n"
+        "def planted_tool(): ...\n"
+        "@_guarded(TOOL_NAME)\n"
+        "def escapes_the_scan(): ...\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(globals(), "_SERVER", planted)
+    assert _guarded_tools() == {"store_put", "planted_tool"}
+    src = planted.read_text(encoding="utf-8")
+    assert len(_GUARDED_ANY_RE.findall(src)) == 3
+    assert len(_GUARDED_NAME_RE.findall(src)) == 2

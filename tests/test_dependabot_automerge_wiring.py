@@ -161,3 +161,18 @@ def test_permissions_are_read_only_now_that_arming_uses_the_pat():
     not carry write scope nothing exercises."""
     perms = _load()["permissions"]
     assert perms == {"contents": "read", "pull-requests": "read"}, perms
+
+
+def test_the_credential_scans_catch_a_planted_step():
+    """Planted: a step armed with the App token, and one on GITHUB_TOKEN.
+    Both helpers above are asserted against the real workflow only in the
+    direction that passes today; this shows each of them firing."""
+    armed = {"env": {"GH_TOKEN": "${{ steps.app-token.outputs.token }}"},
+             "run": "gh pr merge --auto --merge"}
+    unarmed = {"env": {"GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}"},
+               "run": "gh pr merge --auto --merge"}
+    assert _arms_with_non_suppressed_credential(armed)
+    assert not _arms_with_non_suppressed_credential(unarmed)
+    assert _secrets_used(unarmed) == {"GITHUB_TOKEN"}
+    assert _secrets_used({"with": {"token": "${{ secrets.RELEASE_PLEASE_TOKEN }}"}}) == {"RELEASE_PLEASE_TOKEN"}
+    assert _secrets_used(armed) == set(), "a step output is not a secret name"

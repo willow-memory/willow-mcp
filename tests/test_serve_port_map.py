@@ -21,6 +21,8 @@ question is what a fresh install gets, and other suites mutate the environment.
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 SERVE_PORT = 8765
@@ -55,3 +57,25 @@ def test_serve_port_is_the_ratified_one():
 def test_serve_never_binds_the_loopback_only_desk_port():
     assert _module_default() != GROVE_DESK_PORT
     assert _wrapper_default() != GROVE_DESK_PORT
+
+
+def test_the_port_extractors_catch_a_planted_disagreement(tmp_path, monkeypatch):
+    """Planted: a tree whose server.py and willow-serve disagree on the port,
+    which `test_wrapper_and_module_agree` would report — and a wrapper whose
+    default is spelled a way the regex does not read, which must fail loudly
+    rather than return a port. `ROOT` is swapped for the staged tree."""
+    (tmp_path / "src" / "willow_mcp").mkdir(parents=True)
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "src" / "willow_mcp" / "server.py").write_text(
+        'port = int(os.getenv("WILLOW_MCP_PORT", "8765"))\n', encoding="utf-8")
+    wrapper = tmp_path / "scripts" / "willow-serve"
+    wrapper.write_text('PORT="${WILLOW_MCP_PORT:-8766}"\n', encoding="utf-8")
+    monkeypatch.setitem(globals(), "ROOT", tmp_path)
+
+    assert _module_default() == 8765
+    assert _wrapper_default() == 8766
+    assert _module_default() != _wrapper_default()
+
+    wrapper.write_text("PORT=8766\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="PORT default not found"):
+        _wrapper_default()
