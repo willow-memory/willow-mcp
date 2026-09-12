@@ -152,13 +152,14 @@ moment someone self-hosts.
 > answer to *where does egress happen* and the wrong answer to *where does the
 > check go*.
 >
-> Both modules are **vendored byte-for-byte** from `safe-app-store`'s
-> `libs/nest-pipeline` (box audit A4), under an in-repo hash pin
-> (`tests/test_nest_pipeline_vendor.py`) and a CI `vendor-sync` job — see
-> `nest/__init__.py:19-25`. The library is also deliberately policy-free: *"Apps
-> that consume it keep their own app-specific layers outside this core."*
-> Putting a consent check inside would fork the canonical library to carry one
-> consumer's policy and break the drift-guard on its next run.
+> Both modules were **vendored byte-for-byte** from `safe-app-store`'s
+> `libs/nest-pipeline` (box audit A4) under a hash pin and a CI `vendor-sync`
+> job when this was written. Since 2026-09-12 their home is this repo
+> (safe-app-store is archived and is never an origin again — owner decision;
+> see `nest/__init__.py`). The rule that matters survives the move: the library
+> is deliberately policy-free — *"Apps that consume it keep their own
+> app-specific layers outside this core."* — so a consent check belongs to the
+> layer that decides to invoke the pipeline, not inside it.
 >
 > **The gate therefore sits at willow-mcp's own tool boundary** —
 > `model_egress.denial()`, called from `nest_scan` before it imports the

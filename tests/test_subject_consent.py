@@ -12,15 +12,13 @@ Two properties are load-bearing and each has its own section below:
      but the standard library — no willow_mcp runtime, no network stack. This
      mirrors UTETY's test_boundaries.py: the boundary is a test, not a comment.
 
-A third, cross-cutting property lives in the DRIFT-GUARD section at the bottom:
-this package is a VENDORED copy of the canonical safe-app-store
-``libs/subject-consent`` (box audit A1). Its code body must not diverge in
-place — the pinned-hash test below fires on any local edit, and the CI job
-`vendor-sync` (scripts/check_subject_consent_sync.py) catches the canonical
-advancing past us. Mirrors the friction_floor drift-guard added in #185.
+This package was a VENDORED copy of safe-app-store ``libs/subject-consent``
+(box audit A1) under a pinned-hash drift-guard here and a CI compare. Its home
+is this repo since 2026-09-12 (safe-app-store is archived and is never an
+origin again — owner decision), so the drift-guard is gone: the two properties
+above are what hold it, and they hold it wherever it is edited.
 """
 import ast
-import hashlib
 import sys
 from pathlib import Path
 
@@ -264,46 +262,3 @@ def test_core_has_no_network_or_subprocess_imports():
             mods = [node.module.split(".")[0]]
         hit = sorted(set(mods) & banned)
         assert not hit, f"core.py must not import egress/exec modules: {hit}"
-
-
-# ── drift-guard: the vendored package must not silently diverge from canonical ──
-# Finding A1 of the 2026-07-24 box audit: subject_consent is vendored in three
-# repos, each carrying a "canonical lives at safe-app-store, keep in sync"
-# docstring — but nothing enforced it. This pins the CODE BODY of each vendored
-# module (from `from __future__` onward — the docstring is deliberately excluded
-# because the vendored copy adds a provenance stanza the canonical lacks) to a
-# known hash, so ANY local edit fails loudly. Companion CI job `vendor-sync`
-# (scripts/check_subject_consent_sync.py) catches the other direction: canonical
-# advancing while this copy stays behind. Same two-sided guard as #185's
-# friction_floor.
-#
-# The copy is not a place to edit. To adopt a canonical change: sync the code
-# body from safe-app-store libs/subject-consent, keep this repo's provenance
-# docstring stanza, then update the pinned hash to the value the assertion
-# prints.
-_PKG = Path(__file__).resolve().parents[1] / "src/willow_mcp/subject_consent"
-_MARKER = "from __future__ import annotations"
-
-#: sha256 of each module's code body (from _MARKER to EOF), pinned to the
-#: canonical safe-app-store libs/subject-consent copy.
-EXPECTED_BODY_SHA256 = {
-    "__init__.py": "81ed754027759edd081ea431dee8d3f14ac96832ce16d7a4f1c630ca98786ed6",
-    "core.py": "6a9348177ab25312b0674d0cf2d9417504dfa6323b21083b6c34a87660690e98",
-}
-
-
-def _body(text: str) -> str:
-    return text[text.index(_MARKER):]  # code only — docstring/provenance excluded
-
-
-@pytest.mark.parametrize("mod", sorted(EXPECTED_BODY_SHA256))
-def test_vendored_body_matches_pinned_hash(mod):
-    got = hashlib.sha256(_body((_PKG / mod).read_text(encoding="utf-8")).encode()).hexdigest()
-    assert got == EXPECTED_BODY_SHA256[mod], (
-        f"vendored subject_consent/{mod} code body drifted from the pinned "
-        "safe-app-store canonical copy.\n"
-        f"  got:      {got}\n  expected: {EXPECTED_BODY_SHA256[mod]}\n"
-        "If you re-synced from safe-app-store on purpose, update "
-        "EXPECTED_BODY_SHA256.\n"
-        "If you edited the vendored copy directly — don't; edit the canonical "
-        "libs/subject-consent and re-sync.")

@@ -29,18 +29,11 @@ A key that gates nothing gets deleted or gets a caller. It does not get a label.
 
 A note on method, because it changed. These tests originally patched
 `nest/embed.py`'s and `nest/llm.py`'s module constants, on the assumption the
-gate would live where the socket is opened. It cannot: those modules are
-vendored byte-for-byte from safe-app-store's `libs/nest-pipeline` under a CI
-drift-guard, and are deliberately policy-free. The gate sits at willow-mcp's own
-tool boundary instead, so the tests patch `$OLLAMA_HOST` — the thing an operator
-actually sets — rather than a module attribute.
-
-A note on method, because it changed. These tests originally patched
-`nest/embed.py`'s and `nest/llm.py`'s module constants, on the assumption the
-gate would live where the socket is opened. It cannot: those modules are
-vendored byte-for-byte from safe-app-store's `libs/nest-pipeline` under a CI
-drift-guard, and are deliberately policy-free. The gate sits at willow-mcp's own
-tool boundary instead, so the tests patch `$OLLAMA_HOST` — the thing an operator
+gate would live where the socket is opened. It does not: the pipeline is
+deliberately policy-free (it was vendored from safe-app-store under a
+drift-guard when this was written; its home is this repo since 2026-09-12, and
+the policy-free rule is kept on purpose). The gate sits at willow-mcp's own tool
+boundary instead, so the tests patch `$OLLAMA_HOST` — the thing an operator
 actually sets — rather than a module attribute.
 """
 from __future__ import annotations
@@ -169,12 +162,12 @@ def test_lan_is_retired_not_enforced(home):
 #
 # These three were written asserting the gate inside `nest/embed.py` and
 # `nest/llm.py`, where the socket is opened. That is the right answer to "where
-# does egress happen" and the wrong answer to "where does the check go": those
-# modules are vendored BYTE-FOR-BYTE from safe-app-store's libs/nest-pipeline
-# under a hash pin and a CI vendor-sync job (nest/__init__.py:19-25), and the
-# library is deliberately policy-free so each consumer keeps its own layers
-# outside the shared core. A consent check there would fork the canonical
-# library to carry one consumer's policy, and break the drift-guard.
+# does egress happen" and the wrong answer to "where does the check go": the
+# pipeline is deliberately policy-free so each consumer keeps its own layers
+# outside the core (nest/__init__.py). It was vendored from safe-app-store under
+# a drift-guard when this was written; its home is this repo since 2026-09-12,
+# and the policy-free rule stays, because a consent model belongs to the layer
+# that decides to invoke the pipeline.
 #
 # So they now assert at willow-mcp's own boundary — the tool that decides to
 # invoke the pipeline, which is also where the false promise was written. The

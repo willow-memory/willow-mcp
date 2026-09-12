@@ -26,8 +26,10 @@ plugs a SQLite backend so its consent lives in the one on-device store beside th
 learner, atomically. Every public function takes `store`, which may be a
 filesystem path (wrapped in a `FileBackend`) or any `Backend` instance.
 
-Provenance: VENDORED from rudi193-cmd/safe-app-store ``libs/subject-consent``
-(MIT). Canonical lives there; keep this copy in sync, do not diverge it in place.
+Provenance: home is THIS repo. Vendored from rudi193-cmd/safe-app-store
+``libs/subject-consent`` (MIT; box audit A1) until 2026-09-12, when
+safe-app-store was archived (owner decision: never an origin again). Since then
+this is the canonical copy: edit it here, under the HARD CONSTRAINT above.
 """
 from __future__ import annotations
 

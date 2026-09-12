@@ -16,11 +16,14 @@ returns its walled variant over MCP for the same reason. That asymmetry —
 relative/structural shape is process (shareable); absolute content is person
 (walled) — is the load-bearing decision, the same one corpuslens's Guard makes.
 
-Provenance: the shared content pipeline is vendored from the canonical
-rudi193-cmd/safe-app-store ``libs/nest-pipeline`` (MIT; box audit A4). Keep the
-vendored modules byte-for-byte in sync with it — the drift-guard enforces it
-(``tests/test_nest_pipeline_vendor.py`` in-repo hash pin +
-``scripts/check_nest_pipeline_sync.py`` in CI's ``vendor-sync`` job). Only the
-content pipeline is vendored here; the live drop-folder router (``nest_intake``)
-is intentionally not part of this first cut. ΔΣ=42
+Provenance: home is THIS repo. The content pipeline core (db, embed, ingest,
+llm, secrets, selflearn, taxonomy, classify, ocr) was vendored from
+rudi193-cmd/safe-app-store ``libs/nest-pipeline`` (MIT; box audit A4) under a
+hash pin and a CI ``vendor-sync`` compare. safe-app-store is archived and is
+never an origin again (owner decision, 2026-09-12: "the forge is to be
+vendored; safe-app-store isn't to be vendored — it's to be archived and turned
+into a parts bin"), so since that date these modules are source like the rest
+of ``willow_mcp``: edit them here, test them here, no pin. The pipeline is still
+deliberately policy-free — consent and egress gates live at the tool boundary
+(``model_egress``), not in here. ΔΣ=42
 """

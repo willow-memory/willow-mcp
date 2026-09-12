@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Which *direction* did a vendored copy drift?
 
-The four cross-repo sync guards (check_vendor_sync, check_subject_consent_sync,
-check_mem_ratify_sync, check_nest_pipeline_sync) all answer one question: does
-the vendored body still equal upstream's? That is a byte comparison, and a byte
+The two cross-repo sync guards (check_vendor_sync, check_mem_ratify_sync) both
+answer one question: does the vendored body still equal upstream's? (There were
+four: the two that compared against safe-app-store went with it — it is
+archived and is never an origin again, owner decision 2026-09-12, and the
+pieces vendored from it now have their home in this repo.) That is a byte comparison, and a byte
 comparison cannot tell these two apart:
 
   BEHIND    upstream advanced and the vendored copy stayed put. This is box
@@ -30,9 +32,10 @@ deepened when drift has already been found, so a green run pays nothing.
 
 A fourth answer, OVERRIDDEN, is a *record*, not a classification. A vendored
 copy can carry a change on purpose that upstream has not taken yet — the nest
-secret scan's word-boundary hardening (80344b7, f35ab9d) is the one this repo
-holds today — and before this record existed that read as DIVERGED, red on
-every run, indistinguishable from a hand-edit nobody meant. Reading a
+secret scan's word-boundary hardening (80344b7, f35ab9d) was the case that
+produced this, while the Nest pipeline was still vendored — and before this
+record existed that read as DIVERGED, red on every run, indistinguishable from
+a hand-edit nobody meant. Reading a
 permanent red trains the same wave-through habit as a false AHEAD. So a
 deliberate delta is written down in ``scripts/vendor_overrides.json`` as
 (why, sha256 of the exact body it excuses), and only that body is forgiven:

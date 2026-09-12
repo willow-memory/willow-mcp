@@ -65,7 +65,7 @@ def _http_json(path: str, payload: dict, timeout: float = _TIMEOUT) -> dict | No
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 - local Ollama host; egress gated at the tool boundary (model_egress)
             return json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):
         return None
@@ -77,7 +77,7 @@ def installed_models() -> set[str]:
     if _installed_models is not None:
         return _installed_models
     try:
-        with urllib.request.urlopen(f"{DEFAULT_HOST}/api/tags", timeout=5) as resp:
+        with urllib.request.urlopen(f"{DEFAULT_HOST}/api/tags", timeout=5) as resp:  # nosec B310 - local Ollama host; egress gated at the tool boundary (model_egress)
             tags = json.loads(resp.read().decode("utf-8"))
         _installed_models = {m.get("name", "") for m in tags.get("models", [])}
     except (urllib.error.URLError, TimeoutError, OSError, ValueError):

@@ -9,9 +9,11 @@ Nest DB. That DB — a person's legal filings, journals, receipts, messages — 
 the **local PII zone**. From it, the Nest promotes *structure* (not content)
 into the shared knowledge base.
 
-The engine (`willow_mcp.nest`) is vendored from
+The engine (`willow_mcp.nest`) grew out of
 [`rudi193-cmd/safe-app-store` `apps/nest-seed`](https://github.com/rudi193-cmd/safe-app-store)
-(MIT). Both halves ship: the **content pipeline** (`nest_scan`/`status`/`digest`/`promote`,
+(MIT) and was vendored from its `libs/nest-pipeline` until 2026-09-12; its home
+is this repo now (safe-app-store is archived and is never an origin again —
+owner decision). Both halves ship: the **content pipeline** (`nest_scan`/`status`/`digest`/`promote`,
 below) and the **live drop-folder router** (scan → human-gate → file-move, the
 `nest_intake_*` tools — see [The live drop-folder router](#the-live-drop-folder-router)).
 
