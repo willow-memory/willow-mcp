@@ -251,3 +251,38 @@ def test_write_annotated_tools_do_not_claim_read_only():
         "their docstring (update the docstring to reflect what the tool actually "
         "writes). Stale claims:\n  " + "\n  ".join(stale)
     )
+
+
+# ── planted: the extractors fire on a file written to be caught ───────────────
+
+def test_the_extractors_catch_a_planted_annotation_and_stale_docstring(tmp_path):
+    """Planted: a tool-hosting module with one write-annotated tool whose
+    docstring ends in the 'Read-only.' claim the tests above forbid, and one
+    read tool. Both regex extractors above read source without importing it,
+    and nothing had shown either one finding anything — a scan that has never
+    fired has not been shown to check anything."""
+    planted = tmp_path / "planted_tools.py"
+    planted.write_text(
+        "@mcp.tool(annotations=_ANNO_WRITE)\n"
+        "async def store_purge(record_id):\n"
+        '    """Deletes the record. Read-only."""\n'
+        "\n"
+        "@mcp.tool(annotations=_ANNO_READ)\n"
+        "def store_get(record_id):\n"
+        '    """Fetch one record.\n'
+        "    Read-only.\n"
+        '    """\n'
+        "\n"
+        "def not_a_tool():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    assert _extract_tool_annotations(planted) == {
+        "store_purge": "_ANNO_WRITE", "store_get": "_ANNO_READ",
+    }
+    docs = _extract_tool_docstrings(planted)
+    assert set(docs) == {"store_purge", "store_get"}
+    # the exact predicate test_write_annotated_tools_do_not_claim_read_only uses
+    assert re.search(r"Read-only\.\s*$", docs["store_purge"], re.MULTILINE), docs
+    assert docs["store_get"].startswith("Fetch one record.")
+    assert _extract_tool_annotations(tmp_path / "absent.py") == {}

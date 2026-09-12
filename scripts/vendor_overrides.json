@@ -1,0 +1,10 @@
+{
+  "$comment": "Deliberate, named deltas between a vendored copy and its canonical upstream. Keyed by the sync guard's title, then the vendored file name. Each record is (why, sha256 of the exact body it excuses): scripts/vendor_drift.py forgives that body and no other, and fails the job the moment upstream carries the change and the record is no longer true. tests/test_nest_pipeline_vendor.py holds every record to the in-repo pin. A record is a claim about the tree, dated and hashed, never a blanket permission — and it is the third thing a re-sync removes, after the body and the pin.",
+  "nest-pipeline": {
+    "secrets.py": {
+      "why": "Word-boundary evasion hardening (80344b7, f35ab9d, 2026-09-11): every credential shape now matches on its own structure with no \\b anchor, so a key glued to adjacent letters is still caught, and the AWS shape has no trailing anchor so same-charset glue cannot hide it. safe-app-store libs/nest-pipeline still carries the anchored shapes; re-syncing from it would revert the fix and turn tests/test_nest_secrets.py red. Upstream it, then remove this record.",
+      "sha256": "7c6335f883ad80a3d323bc8f2b151ba9748db444eacb32306e8fbca5ec4e28f8",
+      "recorded": "2026-09-12"
+    }
+  }
+}

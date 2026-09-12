@@ -299,3 +299,15 @@ def test_the_checkout_uses_the_pat_so_its_pushes_are_not_gated():
         "checkout must carry a credential whose events trigger workflows. "
         f"Got: {token!r}")
     assert "GITHUB_TOKEN" not in token
+
+
+def test_the_credential_scan_catches_a_planted_step():
+    """Planted: the two credentials that trigger workflows, in the two shapes
+    the workflow carries them, and GITHUB_TOKEN, which must not count. The
+    tests above only ever see the real workflow pass; this is the helper
+    shown to fire."""
+    assert _names_a_non_suppressed_credential(
+        {"with": {"token": "${{ secrets.RELEASE_PLEASE_TOKEN }}"}})
+    assert _names_a_non_suppressed_credential("${{ steps.app-token.outputs.token }}")
+    assert not _names_a_non_suppressed_credential(
+        {"with": {"token": "${{ secrets.GITHUB_TOKEN }}"}})

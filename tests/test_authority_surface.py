@@ -29,7 +29,12 @@ def _mcp_tool_names() -> set[str]:
     """Every function directly decorated @mcp.tool() in server.py, read from
     source (importing server pulls in a heavy runtime)."""
     src = _SERVER.read_text(encoding="utf-8")
-    return set(re.findall(r"@mcp\.tool\([^)]*\)\s*(?:@_guarded\([^\n]*\)\s*)?def\s+([a-zA-Z0-9_]+)", src))
+    # `(?:async\s+)?`: no tool in server.py is `async def` today, and the first
+    # one would have escaped every assertion in this file — the plant below
+    # found the gap. test_annotation_consistency.py's extractor already
+    # accepted both forms.
+    return set(re.findall(
+        r"@mcp\.tool\([^)]*\)\s*(?:@_guarded\([^\n]*\)\s*)?(?:async\s+)?def\s+([a-zA-Z0-9_]+)", src))
 
 
 def test_hook_and_bundle_copy_are_byte_identical():
@@ -99,3 +104,27 @@ def test_no_capability_flag_is_a_member_of_any_permission_group():
     assert not leaks, (
         "capability flags must be granted on their own manifest line, never "
         f"bundled into a permission group: {leaks}")
+
+
+def test_the_tool_name_scan_catches_a_planted_tool(tmp_path, monkeypatch):
+    """Planted: a server module with two `@mcp.tool` functions — one behind
+    `@_guarded`, one bare — and a plain function beside them. `_mcp_tool_names`
+    reads `_SERVER` from source; every test above asserts what it does NOT
+    contain, so nothing had shown it finding a tool at all."""
+    planted = tmp_path / "server.py"
+    planted.write_text(
+        "@mcp.tool()\n"
+        '@_guarded("store_put")\n'
+        "def store_put(record):\n"
+        "    pass\n"
+        "\n"
+        "@mcp.tool(annotations=_ANNO_WRITE)\n"
+        "async def planted_registry_mutation(app_id):\n"
+        "    pass\n"
+        "\n"
+        "def not_a_tool():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(globals(), "_SERVER", planted)
+    assert _mcp_tool_names() == {"store_put", "planted_registry_mutation"}

@@ -318,3 +318,20 @@ def test_the_convention_classifies_every_fleet_package():
         surface, not_surface = rows[name]
         assert surface and not_surface, (
             f"{name}'s Rule 2 row has an empty cell: {rows[name]}")
+
+
+def test_the_pin_scan_catches_a_planted_requirements_list(monkeypatch):
+    """Planted: a requirements list with a fleet package pinned twice (the
+    declaration-order bug the docstring above records), a fleet package with
+    no cap, and a non-fleet package. `_fleet_pins` must keep both occurrences,
+    drop the uncapped one (it is not a pin by `_PIN_RE`), and ignore the
+    stranger — `_requirements` and `_fleet` are stubbed so the plant does not
+    depend on what pyproject.toml says today."""
+    monkeypatch.setitem(globals(), "_requirements", lambda: [
+        "willow_gate>=0.3.0,<0.4.0",
+        "willow-gate >= 0.2.0 , < 1.0.0",
+        "jeles>=0.5.1",
+        "mcp>=2.0.0,<3.0.0",
+    ])
+    monkeypatch.setitem(globals(), "_fleet", lambda: {"willow-gate", "jeles"})
+    assert _fleet_pins() == {"willow-gate": [("0.3.0", "0.4.0"), ("0.2.0", "1.0.0")]}

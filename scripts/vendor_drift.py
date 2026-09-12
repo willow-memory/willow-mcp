@@ -27,9 +27,24 @@ hash pins' job, not this one's.
 
 History is fetched lazily: the upstream checkout is shallow, and it is only
 deepened when drift has already been found, so a green run pays nothing.
+
+A fourth answer, OVERRIDDEN, is a *record*, not a classification. A vendored
+copy can carry a change on purpose that upstream has not taken yet — the nest
+secret scan's word-boundary hardening (80344b7, f35ab9d) is the one this repo
+holds today — and before this record existed that read as DIVERGED, red on
+every run, indistinguishable from a hand-edit nobody meant. Reading a
+permanent red trains the same wave-through habit as a false AHEAD. So a
+deliberate delta is written down in ``scripts/vendor_overrides.json`` as
+(why, sha256 of the exact body it excuses), and only that body is forgiven:
+edit the copy again and the record excuses nothing. When upstream catches up
+and the bodies are equal again, the record is a lie about the tree and
+STALE_OVERRIDE fails the job until it is removed. The guard is narrowed to a
+named, hashed, dated claim — never weakened to "differences are fine".
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -46,6 +61,11 @@ BEHIND = "behind"
 AHEAD = "ahead"
 DIVERGED = "diverged"
 UNKNOWN = "unknown"
+OVERRIDDEN = "overridden"
+STALE_OVERRIDE = "stale-override"
+
+#: The one home for deliberate, named local deltas: {guard title: {file: {why, sha256}}}.
+OVERRIDES_PATH = Path(__file__).resolve().with_name("vendor_overrides.json")
 
 
 @dataclass(frozen=True)
@@ -55,8 +75,41 @@ class Verdict:
 
     @property
     def fatal(self) -> bool:
-        """Only a positively-identified open upstream PR is forgiven."""
-        return self.kind != AHEAD
+        """Only a positively-identified open upstream PR, or a recorded
+        override naming this exact body, is forgiven."""
+        return self.kind not in (AHEAD, OVERRIDDEN)
+
+
+def load_overrides(title: str, path: Path = OVERRIDES_PATH) -> dict[str, dict]:
+    """The overrides recorded for one guard, keyed by file name. {} when the
+    record has none for it, or does not exist."""
+    if not path.is_file():
+        return {}
+    return dict(json.loads(path.read_text(encoding="utf-8")).get(title) or {})
+
+
+def override_for(overrides: dict[str, dict], name: str, mine_body: str) -> Verdict | None:
+    """The OVERRIDDEN verdict for `name`, if a record names exactly this body.
+
+    A record excuses one body — the sha256 it carries — and no other. A copy
+    edited again after the record was written matches nothing and falls
+    through to `classify`, where it is DIVERGED like any other hand-edit.
+    """
+    record = overrides.get(name)
+    if not record:
+        return None
+    if hashlib.sha256(mine_body.encode("utf-8")).hexdigest() != record.get("sha256"):
+        return None
+    return Verdict(OVERRIDDEN, str(record.get("why", "")))
+
+
+def stale_override(overrides: dict[str, dict], name: str) -> Verdict | None:
+    """Bodies are equal, yet a record claims they differ on purpose: the record
+    is false and must go. Fatal, so a stale claim cannot outlive its reason."""
+    record = overrides.get(name)
+    if not record:
+        return None
+    return Verdict(STALE_OVERRIDE, str(record.get("why", "")))
 
 
 def _git(repo: Path, *args: str, check: bool = False) -> str:
@@ -140,6 +193,16 @@ def classify(upstream_file: Path, mine_body: str,
 def annotate(title: str, vendored_path: str, verdict: Verdict,
              resync_hint: str) -> str:
     """The GitHub annotation for a verdict, warning or error as it deserves."""
+    if verdict.kind == OVERRIDDEN:
+        return (f"::warning title={title} overridden::{vendored_path} differs from "
+                f"upstream on purpose, by a record in {OVERRIDES_PATH.name}: "
+                f"{verdict.detail} Upstream the change, or keep the record current; "
+                f"the record excuses this exact body and no other.\n")
+    if verdict.kind == STALE_OVERRIDE:
+        return (f"::error title={title} stale override::{vendored_path} now matches "
+                f"upstream, but {OVERRIDES_PATH.name} still records a deliberate "
+                f"difference ({verdict.detail}). Remove that record — a claim about "
+                f"the tree that is no longer true must not stay written down.\n")
     if verdict.kind == AHEAD:
         return (f"::warning title={title} ahead of upstream::{vendored_path} does not "
                 f"match upstream yet because the canonical half is still open as "
