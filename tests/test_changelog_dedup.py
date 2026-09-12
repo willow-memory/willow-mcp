@@ -192,3 +192,99 @@ def test_hidden_types_stay_out():
     assert "chore" not in visible and "test" not in visible
     assert visible["fix"] == "Fixed" and visible["feat"] == "Added"
     assert order.index("Added") < order.index("Fixed")
+
+
+# ── the two latent defects Forge's body fixes (G2-vendor-pins-willow-mcp) ─────
+#
+# `tools/changelog_dedup.py` is vendored from forge-play/Forge. Its body drifted
+# behind Forge's, and the drift is not cosmetic: Forge's copy ends a section at
+# ANY `## ` heading, and guards `main()` against a changelog with nothing
+# generated in it. Both are latent here rather than live — this repo's
+# hand-written history is spelled `## [2.1.0] — 2026-08-02`, which starts with
+# `## [` and so already terminated the section under the old rule, and
+# CHANGELOG.md has carried a generated section since 2.1.1 — but a sibling that
+# writes `## 2.1.0 — date` hits both, and a vendored copy that is only correct
+# by the accident of a bracket is the drift the pin in test_vendor_pins.py
+# exists to end. These were written to fail against the old body first.
+
+_HAND_WRITTEN_BELOW = f"""## [2.2.0]({_BASE}/compare/v2.1.5...v2.2.0) (2026-08-04)
+
+
+### Added
+
+* **x:** y ([abc1234]({_BASE}/commit/abc1234567890abc1234567890abc1234567890a))
+
+## 2.1.0 — 2026-08-02
+
+### Docs
+
+* hand-written history, never generated, never to be rebuilt
+"""
+
+_NOTHING_GENERATED = """# Changelog
+
+## 2.1.0 — 2026-08-02
+
+### Docs
+
+* backfilled by hand before release-please existed
+"""
+
+
+def test_a_generated_section_ends_at_any_h2_not_only_a_bracketed_one(monkeypatch):
+    """Defect (a). With the section end matched on `## [` alone, a generated
+    section above a hand-written `## x.y — date` section swallowed it whole —
+    and then bailed on its `### Docs` heading, which is not a configured
+    section. The rebuild must stop at the hand-written heading and leave what
+    is below it untouched; `section_for` must not print it into a release body.
+
+    `commits_in_range` is stubbed: the claim under test is where the section
+    ends, not what git says is in it."""
+    monkeypatch.setattr(changelog_dedup, "commits_in_range", lambda prev, new: [
+        {"sha": "abc1234567890abc1234567890abc1234567890a", "type": "feat",
+         "scope": "x", "desc": "y"},
+    ])
+    new_text, summary = changelog_dedup.rebuild(_HAND_WRITTEN_BELOW)
+    assert summary == "", f"the section already matches its one commit: {summary}"
+    assert new_text == _HAND_WRITTEN_BELOW
+
+    section = changelog_dedup.section_for(_HAND_WRITTEN_BELOW, "2.2.0")
+    assert section is not None
+    assert "## 2.1.0" not in section, "the hand-written history leaked into the release body"
+    assert "### Docs" not in section
+
+
+def test_main_treats_a_changelog_with_nothing_generated_as_a_clean_no_op(
+        monkeypatch, tmp_path, capsys):
+    """Defect (b). `rebuild()` raises `Bail` for a changelog with no generated
+    section — right for a library call, and the tests above rely on it. The
+    CLI turned that into exit 2 and a `::error::`, which release-please.yml
+    reads as "check the section by hand": a warning for a file that has
+    nothing to check. Forge's `main()` names the state and exits 0."""
+    changelog = tmp_path / "CHANGELOG.md"
+    changelog.write_text(_NOTHING_GENERATED)
+    monkeypatch.setattr(changelog_dedup, "CHANGELOG", changelog)
+    monkeypatch.setattr(sys, "argv", ["changelog_dedup.py"])
+    assert changelog_dedup.main() == 0
+    out = capsys.readouterr().out
+    assert "::error::" not in out, out
+    assert changelog.read_text() == _NOTHING_GENERATED, "nothing to rebuild means nothing rewritten"
+
+
+def test_main_with_no_changelog_at_all_is_a_no_op_but_print_section_is_not(
+        monkeypatch, tmp_path, capsys):
+    """The other half of defect (b): `main()` read CHANGELOG.md unguarded, so a
+    repo that has never had one crashed with a traceback instead of an answer.
+    A rebuild has nothing to correct there; `--print-section` is different,
+    since its stdout becomes a GitHub Release body, and exit 0 would publish
+    the explanation as the release notes."""
+    monkeypatch.setattr(changelog_dedup, "CHANGELOG", tmp_path / "CHANGELOG.md")
+    monkeypatch.setattr(sys, "argv", ["changelog_dedup.py"])
+    assert changelog_dedup.main() == 0
+    assert "::error::" not in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", ["changelog_dedup.py", "--print-section", "2.2.0"])
+    assert changelog_dedup.main() == 2
+    captured = capsys.readouterr()
+    assert captured.out == "", "nothing may reach stdout — it would become the release body"
+    assert "::error::" in captured.err
