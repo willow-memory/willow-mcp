@@ -277,8 +277,15 @@ jobs:
     #              is a merge ORDER; merge upstream, re-run, green untouched.
     #   diverged → error. Matches no upstream version and no open PR, i.e. a
     #              hand-edit of the vendored copy. Never forgiven.
-    # Only a positive match against a real PR head is downgraded, so the guard
-    # is narrowed to the truth rather than weakened.
+    #   overridden → warning. The copy differs ON PURPOSE and says so:
+    #              scripts/vendor_overrides.json records why and the sha256 of
+    #              the exact body it excuses (nest/secrets.py's word-boundary
+    #              hardening is the one recorded today). Only that body is
+    #              forgiven; the record goes fatal (stale override) the moment
+    #              upstream carries the change, so it cannot outlive its reason.
+    # Only a positive match against a real PR head, or a hashed and reasoned
+    # record, is downgraded, so the guard is narrowed to the truth rather than
+    # weakened.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
