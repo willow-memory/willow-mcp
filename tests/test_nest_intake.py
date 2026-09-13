@@ -49,6 +49,23 @@ def test_classify_deterministic_and_expected(env):
     assert rules.classify("mystery.bin") is None              # unknown
     assert rules.classify(".hidden") is None                  # ignored (dotfile)
     assert rules.classify("screenshot 2026.png") == "screenshots"
+    assert rules.classify("willow-bot.pem") == "secrets"
+    assert rules.classify("github-app-private-key.pem") == "secrets"
+    assert rules.classify("willow-bot.env") == "secrets"
+
+
+def test_confirm_secrets_track_chmod_600(env, store):
+    from pathlib import Path
+    _tmp, drop = env
+    f = drop / "willow-bot.pem"
+    f.write_text("-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n")
+    intake.scan(store, folders=[drop])
+    item = next(i for i in intake.get_queue(store) if i["filename"] == "willow-bot.pem")
+    assert item["track"] == "secrets"
+    res = intake.confirm(store, item["id"], app_id="tester")
+    dest = Path(res["moved_to"])
+    assert dest.exists() and dest.parent.name == "secrets"
+    assert (dest.stat().st_mode & 0o777) == 0o600
 
 
 # ── scan / queue ─────────────────────────────────────────────────────────────

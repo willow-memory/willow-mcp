@@ -13,6 +13,14 @@
     "dot_prefix": true
   },
   "tracks": {
+    "secrets": {
+      "patterns": [
+        "(?i).*\\.pem$",
+        "(?i).*private[-_]?key.*\\.txt$",
+        "(?i)^willow-bot\\.env$"
+      ],
+      "keywords": ["willow-bot.pem", "github-app", "github_app"]
+    },
     "journal": {
       "patterns": ["^\\d{4}-\\d{2}-\\d{2}\\.md$"],
       "keywords": ["journal", "diary", "daily_note", "morning_pages"]

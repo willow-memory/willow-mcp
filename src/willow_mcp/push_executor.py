@@ -34,12 +34,15 @@ What this module does, in order, and nothing else:
    lines. A caller that wants to verify does so against the remote, not
    against this dict's booleans.
 
-Not here yet (gap 5ecb87cfdf56, later slices): a per-push installation token
-minted from the willow-bot App, and Kart-direct initiation from inside a task
-without an agent in the loop.
+Slice 3 (credential): when willows-bot covers the repo, mint a per-push
+installation token in this process and push over HTTPS with an
+``http.extraheader`` — the token never enters Kart. If the App is not
+configured or not installed on the repo, fall back to the host credential
+helper. Kart-direct initiation without an agent in the loop remains open.
 """
 from __future__ import annotations
 
+import base64
 import os
 import subprocess
 from pathlib import Path
@@ -65,6 +68,35 @@ def _git(checkout: Path, *args: str, runner: Optional[Callable] = None) -> subpr
         ["git", "-C", str(checkout), *args],
         capture_output=True, text=True, timeout=_GIT_TIMEOUT_S, env=env, check=False,
     )
+
+
+def _push_argv_for_app_token(
+    *,
+    repo: str,
+    branch: str,
+    remote: str,
+    remote_url: str,
+    token: str,
+    force: bool,
+) -> list[str]:
+    """Build ``git … push`` argv that authenticates as the App without putting
+    the token on a durable remote URL. ``http.extraheader`` keeps it out of
+    ``git remote -v`` / config; argv still holds a short-lived basic blob for
+    the single subprocess (same process that minted it)."""
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    header = f"AUTHORIZATION: basic {basic}"
+    # SSH remotes cannot use the HTTP header — push to the HTTPS form once.
+    push_remote = remote
+    if remote_url.startswith("git@") or remote_url.startswith("ssh://"):
+        push_remote = f"https://github.com/{repo}.git"
+    args = [
+        "-c", f"http.https://github.com/.extraheader={header}",
+        "push",
+    ]
+    if force:
+        args.append("--force-with-lease")
+    args += [push_remote, f"{branch}:{branch}"]
+    return args
 
 
 def _repo_matches_remote(remote_url: str, repo: str) -> bool:
@@ -246,27 +278,56 @@ def execute_push(
                                    store=store)
         return out
 
-    args = ["push"]
-    if force:
-        # Only reachable when the envelope's bounds carry force: true — the
-        # check above matched call_args.force against the grant.
-        args.append("--force-with-lease")
-    args += [remote, f"{branch}:{branch}"]
+    # Credential: App installation token when willows-bot covers the repo;
+    # otherwise the host credential helper (desk / existing setup).
+    from . import github_app_credentials as gac
+
+    auth = gac.mint_installation_token(repo)
+    auth_mode = auth.get("mode") or "unavailable"
+    if auth.get("ok") and auth_mode == "app":
+        if not gac.contents_perm_allows_push(auth.get("permissions")):
+            level = (auth.get("permissions") or {}).get("contents")
+            return _refuse(
+                "EPERM",
+                f"willows-bot is installed on {repo} but Contents is {level!r} "
+                f"(need write). In GitHub App settings → Permissions → "
+                f"Repository → Contents → Read and write, then re-install / "
+                f"accept the permission request on each org.",
+                envelope_id=matches[0], citation_id=result.get("citation_id"),
+                sha=sha, auth_mode="app",
+            )
+        args = _push_argv_for_app_token(
+            repo=repo, branch=branch, remote=remote,
+            remote_url=facts["remote_url"], token=auth["token"], force=force,
+        )
+    elif auth_mode == "host":
+        args = ["push"]
+        if force:
+            args.append("--force-with-lease")
+        args += [remote, f"{branch}:{branch}"]
+    else:
+        return _refuse(
+            "EAUTH",
+            auth.get("reason") or "could not mint a willows-bot installation token",
+            envelope_id=matches[0], citation_id=result.get("citation_id"), sha=sha,
+        )
+
     try:
         pushed = _git(Path(facts["path"]), *args, runner=runner)
     except subprocess.TimeoutExpired:
         return {"ok": False, "pushed": False, "error": "ETIMEDOUT",
                 "reason": f"git push exceeded {_GIT_TIMEOUT_S}s", "envelope_id": matches[0],
-                "citation_id": result.get("citation_id"), "sha": sha}
+                "citation_id": result.get("citation_id"), "sha": sha,
+                "auth_mode": auth_mode}
     tail = "\n".join((pushed.stderr or pushed.stdout or "").strip().splitlines()[-5:])
     if pushed.returncode != 0:
         return {"ok": False, "pushed": False, "error": "EPUSH",
                 "reason": tail or f"git push exited {pushed.returncode}",
                 "envelope_id": matches[0], "citation_id": result.get("citation_id"),
-                "sha": sha}
+                "sha": sha, "auth_mode": auth_mode}
     return {
         "ok": True, "pushed": True, "repo": repo, "branch": branch, "remote": remote,
-        "force": force, "sha": sha, "envelope_id": matches[0],
+        "force": force, "sha": sha, "envelope_id": matches[0], "auth_mode": auth_mode,
         "citation_id": result.get("citation_id"), "git": tail,
         "checkout": facts["path"],
     }
