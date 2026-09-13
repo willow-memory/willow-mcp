@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.38.0](https://github.com/willow-memory/willow-mcp/compare/v2.37.0...v2.38.0) (2026-09-13)
+
+
+### Added
+
+* **push:** mint willows-bot installation tokens in the broker ([0aadcd1](https://github.com/willow-memory/willow-mcp/commit/0aadcd110464fa4417271174c9d011ef79a4e2b3))
+
 ## [2.37.0](https://github.com/willow-memory/willow-mcp/compare/v2.36.1...v2.37.0) (2026-09-13)
 
 
