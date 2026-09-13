@@ -62,6 +62,10 @@ def track_to_dest() -> dict[str, Path]:
         "screenshots":     home / "personal" / "photos" / "screenshots",
         "specs":           wh / "specs",
         "handoffs":        wh / "handoffs" / "filed",
+        # Operator credentials — PEMs / willow-bot.env land here via Nest gate.
+        # Same directory credentials.py reads ($WILLOW_HOME/secrets, usually the
+        # vault box). Autointake never auto-files this track (secret sniff).
+        "secrets":         wh / "secrets",
     }
 
 
@@ -259,6 +263,13 @@ def confirm(store, item_id: str, override_dest: str | None = None,
     dest.parent.mkdir(parents=True, exist_ok=True)
     final_dest = _unique_dest(dest.parent, dest.name)
     shutil.move(str(src), str(final_dest))
+    # Credentials land operator-readable only — Nest is the drop path into
+    # $WILLOW_HOME/secrets; mode must match what vault-first loaders expect.
+    if _track_for_dest(final_dest.parent) == "secrets":
+        try:
+            final_dest.chmod(0o600)
+        except OSError:
+            pass
 
     outcome_track = _track_for_dest(final_dest.parent)
     predicted = (item.get("prediction") or {}).get("track", item.get("track"))

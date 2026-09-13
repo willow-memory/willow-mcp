@@ -107,6 +107,10 @@ _TOOL_REDIRECTS = {
 
 _TASK_SUBMIT = "task_submit(app_id=..., task='…')"
 _TASK_SUBMIT_NET = "task_submit(app_id=..., task='…', allow_net=True)"
+# Brokered push (operator-ruling-2026-09-10-kart-push-is-brokered / KB 482AE83A):
+# Kart or the seat *initiates*; willow-mcp holds the credential and runs git.
+# willow-bot App installation tokens are the APK path (gap 5ecb87cfdf56).
+_GIT_PUSH_EXECUTE = "git_push_execute(app_id=..., repo='org/name', branch=..., remote='origin')"
 
 # Read-only git/gh — allowed on the operator desk (no Kart round-trip).
 _GIT_INSPECT_RE = re.compile(
@@ -132,22 +136,27 @@ _GH_MUTATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# The willow human-orchestrator seat. Repo maintenance — commit, push, PR — IS
-# that seat's job, so the git/gh routing nudges toward task_submit are pure
-# friction for it. The self-grant guard (egress keys, leases, manifest task_net)
-# runs BEFORE routing and is NEVER lifted, for this or any seat, so exempting the
-# routing steering surrenders no authority. The signal is the server env the
-# SessionStart hook exports into the session (.mcp.json / CLAUDE_ENV_FILE).
+# The willow human-orchestrator seat. Repo maintenance — commit, PR create — IS
+# that seat's job, so those git/gh routing nudges toward task_submit are pure
+# friction for it. `git push` is NOT exempt: push is a brokered verb
+# (git_push_execute), never raw Shell and never a Kart-held credential.
+# The self-grant guard (egress keys, leases, manifest task_net) runs BEFORE
+# routing and is NEVER lifted. The signal is the server env the SessionStart
+# hook exports into the session (.mcp.json / CLAUDE_ENV_FILE).
 _ORCHESTRATOR_APP_ID = "willow"
 
-# The git/gh routing entries, named so the loop can lift exactly these for the
-# orchestrator seat (and nothing else) without matching on hint text.
-_ROUTE_GIT_NET_RE = re.compile(r"\bgit\s+(push|pull)\b")
+# git/gh routing entries. Push is always steered (broker); pull/mut/gh are
+# lifted for the orchestrator seat only.
+_ROUTE_GIT_PUSH_RE = re.compile(r"\bgit\s+push\b")
+_ROUTE_GIT_PULL_RE = re.compile(r"\bgit\s+pull\b")
 _ROUTE_GIT_MUT_RE = re.compile(
     r"\bgit\s+(add|commit|checkout|merge|rebase|worktree|clone|stash|reset|"
     r"restore|switch|clean|cherry-pick|revert|tag)\b")
 _ROUTE_GH_RE = re.compile(r"\bgh\s")
-
+# Long-running steward loop belongs on a tracked worker, not the agent Shell.
+_ROUTE_WILLOW_BOT_STEWARD_LOOP_RE = re.compile(
+    r"(?:^|&&|;|\|)\s*willow-bot-steward\s+loop\b"
+)
 # Kart (task_submit) is the sandboxed, tracked execution surface — anything
 # below reaches the network, backgrounds/detaches a process, or mutates the
 # filesystem in bulk, all outside that tracking, when run raw in this Bash
@@ -200,9 +209,12 @@ _BASH_ROUTING: list[tuple[re.Pattern[str], str, str]] = [
      "store_get / store_list / store_search — SQLite store via MCP"),
     (re.compile(r"^\s*pwd\s*$"), "warn", "cwd is in context; fleet_status for roots"),
     (re.compile(r"^\s*tree(\s|$)"), "warn", f"directory tree → {_TASK_SUBMIT}"),
-    (_ROUTE_GIT_NET_RE, "block", f"git network → {_TASK_SUBMIT_NET}"),
+    (_ROUTE_GIT_PUSH_RE, "block", f"git push → {_GIT_PUSH_EXECUTE}"),
+    (_ROUTE_GIT_PULL_RE, "block", f"git pull → {_TASK_SUBMIT_NET}"),
     (_ROUTE_GIT_MUT_RE, "block", f"git mutation → {_TASK_SUBMIT}"),
     (_ROUTE_GH_RE, "block", f"gh (mutations / net) → {_TASK_SUBMIT_NET}"),
+    (_ROUTE_WILLOW_BOT_STEWARD_LOOP_RE, "block",
+     f"willow-bot-steward loop → {_TASK_SUBMIT} (or seat/willow-seat.sh pr-watch-loop on the host)"),
     # Anchored to command position (same as psql/sqlite3). An echo/printf/commit
     # that merely *names* a python heredoc must not trip — only an actual
     # invocation (gap a1416fb1b8b1 / H1 act-vs-text).
@@ -221,8 +233,8 @@ _BASH_ROUTING: list[tuple[re.Pattern[str], str, str]] = [
     (_ROUTE_FS_MUTATE_RE, "warn", f"scripted/bulk filesystem change → {_TASK_SUBMIT}"),
 ]
 
-# Exactly the git/gh routing steers the orchestrator seat is exempt from.
-_GIT_GH_ROUTING = frozenset({_ROUTE_GIT_NET_RE, _ROUTE_GIT_MUT_RE, _ROUTE_GH_RE})
+# Orchestrator exemption: commit/PR/pull friction only — never push (brokered).
+_GIT_GH_ROUTING = frozenset({_ROUTE_GIT_PULL_RE, _ROUTE_GIT_MUT_RE, _ROUTE_GH_RE})
 
 
 def _env_declares_orchestrator() -> bool:

@@ -121,27 +121,50 @@ class _FakeGit:
         self.push_err = push_err
         self.calls: list[list[str]] = []
 
+    @staticmethod
+    def _after_config(sub: list[str]) -> list[str]:
+        i = 0
+        while i + 1 < len(sub) and sub[i] == "-c":
+            i += 2
+        return sub[i:]
+
     def __call__(self, argv, **kw):
         self.calls.append(argv)
         sub = argv[3:]  # git -C <path> ...
-        if sub[:2] == ["remote", "get-url"]:
+        rest = self._after_config(sub)
+        if rest[:2] == ["remote", "get-url"]:
             return subprocess.CompletedProcess(argv, 0, self.remote_url + "\n", "")
-        if sub[:3] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+        if rest[:3] == ["rev-parse", "--abbrev-ref", "HEAD"]:
             return subprocess.CompletedProcess(argv, 0, "feat/x\n", "")
-        if sub == ["rev-parse", "HEAD"]:
+        if rest == ["rev-parse", "HEAD"]:
             return subprocess.CompletedProcess(argv, 0, "abc123\n", "")
-        if sub[:3] == ["rev-parse", "--verify", "--quiet"]:
-            ref = sub[3].removeprefix("refs/heads/")
+        if rest[:3] == ["rev-parse", "--verify", "--quiet"]:
+            ref = rest[3].removeprefix("refs/heads/")
             if ref in self.branches:
                 return subprocess.CompletedProcess(argv, 0, "abc123\n", "")
             return subprocess.CompletedProcess(argv, 1, "", "")
-        if sub[0] == "push":
+        if rest and rest[0] == "push":
             return subprocess.CompletedProcess(argv, self.push_rc, "", self.push_err or "done")
         raise AssertionError(f"unexpected git call {sub}")
 
     @property
     def pushes(self):
-        return [c[3:] for c in self.calls if c[3:4] == ["push"]]
+        out = []
+        for c in self.calls:
+            sub = c[3:]
+            rest = self._after_config(sub)
+            if rest and rest[0] == "push":
+                out.append(sub)
+        return out
+
+
+@pytest.fixture(autouse=True)
+def _default_host_push_auth(monkeypatch):
+    """Existing tests assume the host credential helper; App mint is opt-in."""
+    monkeypatch.setattr(
+        "willow_mcp.github_app_credentials.mint_installation_token",
+        lambda repo: {"ok": False, "mode": "host", "reason": "test default host helper"},
+    )
 
 
 @pytest.fixture
@@ -167,6 +190,7 @@ def test_granted_push_cites_then_runs_git(home, tmp_path, monkeypatch, checkout)
     assert out["ok"] and out["pushed"], out
     assert out["sha"] == "abc123"
     assert out["envelope_id"] == "env-git.push-test"
+    assert out.get("auth_mode") == "host"
     assert git.pushes == [["push", "origin", "feat/x:feat/x"]]
     cites = _citations(pg)
     assert len(cites) == 1 and cites[0]["content"]["outcome"] == "granted"
@@ -174,6 +198,43 @@ def test_granted_push_cites_then_runs_git(home, tmp_path, monkeypatch, checkout)
         "repo": "willow-memory/willow-mcp", "branches": ["feat/x"],
         "remote": "origin", "force": False}
     assert out["citation_id"] == cites[0]["id"]
+
+
+def test_app_token_push_uses_extraheader_not_host_remote(home, tmp_path, monkeypatch, checkout):
+    _charter(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "willow_mcp.github_app_credentials.mint_installation_token",
+        lambda repo: {
+            "ok": True, "mode": "app", "token": "ghs_test_token",
+            "permissions": {"contents": "write"}, "installation_id": 1,
+        },
+    )
+    pg, git = _FakeGovernancePg(), _FakeGit()
+    out = _push(checkout, pg, git)
+    assert out["ok"] and out["pushed"], out
+    assert out.get("auth_mode") == "app"
+    assert len(git.pushes) == 1
+    push = git.pushes[0]
+    assert push[0] == "-c"
+    assert "AUTHORIZATION: basic" in push[1]
+    assert "ghs_test_token" not in " ".join(push)  # token only inside basic blob
+    assert push[2:] == ["push", "origin", "feat/x:feat/x"]
+
+
+def test_app_token_refuses_when_contents_is_read_only(home, tmp_path, monkeypatch, checkout):
+    _charter(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "willow_mcp.github_app_credentials.mint_installation_token",
+        lambda repo: {
+            "ok": True, "mode": "app", "token": "ghs_test_token",
+            "permissions": {"contents": "read"}, "installation_id": 1,
+        },
+    )
+    pg, git = _FakeGovernancePg(), _FakeGit()
+    out = _push(checkout, pg, git)
+    assert not out["ok"] and out["error"] == "EPERM"
+    assert "write" in out["reason"]
+    assert git.pushes == []
 
 
 def test_git_terminal_prompt_is_off_so_a_missing_credential_fails_not_hangs(

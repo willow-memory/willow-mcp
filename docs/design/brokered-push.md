@@ -1,7 +1,8 @@
 # Brokered push
 
-**Status:** slice 1 landed (push executor). Slices 2 and 3 open under gap
-5ecb87cfdf56.
+**Status:** slice 1 landed (push executor). Slice 3 credential path landed
+(willows-bot installation token in the broker). Slice 2 (explicit ask) still
+open under gap 5ecb87cfdf56.
 **Ruling:** governance record `operator-ruling-2026-09-10-kart-push-is-brokered`.
 
 ## The ruling
@@ -68,11 +69,14 @@ rows with the ratify-an-envelope action belongs here too.
 ## Slice 3: the credential
 
 In the APK the user signs in to GitHub once (device flow); the identity
-lives in the app keystore, readable by the broker only. Where the willow-bot
+lives in the app keystore, readable by the broker only. Where the willows-bot
 App covers the repo, the broker mints a per-push installation token scoped
-to that one repo with a short TTL, so nothing durable is held for the push.
-On the development box the executor uses the host's existing credential
-helper until this lands.
+to that one repo with a short TTL (`github_app_credentials.mint_installation_token`),
+and `push_executor` authenticates the single `git push` via
+`http.https://github.com/.extraheader` — nothing durable, nothing in Kart.
+The App must grant **Contents: Read and write** or the executor refuses with
+`EPERM` (read-only Contents cannot push). If the App is not configured or not
+installed on the repo, the executor falls back to the host credential helper.
 
 ## Out of scope
 

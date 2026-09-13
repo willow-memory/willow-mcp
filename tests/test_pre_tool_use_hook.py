@@ -817,12 +817,18 @@ def orchestrator_seat(monkeypatch):
 @pytest.mark.parametrize("command", [
     "git commit -m 'x'",
     "git add -A",
-    "git push -u origin my-branch",
     "git pull origin main",
     "gh pr create --title t",
 ])
 def test_orchestrator_git_gh_mutations_allowed(orchestrator_seat, command):
     assert pre_tool_use.check_bash_routing(command) is None
+
+
+def test_orchestrator_raw_push_is_brokered(orchestrator_seat):
+    """Push is never Shell-exempt — operator-ruling brokered push / willow-bot App."""
+    routed = pre_tool_use.check_bash_routing("git" + " push -u origin my-branch")
+    assert routed is not None and routed[0] == "block"
+    assert "git_push_execute" in routed[1]
 
 
 @pytest.mark.parametrize("command, decision", [
@@ -852,11 +858,23 @@ def test_orchestrator_self_grant_guard_not_lifted(orchestrator_seat):
 def test_main_allows_orchestrator_commit():
     code, stdout = _run_hook({
         "tool_name": "Bash",
-        "tool_input": {"command": "git commit -m 'ship it' && git push"},
+        "tool_input": {"command": "git commit -m 'ship it'"},
         "session_id": "s1",
     }, env={"WILLOW_APP_ID": "willow"})
     assert code == 0
     assert stdout == ""
+
+
+def test_main_blocks_orchestrator_push_to_broker():
+    code, stdout = _run_hook({
+        "tool_name": "Bash",
+        "tool_input": {"command": "git commit -m 'ship it' && git" + " push"},
+        "session_id": "s1",
+    }, env={"WILLOW_APP_ID": "willow"})
+    assert code == 0
+    body = json.loads(stdout)
+    assert body["decision"] == "block"
+    assert "git_push_execute" in body["reason"]
 
 
 def test_main_blocks_orchestrator_grant_net():
@@ -1584,9 +1602,8 @@ def test_cursor_before_shell_execution_denies_routed_git_push():
     assert proc.returncode == 0
     out = json.loads(proc.stdout)
     assert out["permission"] == "deny"
-    assert "task_submit" in out.get("agent_message", "").lower() or "willow-mcp" in out.get(
-        "agent_message", ""
-    )
+    msg = out.get("agent_message", "").lower()
+    assert "git_push_execute" in msg or "willow-mcp" in msg
 
 
 def test_cursor_pre_tool_use_shell_denies_git_push():
@@ -1605,6 +1622,12 @@ def test_cursor_pre_tool_use_shell_denies_git_push():
     )
     assert proc.returncode == 0
     assert json.loads(proc.stdout)["permission"] == "deny"
+
+
+def test_willow_bot_steward_loop_is_routed():
+    routed = pre_tool_use.check_bash_routing("willow-bot-steward loop")
+    assert routed is not None and routed[0] == "block"
+    assert "task_submit" in routed[1]
 
 
 def test_cursor_before_shell_execution_allows_benign_command():
