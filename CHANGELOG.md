@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **install:** apply_hooks accepts a pre-rendered managed_hooks block ([b452a13](https://github.com/willow-memory/willow-mcp/commit/b452a13e0bc877341f2e572a6fec3707b533a124))
 * **install:** apply_hooks accepts a pre-rendered managed_hooks block ([e12e5bf](https://github.com/willow-memory/willow-mcp/commit/e12e5bfa8a6ccf111f301888a8d63932ba89900c))
 
 ## [2.39.0](https://github.com/willow-memory/willow-mcp/compare/v2.38.1...v2.39.0) (2026-09-13)
