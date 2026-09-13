@@ -115,6 +115,49 @@ def test_manifest_from_row_includes_deny_tools():
     assert manifest["store_scope"] == ["loki_*"]
 
 
+def test_manifest_from_row_drops_aliases_outside_store_scope():
+    """gap 982594e01ab3: registry willow aliases must not land on jeles_*."""
+    row = {
+        "agent_id": "jeles",
+        "role": "retrieval",
+        "permissions": ["store_read"],
+        "store_scope": ["jeles_*"],
+        "human_only": False,
+    }
+    registry_aliases = {
+        "stack": "projects_willow_stack",
+        "orient": "projects_willow_orient",
+    }
+    manifest = reg.manifest_from_row(
+        row, collection_aliases=registry_aliases
+    )
+    assert "collection_aliases" not in manifest
+
+
+def test_manifest_from_row_keeps_in_scope_aliases():
+    row = {
+        "agent_id": "binder",
+        "role": "binder",
+        "permissions": ["store_read"],
+        "store_scope": [
+            "binder_*",
+            "projects_homestead_stack",
+        ],
+        "collection_aliases": {
+            "stack": "projects_homestead_stack",
+        },
+        "human_only": False,
+    }
+    manifest = reg.manifest_from_row(
+        row,
+        collection_aliases={"stack": "projects_willow_stack"},
+    )
+    # Row alias wins and is in scope; registry willow target is dropped.
+    assert manifest["collection_aliases"] == {
+        "stack": "projects_homestead_stack",
+    }
+
+
 def test_compile_manifests_only_missing(home):
     hi.ensure_home_layout()
     first = reg.compile_manifests(reg.load_registry(), only_missing=True)
