@@ -37,7 +37,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 ### Added
 
 * **push:** mint willows-bot installation tokens in the broker ([0aadcd1](https://github.com/willow-memory/willow-mcp/commit/0aadcd110464fa4417271174c9d011ef79a4e2b3))
-* **push:** willows-bot App tokens in the broker ([27eadf3](https://github.com/willow-memory/willow-mcp/commit/27eadf3581bd33442992af2c85396fc43a4cb5cf))
 
 ## [2.37.0](https://github.com/willow-memory/willow-mcp/compare/v2.36.1...v2.37.0) (2026-09-13)
 
