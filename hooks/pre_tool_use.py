@@ -242,8 +242,10 @@ _BASH_ROUTING: list[tuple[re.Pattern[str], str, str]] = [
     # Anchored to command position (same as psql/sqlite3). An echo/printf/commit
     # that merely *names* a python heredoc must not trip — only an actual
     # invocation (gap a1416fb1b8b1 / H1 act-vs-text).
-    (re.compile(r"(?i)(?:^|&&|;|\|)\s*python3?\s+(?:-\S+\s+)*<<"), "block",
-     f"Python heredoc → {_TASK_SUBMIT}"),
+    # `-\\S*` (not `-\\S+`): bare `python3 - <<` is stdin-from-heredoc and must
+    # block too — measured miss 2026-09-13 (gap aad87628554c).
+    (re.compile(r"(?i)(?:^|&&|;|\|)\s*python3?\s+(?:-\S*\s+)*<<"), "block",
+     f"Python heredoc → Kart {_TASK_SUBMIT} · look-ups via code_graph_* / nestor_ask"),
     (re.compile(r"(?i)\bgrep\b|\brg\b"), "warn",
      f"knowledge_search / store_search · symbols → code_graph_search · {_TASK_SUBMIT}"),
     (re.compile(r"(?i)\bfind\s"), "warn",
