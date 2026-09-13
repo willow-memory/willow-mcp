@@ -60,6 +60,18 @@ _MANAGED_SIGNATURES: tuple[str, ...] = (
     "willow-mcp/hooks/stop_lint_gate.py",
     "${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py",
     "${CLAUDE_PLUGIN_ROOT}/hooks/stop_lint_gate.py",
+    # Sibling-repo hook commands added for PR 2c: Grove's own hook wrapper
+    # and Nestor's hook wrapper must be classified as fleet-managed when
+    # those repos delegate their settings write through apply_hooks below.
+    # Without these entries, a Grove or Nestor hook row from a previous
+    # sync would be misclassified as third-party and never replaced on
+    # re-sync — exactly the regression the caller wants to avoid.
+    "hooks/grove-hook",
+    "hooks/grove_hook.py",
+    "hooks/nestor-hook",
+    "hooks/nestor_hook.py",
+    "grove-hook",
+    "nestor-hook",
 )
 
 
@@ -143,23 +155,50 @@ def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
 
 def apply_hooks(
     settings_path: Path,
-    package_root: Path,
+    package_root: Path | None = None,
     python_bin: str | None = None,
     dry_run: bool = False,
+    managed_hooks: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read `settings_path`, merge willow-mcp's hook block in, write back.
 
-    `package_root` is the installed willow-mcp package directory (the
-    parent of the `deploy/` subtree). Callers usually pass
-    `Path(__file__).resolve().parent` from a wrapper.
+    Two call shapes:
+
+    - **Default** — `package_root` is the installed willow-mcp package directory
+      (parent of `deploy/`). Callers usually pass `Path(__file__).resolve().parent`
+      from a wrapper. The managed block is loaded from
+      `<package_root>/deploy/claude-settings.json` with `{{WILLOW_MCP_PYTHON}}`
+      substituted from `python_bin` (or the env/`sys.executable` fallback).
+    - **Pre-rendered** — `managed_hooks` is a `{"hooks": {...}}`-shaped dict a
+      sibling repo already compiled (Grove's `sync_desk_client_hooks.py`, for
+      example, hands its `_compile_hook_manifest` output through here so its
+      project-local `.claude/settings.json` write gets the same third-party
+      preservation the global install path has). When `managed_hooks` is set,
+      `package_root` and `python_bin` are ignored — the caller owns the block.
 
     Returns the merged settings dict, whether or not it was written.
     """
-    template = package_root / "deploy" / "claude-settings.json"
-    if not template.is_file():
-        raise FileNotFoundError(f"deploy/claude-settings.json not found under {package_root}")
-    py = _resolve_python_bin(python_bin)
-    fresh = _render_hook_block(template, py)
+    if managed_hooks is not None:
+        if not isinstance(managed_hooks, dict):
+            raise TypeError(
+                "managed_hooks must be a dict with a 'hooks' key (a full "
+                "settings.json-shaped block); got "
+                f"{type(managed_hooks).__name__}"
+            )
+        fresh = managed_hooks
+    else:
+        if package_root is None:
+            raise ValueError(
+                "apply_hooks() needs either `package_root` (to render the "
+                "shipped deploy/claude-settings.json template) or "
+                "`managed_hooks` (a pre-rendered block from a sibling repo). "
+                "Called with neither."
+            )
+        template = package_root / "deploy" / "claude-settings.json"
+        if not template.is_file():
+            raise FileNotFoundError(f"deploy/claude-settings.json not found under {package_root}")
+        py = _resolve_python_bin(python_bin)
+        fresh = _render_hook_block(template, py)
 
     existing: dict[str, Any] = {}
     if settings_path.is_file():
@@ -182,9 +221,21 @@ def apply_hooks(
         )
     merged = dict(existing)
     merged["hooks"] = hooks_out
-    for key in ("enableAllProjectMcpServers",):
-        if key in fresh and key not in existing:
-            merged[key] = fresh[key]
+    if managed_hooks is not None:
+        # Pre-rendered path: the caller owns the block. Forward every top-level
+        # key they set (env, mcpServers, whatever) so a Grove-shaped settings
+        # write doesn't require a second file rewrite. `hooks` was already
+        # merged above.
+        for key, value in fresh.items():
+            if key == "hooks":
+                continue
+            merged[key] = value
+    else:
+        # Template path: preserve the historical seed-only behavior for the
+        # one flag the shipped deploy template carries.
+        for key in ("enableAllProjectMcpServers",):
+            if key in fresh and key not in existing:
+                merged[key] = fresh[key]
 
     if not dry_run:
         _write_json_atomic(settings_path, merged)
