@@ -80,12 +80,12 @@ def test_nestor_manifest_compiles_coherent_client_local_hooks(tmp_path):
         "stop",
         "sessionEnd",
     }
-    assert {
-        hook["matcher"] for hook in cursor["hooks"]["preToolUse"]
-    } == {"MCP:.*", "Write", "Shell"}
-    assert {
-        hook["matcher"] for hook in claude["hooks"]["PreToolUse"]
-    } == {"mcp__", "Write|Edit|MultiEdit|NotebookEdit", "Bash"}
+    assert {hook["matcher"] for hook in cursor["hooks"]["preToolUse"]} == {"MCP:.*", "Write", "Shell"}
+    assert {hook["matcher"] for hook in claude["hooks"]["PreToolUse"]} == {
+        "mcp__",
+        "Write|Edit|MultiEdit|NotebookEdit",
+        "Bash",
+    }
     assert len(cursor["hooks"]["beforeSubmitPrompt"]) == 3
     assert len(claude["hooks"]["UserPromptSubmit"]) == 3
 
@@ -116,9 +116,7 @@ def test_tracked_claude_hook_ownership_keeps_one_local_semantic_stack(tmp_path):
 
     sync_project_wiring("nestor", entry)
 
-    local = json.loads(
-        (root / ".claude" / "settings.local.json").read_text(encoding="utf-8")
-    )
+    local = json.loads((root / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
     assert "hooks" not in local
     assert tracked_path.read_text(encoding="utf-8") == tracked_before
     assert audit_project_wiring("nestor", entry) == []
@@ -135,9 +133,7 @@ def test_tracked_claude_hook_drift_from_manifest_is_reported(tmp_path):
 
     issues = audit_project_wiring("nestor", entry)
 
-    assert any(
-        "tracked Claude hooks drift from hook_manifest" in issue for issue in issues
-    )
+    assert any("tracked Claude hooks drift from hook_manifest" in issue for issue in issues)
 
 
 def test_custom_hook_audit_reports_client_drift(tmp_path):
@@ -168,9 +164,7 @@ def test_hook_manifest_refuses_path_outside_project_before_writing(tmp_path):
     assert not (root / ".willow").exists()
 
 
-def test_unsupported_client_event_is_reported_and_generation_is_atomic(
-    tmp_path, monkeypatch
-):
+def test_unsupported_client_event_is_reported_and_generation_is_atomic(tmp_path, monkeypatch):
     home = tmp_path / ".willow"
     monkeypatch.setenv("WILLOW_HOME", str(home))
     root, entry = _project(tmp_path)
@@ -180,10 +174,7 @@ def test_unsupported_client_event_is_reported_and_generation_is_atomic(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     issues = audit_project("nestor", entry)
-    assert any(
-        "hook event 'notification' is unsupported by cursor" in issue
-        for issue in issues
-    )
+    assert any("hook event 'notification' is unsupported by cursor" in issue for issue in issues)
 
     with pytest.raises(ValueError, match="unsupported by cursor"):
         sync_project("nestor", entry)
@@ -210,11 +201,17 @@ def test_projects_without_manifest_keep_fleet_owned_templates(tmp_path):
     cursor = render_cursor_hooks(entry, project_id="willow")
     claude = render_project_claude_settings(entry, project_id="willow")
 
-    assert "willow_mcp.session_start_hook" in _commands(cursor, "cursor")[0]
-    assert "WILLOW_APP_ID=" in _commands(cursor, "cursor")[0]
+    # Post-2026-09-13 PR 2b: fleet templates now invoke commands through
+    # `willow_mcp.hook_runner --format claude <event>` (the shared runner)
+    # instead of `willow_mcp.<event>_hook` directly. Assertion updated to
+    # match: check the runner + event arg, which is where the boot sentinel
+    # and future per-event hooks live.
+    session_cmd = _commands(cursor, "cursor")[0]
+    assert "willow_mcp.hook_runner" in session_cmd
+    assert "session_start" in session_cmd
+    assert "WILLOW_APP_ID=" in session_cmd
     assert any(
-        "willow_mcp.pre_tool_hook" in command
-        for command in _commands(claude, "claude")
+        ("willow_mcp.hook_runner" in command) and ("pre_tool" in command) for command in _commands(claude, "claude")
     )
 
 
@@ -231,7 +228,10 @@ def test_default_cursor_hooks_wrap_commands_with_seat_env(tmp_path, monkeypatch)
     start = payload["hooks"]["sessionStart"][0]["command"]
     assert start.startswith("env ")
     assert "WILLOW_APP_ID=willow" in start
-    assert "willow_mcp.session_start_hook" in start
+    # Post-2026-09-13 PR 2b: session start routes through the shared
+    # `willow_mcp.hook_runner`; check the runner + event arg present.
+    assert "willow_mcp.hook_runner" in start
+    assert "session_start" in start
     assert "preToolUse" in payload["hooks"]
 
 
@@ -261,5 +261,4 @@ def test_tracked_claude_hook_drift_is_reported(tmp_path):
 
     issues = audit_project_wiring("nestor", entry)
 
-    assert any("tracked Claude hooks drift from hook_manifest" in issue
-               for issue in issues)
+    assert any("tracked Claude hooks drift from hook_manifest" in issue for issue in issues)

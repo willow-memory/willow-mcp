@@ -15,6 +15,7 @@ Neither had a test — this is the drift-catcher hooks/pre_tool_use.py's own
 test_bundled_hook_is_identical_to_the_repo_copy already has, extended to
 the wiring configs the hook file's own docstring points at.
 """
+
 import json
 import re
 from pathlib import Path
@@ -113,22 +114,17 @@ def test_pre_tool_use_web_matcher_does_not_swallow_unrelated_mcp_tools():
         pattern = re.compile(matcher)
         for tool_name in unrelated:
             assert not pattern.match(tool_name), (
-                f"{name}'s PreToolUse matcher {matcher!r} unexpectedly "
-                f"selects unrelated tool {tool_name!r}"
+                f"{name}'s PreToolUse matcher {matcher!r} unexpectedly selects unrelated tool {tool_name!r}"
             )
 
 
 def test_pre_tool_use_matchers_agree_across_every_wiring_config():
-    matchers_by_config = {
-        name: _pre_tool_use_matchers(json.loads(path.read_text()))
-        for name, path in _CONFIGS.items()
-    }
+    matchers_by_config = {name: _pre_tool_use_matchers(json.loads(path.read_text())) for name, path in _CONFIGS.items()}
     canonical = matchers_by_config["deploy/claude-settings.json"]
     assert canonical, "the canonical deploy config itself has no PreToolUse matchers"
     for name, matchers in matchers_by_config.items():
         assert matchers == canonical, (
-            f"{name} wires PreToolUse matchers {matchers}, "
-            f"but deploy/claude-settings.json wires {canonical}"
+            f"{name} wires PreToolUse matchers {matchers}, but deploy/claude-settings.json wires {canonical}"
         )
 
 
@@ -140,12 +136,7 @@ def test_every_wiring_config_has_a_session_start_hook():
 
 def _stop_hook_commands(config: dict) -> list[str]:
     entries = config.get("hooks", {}).get("Stop", [])
-    return [
-        h["command"]
-        for entry in entries
-        for h in entry.get("hooks", [])
-        if "stop_lint" in h.get("command", "")
-    ]
+    return [h["command"] for entry in entries for h in entry.get("hooks", []) if "stop_lint" in h.get("command", "")]
 
 
 def test_dev_environment_stop_lint_hook_does_not_invoke_bare_python3():
@@ -167,9 +158,7 @@ def test_dev_environment_stop_lint_hook_does_not_invoke_bare_python3():
     `deploy/claude-settings.json` is exempt: it ships {{WILLOW_MCP_PYTHON}},
     resolved per-project at wiring time."""
     exempt = {"deploy/claude-settings.json", "plugin.json"}
-    dev_configs = {
-        name: path for name, path in _CONFIGS.items() if name not in exempt
-    }
+    dev_configs = {name: path for name, path in _CONFIGS.items() if name not in exempt}
     for name, path in dev_configs.items():
         config = json.loads(path.read_text())
         commands = _stop_hook_commands(config)
@@ -183,9 +172,118 @@ def test_dev_environment_stop_lint_hook_does_not_invoke_bare_python3():
                 "the operator-box venv python instead."
             )
             assert "venvs/willow-mcp/bin/python3" in first_token, (
-                f"{name} does not invoke the operator-box venv python for "
-                f"the green-claim gate: {command!r}"
+                f"{name} does not invoke the operator-box venv python for the green-claim gate: {command!r}"
             )
+
+
+# ── two-halves rule (Nestor decision 0225) ────────────────────────────────
+#
+# A hook is only wired if BOTH (a) the runner knows how to dispatch it AND
+# (b) the settings file invokes the runner with that event name. These are
+# separate assertions kept deliberately apart — see
+# `Nestor/docs/dogfood/decisions/0225-a-hook-is-only-wired-if-the-settings-invoke-it.json`.
+# The runner half is pinned in `tests/test_hook_runner.py`
+# (`test_event_dispatch_table_covers_every_wired_event`); this section pins
+# the settings half against the runner-half's own registry.
+
+
+def _hook_runner_events() -> set[str]:
+    """The runner-side truth: which events the dispatch table names.
+
+    Read from the runner module directly rather than a hand-kept list — a
+    roster in the test file would be one more thing to remember to update,
+    which is the same shape as the bug Nestor `0225` and `0221→0225` were
+    written to catch (a hook wired by name, dead in practice).
+    """
+    from willow_mcp import hook_runner
+
+    return set(hook_runner._EVENT_HANDLERS.keys())
+
+
+def _runner_events_wired_in(config: dict) -> set[str]:
+    """The settings-side truth: which events this config actually invokes
+    the runner with. Scans every hook command in every event block for
+    `willow_mcp.hook_runner --format <fmt> <event>` and collects the event
+    argument. A settings file that fires the runner for an event NOT in
+    the runner's dispatch table would silently no-op — but that failure
+    is caught by argparse choices; here we only care about the positive
+    side (settings invokes runner ⟹ event in table)."""
+    import re as _re
+
+    wired: set[str] = set()
+    pattern = _re.compile(r"willow_mcp\.hook_runner\s+--format\s+\S+\s+(\S+)")
+    for entries in config.get("hooks", {}).values():
+        for entry in entries or []:
+            for hook in (entry or {}).get("hooks", []) or []:
+                cmd = hook.get("command", "") if isinstance(hook, dict) else ""
+                m = pattern.search(cmd)
+                if m:
+                    wired.add(m.group(1))
+    return wired
+
+
+def test_every_hook_runner_event_has_a_settings_invocation():
+    """The two-halves rule (Nestor `0225`): every event in the runner's
+    dispatch table MUST be invoked by at least one deploy-shipped settings
+    file. An event registered by name that no settings file fires is dead
+    code — the exact "hook wired by name, dead in practice" failure `0221`
+    exposed in Nestor when a UserPromptSubmit module was named but never
+    reached.
+
+    We pin the join against the two SHIPPED settings files
+    (`.claude-plugin/plugin.json` and `deploy/claude-settings.json`).
+    `.claude/settings.json` is the operator's dev override — it may
+    legitimately invoke a subset (e.g. no SessionStart if it uses a
+    dev-bootstrap bash script instead), so it is not required to cover
+    every event.
+    """
+    shipped_names = ("plugin.json", "deploy/claude-settings.json")
+    shipped_wired: set[str] = set()
+    for name in shipped_names:
+        assert name in _CONFIGS, f"missing shipped settings file: {name}"
+        config = json.loads(_CONFIGS[name].read_text())
+        shipped_wired |= _runner_events_wired_in(config)
+
+    runner_events = _hook_runner_events()
+    missing = runner_events - shipped_wired
+    assert not missing, (
+        "hook_runner dispatch table names events with no matching invocation "
+        f"in any shipped settings file: {sorted(missing)}. Either add an "
+        "invocation to plugin.json / deploy/claude-settings.json, or remove "
+        "the entry from `_EVENT_HANDLERS`. Two-halves rule (Nestor 0225): "
+        "a hook is only wired if the settings invoke it."
+    )
+
+
+def test_two_halves_rule_prove_it_can_fail():
+    """Prove-it-can-fail case (mirrors Nestor `0225`'s discipline): a
+    fixture settings file that omits every runner invocation MUST fail
+    the pin. A guard that cannot fail is not a guard — the same rule
+    marching-arts's mutation tests and this test suite's own audit
+    harness state."""
+    empty_config = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "python3 -m my.unrelated.hook"},
+                    ],
+                },
+            ]
+        }
+    }
+    wired = _runner_events_wired_in(empty_config)
+    # Confirm the reader sees no runner invocations in this fixture.
+    assert wired == set(), f"the empty-fixture reader should find zero runner events, saw {wired}"
+    # If this fixture were the ONLY shipped settings file, the pin would
+    # fail because runner_events - wired == runner_events (non-empty).
+    runner_events = _hook_runner_events()
+    assert runner_events - wired == runner_events, (
+        "the fixture must expose the full missing set — a guard that "
+        "silently passes with no invocations wouldn't catch a settings "
+        "file that lost every runner reference."
+    )
 
 
 def test_shipped_plugin_manifest_uses_only_portable_interpreters():
