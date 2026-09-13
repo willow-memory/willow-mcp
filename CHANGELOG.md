@@ -31,6 +31,15 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.38.1](https://github.com/willow-memory/willow-mcp/compare/v2.38.0...v2.38.1) (2026-09-13)
+
+
+### Fixed
+
+* **project_wiring:** extend "web" tool matcher to willow_web_fetch and institutional_search ([f8aaf5d](https://github.com/willow-memory/willow-mcp/commit/f8aaf5d1f41fd670917cfae49c400d6b1bef93c4))
+* **hooks:** shared constants, extended web-family matcher, plugin.json stays portable ([c39f473](https://github.com/willow-memory/willow-mcp/commit/c39f473c775aa8b2b434b0d98b312a61452a5f78))
+* **hooks:** drop absolute vault venv from Stop hook + fix stale port doc ([5350b5f](https://github.com/willow-memory/willow-mcp/commit/5350b5f7bad9c9f8d22c208ebc5737eaed9d19b0))
+
 ## [2.38.0](https://github.com/willow-memory/willow-mcp/compare/v2.37.0...v2.38.0) (2026-09-13)
 
 
