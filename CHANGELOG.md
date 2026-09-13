@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.40.0](https://github.com/willow-memory/willow-mcp/compare/v2.39.0...v2.40.0) (2026-09-13)
+
+
+### Added
+
+* **install:** apply_hooks accepts a pre-rendered managed_hooks block ([b452a13](https://github.com/willow-memory/willow-mcp/commit/b452a13e0bc877341f2e572a6fec3707b533a124))
+* **install:** apply_hooks accepts a pre-rendered managed_hooks block ([e12e5bf](https://github.com/willow-memory/willow-mcp/commit/e12e5bfa8a6ccf111f301888a8d63932ba89900c))
+
 ## [2.39.0](https://github.com/willow-memory/willow-mcp/compare/v2.38.1...v2.39.0) (2026-09-13)
 
 
