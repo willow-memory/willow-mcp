@@ -177,7 +177,7 @@ Group=willow-runtime
 WorkingDirectory=/opt/willow-mcp
 Environment=WILLOW_HOME=/var/lib/willow-mcp
 Environment=WILLOW_MCP_STRICT_TRUST_ROOT=1
-ExecStart=/opt/willow-mcp/.venv/bin/python3 -m willow_mcp --serve --port 8766 --host 127.0.0.1
+ExecStart=/opt/willow-mcp/.venv/bin/python3 -m willow_mcp --serve --port 8768 --host 127.0.0.1
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=true

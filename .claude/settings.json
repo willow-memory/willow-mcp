@@ -40,7 +40,7 @@
         ]
       },
       {
-        "matcher": "WebSearch|WebFetch|willow_web_search|mcp__.*__willow_web_search",
+        "matcher": "WebSearch|WebFetch|willow_web_search|willow_web_fetch|willow_institutional_search|mcp__.*__willow_web_search|mcp__.*__willow_web_fetch|mcp__.*__willow_institutional_search",
         "hooks": [
           {
             "type": "command",

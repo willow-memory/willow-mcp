@@ -192,6 +192,21 @@ Runtime layout: [docs/design/product-layout.md](docs/design/product-layout.md) (
 | `whoami` | Report your own identity and effective permissions — app_id, role, permission groups, the resolved set of tools you can call (minus `deny_tools`), and your `store_scope`. Ungated, like `diagnostic_summary` |
 | `diagnostic_summary` | Self-check: store/Postgres/schema/manifest/bindings/worker/consent/egress-lease/env health, with a verdict and named fixes. Ungated — see below |
 
+### Verified organs first — willow_web_* is the fallback
+
+For a fact worth citing, ask in this order and say which tier answered:
+
+1. **Sealed** — `nestor_ask` / `nestor_resolve` (a sealed answer with provenance).
+2. **Federated corpus (Jeles)** — `federation_call` to server `8cae3d1dcdf4`:
+   `corpus_verify_claim`, `corpus_web_search`, `corpus_institutional_search`.
+3. **Local KB** — `knowledge_search`.
+4. **Open web (unverified fallback)** — `willow_web_search` / `willow_web_fetch` /
+   `willow_institutional_search`, under the three-key egress gate below. Say the
+   result is unverified.
+
+Native IDE WebSearch / WebFetch remain hard-blocked by the hook — see
+`skills/external-guard.md` for the full ladder and when-to-use guidance.
+
 ### Egress needs three keys
 
 **First run:** `willow-mcp-init` then `willow-mcp onboard --project-root <repo> --enable-internet`.

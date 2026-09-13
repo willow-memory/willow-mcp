@@ -59,6 +59,14 @@ _WEB_SEARCH_TOOL_NAMES = [
     "willow_web_search",
     "mcp__willow-mcp__willow_web_search",
     "mcp__willow-mcp-serve__willow_web_search",
+    # willow_web_fetch and willow_institutional_search were added to the
+    # matcher (auditor finding, 2026-09-13): the corpus-first / three-key
+    # reminder must also fire when the seat reaches for the guarded fetch
+    # verb or the institutional-search verb directly, not only WebSearch.
+    "willow_web_fetch",
+    "mcp__willow-mcp__willow_web_fetch",
+    "willow_institutional_search",
+    "mcp__willow-mcp__willow_institutional_search",
 ]
 
 
@@ -92,7 +100,11 @@ def test_pre_tool_use_web_matcher_does_not_swallow_unrelated_mcp_tools():
         "knowledge_search",
         "store_get",
         "mcp__willow-mcp__knowledge_search",
-        "mcp__willow-mcp__willow_web_fetch",
+        # willow_web_fetch was moved OUT of "unrelated" (auditor 2026-09-13):
+        # it is now intentionally matched — the corpus-first / three-key
+        # reminder must fire for a direct fetch call too. See
+        # _WEB_SEARCH_TOOL_NAMES above for the positive assertion.
+        "mcp__willow-mcp__store_search",
     ]
     for name, path in _CONFIGS.items():
         config = json.loads(path.read_text())
@@ -139,15 +151,24 @@ def _stop_hook_commands(config: dict) -> list[str]:
 def test_dev_environment_stop_lint_hook_does_not_invoke_bare_python3():
     """Audit 56C746EB (MEDIUM, interpreter mismatch): this box's bare
     `python3` has no ruff installed, so a Stop hook command of bare
-    `python3 hooks/stop_lint_gate.py` false-blocks every Stop (the gate
-    can never find ruff, so it always reports "not found"). The repo's own
-    dev-environment configs (.claude/settings.json, .claude-plugin/plugin.json)
-    must instead invoke an interpreter known to have ruff — the
-    operator-box venv python the desk's other hooks already resolve to.
-    (src/willow_mcp/deploy/claude-settings.json is exempt: it ships
-    {{WILLOW_MCP_PYTHON}}, resolved per-project at wiring time.)"""
+    `python3 hooks/stop_lint_gate.py` false-blocks every Stop on the
+    operator's own dev box. `.claude/settings.json` is the dev-only
+    override for that specific box, so it must invoke an interpreter
+    known to have ruff — the operator-box venv python.
+
+    `.claude-plugin/plugin.json` is EXEMPT (2026-09-13, auditor 1): it is
+    the plugin manifest a Claude Code user's plugin config points at, so
+    it ships to every consumer. A vault-path hardcoded there breaks every
+    fresh clone. On a fresh clone with no ruff, `stop_lint_gate._run_ruff`
+    returns an explicit "install ruff" block — not silent — which is the
+    right consumer-facing behavior. The operator's own box carries the
+    ruff-having venv via .claude/settings.json's override.
+
+    `deploy/claude-settings.json` is exempt: it ships {{WILLOW_MCP_PYTHON}},
+    resolved per-project at wiring time."""
+    exempt = {"deploy/claude-settings.json", "plugin.json"}
     dev_configs = {
-        name: path for name, path in _CONFIGS.items() if name != "deploy/claude-settings.json"
+        name: path for name, path in _CONFIGS.items() if name not in exempt
     }
     for name, path in dev_configs.items():
         config = json.loads(path.read_text())
@@ -165,3 +186,27 @@ def test_dev_environment_stop_lint_hook_does_not_invoke_bare_python3():
                 f"{name} does not invoke the operator-box venv python for "
                 f"the green-claim gate: {command!r}"
             )
+
+
+def test_shipped_plugin_manifest_uses_only_portable_interpreters():
+    """The shipped plugin manifest goes to every consumer of the plugin
+    (Claude Code plugin install). Hardcoded operator-box vault paths there
+    break every fresh clone. Every Stop-hook command in plugin.json must
+    start with bare `python3` (portable) or a placeholder that the
+    installer resolves per-project. Pinned 2026-09-13 (auditor 1)."""
+    plugin_json = _CONFIGS["plugin.json"]
+    config = json.loads(plugin_json.read_text())
+    commands = _stop_hook_commands(config)
+    assert commands, "plugin.json has no stop_lint hook wired"
+    for command in commands:
+        first_token = command.split()[0]
+        assert first_token == "python3" or "{{" in first_token, (
+            f"plugin.json Stop hook uses {first_token!r} — a shipped "
+            "manifest must start with bare `python3` or a placeholder, "
+            "never a foreign-user absolute path."
+        )
+        assert "sean-campbell" not in command, (
+            f"plugin.json Stop hook still contains an operator-box path: "
+            f"{command!r}. The manifest ships; foreign-user absolute paths "
+            "break every consumer."
+        )

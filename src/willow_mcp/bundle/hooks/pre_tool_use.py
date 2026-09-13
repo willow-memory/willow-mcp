@@ -68,6 +68,20 @@ import shlex
 import sys
 from typing import Optional
 
+# Shared reason-string constants live in hooks/_constants.py so the federation
+# server id, the verified-organs ladder, and the brokered-push hint don't drift
+# between this file and the bundle twin at src/willow_mcp/bundle/hooks/. The
+# hook is invoked as a script (python3 ${CLAUDE_PLUGIN_ROOT}/hooks/…) so the
+# hooks/ directory is not on sys.path by default; add it before importing.
+_HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOK_DIR not in sys.path:
+    sys.path.insert(0, _HOOK_DIR)
+from _constants import (  # noqa: E402
+    JELES_FEDERATION_SERVER,
+    WEB_ORDER,
+    GIT_PUSH_HINT,
+)
+
 # Matches a shell client (psql, or a python -c reaching for psycopg2/sqlite3)
 # together with something naming a willow-mcp-owned store: the WILLOW_PG_DB/
 # WILLOW_STORE_ROOT env var names themselves, or the literal table/path
@@ -110,6 +124,9 @@ _TASK_SUBMIT_NET = "task_submit(app_id=..., task='…', allow_net=True)"
 # Brokered push (operator-ruling-2026-09-10-kart-push-is-brokered / KB 482AE83A):
 # Kart or the seat *initiates*; willow-mcp holds the credential and runs git.
 # willow-bot App installation tokens are the APK path (gap 5ecb87cfdf56).
+# GIT_PUSH_HINT (hooks/_constants.py) is the fuller reason string that also
+# names the broker and the willows-bot token; _GIT_PUSH_EXECUTE below is kept
+# as the tight call-shape callers pattern-match on.
 _GIT_PUSH_EXECUTE = "git_push_execute(app_id=..., repo='org/name', branch=..., remote='origin')"
 
 # Read-only git/gh — allowed on the operator desk (no Kart round-trip).
@@ -209,7 +226,7 @@ _BASH_ROUTING: list[tuple[re.Pattern[str], str, str]] = [
      "store_get / store_list / store_search — SQLite store via MCP"),
     (re.compile(r"^\s*pwd\s*$"), "warn", "cwd is in context; fleet_status for roots"),
     (re.compile(r"^\s*tree(\s|$)"), "warn", f"directory tree → {_TASK_SUBMIT}"),
-    (_ROUTE_GIT_PUSH_RE, "block", f"git push → {_GIT_PUSH_EXECUTE}"),
+    (_ROUTE_GIT_PUSH_RE, "block", f"git push → {GIT_PUSH_HINT}"),
     (_ROUTE_GIT_PULL_RE, "block", f"git pull → {_TASK_SUBMIT_NET}"),
     (_ROUTE_GIT_MUT_RE, "block", f"git mutation → {_TASK_SUBMIT}"),
     (_ROUTE_GH_RE, "block", f"gh (mutations / net) → {_TASK_SUBMIT_NET}"),
@@ -224,7 +241,9 @@ _BASH_ROUTING: list[tuple[re.Pattern[str], str, str]] = [
      f"knowledge_search / store_search · symbols → code_graph_search · {_TASK_SUBMIT}"),
     (re.compile(r"(?i)\bfind\s"), "warn",
      f"code_graph_search / knowledge_search · {_TASK_SUBMIT}"),
-    (_ROUTE_WEB_FETCH_RE, "block", "willow_web_fetch (MCP) — guarded fetch, not raw {curl,wget}"),
+    (_ROUTE_WEB_FETCH_RE, "block",
+     "willow_web_fetch (MCP) — guarded fetch, not raw {curl,wget}. "
+     f"For a verified answer, prefer the ladder first: {WEB_ORDER}."),
     (_ROUTE_PKG_INSTALL_RE, "block", f"package install reaches the network → {_TASK_SUBMIT_NET}"),
     (_ROUTE_REMOTE_RE, "block", f"remote network access → {_TASK_SUBMIT_NET}"),
     (_ROUTE_BACKGROUND_RE, "warn",
@@ -323,15 +342,19 @@ def check_bash_routing(command: str) -> Optional[tuple[str, str]]:
 
 
 _WEB_SEARCH_REDIRECT = (
-    "Use willow_web_search (MCP) for open-web search — not native WebSearch. "
-    "Requires the 'web_net' manifest permission + operator consent.internet + "
-    "a live egress lease; if this seat doesn't hold one, ask the operator to "
-    "grant it (willow-mcp grant-net <app_id> --ttl 30m --reason ...) rather "
-    "than retrying the native tool."
+    f"Prefer verified organs first: {WEB_ORDER}. "
+    "If the ladder misses and you actually need the open web, use "
+    "willow_web_search (MCP) — not native WebSearch. Requires the 'web_net' "
+    "manifest permission + operator consent.internet + a live egress lease; "
+    "if this seat doesn't hold one, ask the operator to grant it "
+    "(willow-mcp grant-net <app_id> --ttl 30m --reason ...) rather than "
+    "retrying the native tool."
 )
 _WEB_FETCH_REDIRECT = (
-    "WebFetch is blocked — use willow_web_fetch (MCP) for guarded URL fetch "
-    "with external-guard scan. Requires the 'web_net' manifest permission + "
+    f"Prefer verified organs first: {WEB_ORDER}. "
+    "If the ladder misses and you actually need to fetch a URL, use "
+    "willow_web_fetch (MCP) for guarded URL fetch with external-guard scan — "
+    "not native WebFetch. Requires the 'web_net' manifest permission + "
     "operator consent.internet + a live egress lease; if this seat doesn't "
     "hold one, ask the operator to grant it (willow-mcp grant-net <app_id> "
     "--ttl 30m --reason ...) rather than retrying the native tool."
@@ -411,11 +434,12 @@ def check_native_web(tool_name: str) -> Optional[tuple[str, str]]:
 _CORPUS_FIRST_REMINDER = (
     "willow-mcp: before searching the open web, consult the fleet's own "
     "verified organs first — knowledge_search (local knowledge base), the "
-    "jeles-corpus federation (federation_call to server 8cae3d1dcdf4), and "
-    "nestor_ask / nestor_resolve for a sealed answer. Order: nestor (sealed) "
-    "-> box (knowledge_search / jeles federation) -> remote (web) — and say "
-    "which tier answered. The corpus can miss; web search is a fine fallback "
-    "then, but say the result is unverified. This is a reminder, not a block."
+    f"jeles-corpus federation (federation_call to server {JELES_FEDERATION_SERVER}), "
+    "and nestor_ask / nestor_resolve for a sealed answer. Order: nestor "
+    "(sealed) -> box (knowledge_search / jeles federation) -> remote (web) — "
+    "and say which tier answered. The corpus can miss; web search is a fine "
+    "fallback then, but say the result is unverified. This is a reminder, "
+    "not a block."
 )
 
 
