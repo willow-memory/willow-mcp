@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.36.1](https://github.com/willow-memory/willow-mcp/compare/v2.36.0...v2.36.1) (2026-09-13)
+
+
+### Fixed
+
+* **hooks:** H1–H5 guard precision and Cursor seat env wrap ([ab7d17f](https://github.com/willow-memory/willow-mcp/commit/ab7d17f549a40a4d52efffb0cb6a2891da145d0a))
+
 ## [2.36.0](https://github.com/willow-memory/willow-mcp/compare/v2.35.1...v2.36.0) (2026-09-11)
 
 
