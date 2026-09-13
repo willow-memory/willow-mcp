@@ -255,7 +255,7 @@ def test_every_hook_runner_event_has_a_settings_invocation():
     )
 
 
-def test_two_halves_rule_prove_it_can_fail():
+def test_two_halves_rule_pin_fires_on_a_fixture_missing_every_invocation():
     """Prove-it-can-fail case (mirrors Nestor `0225`'s discipline): a
     fixture settings file that omits every runner invocation MUST fail
     the pin. A guard that cannot fail is not a guard — the same rule

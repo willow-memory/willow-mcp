@@ -26,6 +26,41 @@ def claude_hooks_template() -> dict[str, Any]:
     return json.loads(json.dumps(hooks).replace("{{WILLOW_MCP_PYTHON}}", py))
 
 
+def _extract_names(cmd: str) -> set[str]:
+    """Extract the willow-mcp module + event fingerprint from a hook command.
+
+    Post-2026-09-13 PR 2b, all lifecycle hooks route through
+    `willow_mcp.hook_runner --format {cursor,claude} <event>`. Bare-module
+    invocations like `willow_mcp.session_start_hook` are the pre-migration
+    shape and still valid; either counts.
+
+    Returns the event name (`session_start`, `pre_tool`, …) when the command
+    goes through the runner, or the legacy module short-name (without the
+    `_hook` suffix) when it's a bare invocation. Both cursor and claude
+    templates should produce the same set of fingerprints — that's the
+    parity invariant this feeds.
+    """
+    import re
+
+    names: set[str] = set()
+    m = re.search(
+        r"willow_mcp\.hook_runner\s+--format\s+\S+\s+(\S+)",
+        cmd,
+    )
+    if m:
+        names.add(m.group(1))
+        return names
+    if "willow_mcp." in cmd:
+        raw = cmd.split("willow_mcp.")[1].split()[0].strip("\"'")
+        # Normalize legacy module names (e.g. `session_start_hook`) to the
+        # same event fingerprint the runner uses (`session_start`).
+        if raw.endswith("_hook"):
+            names.add(raw[: -len("_hook")])
+        else:
+            names.add(raw)
+    return names
+
+
 def hook_module_names(hooks: dict[str, Any], *, claude: bool = False) -> set[str]:
     names: set[str] = set()
     if claude:
@@ -35,16 +70,14 @@ def hook_module_names(hooks: dict[str, Any], *, claude: bool = False) -> set[str
             for entry in block:
                 for hook in entry.get("hooks") or []:
                     cmd = str(hook.get("command") or "")
-                    if "willow_mcp." in cmd:
-                        names.add(cmd.split("willow_mcp.")[1].split()[0].strip("\"'"))
+                    names |= _extract_names(cmd)
         return names
     for _key, entries in hooks.items():
         if not isinstance(entries, list):
             continue
         for entry in entries:
             cmd = str(entry.get("command") or "")
-            if "willow_mcp." in cmd:
-                names.add(cmd.split("willow_mcp.")[1].split()[0].strip("\"'"))
+            names |= _extract_names(cmd)
     return names
 
 
