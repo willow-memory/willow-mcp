@@ -3,38 +3,38 @@
   "hooks": {
     "sessionStart": [
       {
-        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.session_start_hook",
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor session_start",
         "timeout": 15,
         "failClosed": false
       }
     ],
     "preToolUse": [
       {
-        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor pre_tool",
         "matcher": "Shell",
         "timeout": 5,
         "failClosed": true
       },
       {
-        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor pre_tool",
         "matcher": "MCP:.*",
         "timeout": 5,
         "failClosed": true
       },
       {
-        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor pre_tool",
         "matcher": "Write",
         "timeout": 5,
         "failClosed": true
       },
       {
-        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor pre_tool",
         "matcher": "WebSearch|WebFetch",
         "timeout": 5,
         "failClosed": true
       },
       {
-        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor pre_tool",
         "matcher": "Task",
         "timeout": 5,
         "failClosed": true
@@ -42,28 +42,28 @@
     ],
     "beforeShellExecution": [
       {
-        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor pre_tool",
         "timeout": 5,
         "failClosed": true
       }
     ],
     "beforeMCPExecution": [
       {
-        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor pre_tool",
         "timeout": 5,
         "failClosed": true
       }
     ],
     "sessionEnd": [
       {
-        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.session_stop_hook",
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor session_stop",
         "timeout": 15,
         "failClosed": false
       }
     ],
     "stop": [
       {
-        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.stop_lint_hook",
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor stop_lint",
         "timeout": 30,
         "failClosed": false
       }

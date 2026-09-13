@@ -8,7 +8,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -m willow_mcp.session_start_hook"
+            "command": "python3 -m willow_mcp.hook_runner --format claude session_start"
           }
         ]
       }
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -m willow_mcp.session_stop_hook"
+            "command": "python3 -m willow_mcp.hook_runner --format claude session_stop"
           }
         ]
       }
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py"
+            "command": "python3 -m willow_mcp.hook_runner --format claude pre_tool"
           }
         ]
       },
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py"
+            "command": "python3 -m willow_mcp.hook_runner --format claude pre_tool"
           }
         ]
       },
@@ -47,7 +47,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py"
+            "command": "python3 -m willow_mcp.hook_runner --format claude pre_tool"
           }
         ]
       },
@@ -56,7 +56,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/pre_tool_use.py"
+            "command": "python3 -m willow_mcp.hook_runner --format claude pre_tool"
           }
         ]
       }
@@ -66,7 +66,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/stop_lint_gate.py"
+            "command": "python3 -m willow_mcp.hook_runner --format claude stop_lint"
           }
         ]
       }

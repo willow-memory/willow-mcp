@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/hooks/pre_tool_use.py\""
+            "command": "python3 -m willow_mcp.hook_runner --format claude pre_tool"
           }
         ]
       },
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/hooks/pre_tool_use.py\""
+            "command": "python3 -m willow_mcp.hook_runner --format claude pre_tool"
           }
         ]
       },
@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/hooks/pre_tool_use.py\""
+            "command": "python3 -m willow_mcp.hook_runner --format claude pre_tool"
           }
         ]
       },
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/hooks/pre_tool_use.py\""
+            "command": "python3 -m willow_mcp.hook_runner --format claude pre_tool"
           }
         ]
       }
@@ -62,7 +62,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/sean-campbell/sean-data-vault/willow-operator-box/venvs/willow-mcp/bin/python3 \"$CLAUDE_PROJECT_DIR/hooks/stop_lint_gate.py\""
+            "command": "/home/sean-campbell/sean-data-vault/willow-operator-box/venvs/willow-mcp/bin/python3 -m willow_mcp.hook_runner --format claude stop_lint"
           }
         ]
       }
