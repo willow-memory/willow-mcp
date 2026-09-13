@@ -60,10 +60,20 @@ Add `worktrees/` to `.gitignore` if you use worktree directories.
 
 ## Open PR
 
-```bash
-git push -u origin feat/<slug>
-gh pr create --title "..." --body "..."
+Push is **brokered** — the seat asks; willow-mcp holds the credential and runs `git`.
+Never `git push` in Bash and never with a token in Kart.
+
 ```
+git_push_execute(app_id="<seat>", repo="<org>/<name>", branch="feat/<slug>", remote="origin")
+```
+
+Requires a signed `git.push` envelope (or a `human_required` ask when one is
+missing). The broker mints the willows-bot installation token per push and
+never puts it in Kart. See `docs/design/brokered-push.md`.
+
+PR creation is a broker or operator-desk act — `gh pr create` on the
+orchestrator seat, or a steward flow through willow-bot. `gh pr create` in an
+agent Bash is blocked by the same hook that blocks `git push`.
 
 CI must pass. Operator approves. Then merge.
 
