@@ -37,7 +37,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 ### Added
 
 * **hooks:** route plugin manifests through willow_mcp.hook_runner (PR 2b) ([f210065](https://github.com/willow-memory/willow-mcp/commit/f2100656527c40bbf61bd807e1972a719dbf9335))
-* **hooks:** shared hook_runner + install_project + activate migration (PR 2a + 2b) ([1d06272](https://github.com/willow-memory/willow-mcp/commit/1d062720a0dde633ae968e6b9670e148b2ae9ead))
 * **hooks:** shared hook_runner + install_project verb (additive PR 2a) ([b38216f](https://github.com/willow-memory/willow-mcp/commit/b38216f7b3b11ea21f5356489e77a4a3aed1eab3))
 
 
