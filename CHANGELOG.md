@@ -31,6 +31,20 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.39.0](https://github.com/willow-memory/willow-mcp/compare/v2.38.1...v2.39.0) (2026-09-13)
+
+
+### Added
+
+* **hooks:** route plugin manifests through willow_mcp.hook_runner (PR 2b) ([f210065](https://github.com/willow-memory/willow-mcp/commit/f2100656527c40bbf61bd807e1972a719dbf9335))
+* **hooks:** shared hook_runner + install_project + activate migration (PR 2a + 2b) ([1d06272](https://github.com/willow-memory/willow-mcp/commit/1d062720a0dde633ae968e6b9670e148b2ae9ead))
+* **hooks:** shared hook_runner + install_project verb (additive PR 2a) ([b38216f](https://github.com/willow-memory/willow-mcp/commit/b38216f7b3b11ea21f5356489e77a4a3aed1eab3))
+
+
+### Fixed
+
+* **tests:** three PR 2b regressions caught by test-matrix (3.13) ([6fcce29](https://github.com/willow-memory/willow-mcp/commit/6fcce298103774698669f37ac2c1d301bd5e3743))
+
 ## [2.38.1](https://github.com/willow-memory/willow-mcp/compare/v2.38.0...v2.38.1) (2026-09-13)
 
 
