@@ -50,37 +50,30 @@ def handle(payload: dict) -> dict:
         )
         logging.getLogger("willow_mcp.session_start_hook").error(message)
         return {"additional_context": f"WILLOW session_enter FAILED — {message}"}
-    # PR8 (envelope-accrual UX): auto-sign the session at seat-open when the
-    # operator has set WILLOW_OPERATOR_VERIFIER. Removes the "open a second
-    # terminal and run willow-mcp sign-session per session_id" ritual — the
-    # single biggest UX papercut the identity+accrual work left standing
-    # (see docs/design/envelope-accrual.md, "where the friction still is").
+    # PR8 + boot presence (gap attest-via-kart-pinentry / operator ask
+    # 2026-09-13): auto-sign the session at seat-open when the operator has
+    # set WILLOW_OPERATOR_VERIFIER — but ONLY after a desktop pinentry
+    # challenge proves a human is present. Silent auto-sign removed the
+    # second-terminal ritual and also removed the only human act; the
+    # dialog restores it on the host SessionStart path (not Kart — keys
+    # stay where they are; see approval-broker.md §5b for why a pinentry
+    # here is presence, not key unlock).
     #
-    # Design: the MCP server process is running as the operator's own uid
-    # (SessionStart hooks fire in the client's local environment; for the
-    # typical single-box deployment that IS the operator's box). Signing
-    # here IS the operator signing — same trust story as the operator
-    # running `willow-mcp sign-session` from a terminal. The PR3 "server
-    # never signs on the client-supplied path" invariant is preserved
-    # because this is not a client-supplied path — no untrusted caller is
-    # asking the server to sign for them; the server is signing on its
-    # own uid's behalf, and only if the operator explicitly opted in.
+    # Design: SessionStart hooks fire in the client's local environment
+    # as the operator's uid. Signing here IS the operator signing — same
+    # trust story as `willow-mcp sign-session` from a terminal, plus an
+    # out-of-band dialog the agent chat cannot drive. The PR3 "server
+    # never signs on the client-supplied path" invariant is preserved:
+    # no untrusted caller is asking the server to sign for them.
     #
-    # Opt-in: WILLOW_OPERATOR_VERIFIER unset → no auto-sign, existing
-    # behavior. When set:
-    # * keyring disabled → note, session enters unattributed (soft
-    #   degrade — the operator's config is inconsistent, but continuing
-    #   without attribution mirrors the existing WILLOW_KEYRING-off
-    #   behavior; loud enough via the note).
-    # * verifier unknown OR compromised → REFUSE. This is the reliable
-    #   check case: verifying_entry returns None for both, and the
-    #   Nestor prior ("warn when the check can't be reliable; refuse
-    #   when it can") applies. A compromised key that continues under
-    #   graceful degrade is exactly the fail-quiet-and-compound pattern
-    #   this session called out.
-    # * signing fails otherwise → note, degrade. The signer's exception
-    #   surface isn't reliable enough to distinguish
-    #   compromised-mid-sign from transient failure.
+    # Opt-in: WILLOW_OPERATOR_VERIFIER unset → no auto-sign (legacy).
+    # When set:
+    # * pinentry cancelled / unavailable → note, enter unattested (never
+    #   silent-sign around a missing presence proof).
+    # * keyring disabled → note, session enters unattributed.
+    # * verifier unknown OR compromised → REFUSE (reliable check).
+    # * signing fails otherwise → note, degrade.
+    # Tests / headless CI: WILLOW_PRESENCE_CHALLENGE=off skips the dialog.
     verifier_arg = os.environ.get("WILLOW_OPERATOR_VERIFIER", "").strip()
     seal_sig = ""
     attested_at = ""
@@ -89,19 +82,33 @@ def handle(payload: dict) -> dict:
         try:
             from datetime import datetime, timezone
             from . import keyring as _keyring
+            from . import presence as _presence
             from . import session_signing as _ss
-            if not _keyring.enabled():
+
+            # Presence first — before any keyring read or sign. A cancelled
+            # dialog must not proceed to a silent signature.
+            presence = _presence.challenge_presence(
+                title="Willow session attestation",
+                description=(
+                    f"Attest orchestrator session {session_id} as "
+                    f"{verifier_arg}. Completing this dialog is the human "
+                    "presence proof for this seat."
+                ),
+                prompt="Attestation passphrase:",
+            )
+            if not presence.ok:
                 auto_sign_note = (
-                    "WILLOW_OPERATOR_VERIFIER set but WILLOW_KEYRING is not; "
+                    f"presence challenge {presence.status} ({presence.detail}); "
+                    "session will not be auto-signed. Fall back to "
+                    "`willow-mcp sign-session` from an operator terminal, "
+                    "or fix desktop pinentry (DISPLAY/DBUS + pinentry-gnome3)."
+                )
+            elif not _keyring.enabled():
+                auto_sign_note = (
+                    "presence confirmed but WILLOW_KEYRING is not set; "
                     "session will not be auto-signed."
                 )
             elif _keyring.get_keyring().verifying_entry(verifier_arg) is None:
-                # Reliable check (unknown OR compromised) → refuse loudly,
-                # do not enter the session. Nestor's dogfood prior: the
-                # check is reliable, so the answer is refuse, not warn.
-                # Compromised keys that continue unattributed are the
-                # exact fail-quiet pattern the fail-loud-not-break
-                # posture forbids.
                 message = (
                     f"WILLOW_OPERATOR_VERIFIER={verifier_arg!r} is unknown "
                     "to the keyring or has been revoked as compromised. "
@@ -138,7 +145,7 @@ def handle(payload: dict) -> dict:
                 attest_file = _paths.session_attestation_path(app_id, session_id)
                 sig_file = attest_file.parent / f"{attest_file.name}.sig"
                 attest_file.parent.mkdir(parents=True, exist_ok=True)
-                payload = {
+                attest_payload = {
                     "format": "orchestrator_session_attestation_v2",
                     "app_id": app_id,
                     "session_id": session_id,
@@ -146,13 +153,14 @@ def handle(payload: dict) -> dict:
                     "attested_at": attested_at,
                 }
                 attest_file.write_text(
-                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    json.dumps(attest_payload, indent=2, sort_keys=True) + "\n",
                     encoding="utf-8",
                 )
                 sig_file.write_text(seal_sig + "\n", encoding="utf-8")
                 auto_sign_note = (
                     f"session auto-signed by {verifier_arg} at "
-                    f"{attested_at} (PR8; sidecar at {attest_file.name})"
+                    f"{attested_at} after presence pinentry "
+                    f"(sidecar at {attest_file.name})"
                 )
         except Exception as exc:
             # Any auto-sign failure downgrades to unattested — the hook

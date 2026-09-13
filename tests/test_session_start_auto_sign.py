@@ -54,18 +54,46 @@ def ring_with_rita(tmp_path):
                     p.unlink()
 
 
-def _run(session_id, monkeypatch, *, app_id="willow", operator_verifier=None):
+def _run(
+    session_id,
+    monkeypatch,
+    *,
+    app_id="willow",
+    operator_verifier=None,
+    presence_challenge="off",
+):
     """Returns the parsed additional_context dict. Raises the raw string
     onto a `_raw` key for the refusal path (which returns plain-text
     additional_context, not JSON)."""
-    return _run_full(session_id, monkeypatch, app_id=app_id,
-                     operator_verifier=operator_verifier)[0]
+    return _run_full(
+        session_id,
+        monkeypatch,
+        app_id=app_id,
+        operator_verifier=operator_verifier,
+        presence_challenge=presence_challenge,
+    )[0]
 
 
-def _run_full(session_id, monkeypatch, *, app_id="willow", operator_verifier=None):
+def _run_full(
+    session_id,
+    monkeypatch,
+    *,
+    app_id="willow",
+    operator_verifier=None,
+    presence_challenge="off",
+):
     """Returns (parsed_ctx, outer_result_dict). Some tests need the outer
-    dict to assert on top-level hoisted keys like `auto_sign`."""
+    dict to assert on top-level hoisted keys like `auto_sign`.
+
+    ``presence_challenge`` defaults to off so the suite never opens a
+    desktop pinentry; presence-gated paths are covered by dedicated tests
+    that mock :func:`willow_mcp.presence.challenge_presence`.
+    """
     monkeypatch.setenv("WILLOW_APP_ID", app_id)
+    if presence_challenge is None:
+        monkeypatch.delenv("WILLOW_PRESENCE_CHALLENGE", raising=False)
+    else:
+        monkeypatch.setenv("WILLOW_PRESENCE_CHALLENGE", presence_challenge)
     if operator_verifier is None:
         monkeypatch.delenv("WILLOW_OPERATOR_VERIFIER", raising=False)
     else:
@@ -217,6 +245,49 @@ def test_auto_sign_downgrades_when_keyring_disabled(monkeypatch):
     assert "WILLOW_KEYRING is not" in ctx["auto_sign_note"]
     record = dispatch.session_read("willow", "s-no-keyring")
     assert record.get("verifier", "") == ""
+
+
+def test_presence_cancel_skips_auto_sign(ring_with_rita, monkeypatch):
+    """A cancelled pinentry must not silent-sign — enter unattested."""
+    from unittest import mock
+    from willow_mcp.presence import PresenceResult
+
+    with mock.patch(
+        "willow_mcp.presence.challenge_presence",
+        return_value=PresenceResult("cancelled", "ERR canceled"),
+    ):
+        ctx = _run(
+            "s-presence-cancel",
+            monkeypatch,
+            operator_verifier="rudi",
+            presence_challenge="1",
+        )
+    assert "presence challenge cancelled" in ctx.get("auto_sign_note", "")
+    assert not human_session.is_session_attributed("s-presence-cancel")
+    record = dispatch.session_read("willow", "s-presence-cancel")
+    assert record.get("verifier", "") == ""
+
+
+def test_presence_ok_then_auto_sign(ring_with_rita, monkeypatch):
+    """Presence ok is the gate; after it, PR8 signing proceeds as before."""
+    from unittest import mock
+    from willow_mcp.presence import PresenceResult
+
+    with mock.patch(
+        "willow_mcp.presence.challenge_presence",
+        return_value=PresenceResult("ok", "pinentry via pinentry-gnome3"),
+    ), mock.patch(
+        "willow_mcp.server.session_enter",
+        return_value={"entry_mode": "human_orchestrator"},
+    ):
+        ctx = _run(
+            "s-presence-ok",
+            monkeypatch,
+            operator_verifier="rudi",
+            presence_challenge="1",
+        )
+    assert "after presence pinentry" in ctx.get("auto_sign_note", "")
+    assert human_session.is_session_attributed("s-presence-ok")
 
 
 def test_unknown_verifier_refuses_session_enter(ring_with_rita, monkeypatch):

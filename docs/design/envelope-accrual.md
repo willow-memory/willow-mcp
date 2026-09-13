@@ -104,7 +104,8 @@ This is the piece that makes the accrual actually reduce authoring cost. PR5 + P
 
 Before PR8, every session needed a second-terminal `willow-mcp sign-session --verifier NAME` invocation before any envelope authoring could work; otherwise `envelope_propose`/`ratify`/`reject` refused with `UnattributedSessionError`. PR8 auto-signs at seat-open when the operator has set `WILLOW_OPERATOR_VERIFIER=NAME` in the MCP env:
 
-- SessionStart hook reads the verifier's Ed25519 private half from `$WILLOW_KEYRING`.
+- SessionStart hook opens desktop pinentry (presence proof; see approval-broker.md §5b — the keyring private half is not passphrase-protected). Cancel → enter unattested; never silent-sign around a missing presence proof. `WILLOW_PRESENCE_CHALLENGE=off` skips the dialog for CI.
+- On presence OK, reads the verifier's Ed25519 private half from `$WILLOW_KEYRING`.
 - Writes the `_v2` sidecar + `.sig` atomically at `paths.session_attestation_path(...)` — same shape `sign_session_cli` produces, so `orchestrator_write_denial`'s sidecar-verify path (PR3) finds them on the next orchestrator write.
 - Warms the attribution cache post-`session_enter` so the operator's very first `envelope_propose` doesn't refuse.
 - Preserves the PR3 "server never signs on the client-supplied path" invariant — this is not a client-supplied path; the server signs on its own uid's behalf, only when the operator explicitly opted in via env.
