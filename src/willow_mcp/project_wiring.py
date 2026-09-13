@@ -51,7 +51,21 @@ _TOOL_MATCHERS: dict[str, dict[str, str]] = {
         "claude": "Write|Edit|MultiEdit|NotebookEdit",
     },
     "mcp": {"cursor": "MCP:.*", "claude": "mcp__"},
-    "web": {"cursor": "WebSearch|WebFetch", "claude": "WebSearch|WebFetch"},
+    # Extended 2026-09-13 (auditor 2 finding): `willow_web_fetch` and
+    # `willow_institutional_search` must also fire the pre-tool guard so a
+    # direct call goes through corpus-first / three-key checks. The mcp__.*__
+    # variants cover federated invocations from any downstream MCP server.
+    "web": {
+        "cursor": (
+            "WebSearch|WebFetch|willow_web_search|willow_web_fetch|"
+            "willow_institutional_search"
+        ),
+        "claude": (
+            "WebSearch|WebFetch|willow_web_search|willow_web_fetch|"
+            "willow_institutional_search|mcp__.*__willow_web_search|"
+            "mcp__.*__willow_web_fetch|mcp__.*__willow_institutional_search"
+        ),
+    },
     "task": {"cursor": "Task", "claude": "Task"},
 }
 
