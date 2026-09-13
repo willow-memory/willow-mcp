@@ -149,7 +149,8 @@ willow-mcp keys add rita         # your operator handle (any name; matches WILLO
 willow-mcp keys status rita      # confirm the key is active
 ```
 
-Then set the env in the MCP config so every SessionStart auto-signs:
+Then set the env in the MCP config so every SessionStart auto-signs
+**after a desktop pinentry presence challenge**:
 
 ```jsonc
 // .cursor/mcp.json  (willow orchestrator seat)
@@ -171,11 +172,16 @@ straight from the process environment — there's no `--keyring` flag on
 the same path the MCP server uses fails with "WILLOW_KEYRING is not set"
 even though the server-side keyring is configured correctly.
 
-With `WILLOW_OPERATOR_VERIFIER` set, the SessionStart hook (PR8) auto-signs
-each new session: it writes the `_v2` sidecar + `.sig`, warms the
-attribution cache, and prints an `auto_sign_note` into the boot context.
+With `WILLOW_OPERATOR_VERIFIER` set, the SessionStart hook opens the
+system pinentry (presence proof — the ed25519 private half is not
+passphrase-protected; see `docs/design/approval-broker.md` §5b), then
+auto-signs: writes the `_v2` sidecar + `.sig`, warms the attribution
+cache, and prints an `auto_sign_note` into the boot context. Cancel the
+dialog and the session enters unattested. Headless / CI: set
+`WILLOW_PRESENCE_CHALLENGE=off` to skip the dialog (tests do this).
+
 Your first `envelope_propose`/`ratify`/`reject` works without a second
-terminal.
+terminal — the human act is the pinentry at boot, not a later CLI.
 
 An **unknown or compromised verifier REFUSES `session_enter` outright**
 (PR8 Commit A): a compromised key that continued unattested is exactly
