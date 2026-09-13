@@ -103,6 +103,38 @@ def _blocker_lines(orientation: dict[str, Any]) -> list[str]:
         return []
 
 
+def _frank_line(orientation: dict[str, Any]) -> list[str]:
+    """FRANK presence from session_enter orientation (H4 / gap 344388bc31fc).
+
+    session_enter already computed orientation['frank']; surfacing it here is
+    the boot-state contract, not a second probe.
+    """
+    frank = orientation.get("frank")
+    if not isinstance(frank, dict):
+        return []
+    status = frank.get("status")
+    if not status:
+        return []
+    path = frank.get("path")
+    if status == "present" and path:
+        return [f"frank: present ({path})"]
+    return [f"frank: {status}"]
+
+
+def _attestation_line(enter_result: dict[str, Any]) -> list[str]:
+    """One-line attestation status for the boot contract (H4).
+
+    Prefer explicit verifier fields from session_enter; otherwise stay silent
+    rather than inventing a second attestation check (blockers already speak).
+    """
+    verifier = enter_result.get("verifier") or enter_result.get("attested_by")
+    if verifier:
+        return [f"attestation: verified by {verifier}"]
+    if enter_result.get("auto_sign_note"):
+        return []  # session_start_hook already appends [attribution]
+    return []
+
+
 def _gap_lines(limit: int = MAX_BOOT_GAPS) -> list[str]:
     """Top open gaps by asked_count, via the same backlog gap_list reads.
 
@@ -219,6 +251,8 @@ def build_boot_lines(
     # degrades to no line on any fault (see commitments/boot.py).
     lines.extend(commitment_boot_lines(app_id))
 
+    lines.extend(_frank_line(orientation))
+    lines.extend(_attestation_line(enter_result))
     lines.extend(_blocker_lines(orientation))
     if not lite_inject:
         lines.extend(_gap_lines())

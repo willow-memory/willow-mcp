@@ -203,7 +203,11 @@ _BASH_ROUTING: list[tuple[re.Pattern[str], str, str]] = [
     (_ROUTE_GIT_NET_RE, "block", f"git network → {_TASK_SUBMIT_NET}"),
     (_ROUTE_GIT_MUT_RE, "block", f"git mutation → {_TASK_SUBMIT}"),
     (_ROUTE_GH_RE, "block", f"gh (mutations / net) → {_TASK_SUBMIT_NET}"),
-    (re.compile(r"(?i)python3?\s+.*<<"), "block", f"Python heredoc → {_TASK_SUBMIT}"),
+    # Anchored to command position (same as psql/sqlite3). An echo/printf/commit
+    # that merely *names* a python heredoc must not trip — only an actual
+    # invocation (gap a1416fb1b8b1 / H1 act-vs-text).
+    (re.compile(r"(?i)(?:^|&&|;|\|)\s*python3?\s+(?:-\S+\s+)*<<"), "block",
+     f"Python heredoc → {_TASK_SUBMIT}"),
     (re.compile(r"(?i)\bgrep\b|\brg\b"), "warn",
      f"knowledge_search / store_search · symbols → code_graph_search · {_TASK_SUBMIT}"),
     (re.compile(r"(?i)\bfind\s"), "warn",
@@ -228,9 +232,19 @@ def _env_declares_orchestrator() -> bool:
 
 
 def _project_dir() -> Optional[str]:
-    """The project root, from CLAUDE_PROJECT_DIR. The harness sets it on every
-    hook invocation; it is the one reliable pointer to where .mcp.json lives."""
-    return os.environ.get("CLAUDE_PROJECT_DIR") or None
+    """The project root for seat detection (.mcp.json).
+
+    Claude Code sets CLAUDE_PROJECT_DIR on every hook invocation. Cursor does
+    not — project sync wraps hook commands with WILLOW_PROJECT_ROOT instead
+    (and some Cursor builds set CURSOR_PROJECT_DIR). Prefer the harness signal
+    when present; fall back to the env the Cursor hooks.json injects.
+    """
+    return (
+        os.environ.get("CLAUDE_PROJECT_DIR")
+        or os.environ.get("CURSOR_PROJECT_DIR")
+        or os.environ.get("WILLOW_PROJECT_ROOT")
+        or None
+    )
 
 
 def _mcp_json_declares_orchestrator(project_dir: str) -> bool:
@@ -762,6 +776,47 @@ _SEAT_PRIV_RE = re.compile(
 _SEAT_PRIV_QUOTED_RE = re.compile(r"[\"'](orchestrator|context|binding)[\"']")
 _SCOPE_ALL_RE = re.compile(r'"store_scope"\s*:\s*\[\s*"\*"\s*\]')
 
+# Literal tool names that expand from write-capable groups and do NOT also
+# appear in a read-only group. Gap 7c3f45e495b4 / H3: `allow-permission app
+# decision_propose` (or a manifest listing `"store_put"`) must refuse the same
+# as granting `governance_propose` / `store_write`. Hook is stdlib-only, so the
+# set is literal; tests/test_pre_tool_use_hook.py pins it against
+# gate.PERMISSION_GROUPS so a new write tool cannot land unguarded.
+_SEAT_WRITE_TOOLS = frozenset({
+    "__mai_directives__",
+    "agent_clear", "agent_dispatch_result", "agent_route",
+    "code_graph_index",
+    "commitment_acknowledge", "commitment_ingest",
+    "context_expire", "context_get", "context_list", "context_save",
+    "decision_propose",
+    "dispatch_accept", "dispatch_send",
+    "envelope_apply", "envelope_propose", "envelope_ratify", "envelope_reject",
+    "federation_call",
+    "fork_create", "fork_delete", "fork_join", "fork_log", "fork_merge",
+    "frank_append",
+    "friction_scan",
+    "gap_delete", "gap_log", "gap_promote", "gap_purge_topic", "gap_resolve",
+    "grove_ack", "grove_bus_send", "grove_flag", "grove_heartbeat",
+    "grove_reply", "grove_send_message", "grove_unflag",
+    "handoff_write_v4",
+    "human_attestation_create", "human_required_enqueue", "human_required_resolve",
+    "integration_call",
+    "kb_ingest", "kb_journal", "kb_promote",
+    "knowledge_flag", "knowledge_ingest", "knowledge_retract",
+    "lineage_link", "lineage_record",
+    "mai_execute_directive", "mai_get_env", "mai_invalidate_cache", "mai_write_file",
+    "nest_intake_file", "nest_intake_scan", "nest_intake_skip", "nest_promote", "nest_scan",
+    "nestor_tool_route", "nestor_tool_seal",
+    "schema_confirm_mapping",
+    "session_bind", "session_handoff_write", "session_reconcile",
+    "store_delete", "store_purge_collection", "store_put", "store_update",
+    "task_list", "task_status", "task_submit",
+    "verify_handoff",
+})
+_SEAT_WRITE_TOOL_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(t) for t in sorted(_SEAT_WRITE_TOOLS)) + r")\b"
+)
+
 _SEAT_ESCALATION_REASON = (
     "willow-mcp: this edits a manifest to add a WRITE-capable permission group "
     "(store_write / store_all / knowledge_write / knowledge_curate / lineage_write / schema_admin / "
@@ -1013,8 +1068,12 @@ def _raw_self_grant_scan(command: str) -> Optional[str]:
         return _SELF_GRANT_REASON
     for _m in _ALLOW_PERMISSION_GRANT_RE.finditer(command):
         perm = _m.group(1)
-        if (_NET_CAP_RE.fullmatch(perm) or _SEAT_PRIV_RE.fullmatch(perm)
-                or perm in _ALLOW_PERMISSION_SEAT_BARE):
+        if (
+            _NET_CAP_RE.fullmatch(perm)
+            or _SEAT_PRIV_RE.fullmatch(perm)
+            or perm in _ALLOW_PERMISSION_SEAT_BARE
+            or perm in _SEAT_WRITE_TOOLS
+        ):
             return _ALLOW_PERMISSION_REASON
     return None
 
@@ -1056,6 +1115,7 @@ def check_bash_self_grant(command: str) -> Optional[str]:
     if _MANIFEST_RE.search(command) and (
         _SEAT_PRIV_RE.search(command)
         or _SEAT_PRIV_QUOTED_RE.search(command)
+        or _SEAT_WRITE_TOOL_RE.search(command)
         or _SCOPE_ALL_RE.search(command)
     ):
         return _SEAT_ESCALATION_REASON
@@ -1097,8 +1157,12 @@ def check_trust_root_write(tool_input: dict) -> Optional[str]:
                            for k in ("content", "new_string", "new_str"))
         if _NET_CAP_RE.search(written):
             return _SELF_GRANT_REASON
-        if (_SEAT_PRIV_RE.search(written) or _SEAT_PRIV_QUOTED_RE.search(written)
-                or _SCOPE_ALL_RE.search(written)):
+        if (
+            _SEAT_PRIV_RE.search(written)
+            or _SEAT_PRIV_QUOTED_RE.search(written)
+            or _SEAT_WRITE_TOOL_RE.search(written)
+            or _SCOPE_ALL_RE.search(written)
+        ):
             return _SEAT_ESCALATION_REASON
     return None
 
@@ -1120,11 +1184,41 @@ def main() -> None:
     except Exception:
         sys.exit(0)
 
+    from willow_mcp.cursor_hook_io import (
+        extract_shell_command,
+        is_cursor_dialect,
+        is_cursor_mcp_event,
+        is_cursor_shell_event,
+        normalize_cursor_mcp_payload,
+    )
+
+    if is_cursor_shell_event(payload):
+        command = extract_shell_command(payload)
+        if command.strip():
+            from willow_mcp.cursor_hook_io import run_cursor_shell_guards
+
+            run_cursor_shell_guards(
+                command,
+                check_bash_self_grant=check_bash_self_grant,
+                check_bash_remote_fail_closed=check_bash_remote_fail_closed,
+                check_bash=check_bash,
+                check_bash_routing=check_bash_routing,
+            )
+        from willow_mcp.cursor_hook_io import emit_cursor_permission
+
+        emit_cursor_permission("allow")
+        sys.exit(0)
+
+    cursor_dialect = is_cursor_dialect(payload)
+    if is_cursor_mcp_event(payload):
+        payload = normalize_cursor_mcp_payload(payload)
+
     tool_name = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {}) or {}
+    tool_base = tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
 
-    native = check_native_web(tool_name)
-    corpus = check_corpus_first(tool_name)
+    native = check_native_web(tool_base)
+    corpus = check_corpus_first(tool_base)
     if native:
         decision, route_reason = native
         # compose, don't clobber: check_native_web already hard-blocks native
@@ -1133,36 +1227,95 @@ def main() -> None:
         # second, conflicting one (only one decision reaches the caller).
         if corpus:
             route_reason = f"{route_reason} {corpus[1]}"
+        if cursor_dialect:
+            from willow_mcp.cursor_hook_io import cursor_permission_for_guard
+
+            cursor_permission_for_guard(decision, route_reason)
+            sys.exit(0)
         print(json.dumps({"decision": decision, "reason": route_reason}))
     elif corpus:
         decision, reason = corpus
+        if cursor_dialect:
+            from willow_mcp.cursor_hook_io import cursor_permission_for_guard
+
+            cursor_permission_for_guard(decision, reason)
+            sys.exit(0)
         print(json.dumps({"decision": decision, "reason": reason}))
-    elif tool_name == "Bash":
-        command = tool_input.get("command", "")
+    elif tool_name in ("Bash", "Shell"):
+        command = tool_input.get("command", "") or extract_shell_command(payload)
         reason = (
             check_bash_self_grant(command)
             or check_bash_remote_fail_closed(command)
             or check_bash(command)
         )
         if reason:
-            print(json.dumps({"decision": "block", "reason": reason}))
+            if cursor_dialect:
+                from willow_mcp.cursor_hook_io import cursor_permission_for_guard
+
+                cursor_permission_for_guard("block", reason)
+                sys.exit(0)
+            from willow_mcp.cursor_hook_io import emit_claude_block
+
+            emit_claude_block(reason)
         else:
             routed = check_bash_routing(command)
             if routed:
                 decision, route_reason = routed
-                print(json.dumps({"decision": decision, "reason": route_reason}))
-    elif _is_file_write(tool_name):
+                if cursor_dialect:
+                    from willow_mcp.cursor_hook_io import cursor_permission_for_guard
+
+                    cursor_permission_for_guard(decision, route_reason)
+                    sys.exit(0)
+                if decision == "block":
+                    from willow_mcp.cursor_hook_io import emit_claude_block
+
+                    emit_claude_block(route_reason)
+                else:
+                    from willow_mcp.cursor_hook_io import emit_claude_warn
+
+                    emit_claude_warn(route_reason)
+            elif cursor_dialect:
+                from willow_mcp.cursor_hook_io import emit_cursor_permission
+
+                emit_cursor_permission("allow")
+                sys.exit(0)
+    elif _is_file_write(tool_name) or _is_file_write(tool_base):
         reason = check_owned_db_file_write(tool_input) or check_trust_root_write(tool_input)
         if reason:
-            print(json.dumps({"decision": "block", "reason": reason}))
-    elif _is_task_submit(tool_name):
+            if cursor_dialect:
+                from willow_mcp.cursor_hook_io import cursor_permission_for_guard
+
+                cursor_permission_for_guard("block", reason)
+                sys.exit(0)
+            from willow_mcp.cursor_hook_io import emit_claude_block
+
+            emit_claude_block(reason)
+    elif _is_task_submit(tool_name) or _is_task_submit(tool_base):
         blocked = check_task_submit_self_grant(tool_input)
         if blocked:
-            print(json.dumps({"decision": "block", "reason": blocked}))
+            if cursor_dialect:
+                from willow_mcp.cursor_hook_io import cursor_permission_for_guard
+
+                cursor_permission_for_guard("block", blocked)
+                sys.exit(0)
+            from willow_mcp.cursor_hook_io import emit_claude_block
+
+            emit_claude_block(blocked)
         else:
             reason = check_task_submit(tool_input)
             if reason:
-                print(json.dumps({"decision": "warn", "reason": reason}))
+                if cursor_dialect:
+                    from willow_mcp.cursor_hook_io import cursor_permission_for_guard
+
+                    cursor_permission_for_guard("warn", reason)
+                    sys.exit(0)
+                from willow_mcp.cursor_hook_io import emit_claude_warn
+
+                emit_claude_warn(reason)
+    if cursor_dialect:
+        from willow_mcp.cursor_hook_io import emit_cursor_permission
+
+        emit_cursor_permission("allow")
     sys.exit(0)
 
 

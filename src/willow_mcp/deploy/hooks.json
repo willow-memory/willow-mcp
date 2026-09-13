@@ -8,16 +8,50 @@
         "failClosed": false
       }
     ],
+    "preToolUse": [
+      {
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "matcher": "Shell",
+        "timeout": 5,
+        "failClosed": true
+      },
+      {
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "matcher": "MCP:.*",
+        "timeout": 5,
+        "failClosed": true
+      },
+      {
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "matcher": "Write",
+        "timeout": 5,
+        "failClosed": true
+      },
+      {
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "matcher": "WebSearch|WebFetch",
+        "timeout": 5,
+        "failClosed": true
+      },
+      {
+        "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
+        "matcher": "Task",
+        "timeout": 5,
+        "failClosed": true
+      }
+    ],
     "beforeShellExecution": [
       {
         "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
-        "timeout": 5
+        "timeout": 5,
+        "failClosed": true
       }
     ],
     "beforeMCPExecution": [
       {
         "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.pre_tool_hook",
-        "timeout": 5
+        "timeout": 5,
+        "failClosed": true
       }
     ],
     "sessionEnd": [

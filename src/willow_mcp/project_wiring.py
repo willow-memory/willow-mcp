@@ -499,10 +499,71 @@ def render_cursor_hooks(
                 ),
             }
     template = json.loads((deploy_dir() / "hooks.json").read_text(encoding="utf-8"))
-    return _substitute_placeholders(
+    payload = _substitute_placeholders(
         template,
         {"WILLOW_MCP_PYTHON": resolve_willow_mcp_python()},
     )
+    # Cursor hook subprocesses do NOT inherit MCP server env. Without wrapping
+    # each command with WILLOW_APP_ID / WILLOW_HOME / WILLOW_PROJECT_ROOT,
+    # sessionStart refuses ("WILLOW_APP_ID is not set") and PreToolUse cannot
+    # resolve the orchestrator seat from .mcp.json. Same shape as the
+    # hook_manifest path's `env KEY=val …` prefix.
+    agent = "willow"
+    root = ""
+    if entry is not None:
+        agent = str(entry.get("agent") or "willow").strip()
+        try:
+            root = str(_project_root(project_id, entry))
+        except Exception:
+            root = ""
+        env = runtime_env(agent, entry)
+    else:
+        from .paths import store_root
+
+        env = {
+            "WILLOW_AGENT_NAME": agent,
+            "AGENT_NAME": agent,
+            "WILLOW_APP_ID": agent,
+            "WILLOW_HOME": str(willow_home().resolve()),
+            "WILLOW_STORE_ROOT": str(store_root().resolve()),
+            "WILLOW_MCP_PYTHON": resolve_willow_mcp_python(),
+        }
+    if root:
+        env.setdefault("WILLOW_PROJECT_ROOT", root)
+        env.setdefault("CLAUDE_PROJECT_DIR", root)
+    return _inject_cursor_hook_env(payload, env)
+
+
+def _inject_cursor_hook_env(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any]:
+    """Prefix every Cursor hook command with `env KEY=val …` so seat identity
+    reaches the subprocess (Cursor does not pass MCP env to hooks)."""
+    if not env:
+        return payload
+    prefix = ["env", *(f"{key}={value}" for key, value in sorted(env.items()))]
+    hooks = payload.get("hooks")
+    if not isinstance(hooks, dict):
+        return payload
+    out_hooks: dict[str, Any] = {}
+    for event, entries in hooks.items():
+        if not isinstance(entries, list):
+            out_hooks[event] = entries
+            continue
+        new_entries = []
+        for entry in entries:
+            if not isinstance(entry, dict) or "command" not in entry:
+                new_entries.append(entry)
+                continue
+            cmd = entry["command"]
+            if not isinstance(cmd, str) or not cmd.strip():
+                new_entries.append(entry)
+                continue
+            if cmd.lstrip().startswith("env "):
+                new_entries.append(entry)
+                continue
+            wrapped = {**entry, "command": shlex.join([*prefix, *shlex.split(cmd)])}
+            new_entries.append(wrapped)
+        out_hooks[event] = new_entries
+    return {**payload, "hooks": out_hooks}
 
 
 def runtime_env(agent: str, entry: dict[str, Any]) -> dict[str, str]:

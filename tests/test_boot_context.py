@@ -310,3 +310,21 @@ def test_boot_lines_healthy_seat_no_false_alarms(monkeypatch):
     assert "[BLOCKERS]" not in joined
     assert "[GAPS]" not in joined
     assert "BOOT DEGRADED" not in joined
+
+
+def test_boot_lines_surface_frank_from_orientation(monkeypatch):
+    """H4 / gap 344388bc31fc: FRANK presence is part of the boot-state contract."""
+    _quiet_boot(monkeypatch)
+    monkeypatch.setattr(gaps_mod, "list_gaps", lambda status=None, limit=50: {"items": []})
+    enter_result = {
+        "orientation": {
+            "blockers": {"count": 0, "items": []},
+            "records": {},
+            "frank": {"status": "present", "path": "/tmp/FRANK"},
+        },
+        "verifier": "sean",
+    }
+    lines = bc.build_boot_lines("hanuman", "sess-frank", "startup", enter_result)
+    joined = "\n".join(lines)
+    assert "frank: present (/tmp/FRANK)" in joined
+    assert "attestation: verified by sean" in joined

@@ -1566,3 +1566,123 @@ def test_git_no_pager_commit_naming_the_verb_in_prose_is_allowed():
     cmd = ('git --no-pager commit -m '
            "'note: never willow-mcp grant-net anyone'")
     assert pre_tool_use.check_bash_self_grant(cmd) is None
+
+
+def test_cursor_before_shell_execution_denies_routed_git_push():
+    """Cursor beforeShellExecution must not use the Claude Bash schema."""
+    payload = {
+        "command": "git push origin master",
+        "hook_event_name": "beforeShellExecution",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "willow_mcp.pre_tool_hook"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert out["permission"] == "deny"
+    assert "task_submit" in out.get("agent_message", "").lower() or "willow-mcp" in out.get(
+        "agent_message", ""
+    )
+
+
+def test_cursor_pre_tool_use_shell_denies_git_push():
+    """Agent Shell tool uses preToolUse + Shell matcher, not beforeShellExecution."""
+    payload = {
+        "tool_name": "Shell",
+        "tool_input": {"command": "git push origin master"},
+        "hook_event_name": "preToolUse",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "willow_mcp.pre_tool_hook"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout)["permission"] == "deny"
+
+
+def test_cursor_before_shell_execution_allows_benign_command():
+    payload = {
+        "command": "echo hello",
+        "hook_event_name": "beforeShellExecution",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "willow_mcp.pre_tool_hook"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout)["permission"] == "allow"
+
+
+# ── H1 act-vs-text: python heredoc routing is command-position only ─────────
+
+
+def test_python_heredoc_mentioned_in_echo_is_not_routed():
+    """gap a1416fb1b8b1: naming a python heredoc inside echo/printf must not
+    trip the prefer-MCP heredoc steer — only an actual invocation does."""
+    assert pre_tool_use.check_bash_routing(
+        'echo "example: python3 <<END then code END"'
+    ) is None
+
+
+def test_python_heredoc_at_command_position_is_still_routed():
+    decision = pre_tool_use.check_bash_routing("python3 <<'EOF'\nprint(1)\nEOF")
+    assert decision is not None
+    assert decision[0] == "block"
+    assert "heredoc" in decision[1].lower()
+
+
+# ── H3: self-grant is tool-level, not only group-level (gap 7c3f45e495b4) ───
+
+
+def test_allow_permission_literal_write_tool_is_refused():
+    assert pre_tool_use.check_bash_self_grant(
+        "willow-mcp allow-permission app decision_propose"
+    ) is not None
+    assert pre_tool_use.check_bash_self_grant(
+        "willow-mcp allow-permission app store_put"
+    ) is not None
+
+
+def test_allow_permission_literal_read_tool_is_allowed():
+    assert pre_tool_use.check_bash_self_grant(
+        "willow-mcp allow-permission app store_get"
+    ) is None
+    assert pre_tool_use.check_bash_self_grant(
+        "willow-mcp allow-permission app knowledge_search"
+    ) is None
+
+
+def test_manifest_write_of_literal_write_tool_is_refused():
+    assert _manifest_write("decision_propose") is not None
+    assert _manifest_write("store_put") is not None
+
+
+def test_seat_write_tools_cover_every_exclusive_write_tool():
+    """Drift pin: exclusive write tools from gate.PERMISSION_GROUPS must match
+    the hook's _SEAT_WRITE_TOOLS literal (stdlib-only hook cannot import gate)."""
+    from willow_mcp import gate
+
+    write_tools = set()
+    read_tools = set()
+    for group in _WRITE_CAPABLE_GROUPS:
+        write_tools |= set(gate.PERMISSION_GROUPS[group])
+    for group in _READ_ONLY_GROUPS:
+        read_tools |= set(gate.PERMISSION_GROUPS[group])
+    expected = write_tools - read_tools
+    actual = set(pre_tool_use._SEAT_WRITE_TOOLS)
+    assert not (expected - actual), (
+        "write tools missing from _SEAT_WRITE_TOOLS: %s" % sorted(expected - actual)
+    )
+    assert not (actual - expected), (
+        "_SEAT_WRITE_TOOLS has extras not exclusive-write: %s" % sorted(actual - expected)
+    )

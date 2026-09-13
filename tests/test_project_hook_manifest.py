@@ -211,10 +211,28 @@ def test_projects_without_manifest_keep_fleet_owned_templates(tmp_path):
     claude = render_project_claude_settings(entry, project_id="willow")
 
     assert "willow_mcp.session_start_hook" in _commands(cursor, "cursor")[0]
+    assert "WILLOW_APP_ID=" in _commands(cursor, "cursor")[0]
     assert any(
         "willow_mcp.pre_tool_hook" in command
         for command in _commands(claude, "claude")
     )
+
+
+def test_default_cursor_hooks_wrap_commands_with_seat_env(tmp_path, monkeypatch):
+    """Cursor hook subprocesses do not inherit MCP env — without an env prefix,
+    sessionStart refuses for missing WILLOW_APP_ID (live Grove desk 2026-09-13)."""
+    from willow_mcp.project_wiring import render_cursor_hooks
+
+    monkeypatch.setenv(
+        "WILLOW_MCP_PYTHON",
+        "/tmp/fake-venv/bin/python",
+    )
+    payload = render_cursor_hooks(None, project_id="orphan")
+    start = payload["hooks"]["sessionStart"][0]["command"]
+    assert start.startswith("env ")
+    assert "WILLOW_APP_ID=willow" in start
+    assert "willow_mcp.session_start_hook" in start
+    assert "preToolUse" in payload["hooks"]
 
 
 def test_tracked_claude_hooks_are_validated_but_not_duplicated_locally(tmp_path):

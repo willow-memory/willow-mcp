@@ -209,6 +209,20 @@ def test_cursor_hook_uses_a_stable_available_interpreter():
     assert "python3" in cmd or "python" in cmd or "WILLOW_MCP_PYTHON" in cmd
 
 
+def test_cursor_hook_registers_pre_tool_use_for_agent_shell():
+    hooks = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "willow_mcp"
+        / "deploy"
+        / "hooks.json"
+    )
+    data = json.loads(hooks.read_text())
+    matchers = {h["matcher"] for h in data["hooks"]["preToolUse"]}
+    assert "Shell" in matchers
+    assert "MCP:.*" in matchers
+
+
 def test_cursor_hook_registers_session_end():
     hooks = Path(__file__).resolve().parents[1] / "deploy" / "cursor" / "hooks.json"
     data = json.loads(hooks.read_text())
