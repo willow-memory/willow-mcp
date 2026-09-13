@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **hooks:** H1–H5 guard precision and Cursor seat env wrap ([e244dad](https://github.com/willow-memory/willow-mcp/commit/e244dad5c5be27213b8647526da744d9986d2be1))
 * **hooks:** H1–H5 guard precision and Cursor seat env wrap ([ab7d17f](https://github.com/willow-memory/willow-mcp/commit/ab7d17f549a40a4d52efffb0cb6a2891da145d0a))
 
 ## [2.36.0](https://github.com/willow-memory/willow-mcp/compare/v2.35.1...v2.36.0) (2026-09-11)
