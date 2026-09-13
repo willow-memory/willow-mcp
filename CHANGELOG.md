@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **session:** gate SessionStart auto-sign on desktop pinentry ([3142a2f](https://github.com/willow-memory/willow-mcp/commit/3142a2f9ca0a7e62152c73eda5b618b5b34e2847))
 * **session:** gate SessionStart auto-sign on desktop pinentry ([c074784](https://github.com/willow-memory/willow-mcp/commit/c07478488a5116d91ba98061e3a73ea7a1691cc3))
 
 ## [2.36.1](https://github.com/willow-memory/willow-mcp/compare/v2.36.0...v2.36.1) (2026-09-13)
