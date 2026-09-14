@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.41.0](https://github.com/willow-memory/willow-mcp/compare/v2.40.0...v2.41.0) (2026-09-14)
+
+
+### Added
+
+* **broker:** pr_open_execute — the broker opens the pull request as willows-bot ([494293f](https://github.com/willow-memory/willow-mcp/commit/494293f48d2ddd18d8b6f350e96819723470b3bc))
+* **broker:** pr_open_execute — the broker opens the pull request as willows-bot ([534c84c](https://github.com/willow-memory/willow-mcp/commit/534c84c3794312019e388c153dc3c60144035532))
+
 ## [2.40.0](https://github.com/willow-memory/willow-mcp/compare/v2.39.0...v2.40.0) (2026-09-13)
 
 
