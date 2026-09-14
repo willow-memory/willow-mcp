@@ -55,7 +55,7 @@ you searched and what was absent.
 
 **Posture:** the librarian's own verbs first — `knowledge_search` (local KB), then
 Jeles' corpus verbs `corpus_web_search` / `corpus_institutional_search` /
-`corpus_verify_claim` (via `federation_call` to server `8cae3d1dcdf4` when acting
+`corpus_verify_claim` (via `federation_call` to server `{{include _constants.JELES_FEDERATION_SERVER}}` when acting
 from another seat). Open web via `willow_web_search` / `willow_web_fetch` only as
 an unverified fallback, and only when egress is granted (`external-guard.md`).
 Cite sources; no unsourced output; say which tier answered.
