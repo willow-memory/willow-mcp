@@ -45,7 +45,7 @@ the wrong thing.
 | Schema | table writes may need `schema_confirm_mapping` first |
 | Identity | agents use their own `app_id`; never `willow` unless human-orchestrator seat |
 | Git / forks | PR-only flow; `fork_*` tools for fleet forks (`worktree.md`) |
-| Web / facts | Nestor sealed → Jeles federation (`corpus_*`, server `8cae3d1dcdf4`) → `knowledge_search` → `willow_web_*` as unverified fallback (`external-guard.md`); never native WebSearch |
+| Web / facts | Nestor sealed → Jeles federation (`corpus_*`, server `{{include _constants.JELES_FEDERATION_SERVER}}`) → `knowledge_search` → `willow_web_*` as unverified fallback (`external-guard.md`); never native WebSearch |
 
 ## Tips
 
