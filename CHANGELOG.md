@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.42.0](https://github.com/willow-memory/willow-mcp/compare/v2.41.0...v2.42.0) (2026-09-14)
+
+
+### Added
+
+* **broker:** git_pull_execute + gitsync_sweep — a merge comes home without a keyboard ([c8d4920](https://github.com/willow-memory/willow-mcp/commit/c8d4920b498c24e2c3cc6907a173fc515d11923a))
+
 ## [2.41.0](https://github.com/willow-memory/willow-mcp/compare/v2.40.0...v2.41.0) (2026-09-14)
 
 
