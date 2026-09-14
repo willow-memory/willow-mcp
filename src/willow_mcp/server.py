@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 123 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 125 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -4489,6 +4489,77 @@ def pr_open_execute(
         )
     except Exception as exc:
         return {"ok": False, "opened": False, "error": f"pr_open_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def git_pull_execute(
+    app_id: str,
+    checkout: str,
+    repo: str,
+    branch: str = "",
+    remote: str = "origin",
+    prune_branches: Optional[list[str]] = None,
+    project: str = "",
+) -> dict:
+    """Bring a merge home: fast-forward `branch` (default: the remote's HEAD
+    branch) of the checkout at `checkout` to `remote/branch`, performed by
+    THIS process — fetch with the willows-bot token when the App covers
+    `repo`, `merge --ff-only`, then `branch -d` each of `prune_branches`
+    (git refuses anything unmerged). Refuses a dirty tree (EBUSY), a branch
+    that is ahead or diverged (EDIVERGED), a checkout that is not `repo`, or
+    a symlink — a pull never loses work. Takes no envelope: a fast-forward
+    creates no history and publishes none (the desk hook already treats it
+    as repo maintenance); it leaves a FRANK `git_pull` receipt instead, so
+    the act has ink. Gated as envelope_apply beside the push and the PR."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import pull_executor
+        from .governance_ledger import GovernanceLedger
+
+        return pull_executor.execute_pull(
+            app_id,
+            checkout=checkout,
+            repo=repo,
+            branch=branch,
+            remote=remote,
+            prune_branches=prune_branches,
+            project=project or repo,
+            session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "pulled": False, "error": f"git_pull_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def gitsync_sweep(app_id: str, project: str = "") -> dict:
+    """Consume willow-bot's gitsync triggers: for every
+    `$WILLOW_HOME/gitsync/trigger-<owner>-<repo>.flag` the bridge wrote on a
+    push to a default branch, resolve the checkout under the github root
+    (org layout first, then flat), pull it home via git_pull_execute's
+    executor, and remove the flag on success. A refusal (dirty, diverged, no
+    clone) leaves the flag for the next sweep and is reported in `swept`,
+    never swallowed. An absent trigger dir is reported as `present: false`,
+    not as an empty success."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import pull_executor
+        from .governance_ledger import GovernanceLedger
+
+        return pull_executor.sweep_triggers(
+            app_id,
+            project=project or "fleet",
+            session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"gitsync_sweep_failed: {exc}"}
 
 
 # ---------------------------------------------------------------------------
