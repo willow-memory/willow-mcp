@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 122 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 123 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -4440,6 +4440,55 @@ def git_push_execute(
         )
     except Exception as exc:
         return {"ok": False, "pushed": False, "error": f"git_push_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def pr_open_execute(
+    app_id: str,
+    repo: str,
+    head: str,
+    base: str,
+    title: str,
+    body: str = "",
+    draft: bool = False,
+    envelope_id: str = "",
+    project: str = "",
+    task_id: str = "",
+) -> dict:
+    """Open a pull request `head` -> `base` on `repo` (`org/name`), performed
+    by THIS process as willows-bot under the `pr.open` envelope that governs
+    `app_id` — the brokered push's sibling for verb 4. The agent initiates;
+    the broker mints the App's installation token for this one act and POSTs
+    to GitHub; no token enters a sandbox and none is stored. There is no
+    host-token fallback: a PR the bot cannot open is refused (EAUTH), not
+    opened as the operator. A refusal is cited in FRANK with its errno and
+    files the ask in the human-required queue. Returns the PR number and URL
+    and the citation id on success. Gated as envelope_apply, as
+    git_push_execute is: an envelope application with the act attached."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import pr_executor
+        from .governance_ledger import GovernanceLedger
+
+        return pr_executor.execute_pr_open(
+            app_id,
+            repo=repo,
+            head=head,
+            base=base,
+            title=title,
+            body=body,
+            draft=draft,
+            envelope_id=envelope_id,
+            project=project or repo,
+            session=_current_orchestrator_session(),
+            task_id=task_id,
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "opened": False, "error": f"pr_open_execute_failed: {exc}"}
 
 
 # ---------------------------------------------------------------------------
