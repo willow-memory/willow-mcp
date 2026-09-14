@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **broker:** git_pull_execute + gitsync_sweep — a merge comes home without a keyboard ([396a2fa](https://github.com/willow-memory/willow-mcp/commit/396a2fab1c31cf271a30f3e48095e0ba1d5b1112))
 * **broker:** git_pull_execute + gitsync_sweep — a merge comes home without a keyboard ([c8d4920](https://github.com/willow-memory/willow-mcp/commit/c8d4920b498c24e2c3cc6907a173fc515d11923a))
 
 ## [2.41.0](https://github.com/willow-memory/willow-mcp/compare/v2.40.0...v2.41.0) (2026-09-14)
