@@ -29,7 +29,7 @@ from model recall.
    provenance. If sealed, cite the seal id and stop.
 
 2. **Federated corpus (Jeles)** — via `federation_call` to server
-   `8cae3d1dcdf4`. Three verbs, cheapest first:
+   `{{include _constants.JELES_FEDERATION_SERVER}}`. Three verbs, cheapest first:
    - `corpus_verify_claim(claim=...)` — is this exact claim already in the
      corpus? Returns confidence, hits, and source pinned to a commit.
    - `corpus_web_search(query=...)` — the corpus over open-web-shaped
@@ -52,7 +52,7 @@ from model recall.
 
 ## When federation is unreachable
 
-- One-line orient: `federation_call` to server `8cae3d1dcdf4` did not answer.
+- One-line orient: `federation_call` to server `{{include _constants.JELES_FEDERATION_SERVER}}` did not answer.
 - Drop to `knowledge_search` (step 3) with the same query.
 - If step 3 also misses, THEN the open-web fallback with the operator's
   say-so. Never silently skip federation to reach the fallback.
@@ -163,7 +163,7 @@ willow_web_fetch(app_id="willow", url="https://…", wrap=true)
 ## Rules
 
 @constraint severity=critical
-- Consult verified organs first (Nestor → Jeles federation `8cae3d1dcdf4` →
+- Consult verified organs first (Nestor → Jeles federation `{{include _constants.JELES_FEDERATION_SERVER}}` →
   `knowledge_search`) before any `willow_web_*` call. Say which tier answered.
 - Discover URLs with `willow_web_search` only after the verified organs missed,
   and only when you do not already have a canonical link.

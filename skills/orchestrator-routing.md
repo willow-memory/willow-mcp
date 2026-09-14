@@ -20,7 +20,7 @@ Shell front-end: `bash scripts/willow-seat.sh` (repo `willow-memory`).
 | 1 | Sealed fact? | `nestor_ask` / `nestor_check` — serve verbatim if sealed | Re-derive from memory |
 | 2 | Deterministic? | `tools/*.py`, `scripts/fleet_seams.py`, `code_graph_*`, `gap_*`, `friction_scan`, `mai_lint.py` | Eyeball in chat |
 | 3 | MCP read? | `wtool.py` or `willow-seat.sh wtool` | Re-implement query logic |
-| 4 | Jeles corpus? | `federation_call` → `8cae3d1dcdf4` / `willow-seat.sh jeles` | Direct jeles MCP in Cursor; **`willow_web_*` / search-shaped `integration_call`** |
+| 4 | Jeles corpus? | `federation_call` → `{{include _constants.JELES_FEDERATION_SERVER}}` / `willow-seat.sh jeles` | Direct jeles MCP in Cursor; **`willow_web_*` / search-shaped `integration_call`** |
 | 5 | Shell / git / network? | `task_submit` (Kart) after `fleet_health` | Raw bash (hooks steer) |
 | 6 | NL → tool unknown? | `nestor_tool_route` — served or queued, never guess | Invent tool name |
 | 7 | Draft only? | Loopback Ollama via Nestor (`nestor_draft`, `willow-lane4-3b` / `llama3.2:3b`) | Auto-seal or treat draft as fact |
@@ -61,7 +61,7 @@ Shell front-end: `bash scripts/willow-seat.sh` (repo `willow-memory`).
 
 ## Jeles replaces Willow web/integration egress (operator policy)
 
-When **jeles-corpus federation is ratified and working** (`federation_call` → `8cae3d1dcdf4` succeeds):
+When **jeles-corpus federation is ratified and working** (`federation_call` → `{{include _constants.JELES_FEDERATION_SERVER}}` succeeds):
 
 | Retired for the willow seat | Use instead (federated jeles) |
 |----------------------------|-------------------------------|
