@@ -884,6 +884,42 @@ def permitted(app_id: str, tool_name: str) -> bool:
     return True
 
 
+def narrowest_requestable_perm_scope(tool_name: str) -> str:
+    """The narrowest `PERMISSION_GROUPS` entry containing `tool_name` that the
+    request queue may name, or the literal `tool_name` if no such group exists.
+
+    The whole point of surfacing a `perm.*` ask at the denial site is to name
+    what would un-refuse the caller. Two decisions the operator made on this
+    (gap `5ecb87cfdf56`, slice 2b):
+
+    * **(b) narrowest group** — prefer the smallest `PERMISSION_GROUPS` entry
+      whose grant would admit `tool_name`. A wider one would ask for more than
+      the denial proved was needed: a `store_get` denial should ask for
+      `store_read` (6 tools), not `store_all` (10) or `orchestrator` (25+).
+    * **(c) literal tool name fallback** — when no group contains the tool, or
+      every group that does is on `PERM_NEVER_REQUESTABLE` (the queue may not
+      carry it — `full_access`, `orchestrator`, `envelope_apply`, ...), fall
+      through to the tool name itself. A manifest's `permissions` list already
+      accepts literal tool names alongside group names, so this is the same
+      grammar the manifest speaks.
+
+    Two groups the same size are tie-broken alphabetically — deterministic
+    rather than dictionary-insertion-order, so a future refactor of
+    `PERMISSION_GROUPS` cannot silently change which of two equally-narrow
+    groups the operator sees.
+    """
+    from . import gates_panel
+
+    candidates = [
+        (name, group) for name, group in PERMISSION_GROUPS.items()
+        if tool_name in group and name not in gates_panel.PERM_NEVER_REQUESTABLE
+    ]
+    if not candidates:
+        return tool_name
+    candidates.sort(key=lambda pair: (len(pair[1]), pair[0]))
+    return candidates[0][0]
+
+
 def visible_tools(
     app_id: str, tool_gate_names: dict[str, str]
 ) -> tuple[list[str], list[str]]:

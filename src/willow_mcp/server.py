@@ -757,11 +757,21 @@ def _gate(app_id: str, tool_name: str) -> tuple[Optional[str], Optional[dict]]:
                 detail = f"{detail} (missing authority: {decision.missing_authority})"
             return None, {"error": f"authority denied: {detail}"}
     elif not permitted(effective, tool_name):
+        # Gap `5ecb87cfdf56`, slice 2b PR 2: file the ask, then refuse. Same
+        # discipline as the four `lease_denied` sites — the denial is what
+        # the caller sees and does not change; the queued row is the
+        # operator's copy. `note_for_perm_denial` returns "" on a failed
+        # enqueue, so a queue outage cannot re-write the refusal into a
+        # traceback or a silent success.
+        from . import gate_request
+
+        note = gate_request.note_for_perm_denial(effective, tool_name)
         return None, {
             "error": (
                 f"gate denied: '{effective}' not permitted for '{tool_name}'. "
                 f"Ensure a manifest exists at $WILLOW_HOME/mcp_apps/{effective}/manifest.json "
                 f"and lists this tool or a group that includes it."
+                f"{note}"
             )
         }
 
