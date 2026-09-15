@@ -198,3 +198,82 @@ def preflight_local_ancestry(
                    "the current base before the request"),
         **common,
     }
+
+
+def preflight_via_compare(
+    api: Callable,
+    *,
+    repo: str,
+    head: str,
+    base: str,
+    bearer: str,
+    api_base: str = "https://api.github.com",
+) -> dict[str, Any]:
+    """The pr-open lane's preflight: no local checkout, so ask GitHub the
+    same question. ``GET /repos/{repo}/compare/{base}...{head}`` returns
+    ``status`` in ``{"identical", "ahead", "behind", "diverged"}`` plus
+    ``ahead_by``/``behind_by``; we translate those to the same receipt
+    :func:`preflight_local_ancestry` produces so a caller reads one shape
+    regardless of which lane refused.
+
+    ``api`` matches ``github_app_credentials._api`` — a callable taking
+    ``(method, url, bearer=..., body=...)`` and returning
+    ``{"ok": bool, "status": int, "body": ...}``. ``bearer`` is the App's
+    install token minted for ``repo``.
+
+    ``EFETCH`` covers a non-2xx or malformed response; ``ESTALE`` covers
+    ``behind`` and ``diverged``. There is no ``skipped`` state in this
+    lane — the PR-open caller has already named a base (it is a required
+    argument).
+    """
+    common = {"remote": "origin", "base_branch": base, "head_ref": head}
+    url = f"{api_base}/repos/{repo}/compare/{base}...{head}"
+    resp = api("GET", url, bearer=bearer)
+    if not resp.get("ok"):
+        return {
+            "ok": False, "errno": "EFETCH",
+            "reason": (f"HTTP {resp.get('status')} from GET "
+                       f"/repos/{repo}/compare/{base}...{head}: "
+                       f"{str(resp.get('reason', ''))[:200]}"),
+            **common,
+        }
+    body = resp.get("body") or {}
+    status = (body.get("status") or "").strip()
+    try:
+        ahead = int(body.get("ahead_by") or 0)
+        behind = int(body.get("behind_by") or 0)
+    except (TypeError, ValueError):
+        return {
+            "ok": False, "errno": "EFETCH",
+            "reason": "malformed compare response: ahead_by/behind_by not integers",
+            **common,
+        }
+    base_sha = ((body.get("merge_base_commit") or {}).get("sha")
+                or (body.get("base_commit") or {}).get("sha") or "")
+    commits = body.get("commits") or []
+    head_sha = commits[-1].get("sha") if commits else base_sha
+    full = {**common, "base_sha": base_sha, "head_sha": head_sha,
+            "ahead": ahead, "behind": behind}
+    if status in ("identical", "ahead"):
+        return {"ok": True, "state": "current", **full}
+    if status == "behind":
+        return {
+            "ok": False, "errno": "ESTALE", "state": "behind",
+            "reason": (f"{head} is {behind} commit(s) behind {base} on {repo}; "
+                       "the pull request would carry a stale base — refresh the "
+                       "head branch before opening the request"),
+            **full,
+        }
+    if status == "diverged":
+        return {
+            "ok": False, "errno": "ESTALE", "state": "diverged",
+            "reason": (f"{head} is {ahead} ahead of {base} and {behind} behind on {repo}; "
+                       "the branches share history but each has commits the other "
+                       "does not — rebase or merge the current base before the request"),
+            **full,
+        }
+    return {
+        "ok": False, "errno": "EFETCH",
+        "reason": f"unexpected compare status: {status!r}",
+        **full,
+    }
