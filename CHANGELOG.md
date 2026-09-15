@@ -36,9 +36,7 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **gate:** `perm.*` producer at `server._gate`'s authority-branch denial ([8816170](https://github.com/willow-memory/willow-mcp/commit/8816170b0e5e688e0f38a7e0e2e5199571b981cb))
 * **gate:** `perm.*` producer at `server._gate`'s authority-branch denial ([a3dbdb0](https://github.com/willow-memory/willow-mcp/commit/a3dbdb083d211c39b83da8a701bb575d74f29f04))
-* **gates:** `pr.<repo>:<base>` joins the request seam ([20d8698](https://github.com/willow-memory/willow-mcp/commit/20d8698d608509af9c8c2498d7b40bdacefc8e77))
 * **gates:** `pr.<repo>:<base>` joins the request seam ([33e32c9](https://github.com/willow-memory/willow-mcp/commit/33e32c966ab5f15569458a4bfb1001bc07a8e6ce))
 
 ## [2.47.0](https://github.com/willow-memory/willow-mcp/compare/v2.46.0...v2.47.0) (2026-09-15)
