@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.43.0](https://github.com/willow-memory/willow-mcp/compare/v2.42.0...v2.43.0) (2026-09-15)
+
+
+### Added
+
+* **broker:** a bot-opened PR lands on the operator's list ([ab5583d](https://github.com/willow-memory/willow-mcp/commit/ab5583d952196a41b530889600707c3834fd8b55))
+
 ## [2.42.0](https://github.com/willow-memory/willow-mcp/compare/v2.41.0...v2.42.0) (2026-09-14)
 
 
