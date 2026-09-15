@@ -755,7 +755,23 @@ def _gate(app_id: str, tool_name: str) -> tuple[Optional[str], Optional[dict]]:
             detail = decision.reason
             if decision.missing_authority:
                 detail = f"{detail} (missing authority: {decision.missing_authority})"
-            return None, {"error": f"authority denied: {detail}"}
+            # Gap `5ecb87cfdf56` follow-up bite: file the same `perm.*` ask
+            # the sister branch (`permitted()` miss) files, but only for the
+            # ordinary "no grant admits this tool" outcome. Other
+            # `missing_authority` values (`valid_app_id`, `manifest`,
+            # malformed `permissions`/`deny_tools`, `deny_tools:<tool>`) name
+            # conditions no `perm.*` ask could satisfy — the principal is
+            # garbage, the app does not exist, the manifest is broken, or
+            # the operator explicitly denied this tool. The trigger is
+            # `missing_authority == tool_name`, the same predicate
+            # `_check_mcp_tool` uses to distinguish "not granted" from every
+            # other failure mode.
+            note = ""
+            if decision.missing_authority == tool_name:
+                from . import gate_request
+
+                note = gate_request.note_for_perm_denial(effective, tool_name)
+            return None, {"error": f"authority denied: {detail}{note}"}
     elif not permitted(effective, tool_name):
         # Gap `5ecb87cfdf56`, slice 2b PR 2: file the ask, then refuse. Same
         # discipline as the four `lease_denied` sites — the denial is what

@@ -238,3 +238,95 @@ def test_flag_on_uses_authority_check(tmp_path, monkeypatch):
     result = server.store_put(app_id="readonly", collection="c", record={"v": 1})
     assert "authority denied" in result["error"]
     assert "store_put" in result["error"]
+
+
+def test_authority_denied_files_a_perm_ask_and_appends_the_sentence(
+    tmp_path, monkeypatch
+):
+    """Gap `5ecb87cfdf56` follow-up (authority-branch producer): the
+    authority-check path files the same `perm.*` ask its sister branch
+    (`permitted()` miss) files. Trigger is the ordinary "not granted"
+    outcome — `missing_authority == tool_name` — nothing else, since the
+    other failure modes name conditions no ask can satisfy."""
+    from willow_mcp import gates_panel
+    from willow_mcp.db import Store
+
+    monkeypatch.setenv("WILLOW_MCP_AUTHORITY_CHECK", "1")
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
+    apps_root = tmp_path / "mcp_apps"
+    monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(apps_root))
+    app_dir = apps_root / "readonly"
+    app_dir.mkdir(parents=True)
+    (app_dir / "manifest.json").write_text(
+        json.dumps({"permissions": ["store_read"]}))
+
+    effective, err = server._gate("readonly", "store_put")
+    assert effective is None
+    # The original refusal is preserved verbatim above the appended sentence.
+    assert "authority denied" in err["error"]
+    assert "store_put" in err["error"]
+    # And the ask sentence is appended.
+    assert "queued for the operator as request" in err["error"]
+    assert "willow-mcp gates" in err["error"]
+
+    items = gates_panel.open_requests(Store(store_root=str(tmp_path / "store")))
+    assert len(items) == 1
+    assert items[0]["request"]["gate_id"] == "perm.readonly.store_write"
+
+
+def test_authority_denied_files_no_ask_for_missing_manifest(
+    tmp_path, monkeypatch
+):
+    """A principal with no manifest at all names a condition no `perm.*`
+    ask can satisfy — the app does not exist, so nobody is asking for its
+    permission. The denial says why; no queue row backs a claim of
+    'someone asked'."""
+    from willow_mcp import gates_panel
+    from willow_mcp.db import Store
+
+    monkeypatch.setenv("WILLOW_MCP_AUTHORITY_CHECK", "1")
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
+    apps_root = tmp_path / "mcp_apps"
+    monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(apps_root))
+    apps_root.mkdir(parents=True)  # empty — no manifest
+
+    effective, err = server._gate("unknownapp", "store_put")
+    assert effective is None
+    assert "authority denied" in err["error"]
+    assert "queued for the operator" not in err["error"]
+
+    assert gates_panel.open_requests(
+        Store(store_root=str(tmp_path / "store"))) == []
+
+
+def test_authority_denied_files_no_ask_for_explicit_deny_tools(
+    tmp_path, monkeypatch
+):
+    """`deny_tools:<tool>` names a tool the operator explicitly denied. An
+    ask would be a request to un-deny — but the operator's ordinary path
+    for that is to edit `deny_tools`, not press a `perm.*` row. Filing an
+    ask here would teach the queue to render presses that do nothing."""
+    from willow_mcp import gates_panel
+    from willow_mcp.db import Store
+
+    monkeypatch.setenv("WILLOW_MCP_AUTHORITY_CHECK", "1")
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
+    apps_root = tmp_path / "mcp_apps"
+    monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(apps_root))
+    app_dir = apps_root / "readonly"
+    app_dir.mkdir(parents=True)
+    (app_dir / "manifest.json").write_text(json.dumps({
+        "permissions": ["full_access"],
+        "deny_tools": ["store_put"],
+    }))
+
+    effective, err = server._gate("readonly", "store_put")
+    assert effective is None
+    assert "authority denied" in err["error"]
+    assert "queued for the operator" not in err["error"]
+
+    assert gates_panel.open_requests(
+        Store(store_root=str(tmp_path / "store"))) == []
