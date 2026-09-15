@@ -286,7 +286,8 @@ def publish_via_trust_owner(
 
     with tempfile.TemporaryDirectory(prefix="willow-publish-") as raw_dir:
         stage_dir = Path(raw_dir)
-        os.chmod(stage_dir, 0o755)
+        # Traverse-only for other uids: sudo passes explicit paths; listing denied.
+        os.chmod(stage_dir, 0o711)
         staged_manifest = stage_dir / "manifest.json"
         staged_sig = pgp.detached_sig_path(staged_manifest)
         staged_public_key = stage_dir / "operator-public-key.asc"

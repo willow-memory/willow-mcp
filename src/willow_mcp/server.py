@@ -8499,7 +8499,9 @@ def _cmd_set_permission(args, *, granted: bool) -> None:
     it was just denied.
     """
     from . import manifest_admin
+    from .human_session import require_operator_terminal
 
+    require_operator_terminal()
     try:
         manifest = manifest_admin.set_permission(
             args.app_id,
@@ -8731,9 +8733,9 @@ def _cmd_deny_permission(args) -> None:
 def _cmd_publish_permission(args) -> None:
     """Internal trust-owner half of a pre-signed permission update."""
     from . import manifest_admin
-    from .human_session import require_operator_terminal
+    from .human_session import require_trust_owner_publication_terminal
 
-    require_operator_terminal()
+    require_trust_owner_publication_terminal()
     try:
         manifest_admin.publish_staged_permission(
             apps_root=Path(args.apps_root),

@@ -296,6 +296,97 @@ def test_publish_signed_pair_rolls_back_both_bytes_on_second_rename_failure(
     assert sig.read_bytes() == b"PRIOR-SIG"
 
 
+def test_publish_via_trust_owner_staging_dir_is_not_world_listable(
+    apps_root, monkeypatch
+):
+    """Pre-sudo staging must not be 0o755; trust owner reaches files by path."""
+    app_dir = apps_root / "app"
+    app_dir.mkdir()
+    path = app_dir / "manifest.json"
+    monkeypatch.setattr(manifest_admin.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        manifest_admin.pwd,
+        "getpwuid",
+        lambda uid: SimpleNamespace(pw_uid=994, pw_name="willow-operator"),
+    )
+    modes: list[int] = []
+    real_chmod = manifest_admin.os.chmod
+
+    def _chmod(p, mode):
+        modes.append(mode)
+        return real_chmod(p, mode)
+
+    monkeypatch.setattr(manifest_admin.os, "chmod", _chmod)
+    monkeypatch.setattr(
+        manifest_admin.subprocess,
+        "run",
+        lambda argv, check: SimpleNamespace(returncode=0),
+    )
+
+    manifest_admin.publish_via_trust_owner(
+        path,
+        b'{"permissions": ["store_read"]}',
+        b"SIGNED",
+        b"PUBLIC-KEY",
+        "B" * 40,
+        "absent",
+        "store_read",
+        True,
+    )
+
+    assert 0o711 in modes
+
+
+def test_cmd_publish_permission_uses_sudo_bridge_terminal_gate(
+    apps_root, monkeypatch, tmp_path
+):
+    """_publish-permission must not call require_operator_terminal on trust uid."""
+    from willow_mcp import human_session, server
+
+    staged_manifest = tmp_path / "manifest.json"
+    staged_sig = manifest_admin.pgp.detached_sig_path(staged_manifest)
+    staged_key = tmp_path / "operator-public-key.asc"
+    staged_manifest.write_bytes(b'{"permissions": ["store_read"]}')
+    staged_sig.write_bytes(b"SIG")
+    staged_key.write_bytes(b"KEY")
+
+    calls: list[str] = []
+
+    def _bridge():
+        calls.append("bridge")
+
+    def _human():
+        calls.append("human")
+        raise PermissionError("would block trust-owner sudo")
+
+    monkeypatch.setattr(
+        human_session, "require_trust_owner_publication_terminal", _bridge
+    )
+    monkeypatch.setattr(human_session, "require_operator_terminal", _human)
+    published = []
+    monkeypatch.setattr(
+        manifest_admin,
+        "publish_staged_permission",
+        lambda **kw: published.append(kw),
+    )
+
+    args = SimpleNamespace(
+        apps_root=str(apps_root),
+        app_id="app",
+        manifest=str(staged_manifest),
+        signature=str(staged_sig),
+        public_key=str(staged_key),
+        fingerprint="C" * 40,
+        previous_digest="absent",
+        permission="store_read",
+        action="grant",
+    )
+    server._cmd_publish_permission(args)
+
+    assert calls == ["bridge"]
+    assert published
+
+
 def test_privilege_bridge_uses_absolute_python_and_explicit_fingerprint(
     apps_root, monkeypatch
 ):

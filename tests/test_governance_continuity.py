@@ -468,6 +468,68 @@ def test_operator_terminal_refused_without_tty(monkeypatch):
         raise AssertionError("mutation allowed without an operator terminal")
 
 
+def _fake_tty_stat(monkeypatch, human_session, tty_owner_uid: int):
+    import os as _os
+    import sys as _sys
+
+    tty = "/dev/pts/7"
+    real_stat = human_session.os.stat
+
+    def _stat(path, *args, **kwargs):
+        if path == tty:
+            return _os.stat_result(
+                (0o620, 0, 0, 0, tty_owner_uid, 0, 0, 0, 0, 0)
+            )
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(human_session.os, "ttyname", lambda _fd: tty)
+    monkeypatch.setattr(human_session.os, "stat", _stat)
+    monkeypatch.setattr(_sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(_sys.stdin, "fileno", lambda: 0)
+
+
+def test_trust_owner_publication_accepts_human_tty_under_sudo(monkeypatch):
+    """After sudo -u trust-owner, getuid() is not the tty owner; SUDO_UID is."""
+    from willow_mcp import human_session
+
+    monkeypatch.delenv("WILLOW_IN_KART", raising=False)
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setattr(human_session.os, "geteuid", lambda: 994)
+    monkeypatch.setattr(human_session.os, "getuid", lambda: 994)
+    _fake_tty_stat(monkeypatch, human_session, 1000)
+    human_session.require_trust_owner_publication_terminal()
+
+
+def test_trust_owner_publication_refuses_tty_owner_mismatch(monkeypatch):
+    from willow_mcp import human_session
+
+    monkeypatch.delenv("WILLOW_IN_KART", raising=False)
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setattr(human_session.os, "geteuid", lambda: 994)
+    _fake_tty_stat(monkeypatch, human_session, 1001)
+    try:
+        human_session.require_trust_owner_publication_terminal()
+    except PermissionError as exc:
+        assert "invoked sudo" in str(exc)
+    else:
+        raise AssertionError("publication allowed with wrong tty owner")
+
+
+def test_operator_terminal_refuses_trust_owner_uid_with_human_tty(monkeypatch):
+    """Regression for Loki publish-sudo-tty-ownership: the old check blocked sudo."""
+    from willow_mcp import human_session
+
+    monkeypatch.delenv("WILLOW_IN_KART", raising=False)
+    monkeypatch.setattr(human_session.os, "getuid", lambda: 994)
+    _fake_tty_stat(monkeypatch, human_session, 1000)
+    try:
+        human_session.require_operator_terminal()
+    except PermissionError as exc:
+        assert "invoking operator" in str(exc)
+    else:
+        raise AssertionError("trust-owner uid passed the human-only gate")
+
+
 # ── §4.2 frank_append / envelope_apply behind the human-orchestrator boundary ─
 
 def test_governance_tools_require_human_orchestrator_for_willow(monkeypatch):
