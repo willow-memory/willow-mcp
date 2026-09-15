@@ -330,6 +330,11 @@ def test_publish_via_trust_owner_staging_dir_is_not_world_listable(
     monkeypatch.setattr(
         manifest_admin, "_uid_can_execute_path", lambda _path, _uid: True
     )
+    monkeypatch.setattr(
+        manifest_admin,
+        "_REAL_SUBPROCESS_RUN",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+    )
 
     manifest_admin.publish_via_trust_owner(
         path,
@@ -421,6 +426,11 @@ def test_privilege_bridge_uses_absolute_python_and_explicit_fingerprint(
     monkeypatch.setattr(
         manifest_admin, "_uid_can_execute_path", lambda _path, _uid: True
     )
+    monkeypatch.setattr(
+        manifest_admin,
+        "_REAL_SUBPROCESS_RUN",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+    )
 
     manifest_admin.publish_via_trust_owner(
         path,
@@ -509,12 +519,18 @@ def test_publish_via_trust_owner_uses_venv_symlink_not_resolved_base(
         return real_run(argv, check=check, **kwargs)
 
     monkeypatch.setattr(manifest_admin.subprocess, "run", _run)
-    monkeypatch.setattr(manifest_admin, "_require_python_imports_willow_mcp", lambda _p: None)
     monkeypatch.setattr(
         manifest_admin,
         "_uid_can_execute_path",
         lambda _path, _uid: True,
     )
+    import_runs: list[list[str]] = []
+
+    def _probe(argv, **kwargs):
+        import_runs.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(manifest_admin, "_REAL_SUBPROCESS_RUN", _probe)
 
     manifest_admin.publish_via_trust_owner(
         path,
@@ -527,9 +543,78 @@ def test_publish_via_trust_owner_uses_venv_symlink_not_resolved_base(
         True,
     )
 
-    sudo_cmd = calls[0]
+    sudo_cmd = next(c for c in calls if "_publish-permission" in c)
     assert sudo_cmd[4] == os.path.abspath(str(venv_python))
     assert sudo_cmd[4] != str(real)
+    assert import_runs[0][:4] == ["sudo", "-u", "willow-operator", "--"]
+    assert import_runs[0][4] == os.path.abspath(str(venv_python))
+    assert import_runs[0][5:] == ["-c", "import willow_mcp"]
+
+
+def test_trust_owner_import_preflight_runs_as_trust_owner(monkeypatch, tmp_path):
+    python = tmp_path / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+    os.chmod(python, 0o755)
+
+    runs: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        runs.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(manifest_admin, "_REAL_SUBPROCESS_RUN", fake_run)
+
+    manifest_admin._require_trust_owner_can_import_willow_mcp(python, "willow-operator")
+    assert runs[0][:4] == ["sudo", "-u", "willow-operator", "--"]
+    assert runs[0][4] == str(python)
+    assert runs[0][5:] == ["-c", "import willow_mcp"]
+
+
+def test_trust_owner_import_preflight_refuses_when_trust_owner_cannot_import(
+    monkeypatch, tmp_path,
+):
+    python = tmp_path / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    os.chmod(python, 0o755)
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stdout=b"",
+            stderr=b"ModuleNotFoundError: No module named 'willow_mcp'",
+        )
+
+    monkeypatch.setattr(manifest_admin, "_REAL_SUBPROCESS_RUN", fake_run)
+
+    with pytest.raises(RuntimeError, match="trust owner .* cannot import willow_mcp"):
+        manifest_admin._require_trust_owner_can_import_willow_mcp(python, "willow-operator")
+
+
+def test_human_importable_venv_does_not_skip_trust_owner_preflight(monkeypatch, tmp_path):
+    """Human-process import success must not satisfy the preflight."""
+    real = Path(sys.executable).resolve()
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(real)
+    entry = Path(os.path.abspath(str(venv_python)))
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[0] == "sudo":
+            return SimpleNamespace(returncode=1, stdout=b"", stderr=b"trust-owner miss")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(manifest_admin, "_REAL_SUBPROCESS_RUN", fake_run)
+
+    with pytest.raises(RuntimeError, match="trust owner .* cannot import"):
+        manifest_admin._require_trust_owner_can_import_willow_mcp(entry, "willow-operator")
+
+    assert calls[0][0] == "sudo"
+    assert calls[0][4] == str(entry)
 
 
 def test_publish_via_trust_owner_refuses_when_trust_owner_cannot_execute(

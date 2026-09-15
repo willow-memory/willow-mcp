@@ -207,9 +207,42 @@ def _require_trust_owner_can_invoke_python(python: Path, owner_uid: int) -> None
         )
 
 
-def _require_python_imports_willow_mcp(python: Path) -> None:
+def _require_trust_owner_can_import_willow_mcp(python: Path, trust_owner: str) -> None:
+    """Prove the trust-owner sudo launch can import ``willow_mcp``.
+
+    Runs the same ``sudo -u <owner> -- <python> -c ...`` shape as publication.
+    A probe as the invoking human can succeed while the trust owner cannot —
+    that is the live failure class this closes.
+    """
+    if not python.is_absolute():
+        raise RuntimeError(
+            "permission change refused before mutation: CLI python "
+            f"{python} must be an absolute path"
+        )
+    try:
+        st = python.lstat()
+    except OSError as exc:
+        raise RuntimeError(
+            "permission change refused before mutation: CLI python "
+            f"{python} is not reachable ({exc})"
+        ) from exc
+    if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+        raise RuntimeError(
+            "permission change refused before mutation: CLI python "
+            f"{python} is not a regular file or symlink"
+        )
+
+    command = [
+        "sudo",
+        "-u",
+        trust_owner,
+        "--",
+        str(python),
+        "-c",
+        "import willow_mcp",
+    ]
     probe = _REAL_SUBPROCESS_RUN(
-        [str(python), "-c", "import willow_mcp"],
+        command,
         check=False,
         capture_output=True,
         timeout=60,
@@ -218,7 +251,8 @@ def _require_python_imports_willow_mcp(python: Path) -> None:
         detail = (probe.stderr or probe.stdout or b"").decode("utf-8", "replace").strip()
         raise RuntimeError(
             "permission change refused before mutation: "
-            f"{python} cannot import willow_mcp ({detail or 'nonzero exit'})"
+            f"trust owner {trust_owner!r} via {python} cannot import willow_mcp "
+            f"({detail or 'nonzero exit'})"
         )
 
 
@@ -387,8 +421,8 @@ def publish_via_trust_owner(
         os.chmod(staged_public_key, 0o644)
 
         python = _cli_python_for_trust_owner()
-        _require_python_imports_willow_mcp(python)
         _require_trust_owner_can_invoke_python(python, owner_info.pw_uid)
+        _require_trust_owner_can_import_willow_mcp(python, owner_info.pw_name)
 
         command = [
             "sudo",
