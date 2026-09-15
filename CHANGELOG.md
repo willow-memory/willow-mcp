@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.45.1](https://github.com/willow-memory/willow-mcp/compare/v2.45.0...v2.45.1) (2026-09-15)
+
+
+### Fixed
+
+* **seal-daemon:** SIGTERM cannot be outrun by the run-loop wait ([386a3cd](https://github.com/willow-memory/willow-mcp/commit/386a3cdff403440f728226ab327df43f743be37a))
+
 ## [2.45.0](https://github.com/willow-memory/willow-mcp/compare/v2.44.1...v2.45.0) (2026-09-15)
 
 
