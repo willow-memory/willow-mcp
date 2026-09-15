@@ -180,3 +180,14 @@ def mint_installation_token(repo: str) -> dict[str, Any]:
 def contents_perm_allows_push(permissions: dict | None) -> bool:
     level = (permissions or {}).get("contents") or ""
     return level in ("write", "admin")
+
+
+def workflows_perm_allows_write(permissions: dict | None) -> bool:
+    """The App's ``workflows`` permission gates changes under
+    ``.github/workflows/**``: even with ``contents: write``, a push whose
+    commit range modifies a workflow file is rejected by GitHub when the
+    App does not carry ``workflows: write``. Gap ``3f24d2d4a243`` — the
+    broker preflights this so the envelope is not consumed on a request
+    GitHub will refuse."""
+    level = (permissions or {}).get("workflows") or ""
+    return level in ("write", "admin")

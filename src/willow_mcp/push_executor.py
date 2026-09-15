@@ -99,6 +99,99 @@ def _push_argv_for_app_token(
     return args
 
 
+_WORKFLOW_PREFIX = ".github/workflows/"
+
+
+def _outgoing_files(
+    checkout: Path,
+    *,
+    preflight: dict,
+    remote: str,
+    head_ref: str,
+    runner: Optional[Callable] = None,
+) -> tuple[list[str], str | None]:
+    """List the files the outgoing push would carry to the remote.
+
+    Uses the ancestry-preflight result to decide the range: when
+    ``preflight`` reports a live ``base_sha`` we compare
+    ``base_sha..head`` (only the commits the remote does not already
+    have); when the preflight was ``skipped`` we cannot bound the range
+    that way and return an empty list — a caller reading an empty list
+    together with ``skipped`` learns "we could not tell", not "no
+    workflow files changed".
+    """
+    base_sha = (preflight or {}).get("base_sha") or ""
+    state = (preflight or {}).get("state") or ""
+    if state == "skipped" or not base_sha:
+        return [], "preflight_skipped"
+    proc = _git(checkout, "diff", "--name-only", f"{base_sha}..refs/heads/{head_ref}",
+                runner=runner)
+    if proc.returncode != 0:
+        return [], (proc.stderr or proc.stdout or "").strip()[-300:] or "git diff failed"
+    return [line for line in (proc.stdout or "").splitlines() if line.strip()], None
+
+
+def _preflight_workflow_paths(
+    checkout: Path,
+    *,
+    preflight: dict,
+    remote: str,
+    head_ref: str,
+    repo: str,
+    runner: Optional[Callable] = None,
+) -> dict:
+    """Detect ``.github/workflows/**`` in the outgoing commit range and, if
+    present, check the App's ``workflows`` permission. Gap 3f24d2d4a243.
+
+    Returns:
+    - ``{"ok": True, "state": "unaffected", "files": []}`` when the range
+      touches no workflow file — the push proceeds without a workflows
+      permission check.
+    - ``{"ok": True, "state": "permitted", "files": [...], "permission": "write"}``
+      when the range touches workflows AND the App carries the scope.
+    - ``{"ok": False, "errno": "EWORKFLOW", "state": "denied", "files":
+      [...], "permission": <level>}`` when workflows are touched and the
+      App does not carry ``workflows: write``.
+    - ``{"ok": True, "state": "unknown", "reason": "..."}`` when the range
+      could not be determined (preflight was skipped, git diff failed).
+      The push proceeds — a workflow rejection would then land as EPUSH
+      after action, which is the existing behaviour.
+    """
+    from . import github_app_credentials as gac
+
+    files, reason = _outgoing_files(checkout, preflight=preflight, remote=remote,
+                                     head_ref=head_ref, runner=runner)
+    if reason and not files:
+        return {"ok": True, "state": "unknown", "reason": reason, "files": []}
+    workflow_files = [f for f in files if f.startswith(_WORKFLOW_PREFIX)]
+    if not workflow_files:
+        return {"ok": True, "state": "unaffected", "files": []}
+    auth = gac.mint_installation_token(repo)
+    if not auth.get("ok"):
+        # Cannot check the scope. Do not refuse on that alone — an EAUTH
+        # will fire below the preflight anyway with a clearer message. Say
+        # what we saw and let the auth check own the refusal.
+        return {"ok": True, "state": "unknown",
+                "reason": f"could not mint an installation token to check workflows scope: "
+                          f"{auth.get('reason', '')[:200]}",
+                "files": workflow_files}
+    permissions = auth.get("permissions") or {}
+    if gac.workflows_perm_allows_write(permissions):
+        return {"ok": True, "state": "permitted", "files": workflow_files,
+                "permission": permissions.get("workflows")}
+    level = permissions.get("workflows") or "absent"
+    return {
+        "ok": False, "errno": "EWORKFLOW", "state": "denied",
+        "reason": (f"outgoing range touches {len(workflow_files)} workflow file(s) "
+                   f"({', '.join(workflow_files[:3])}"
+                   f"{'…' if len(workflow_files) > 3 else ''}) but the App's "
+                   f"`workflows` permission is {level!r}. In GitHub App settings → "
+                   f"Permissions → Repository → Workflows → Read and write, then "
+                   f"re-install / accept the permission request on each org."),
+        "files": workflow_files, "permission": level,
+    }
+
+
 def _repo_matches_remote(remote_url: str, repo: str) -> bool:
     """``org/name`` against the tail of an https or ssh remote URL.
 
@@ -248,6 +341,27 @@ def execute_push(
             preflight=preflight,
         )
 
+    # Workflow-path preflight (gap 3f24d2d4a243). A push whose outgoing
+    # commit range touches `.github/workflows/**` is rejected by GitHub
+    # unless the App carries `workflows: write` — the incident that
+    # motivated this: the reconciled commit on PR #530 touched
+    # `.github/workflows/tests.yml`, `git_push_execute` consumed its
+    # one-use envelope, and only then did GitHub answer "workflow
+    # scope missing". We now detect the workflow files in the range
+    # BEFORE citation and mint the App token (idempotent, no grant
+    # consumed) to check the permission; a missing scope refuses
+    # `EWORKFLOW` before the envelope is consulted.
+    workflow_check = _preflight_workflow_paths(
+        Path(facts["path"]), preflight=preflight, remote=remote,
+        head_ref=branch, repo=repo, runner=runner,
+    )
+    if not workflow_check.get("ok"):
+        return _refuse(
+            workflow_check.get("errno", "EWORKFLOW"),
+            workflow_check.get("reason", "workflow-path preflight refused"),
+            preflight=preflight, workflow=workflow_check,
+        )
+
     call_args = {"repo": repo, "branches": [branch], "remote": remote, "force": force}
 
     # Resolve which grant to charge — the same discipline as
@@ -351,4 +465,5 @@ def execute_push(
         "force": force, "sha": sha, "envelope_id": matches[0], "auth_mode": auth_mode,
         "citation_id": result.get("citation_id"), "git": tail,
         "checkout": facts["path"], "preflight": preflight,
+        "workflow": workflow_check,
     }
