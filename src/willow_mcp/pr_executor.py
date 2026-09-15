@@ -101,6 +101,7 @@ def execute_pr_open(
     project: str,
     session: str = "",
     task_id: str = "",
+    enforce_template: bool = True,
     ledger=None,
     store=None,
     api: Optional[Callable] = None,
@@ -229,6 +230,26 @@ def execute_pr_open(
             envelope_id=matches[0], preflight=preflight,
         )
 
+    # PR template shape preflight (gap 378c2e57c3d0). The API path does not
+    # apply the repo's ``pull_request_template.md`` to the body field the way
+    # the web UI does, so a bot-opened PR ships an empty body and the first
+    # thing the operator sees is "please fill this in". Enforce the template
+    # BEFORE citation: a body missing required sections refuses ``EBODY``
+    # and the one-use grant is not spent on a shape the reviewer will
+    # bounce anyway. Absent template = no shape to enforce; proceed.
+    from . import pr_template as _tpl
+
+    template_check: dict = {"state": "not_enforced"}
+    if enforce_template:
+        template_check = _tpl.preflight(call, repo=repo, body=body or "",
+                                        bearer=auth["token"], api_base=_API)
+        if not template_check.get("ok"):
+            return _refuse(
+                template_check.get("errno", "EBODY"),
+                template_check.get("reason", "PR body does not satisfy the repo template"),
+                envelope_id=matches[0], preflight=preflight, template=template_check,
+            )
+
     # All preflights passed. Atomic cite: bounds may have changed since the
     # cheap check (a racing caller could exhaust the max_count between now
     # and here), so re-check and cite in one indivisible step.
@@ -264,7 +285,7 @@ def execute_pr_open(
         "envelope_id": matches[0], "auth_mode": "app",
         "citation_id": result.get("citation_id"), "status": resp.get("status"),
         "operator": _put_in_front_of_the_operator(call, repo, number, auth["token"]),
-        "preflight": preflight,
+        "preflight": preflight, "template": template_check,
     }
 
 

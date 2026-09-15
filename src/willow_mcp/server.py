@@ -4461,6 +4461,7 @@ def pr_open_execute(
     envelope_id: str = "",
     project: str = "",
     task_id: str = "",
+    enforce_template: bool = True,
 ) -> dict:
     """Open a pull request `head` -> `base` on `repo` (`org/name`), performed
     by THIS process as willows-bot under the `pr.open` envelope that governs
@@ -4491,6 +4492,7 @@ def pr_open_execute(
             project=project or repo,
             session=_current_orchestrator_session(),
             task_id=task_id,
+            enforce_template=enforce_template,
             ledger=GovernanceLedger(pg),
         )
     except Exception as exc:
