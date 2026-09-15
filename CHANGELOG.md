@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **hooks:** the willow seat does not use Shell — every Bash refused with the door named ([357b429](https://github.com/willow-memory/willow-mcp/commit/357b429e4f41bb0d9e4215cb51dee8a760394ab1))
 * **hooks:** the willow seat does not use Shell — every Bash refused with the door named ([7b6dc7d](https://github.com/willow-memory/willow-mcp/commit/7b6dc7d004e39ff3d2a8a95306e0447227e0c335))
 
 ## [2.43.0](https://github.com/willow-memory/willow-mcp/compare/v2.42.0...v2.43.0) (2026-09-15)
