@@ -23,6 +23,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -208,10 +209,36 @@ def run_seal_watch_forever(
             logger.error("seal watch: poll failed", exc_info=True)
             if on_status:
                 on_status(f"seal watch error: {exc}")
-        stop.wait(poll_interval)
+        # Gap 1673bc4bd9a4: the loop must notice a SIGTERM-set stop within
+        # bounded wall-clock, not the full ``poll_interval``. A single
+        # ``stop.wait(poll_interval)`` was observed on 3.11 CI to keep the
+        # process alive past the test's 5s SIGTERM deadline — the signal
+        # handler ran and set the event but the wait did not fall through
+        # promptly. Two guards close the gap:
+        #
+        # 1. an explicit ``stop.is_set()`` check between poll and wait, so a
+        #    stop set DURING poll exits without entering wait at all;
+        # 2. the wait is sliced into short chunks (``_WAIT_SLICE_S``) and
+        #    re-checks stop after each, so a wait-in-progress cannot outrun
+        #    the flag by more than one slice.
+        #
+        # ``poll_interval < _WAIT_SLICE_S`` (e.g. the test's 0.1s vs 0.05s
+        # slice) still works — the min() below shrinks the slice to fit.
+        if stop.is_set():
+            break
+        deadline = time.monotonic() + poll_interval
+        while not stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if stop.wait(min(remaining, _WAIT_SLICE_S)):
+                break
 
     if on_status:
         on_status("stopped")
+
+
+_WAIT_SLICE_S = 0.05
 
 
 def main(argv: Optional[list] = None) -> None:
