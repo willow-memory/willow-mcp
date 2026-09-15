@@ -31,6 +31,26 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.45.0](https://github.com/willow-memory/willow-mcp/compare/v2.44.1...v2.45.0) (2026-09-15)
+
+
+### Added
+
+* **broker:** pr_open_execute enforces the repo PR template ([6fc3993](https://github.com/willow-memory/willow-mcp/commit/6fc3993781e28cfcb79aa30765abe40c411f38d9))
+* **broker:** pr_open_execute enforces the repo PR template ([27b2f41](https://github.com/willow-memory/willow-mcp/commit/27b2f41fe4588d731b6ed846fb249c9ef91e291b))
+* **broker:** pr_open_execute preflights the remote base via compare API ([4436984](https://github.com/willow-memory/willow-mcp/commit/4436984c31faf9e3b8be16f3d474583d3fa1d38f))
+* **broker:** pr_open_execute preflights the remote base via compare API ([479515d](https://github.com/willow-memory/willow-mcp/commit/479515d9e5272223d23374bc3d13521204945f24))
+* **broker:** remote-base ancestry preflight refuses stale before envelope citation ([41b9f09](https://github.com/willow-memory/willow-mcp/commit/41b9f092e8038897c98765f1233bf49a6d9470ab))
+* **broker:** remote-base ancestry preflight refuses stale before envelope citation ([a9c595d](https://github.com/willow-memory/willow-mcp/commit/a9c595dc9396a30932d791a7679b0127b1cbf921))
+* **broker:** workflow-path preflight refuses EWORKFLOW before envelope citation ([d56ed4c](https://github.com/willow-memory/willow-mcp/commit/d56ed4c4ca3aecc73b63fc89388c4d2964378333))
+* **broker:** workflow-path preflight refuses EWORKFLOW before envelope citation ([573e664](https://github.com/willow-memory/willow-mcp/commit/573e6648edcf07f58658bf6259f5f13c6419e7c1))
+
+
+### Fixed
+
+* **broker:** drop the extraneous f-prefix on a placeholderless string ([4b6c447](https://github.com/willow-memory/willow-mcp/commit/4b6c4470cb51e920c70dfc91f1e9038b4c207f24))
+* move subprocess alias below imports in manifest_admin ([86bc9c8](https://github.com/willow-memory/willow-mcp/commit/86bc9c8ea976414728e2c1d9d4bd7752006b340c))
+
 ## [2.44.1](https://github.com/willow-memory/willow-mcp/compare/v2.44.0...v2.44.1) (2026-09-15)
 
 
