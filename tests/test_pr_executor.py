@@ -274,6 +274,73 @@ def test_github_refusal_is_epr_with_the_status(home, tmp_path, monkeypatch):
     assert out["citation_id"]
 
 
+# ── the PR lands on the operator's list ──────────────────────────────────────
+#
+# github.com/pulls and the mobile app list what you created / are assigned /
+# are mentioned in / were asked to review. The bot created it, so a bot PR was
+# on none of those lists (operator, 2026-09-14). The broker asks for the
+# operator's review and assigns it to them, from a login in the seat env.
+
+
+class _ApiWithFollowups(_FakeApi):
+    def __init__(self, *, review_ok=True, assign_ok=True):
+        super().__init__()
+        self.review_ok, self.assign_ok = review_ok, assign_ok
+
+    def __call__(self, method, url, *, bearer, body=None):
+        if url.endswith("/requested_reviewers"):
+            self.calls.append({"method": method, "url": url, "bearer": bearer, "body": body})
+            return {"ok": True, "status": 201, "body": {}} if self.review_ok else \
+                {"ok": False, "status": 422, "reason": "Review cannot be requested from pull request author."}
+        if url.endswith("/assignees"):
+            self.calls.append({"method": method, "url": url, "bearer": bearer, "body": body})
+            return {"ok": True, "status": 201, "body": {}} if self.assign_ok else \
+                {"ok": False, "status": 403, "reason": "Resource not accessible by integration"}
+        return super().__call__(method, url, bearer=bearer, body=body)
+
+
+def test_the_operator_is_asked_to_review_and_assigned(home, tmp_path, monkeypatch):
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    monkeypatch.setenv("WILLOW_OPERATOR_GITHUB_LOGIN", "the-operator")
+    api = _ApiWithFollowups()
+    out = _open(_FakeGovernancePg(), api)
+    assert out["ok"]
+    assert out["operator"] == {"login": "the-operator", "review_requested": True, "assigned": True}
+    urls = [c["url"] for c in api.calls]
+    assert urls == [
+        "https://api.github.com/repos/forge-play/Forge/pulls",
+        "https://api.github.com/repos/forge-play/Forge/pulls/31/requested_reviewers",
+        "https://api.github.com/repos/forge-play/Forge/issues/31/assignees",
+    ]
+    assert api.calls[1]["body"] == {"reviewers": ["the-operator"]}
+    assert api.calls[2]["body"] == {"assignees": ["the-operator"]}
+    assert all(c["bearer"] == "ghs_test_token" for c in api.calls)
+
+
+def test_no_login_configured_is_said_not_pretended(home, tmp_path, monkeypatch):
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    monkeypatch.delenv("WILLOW_OPERATOR_GITHUB_LOGIN", raising=False)
+    api = _ApiWithFollowups()
+    out = _open(_FakeGovernancePg(), api)
+    assert out["ok"] and out["operator"]["login"] is None
+    assert out["operator"]["review_requested"] is False and out["operator"]["assigned"] is False
+    assert "WILLOW_OPERATOR_GITHUB_LOGIN" in out["operator"]["detail"]
+    assert len(api.calls) == 1, "no follow-up calls without a login"
+
+
+def test_a_refused_followup_does_not_unopen_the_pr(home, tmp_path, monkeypatch):
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    monkeypatch.setenv("WILLOW_OPERATOR_GITHUB_LOGIN", "the-operator")
+    api = _ApiWithFollowups(review_ok=False, assign_ok=True)
+    out = _open(_FakeGovernancePg(), api)
+    assert out["ok"] and out["opened"] and out["number"] == 31
+    assert out["operator"]["review_requested"] is False and "422" in out["operator"]["review_error"]
+    assert out["operator"]["assigned"] is True
+
+
 # ── the tool is wired the way git_push_execute is ────────────────────────────
 
 def test_pr_open_execute_is_gated_as_envelope_apply_by_name():

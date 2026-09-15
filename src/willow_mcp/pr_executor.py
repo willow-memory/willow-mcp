@@ -32,6 +32,7 @@ What this module does, in order, and nothing else:
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Optional
 
 VERB = "pr.open"
@@ -204,9 +205,49 @@ def execute_pr_open(
                 "envelope_id": matches[0], "citation_id": result.get("citation_id"),
                 "auth_mode": "app"}
     pr = resp.get("body") or {}
+    number = pr.get("number")
     return {
         "ok": True, "opened": True, "repo": repo, "head": head, "base": base,
-        "number": pr.get("number"), "url": pr.get("html_url"), "draft": bool(draft),
+        "number": number, "url": pr.get("html_url"), "draft": bool(draft),
         "envelope_id": matches[0], "auth_mode": "app",
         "citation_id": result.get("citation_id"), "status": resp.get("status"),
+        "operator": _put_in_front_of_the_operator(call, repo, number, auth["token"]),
     }
+
+
+OPERATOR_LOGIN_ENV = "WILLOW_OPERATOR_GITHUB_LOGIN"
+
+
+def operator_login() -> str:
+    return (os.environ.get(OPERATOR_LOGIN_ENV) or "").strip()
+
+
+def _put_in_front_of_the_operator(call: Callable, repo: str, number, token: str) -> dict:
+    """A PR the bot authored is on nobody's list: github.com/pulls and the
+    mobile app show what you created, are assigned, are mentioned in, or
+    were asked to review — and the bot created it. Request the operator's
+    review and assign it to them, so it lands in "Review requests" and
+    "Assigned" with the notification the "Created" path never gave.
+
+    Never fatal: the PR is open either way, and the receipt says which
+    half landed. Honest absence when no login is configured — the operator
+    is named in the seat env, never in this file."""
+    login = operator_login()
+    if not login:
+        return {"login": None, "review_requested": False, "assigned": False,
+                "detail": f"none configured ({OPERATOR_LOGIN_ENV} unset)"}
+    if not number:
+        return {"login": login, "review_requested": False, "assigned": False,
+                "detail": "no PR number in GitHub's response"}
+    out: dict = {"login": login}
+    review = call("POST", f"{_API}/repos/{repo}/pulls/{number}/requested_reviewers",
+                  bearer=token, body={"reviewers": [login]})
+    out["review_requested"] = bool(review.get("ok"))
+    if not review.get("ok"):
+        out["review_error"] = f"HTTP {review.get('status')}: {str(review.get('reason', ''))[:200]}"
+    assign = call("POST", f"{_API}/repos/{repo}/issues/{number}/assignees",
+                  bearer=token, body={"assignees": [login]})
+    out["assigned"] = bool(assign.get("ok"))
+    if not assign.get("ok"):
+        out["assign_error"] = f"HTTP {assign.get('status')}: {str(assign.get('reason', ''))[:200]}"
+    return out
