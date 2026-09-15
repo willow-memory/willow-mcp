@@ -54,17 +54,51 @@ slice's envelope.
 
 ## Slice 2: the explicit ask
 
-Today the ask is a side effect of a refusal (`gate_request`'s rule: the
-denial is the ask). Slice 2 lets an agent that knows it will need a push,
-egress, or a permission group file the request up front, so the operator
-sees it while the task is still queued. Shape from the superseded commit
-db50715: `file_request(store, app_id, gate_id, reason, task_id, ttl)`. It
-also adds the producer call at the permission-denial site so `perm.*`
-requests have an asker, and either serves or drops the `gate_request` tool
-name the willow manifest still lists.
+**Landed (2026-09-15, gap `5ecb87cfdf56`, denial-site half).** The producer
+side is done. `gate_request`'s denial-is-the-ask rule holds; the missing
+step was that the denial sites did not call the producer. They do now:
+`willow_bot`-style `_file_ask` calls run in `push_executor`, `pr_executor`,
+`web_egress`, `federation_egress`, and `integrations` — every refusal
+with an `_ASKABLE` errno (ENOENT, EAMBIG, EEXPIRED, EDQUOT, ENOGRANTS)
+enqueues a `human_required` row naming the repo, the branch, the exact
+bounds an envelope would need, and the actor. The operator sees the ask
+while the work is still waiting. This is `gate_request`'s "wrong-shape
+tool" alternative from the module docstring: the producer is the
+denial site, not an agent-facing MCP tool.
 
-A `push.` requestable prefix in `gates_panel` so the panel renders these
-rows with the ratify-an-envelope action belongs here too.
+**Wrong-shape tool name is not being re-adopted.** The design once
+imagined an `agent_request_gate` MCP tool. `gate_request.py`'s docstring
+explains why it is the wrong shape (a tool whose whole purpose is to put
+a row in front of a tired operator is one `full_access` typo away from a
+phishing surface, which is why `PERM_NEVER_REQUESTABLE` exists). No
+manifest under `src/willow_mcp/bundle/` declares such a tool. If an
+operator's per-installation `$WILLOW_HOME/mcp_apps/<app_id>/manifest.json`
+still lists one from an older manifest, that is per-installation
+cleanup: remove the entry, the server was never going to serve it.
+
+**Still open under gap `5ecb87cfdf56`** — slice 2 is not closed by the
+denial-site half alone:
+
+- **Upfront `file_request` API.** The producer today only fires as a
+  side effect of a refusal. Slice 2's original shape is
+  `file_request(store, app_id, gate_id, reason, task_id, ttl)` — a way
+  for an agent that knows in advance it will need a push, an egress, or
+  a permission group to put the ask in front of the operator BEFORE it
+  hits the denial site. Not yet built.
+- **Producer at `perm.*` denial sites.** Every non-envelope permission
+  refusal (the manifest ACL denies a tool, a permission group is
+  missing) still exits with no row filed. Add the producer at
+  `gate.check_permission` and its callers.
+- **`push.` requestable prefix in `gates_panel`.** The panel already
+  knows how to render `perm.*` and `net.*` request rows; a `push.*`
+  prefix so the ratify-an-envelope action is one click from the
+  request belongs here.
+
+## Slice 2b: closing the gap
+
+The gap closes when the three bullets above land (or an operator
+explicitly defers them with a written note). This doc reconciliation is
+not itself the close.
 
 ## Slice 3: the credential
 
