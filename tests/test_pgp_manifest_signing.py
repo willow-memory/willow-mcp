@@ -74,6 +74,27 @@ def test_signed_manifest_verifies_and_is_trusted(home, pgp_env):
     assert gate.permitted("kart", "store_get") is True
 
 
+def test_exported_public_key_verifies_without_signers_gpg_home(
+    home, pgp_env, gpg_keypair, monkeypatch
+):
+    """The trust-owner sudo process has a different HOME/keyring.  A staged
+    public key is sufficient for isolated verification and carries no signing
+    authority."""
+    path = _write_manifest(home, "kart")
+    ok, detail = pgp.sign_detached(path)
+    assert ok, detail
+    public_key, detail = pgp.export_public_key(gpg_keypair["fingerprint"])
+    assert public_key, detail
+
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    ok, detail = pgp.verify_detached(
+        path,
+        fingerprint=gpg_keypair["fingerprint"],
+        public_key=public_key,
+    )
+    assert ok, detail
+
+
 def test_unsigned_manifest_is_denied_once_pgp_enabled(home, pgp_env):
     _write_manifest(home, "kart")
     assert gate.authorized("kart") is False

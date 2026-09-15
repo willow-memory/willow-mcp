@@ -1,6 +1,8 @@
 """Tests for manifest_admin.py — the local-CLI-only permission toggle backing
 `willow-mcp allow-permission` / `deny-permission`."""
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,10 +42,20 @@ def test_set_permission_resigns_when_pgp_enforced(apps_root, monkeypatch):
     manifest is denied everywhere — so the edit path must re-sign, or the
     operator's own supported command silently revokes the app's whole gate."""
     signed: list = []
-    monkeypatch.setattr(manifest_admin.pgp, "pgp_enabled", lambda: True)
     monkeypatch.setattr(
-        manifest_admin.pgp, "sign_detached",
-        lambda p: (signed.append(p) or (True, str(p) + ".sig")),
+        manifest_admin.pgp, "expected_fingerprint", lambda: "A" * 40
+    )
+    monkeypatch.setattr(
+        manifest_admin.pgp, "verify_detached", lambda *a, **kw: (True, "ok")
+    )
+
+    def _sign(path):
+        manifest_admin.pgp.detached_sig_path(path).write_bytes(b"SIGNED")
+        signed.append(path)
+        return True, str(path) + ".sig"
+
+    monkeypatch.setattr(
+        manifest_admin.pgp, "sign_detached", _sign,
     )
     manifest_admin.set_permission("app", "store_read", True)
     assert [p.name for p in signed] == ["manifest.json"]
@@ -62,13 +74,18 @@ def test_set_permission_rolls_back_when_resigning_fails(apps_root, monkeypatch):
     before_sig = sig.read_bytes()
 
     def _failing_sign(p):
-        # Simulate gpg --yes -o clobbering the prior .sig before failing.
+        # Signing happens in staging, before the protected pair is touched.
         (p.parent / f"{p.name}.sig").write_bytes(b"PARTIAL")
         return False, "gpg not found on PATH"
 
-    monkeypatch.setattr(manifest_admin.pgp, "pgp_enabled", lambda: True)
+    monkeypatch.setattr(
+        manifest_admin.pgp, "expected_fingerprint", lambda: "A" * 40
+    )
+    monkeypatch.setattr(
+        manifest_admin.pgp, "verify_detached", lambda *a, **kw: (True, "ok")
+    )
     monkeypatch.setattr(manifest_admin.pgp, "sign_detached", _failing_sign)
-    with pytest.raises(RuntimeError, match="rolled back"):
+    with pytest.raises(RuntimeError, match="refused before mutation"):
         manifest_admin.set_permission("app", "task_net", True)
 
     assert path.read_text() == before
@@ -79,14 +96,16 @@ def test_set_permission_rollback_removes_a_manifest_it_created(apps_root, monkey
     """First-permission case: there is no previous content to restore, so the
     file the failed call materialized must be removed, not left unsigned —
     including any partial `.sig` gpg may have written."""
-    monkeypatch.setattr(manifest_admin.pgp, "pgp_enabled", lambda: True)
+    monkeypatch.setattr(
+        manifest_admin.pgp, "expected_fingerprint", lambda: "A" * 40
+    )
 
     def _failing_sign(p):
         (p.parent / f"{p.name}.sig").write_bytes(b"PARTIAL")
         return False, "gpg-agent unreachable"
 
     monkeypatch.setattr(manifest_admin.pgp, "sign_detached", _failing_sign)
-    with pytest.raises(RuntimeError, match="rolled back"):
+    with pytest.raises(RuntimeError, match="refused before mutation"):
         manifest_admin.set_permission("fresh", "store_read", True)
 
     assert not (apps_root / "fresh" / "manifest.json").exists()
@@ -140,7 +159,9 @@ def test_set_permission_is_idempotent_under_pgp_enforcement(apps_root, monkeypat
     before = path.read_text()
 
     calls: list = []
-    monkeypatch.setattr(manifest_admin.pgp, "pgp_enabled", lambda: True)
+    monkeypatch.setattr(
+        manifest_admin.pgp, "expected_fingerprint", lambda: "A" * 40
+    )
     monkeypatch.setattr(
         manifest_admin.pgp, "sign_detached",
         lambda p: (calls.append(p) or (False, "gpg-agent unreachable")),
@@ -154,3 +175,196 @@ def test_set_permission_is_idempotent_under_pgp_enforcement(apps_root, monkeypat
     manifest_admin.set_permission("app", "task_net", False)
     assert calls == []
     assert path.read_text() == before
+
+
+def test_signed_manifest_refuses_when_sudo_lost_fingerprint(apps_root):
+    """An existing signed trust artifact is proof that unsigned mode is not an
+    acceptable fallback.  Environment loss must refuse before either sibling
+    changes."""
+    manifest_admin.set_permission("app", "store_read", True)
+    path = apps_root / "app" / "manifest.json"
+    sig = manifest_admin.pgp.detached_sig_path(path)
+    sig.write_bytes(b"PRIOR-SIG")
+    before = path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="accidental side effect of sudo"):
+        manifest_admin.set_permission("app", "task_net", True)
+
+    assert path.read_bytes() == before
+    assert sig.read_bytes() == b"PRIOR-SIG"
+
+
+def test_permissionerror_tmp_topology_routes_only_presigned_pair(
+    apps_root, monkeypatch
+):
+    """The deployed failure is EACCES creating manifest.json.tmp-* under the
+    trust-owner directory.  Sign and verify first, then hand the immutable
+    candidate to the privileged publisher; never mutate the live pair."""
+    monkeypatch.setattr(
+        manifest_admin.pgp, "expected_fingerprint", lambda: "A" * 40
+    )
+    monkeypatch.setattr(
+        manifest_admin.pgp, "verify_detached", lambda *a, **kw: (True, "ok")
+    )
+
+    def _sign(path):
+        manifest_admin.pgp.detached_sig_path(path).write_bytes(b"NEW-SIG")
+        return True, "signed"
+
+    monkeypatch.setattr(manifest_admin.pgp, "sign_detached", _sign)
+    denied = PermissionError(
+        13, "Permission denied", str(apps_root / "app" / "manifest.json.tmp-123")
+    )
+    monkeypatch.setattr(
+        manifest_admin, "publish_signed_pair",
+        lambda *a, **kw: (_ for _ in ()).throw(denied),
+    )
+    monkeypatch.setattr(
+        manifest_admin.pgp,
+        "export_public_key",
+        lambda fingerprint: (b"PUBLIC-KEY", "ok"),
+    )
+    published = []
+
+    manifest = manifest_admin.set_permission(
+        "app",
+        "store_read",
+        True,
+        privileged_publisher=lambda path, body, sig, key, fp, previous, perm, granted: published.append(
+            (path, body, sig, key, fp, previous, perm, granted)
+        ),
+    )
+
+    assert manifest["permissions"] == ["store_read"]
+    assert len(published) == 1
+    (
+        path,
+        body,
+        signature,
+        public_key,
+        fingerprint,
+        previous,
+        permission,
+        granted,
+    ) = published[0]
+    assert path == apps_root / "app" / "manifest.json"
+    assert json.loads(body)["permissions"] == ["store_read"]
+    assert signature == b"NEW-SIG"
+    assert public_key == b"PUBLIC-KEY"
+    assert fingerprint == "A" * 40
+    assert previous == "absent"
+    assert permission == "store_read"
+    assert granted is True
+    assert not path.exists()
+
+
+def test_publish_signed_pair_rolls_back_both_bytes_on_second_rename_failure(
+    apps_root, monkeypatch
+):
+    app_dir = apps_root / "app"
+    app_dir.mkdir()
+    path = app_dir / "manifest.json"
+    sig = manifest_admin.pgp.detached_sig_path(path)
+    path.write_bytes(b'{"permissions": ["store_read"]}')
+    sig.write_bytes(b"PRIOR-SIG")
+    previous_digest = manifest_admin._content_digest(path.read_bytes())
+    monkeypatch.setattr(
+        manifest_admin.pgp, "verify_detached", lambda *a, **kw: (True, "ok")
+    )
+    real_replace = manifest_admin.os.replace
+
+    def _replace(src, dst):
+        if Path(dst) == path and ".candidate-" in Path(src).name:
+            raise PermissionError(13, "Permission denied", str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(manifest_admin.os, "replace", _replace)
+    with pytest.raises(PermissionError):
+        manifest_admin.publish_signed_pair(
+            path,
+            json.dumps(
+                {"permissions": ["store_read", "task_net"]}, indent=2
+            ).encode(),
+            b"NEW-SIG",
+            "A" * 40,
+            previous_digest,
+            "task_net",
+            True,
+        )
+
+    assert path.read_bytes() == b'{"permissions": ["store_read"]}'
+    assert sig.read_bytes() == b"PRIOR-SIG"
+
+
+def test_privilege_bridge_uses_absolute_python_and_explicit_fingerprint(
+    apps_root, monkeypatch
+):
+    """sudo may discard PATH, HOME and WILLOW_PGP_FINGERPRINT.  The bridge
+    resolves Python before sudo and passes public verification inputs as
+    arguments; it never asks the trust-owner identity to sign."""
+    app_dir = apps_root / "app"
+    app_dir.mkdir()
+    path = app_dir / "manifest.json"
+    monkeypatch.setattr(manifest_admin.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        manifest_admin.pwd,
+        "getpwuid",
+        lambda uid: SimpleNamespace(pw_uid=994, pw_name="willow-operator"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        manifest_admin.subprocess,
+        "run",
+        lambda argv, check: (calls.append(argv) or SimpleNamespace(returncode=0)),
+    )
+
+    manifest_admin.publish_via_trust_owner(
+        path,
+        b'{"permissions": ["store_read"]}',
+        b"SIGNED",
+        b"PUBLIC-KEY",
+        "B" * 40,
+        "absent",
+        "store_read",
+        True,
+    )
+
+    command = calls[0]
+    assert command[:4] == ["sudo", "-u", "willow-operator", "--"]
+    assert Path(command[4]).is_absolute()
+    assert command[5:8] == ["-m", "willow_mcp", "_publish-permission"]
+    assert command[command.index("--fingerprint") + 1] == "B" * 40
+    assert "gpg" not in command
+    assert not any(arg.startswith("WILLOW_PGP_FINGERPRINT=") for arg in command)
+
+
+def test_publisher_rejects_signed_replay_beyond_requested_permission(
+    apps_root, monkeypatch
+):
+    app_dir = apps_root / "app"
+    app_dir.mkdir()
+    path = app_dir / "manifest.json"
+    sig = manifest_admin.pgp.detached_sig_path(path)
+    path.write_text(json.dumps({"permissions": ["store_read"]}, indent=2))
+    sig.write_bytes(b"PRIOR")
+    before = path.read_bytes()
+    monkeypatch.setattr(
+        manifest_admin.pgp, "verify_detached", lambda *a, **kw: (True, "ok")
+    )
+
+    replay = json.dumps(
+        {"permissions": ["store_read", "task_net", "full_access"]}, indent=2
+    ).encode()
+    with pytest.raises(RuntimeError, match="exact requested one-permission"):
+        manifest_admin.publish_signed_pair(
+            path,
+            replay,
+            b"VALID-OLD-SIGNATURE",
+            "A" * 40,
+            manifest_admin._content_digest(before),
+            "task_net",
+            True,
+        )
+
+    assert path.read_bytes() == before
+    assert sig.read_bytes() == b"PRIOR"

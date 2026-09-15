@@ -8501,8 +8501,13 @@ def _cmd_set_permission(args, *, granted: bool) -> None:
     from . import manifest_admin
 
     try:
-        manifest = manifest_admin.set_permission(args.app_id, args.permission, granted)
-    except ValueError as e:
+        manifest = manifest_admin.set_permission(
+            args.app_id,
+            args.permission,
+            granted,
+            privileged_publisher=manifest_admin.publish_via_trust_owner,
+        )
+    except (OSError, RuntimeError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
         raise SystemExit(1)
     verb = "granted to" if granted else "revoked from"
@@ -8723,6 +8728,29 @@ def _cmd_deny_permission(args) -> None:
     _cmd_set_permission(args, granted=False)
 
 
+def _cmd_publish_permission(args) -> None:
+    """Internal trust-owner half of a pre-signed permission update."""
+    from . import manifest_admin
+    from .human_session import require_operator_terminal
+
+    require_operator_terminal()
+    try:
+        manifest_admin.publish_staged_permission(
+            apps_root=Path(args.apps_root),
+            app_id=args.app_id,
+            staged_manifest=Path(args.manifest),
+            staged_signature=Path(args.signature),
+            staged_public_key=Path(args.public_key),
+            fingerprint=args.fingerprint,
+            previous_digest=args.previous_digest,
+            permission=args.permission,
+            granted=args.action == "grant",
+        )
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 #: Every subcommand, mapped to the callable that runs it.
 #:
 #: This was a ~45-branch `if args.command == "...":` ladder in which each branch
@@ -8798,6 +8826,7 @@ _COMMANDS: dict[str, str] = {
     "gates": "_cmd_gates",
     "allow-permission": "_cmd_allow_permission",
     "deny-permission": "_cmd_deny_permission",
+    "_publish-permission": "_cmd_publish_permission",
     "federation": "_cmd_federation",
     "tree": "_cmd_tree",
     "compile-agents": "_cmd_compile_agents",
@@ -9331,6 +9360,23 @@ def _build_parser():
         help="Remove a permission group (or the task_net capability) from an app's manifest")
     deny_p.add_argument("app_id")
     deny_p.add_argument("permission")
+
+    # Privilege-separated second half of allow/deny.  The public command signs
+    # as the invoking human, then sudo re-enters here as the hardened path's
+    # owner to verify and publish; it is intentionally absent from help prose.
+    publish_permission_p = subparsers.add_parser(
+        "_publish-permission",
+        help=argparse.SUPPRESS,
+    )
+    publish_permission_p.add_argument("--apps-root", required=True)
+    publish_permission_p.add_argument("--manifest", required=True)
+    publish_permission_p.add_argument("--signature", required=True)
+    publish_permission_p.add_argument("--public-key", required=True)
+    publish_permission_p.add_argument("--fingerprint", required=True)
+    publish_permission_p.add_argument("--previous-digest", required=True)
+    publish_permission_p.add_argument("--permission", required=True)
+    publish_permission_p.add_argument("--action", choices=("grant", "revoke"), required=True)
+    publish_permission_p.add_argument("app_id")
 
     federation_p = subparsers.add_parser(
         "federation",

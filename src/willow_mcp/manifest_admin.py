@@ -16,8 +16,14 @@ an editor.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
+import pwd
+import subprocess
+import sys
+import tempfile
+from typing import Callable
 
 from . import pgp
 from .gate import (
@@ -98,8 +104,11 @@ def manifest_path(app_id: str) -> Path:
 def _write_json_atomic(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
-    tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(json.dumps(record, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def read_manifest(app_id: str) -> dict:
@@ -114,7 +123,261 @@ def read_manifest(app_id: str) -> dict:
     return data
 
 
-def set_permission(app_id: str, perm: str, granted: bool) -> dict:
+_ABSENT_DIGEST = "absent"
+PrivilegedPublisher = Callable[
+    [Path, bytes, bytes, bytes, str, str, str, bool],
+    None,
+]
+
+
+def _content_digest(content: bytes | None) -> str:
+    return _ABSENT_DIGEST if content is None else hashlib.sha256(content).hexdigest()
+
+
+def _replace_bytes(path: Path, content: bytes | None, token: str) -> None:
+    """Atomically restore one sibling while the signed-pair lock is held."""
+    if content is None:
+        path.unlink(missing_ok=True)
+        return
+    tmp = path.parent / f".{path.name}.restore-{token}"
+    try:
+        tmp.write_bytes(content)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def publish_signed_pair(
+    path: Path,
+    manifest_bytes: bytes,
+    signature_bytes: bytes,
+    fingerprint: str,
+    previous_digest: str,
+    permission: str,
+    granted: bool,
+    public_key: bytes | None = None,
+) -> None:
+    """Verify and publish a manifest/signature generation as one logical pair.
+
+    The two renames happen under the exclusive side of ``signed_pair_lock``;
+    gate readers hold the shared side.  Any failure after the first rename
+    restores both prior siblings byte-for-byte before releasing the lock.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = f"{os.getpid()}-{os.urandom(6).hex()}"
+    candidate = path.parent / f".{path.name}.candidate-{token}"
+    candidate_sig = pgp.detached_sig_path(candidate)
+    live_sig = pgp.detached_sig_path(path)
+
+    with pgp.signed_pair_lock(path, exclusive=True):
+        current = path.read_bytes() if path.is_file() else None
+        if _content_digest(current) != previous_digest:
+            raise RuntimeError(
+                "manifest changed while the permission update was being signed; "
+                "nothing was published — re-run the command against the current manifest"
+            )
+        current_manifest = (
+            json.loads(current.decode("utf-8"))
+            if current is not None
+            else {"permissions": []}
+        )
+        expected_perms = list(current_manifest.get("permissions") or [])
+        if granted and permission not in expected_perms:
+            expected_perms.append(permission)
+        elif not granted and permission in expected_perms:
+            expected_perms = [p for p in expected_perms if p != permission]
+        current_manifest["permissions"] = expected_perms
+        expected_bytes = json.dumps(current_manifest, indent=2).encode("utf-8")
+        if manifest_bytes != expected_bytes:
+            raise RuntimeError(
+                "signed candidate is not the exact requested one-permission change "
+                "from the current manifest; nothing was published"
+            )
+        previous_sig = live_sig.read_bytes() if live_sig.is_file() else None
+        published = False
+        try:
+            candidate.write_bytes(manifest_bytes)
+            candidate_sig.write_bytes(signature_bytes)
+            os.chmod(candidate, 0o644)
+            os.chmod(candidate_sig, 0o644)
+            ok, detail = pgp.verify_detached(
+                candidate,
+                fingerprint=fingerprint,
+                public_key=public_key,
+            )
+            if not ok:
+                raise RuntimeError(
+                    f"signed manifest candidate failed verification; nothing was "
+                    f"published ({detail})"
+                )
+
+            # Signature first is fail-closed even for a non-cooperating reader;
+            # cooperating gate readers cannot enter between these renames.
+            os.replace(candidate_sig, live_sig)
+            published = True
+            os.replace(candidate, path)
+        except Exception:
+            if published:
+                _replace_bytes(path, current, token)
+                _replace_bytes(live_sig, previous_sig, token)
+            raise
+        finally:
+            candidate.unlink(missing_ok=True)
+            candidate_sig.unlink(missing_ok=True)
+
+
+def _signed_candidate(
+    manifest: dict,
+    fingerprint: str,
+    publish: Callable[[bytes, bytes], None],
+) -> None:
+    """Sign outside the protected trust root, verify, then call ``publish``."""
+    manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
+    with tempfile.TemporaryDirectory(prefix="willow-manifest-") as raw_dir:
+        stage_dir = Path(raw_dir)
+        # The trust-owner uid must be able to read the staged public policy and
+        # signature after sudo changes identity.  Neither file contains a key.
+        os.chmod(stage_dir, 0o755)
+        candidate = stage_dir / "manifest.json"
+        candidate.write_bytes(manifest_bytes)
+        os.chmod(candidate, 0o644)
+        ok, detail = pgp.sign_detached(candidate)
+        if not ok:
+            raise RuntimeError(
+                f"permission change refused before mutation: manifest candidate "
+                f"could not be signed ({detail})"
+            )
+        signature = pgp.detached_sig_path(candidate)
+        os.chmod(signature, 0o644)
+        ok, detail = pgp.verify_detached(candidate, fingerprint=fingerprint)
+        if not ok:
+            raise RuntimeError(
+                f"permission change refused before mutation: signed candidate "
+                f"did not verify against WILLOW_PGP_FINGERPRINT ({detail})"
+            )
+        publish(manifest_bytes, signature.read_bytes())
+
+
+def publish_via_trust_owner(
+    path: Path,
+    manifest_bytes: bytes,
+    signature_bytes: bytes,
+    public_key: bytes,
+    fingerprint: str,
+    previous_digest: str,
+    permission: str,
+    granted: bool,
+) -> None:
+    """Ask sudo to run only the verified publication step as the path owner.
+
+    Signing has already happened as the invoking human, with that human's
+    gpg-agent and key context.  The trust-owner process receives no signing
+    environment and cannot silently disable enforcement: the expected
+    fingerprint and already-signed public files are explicit arguments.
+    """
+    ownership_anchor = path.parent if path.parent.exists() else path.parent.parent
+    owner_info = pwd.getpwuid(ownership_anchor.stat().st_uid)
+    if owner_info.pw_uid == os.geteuid():
+        raise PermissionError(
+            f"cannot publish under {path.parent}: it is owned by the current uid "
+            "but is not writable; fix its ACL/mode instead of changing identity"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="willow-publish-") as raw_dir:
+        stage_dir = Path(raw_dir)
+        os.chmod(stage_dir, 0o755)
+        staged_manifest = stage_dir / "manifest.json"
+        staged_sig = pgp.detached_sig_path(staged_manifest)
+        staged_public_key = stage_dir / "operator-public-key.asc"
+        staged_manifest.write_bytes(manifest_bytes)
+        staged_sig.write_bytes(signature_bytes)
+        staged_public_key.write_bytes(public_key)
+        os.chmod(staged_manifest, 0o644)
+        os.chmod(staged_sig, 0o644)
+        os.chmod(staged_public_key, 0o644)
+
+        command = [
+            "sudo",
+            "-u",
+            owner_info.pw_name,
+            "--",
+            str(Path(sys.executable).resolve()),
+            "-m",
+            "willow_mcp",
+            "_publish-permission",
+            "--apps-root",
+            str(path.parent.parent),
+            "--manifest",
+            str(staged_manifest),
+            "--signature",
+            str(staged_sig),
+            "--public-key",
+            str(staged_public_key),
+            "--fingerprint",
+            fingerprint,
+            "--previous-digest",
+            previous_digest,
+            "--permission",
+            permission,
+            "--action",
+            "grant" if granted else "revoke",
+            path.parent.name,
+        ]
+        result = subprocess.run(command, check=False)
+        if result.returncode != 0:
+            raise PermissionError(
+                "trust-owner publication failed; the prior manifest and signature "
+                "were preserved. Run from an interactive operator terminal with "
+                f"sudo authority for {owner_info.pw_name!r}"
+            )
+
+
+def publish_staged_permission(
+    *,
+    apps_root: Path,
+    app_id: str,
+    staged_manifest: Path,
+    staged_signature: Path,
+    staged_public_key: Path,
+    fingerprint: str,
+    previous_digest: str,
+    permission: str,
+    granted: bool,
+) -> None:
+    """Trust-owner half of a staged signed permission update."""
+    app_id = _validate_app_id(app_id)
+    apps_root = apps_root.expanduser().resolve()
+    ownership_anchor = apps_root / app_id
+    if not ownership_anchor.exists():
+        ownership_anchor = apps_root
+    if ownership_anchor.stat().st_uid != os.geteuid():
+        raise PermissionError(
+            f"publication uid {os.geteuid()} does not own hardened trust path "
+            f"{ownership_anchor}"
+        )
+    manifest_bytes = staged_manifest.read_bytes()
+    signature_bytes = staged_signature.read_bytes()
+    public_key = staged_public_key.read_bytes()
+    publish_signed_pair(
+        apps_root / app_id / "manifest.json",
+        manifest_bytes,
+        signature_bytes,
+        fingerprint,
+        previous_digest,
+        permission,
+        granted,
+        public_key,
+    )
+
+
+def set_permission(
+    app_id: str,
+    perm: str,
+    granted: bool,
+    *,
+    privileged_publisher: PrivilegedPublisher | None = None,
+) -> dict:
     """Add or remove `perm` from an app's manifest `permissions` list.
 
     Creates the manifest if this is its first permission. Raises on an
@@ -151,27 +414,63 @@ def set_permission(app_id: str, perm: str, granted: bool) -> dict:
 
     manifest["permissions"] = perms
     path = manifest_path(_validate_app_id(app_id))
-    previous = path.read_text(encoding="utf-8") if existed else None
-    previous_sig = pgp.read_detached_sig_bytes(path) if existed else None
-    _write_json_atomic(path, manifest)
+    previous = path.read_bytes() if existed else None
+    previous_digest = _content_digest(previous)
+    existing_sig = pgp.read_detached_sig_bytes(path) if existed else None
 
-    # Under PGP enforcement the manifest's authority comes from its detached
-    # signature, and rewriting the file invalidates it. Writing and walking away
-    # would silently revoke the app's entire gate -- the operator's own supported
-    # edit path taking the fleet down, with nothing said. Re-sign, or put the
-    # content *and* `.sig` back exactly as they were and refuse: a half-applied
-    # permission change that leaves an unsigned (or wrong-signed) manifest is
-    # strictly worse than no change at all. `gpg --detach-sign --yes -o` can
-    # clobber the prior `.sig` even when the sign later fails, so content-only
-    # rollback is not enough.
-    if pgp.pgp_enabled():
-        ok, detail = pgp.sign_detached(path)
-        if not ok:
-            pgp.restore_signed_content(path, previous, previous_sig)
-            raise RuntimeError(
-                f"permission change rolled back: manifest for {app_id!r} could not be "
-                f"re-signed and an unsigned manifest is denied everywhere ({detail}). "
-                f"Sign from a host terminal with a reachable gpg-agent, or unset "
-                f"WILLOW_PGP_FINGERPRINT to run without enforcement."
-            )
+    fingerprint = pgp.expected_fingerprint()
+    if existing_sig is not None and not fingerprint:
+        raise RuntimeError(
+            "permission change refused before mutation: this manifest already has "
+            "a detached signature but WILLOW_PGP_FINGERPRINT is unset or malformed. "
+            "Restore the operator fingerprint in this shell; disabling enforcement "
+            "must never be an accidental side effect of sudo environment loss"
+        )
+
+    if fingerprint:
+        if existed:
+            ok, detail = pgp.verify_detached(path, fingerprint=fingerprint)
+            if not ok:
+                raise RuntimeError(
+                    f"permission change refused before mutation: the current manifest "
+                    f"signature is not valid for WILLOW_PGP_FINGERPRINT ({detail})"
+                )
+
+        def _publish(manifest_bytes: bytes, signature_bytes: bytes) -> None:
+            try:
+                publish_signed_pair(
+                    path,
+                    manifest_bytes,
+                    signature_bytes,
+                    fingerprint,
+                    previous_digest,
+                    perm,
+                    granted,
+                )
+            except PermissionError:
+                if privileged_publisher is None:
+                    raise
+                public_key, detail = pgp.export_public_key(fingerprint)
+                if public_key is None:
+                    raise RuntimeError(
+                        "permission change refused before privileged publication: "
+                        f"the signer public key could not be exported ({detail})"
+                    )
+                privileged_publisher(
+                    path,
+                    manifest_bytes,
+                    signature_bytes,
+                    public_key,
+                    fingerprint,
+                    previous_digest,
+                    perm,
+                    granted,
+                )
+
+        _signed_candidate(manifest, fingerprint, _publish)
+    else:
+        # Unsigned local/dev mode remains supported, but it never gets a sudo
+        # bridge: a hardened trust root must not be mutated through a path that
+        # only "works" because the fingerprint disappeared from the environment.
+        _write_json_atomic(path, manifest)
     return manifest

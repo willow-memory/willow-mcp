@@ -564,30 +564,36 @@ def _read_manifest(app_id: str) -> tuple[Optional[dict], str, str]:
     manifest_path = root / app_id / "manifest.json"
     if not manifest_path.exists():
         return None, MANIFEST_ABSENT, f"no manifest at {manifest_path}"
-    try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.error("gate: manifest unreadable for %s: %s", app_id, e)
-        return None, MANIFEST_UNPARSEABLE, f"{manifest_path} is not readable JSON: {str(e)[:160]}"
-    # #183: opt-in PGP enforcement. Every caller of _load_manifest already
-    # treats None as "deny" (fail-closed) -- checking here, once, means an
-    # unsigned or tampered manifest is denied everywhere a manifest is read,
-    # with no per-call-site change needed. Only fires when the operator has
-    # set WILLOW_PGP_FINGERPRINT; unset, behavior is byte-for-byte unchanged
-    # from before this landed (docs/design/pgp-and-persona.md: "no dev_bypass,
-    # no pgp_enforced toggle" -- the fingerprint's presence IS the switch).
-    if pgp.pgp_enabled():
-        ok, detail = pgp.verify_detached(manifest_path)
-        if not ok:
-            logger.error(
-                "gate: manifest signature invalid for %s: %s — denied (PGP enforced)",
-                app_id, detail,
+    # The manifest and detached signature are one authority artifact.  A
+    # publisher needs two renames to replace them, so readers share-lock the
+    # app directory while reading and verifying; the permission CLI takes the
+    # exclusive side.  This prevents a transient mixed-generation pair from
+    # looking like an unsigned manifest during an otherwise successful update.
+    with pgp.signed_pair_lock(manifest_path, exclusive=False):
+        if not manifest_path.exists():
+            return None, MANIFEST_ABSENT, f"no manifest at {manifest_path}"
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.error("gate: manifest unreadable for %s: %s", app_id, e)
+            return None, MANIFEST_UNPARSEABLE, (
+                f"{manifest_path} is not readable JSON: {str(e)[:160]}"
             )
-            return None, MANIFEST_UNSIGNED, (
-                f"{manifest_path} exists and parses, but PGP enforcement is ON "
-                f"(WILLOW_PGP_FINGERPRINT is set) and its signature did not verify: "
-                f"{detail}. Sign it with `willow-mcp sign-manifest {app_id}`."
-            )
+        # #183: opt-in PGP enforcement. Every caller of _load_manifest already
+        # treats None as "deny" (fail-closed) -- checking here, once, means an
+        # unsigned or tampered manifest is denied everywhere a manifest is read.
+        if pgp.pgp_enabled():
+            ok, detail = pgp.verify_detached(manifest_path)
+            if not ok:
+                logger.error(
+                    "gate: manifest signature invalid for %s: %s — denied (PGP enforced)",
+                    app_id, detail,
+                )
+                return None, MANIFEST_UNSIGNED, (
+                    f"{manifest_path} exists and parses, but PGP enforcement is ON "
+                    f"(WILLOW_PGP_FINGERPRINT is set) and its signature did not verify: "
+                    f"{detail}. Sign it with `willow-mcp sign-manifest {app_id}`."
+                )
     return data, MANIFEST_OK, "manifest loaded"
 
 

@@ -96,6 +96,21 @@ sudo -u willow-operator willow-mcp sign-net-task hanuman --task-file /path/to/ta
 sudo -u willow-operator willow-mcp consent set internet true
 ```
 
+For a PGP-enforced manifest, keep the human signer's environment and run the
+permission command without a sudo prefix:
+
+```bash
+export WILLOW_PGP_FINGERPRINT=<40-hex operator fingerprint>
+willow-mcp allow-permission hanuman task_queue
+```
+
+It signs and verifies before mutation, then prompts through sudo only for the
+trust-owner publication step. Running the whole command under
+`sudo -u willow-operator` is unsupported: sudo may discard the fingerprint,
+PATH, HOME, and access to the human's gpg-agent. An existing signed manifest
+with no valid fingerprint in the invoking shell is refused, not edited as
+though enforcement were off.
+
 Dry-run first: `willow-mcp harden-trust-root --dry-run`
 
 Verify: `willow-mcp doctor` should report the egress key as no longer
