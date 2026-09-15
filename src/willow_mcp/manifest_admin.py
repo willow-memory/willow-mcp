@@ -15,8 +15,8 @@ an editor.
 """
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 from pathlib import Path
 import pwd
@@ -26,8 +26,6 @@ import sys
 import tempfile
 from typing import Callable
 
-_REAL_SUBPROCESS_RUN = subprocess.run
-
 from . import pgp
 from .gate import (
     CAPABILITY_PERMISSIONS,
@@ -36,6 +34,8 @@ from .gate import (
     _apps_root,
     _validate_app_id,
 )
+
+_REAL_SUBPROCESS_RUN = subprocess.run
 
 #: Same typo-guard reasoning as `gate.store_scope`'s malformed-field check
 #: (B-25): an operator toggling a misspelled permission name would otherwise
