@@ -2337,6 +2337,100 @@ def knowledge_check(
 
 # ── Task queue tools ───────────────────────────────────────────────────────────
 
+def _validate_anticipated_gates(app_id: str,
+                                 anticipated_gates: Optional[list[str]]
+                                 ) -> Optional[dict]:
+    """`task_submit`'s shape check on ``anticipated_gates``. Returns ``None``
+    when the list is safe to file, or an error dict the caller returns.
+
+    Two rules:
+
+    1. Every entry passes ``gate_request.check_requestable`` — the same
+       allowlist that shape-checks denial-site asks. A ``full_access`` or
+       ``sudo.``-prefixed entry is refused here rather than half-filed and
+       then declined by the queue writer; a caller sees one refusal, not
+       one queue row plus a task_id.
+    2. Every ``lease.<X>`` or ``perm.<X>.<...>`` gate names THIS submitting
+       app. A task may anticipate only its own gates — otherwise ``task_submit``
+       would be a laundering path for asks the caller's own denial site would
+       refuse to file.
+
+    ``push.<...>`` and ``attest.<...>`` carry no app_id in the gate id, so
+    ownership is beyond what the shape can prove; ``check_requestable`` still
+    validates their format.
+    """
+    if anticipated_gates is None:
+        return None
+    if not isinstance(anticipated_gates, list):
+        return {"error": (
+            f"anticipated_gates: expected a list of gate ids, got "
+            f"{type(anticipated_gates).__name__}"
+        )}
+
+    from . import gate_request, gates_panel
+
+    for entry in anticipated_gates:
+        if not isinstance(entry, str):
+            return {"error": (
+                f"anticipated_gates: entry {entry!r} is not a string"
+            )}
+        refusal = gate_request.check_requestable(entry)
+        if refusal is not None:
+            return {"error": f"anticipated_gates: {refusal}"}
+        if entry.startswith("lease."):
+            owner = entry[len("lease."):].strip()
+            if owner != app_id:
+                return {"error": (
+                    f"anticipated_gates: {entry!r} names {owner!r}'s lease; a "
+                    f"task may anticipate only its own gates"
+                )}
+        elif entry.startswith("perm."):
+            owner, _group = gates_panel.split_permission_gate(entry)
+            if owner and owner != app_id:
+                return {"error": (
+                    f"anticipated_gates: {entry!r} names {owner!r}'s "
+                    f"permission; a task may anticipate only its own gates"
+                )}
+    return None
+
+
+def _file_anticipated_gate_asks(app_id: str, task_id: str, task_text: str,
+                                  anticipated_gates: Optional[list[str]]
+                                  ) -> list[dict]:
+    """File one row per anticipated gate, deduped on ``task_id`` per gate.
+
+    Called AFTER the task row is inserted, so a queued ask never claims to
+    wait for a task the DB does not hold. Never raises: ``open_request``
+    already fails closed, and this function just aggregates its results.
+    """
+    if not anticipated_gates:
+        return []
+    from . import gate_request
+
+    filed: list[dict] = []
+    trimmed = (task_text or "").strip()
+    for entry in anticipated_gates:
+        result = gate_request.open_request(
+            app_id,
+            entry,
+            task_id=task_id,
+            reason=(
+                f"task {task_id} anticipates needing {entry} before it can "
+                f"run. Task: {trimmed[:200]}"
+            ),
+        )
+        row = {"gate_id": entry, "queued": bool(result.get("queued"))}
+        rid = result.get("id") or result.get("duplicate_of")
+        if rid:
+            row["id"] = rid
+        if result.get("duplicate_of"):
+            row["duplicate_of"] = result["duplicate_of"]
+        if not result.get("queued") and not result.get("duplicate_of"):
+            row["reason"] = result.get("reason") or "not queued"
+        filed.append(row)
+    return filed
+
+
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("task_submit")
 def task_submit(
@@ -2349,6 +2443,7 @@ def task_submit(
     allow_db: bool = False,
     network_authorization: str = "",
     db_authorization: str = "",
+    anticipated_gates: Optional[list[str]] = None,
 ) -> dict:
     """Submit a task to the Kart sandboxed execution queue. Returns task_id for polling.
 
@@ -2380,7 +2475,29 @@ def task_submit(
     here before it ever occupies a queue slot, not only when the worker later
     picks it up. The worker re-scans at execution regardless; this just denies
     earlier and keeps a bomb from sitting `pending`.
+
+    ``anticipated_gates`` (gap ``5ecb87cfdf56``, slice 2b PR 3) is an optional
+    list of gate ids the task expects to need. Each is filed at SUBMIT time
+    via ``gate_request.open_request`` with the new task_id as the dedup key,
+    so an operator sees the whole ask set upfront (in ``willow-mcp gates``)
+    rather than one denial per retry. Grants nothing — every ask is still
+    an ask; the same operator press ``willow-mcp gates`` shows for a denial-
+    site ask is what activates a standing grant here. Each entry must pass
+    ``gate_request.check_requestable`` (the same allowlist that shape-checks
+    denial-site asks), and every ``lease.<X>`` or ``perm.<X>.<...>`` gate
+    must name THIS submitting app — a task may anticipate only its own
+    gates, not laundering an ask through whichever seat happens to be
+    trusted enough to reach ``task_submit``.
     """
+    # Anticipated-gates validation, before any DB work — the submission fails
+    # loudly on a malformed or misdirected ask rather than half-filing and
+    # returning a task_id. This is the shape check; the fail-closed side (a
+    # queue that cannot enqueue) still surfaces below and never turns a
+    # successful submission into a traceback.
+    _antic_refusal = _validate_anticipated_gates(app_id, anticipated_gates)
+    if _antic_refusal is not None:
+        return _antic_refusal
+
     # Submit-time scan, before any DB work — a dangerous task is refused even if
     # Postgres is down. kartikeya is a hard dependency, but degrade open (worker
     # still scans) rather than crash the tool if it is somehow unimportable.
@@ -2644,7 +2761,17 @@ def task_submit(
     cur = pg.cursor()
     cur.execute(f"INSERT INTO tasks ({cols}) VALUES ({placeholders})", params)  # nosec B608 - cols come from the confirmed schema_profile field mapping, not request input; placeholders is a fixed "%s" repeat; all values are bound params
     cur.close()
-    return {"task_id": task_id, "status": "pending"}
+
+    # Slice 2b PR 3: file each anticipated ask now that the task row is live,
+    # so a queued row never claims to wait for a task the DB does not hold.
+    # `_file_anticipated_gate_asks` never raises — a queue outage becomes an
+    # empty list, not a traceback that would replace the successful
+    # submission with an error the caller has to unpick.
+    filed = _file_anticipated_gate_asks(app_id, task_id, task, anticipated_gates)
+    out = {"task_id": task_id, "status": "pending"}
+    if filed:
+        out["anticipated_gates"] = filed
+    return out
 
 
 @mcp.tool(annotations=_ANNO_READ)

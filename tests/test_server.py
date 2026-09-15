@@ -907,6 +907,77 @@ def test_task_submit_rejects_unknown_lane_before_database_work(
     assert fake.executed == []
 
 
+def test_task_submit_refuses_a_bad_anticipated_gate_before_database_work(
+    app_id, monkeypatch
+):
+    """Slice 2b PR 3: shape check runs before `get_pg`, so a caller who names
+    an out-of-allowlist gate id gets one refusal, not a task_id and a queue
+    row that ``check_requestable`` would have refused anyway."""
+    fake = _FakePg(columns=_TASKS_COLUMNS)
+    monkeypatch.setattr(server, "get_pg", lambda: fake)
+    result = server.task_submit(
+        app_id=app_id, task="echo hi",
+        anticipated_gates=["sudo.kart"],
+    )
+    assert "anticipated_gates" in result["error"]
+    assert "sudo.kart" in result["error"]
+    assert fake.executed == []
+
+
+def test_task_submit_files_the_anticipated_asks_after_the_insert(
+    app_id, monkeypatch
+):
+    """The whole point: an operator sees the ask set in `willow-mcp gates`
+    at submit time. The row is only filed once the task row is in the DB,
+    so a queued ask never claims to wait for a task that does not exist."""
+    fake = _FakePg(columns=_TASKS_COLUMNS)
+    monkeypatch.setattr(server, "get_pg", lambda: fake)
+    server.schema_confirm_mapping(app_id=app_id, table="tasks")
+
+    calls: list[dict] = []
+
+    def _fake_open_request(caller_app, gate_id, *, task_id="", reason="", store=None):
+        calls.append({"app_id": caller_app, "gate_id": gate_id,
+                      "task_id": task_id})
+        return {"queued": True, "id": f"req-{len(calls)}"}
+
+    from willow_mcp import gate_request
+
+    monkeypatch.setattr(gate_request, "open_request", _fake_open_request)
+
+    result = server.task_submit(
+        app_id=app_id, task="do a thing",
+        anticipated_gates=[f"lease.{app_id}", f"perm.{app_id}.store_read"],
+    )
+    assert result["status"] == "pending"
+    task_id = result["task_id"]
+    # Each ask was filed with the fresh task_id as the dedup key.
+    assert len(calls) == 2
+    assert {c["gate_id"] for c in calls} == {
+        f"lease.{app_id}", f"perm.{app_id}.store_read",
+    }
+    assert {c["task_id"] for c in calls} == {task_id}
+    # The tool surfaces which ones landed.
+    assert [row["gate_id"] for row in result["anticipated_gates"]] == [
+        f"lease.{app_id}", f"perm.{app_id}.store_read",
+    ]
+    assert all(row["queued"] for row in result["anticipated_gates"])
+
+
+def test_task_submit_absence_of_anticipated_gates_yields_no_field(
+    app_id, monkeypatch
+):
+    """Default is None → the return dict does not carry the field, so existing
+    callers see no surface change."""
+    fake = _FakePg(columns=_TASKS_COLUMNS)
+    monkeypatch.setattr(server, "get_pg", lambda: fake)
+    server.schema_confirm_mapping(app_id=app_id, table="tasks")
+
+    result = server.task_submit(app_id=app_id, task="do a thing")
+    assert result["status"] == "pending"
+    assert "anticipated_gates" not in result
+
+
 # Patterns kartikeya's scanner blocks at submit time — validates willow's
 # submit-time WIRING (check_kart_task), including resource_exhaustion (#111).
 @pytest.mark.parametrize("task,category", [
