@@ -414,6 +414,13 @@ environment variables read once at process start, so their rows name the
 env var to set and restart with, rather than pretending a live toggle
 exists.
 
+When `mcp_apps/` belongs to a dedicated trust-owner uid and manifests are
+PGP-enforced, invoke these two commands as the human signer. They sign and
+verify a staged candidate first, then use sudo only to publish the pair as the
+directory owner; do not wrap the whole command in `sudo -u`. See
+[`dedicated-uid-deployment.md`](docs/deploy/dedicated-uid-deployment.md) for
+the exact hardened workflow and failure guarantees.
+
 `task_net` and `integration_net` both show up as their own capability rows
 (neither is folded into `full_access`), and both are authorized by the same
 per-app egress lease below them — one `grant-net`/`revoke-net` covers Kart

@@ -303,6 +303,21 @@ def by_human_attested(app_id: str, *, serve_mode: bool) -> bool:
     return human_orchestrator_attested()
 
 
+def _controlling_tty_owner_uid() -> int:
+    """Return the uid owning stdin's controlling terminal, or refuse."""
+    import sys
+
+    if os.environ.get("WILLOW_IN_KART", "").strip():
+        raise PermissionError("mutation refused inside the Kart sandbox")
+    if not sys.stdin.isatty():
+        raise PermissionError("mutation requires an interactive operator terminal")
+    try:
+        terminal = os.ttyname(sys.stdin.fileno())
+        return os.stat(terminal).st_uid
+    except OSError as exc:
+        raise PermissionError(f"operator terminal not verifiable: {exc}")
+
+
 def require_operator_terminal() -> None:
     """Fail-closed operator-presence gate for local mutation CLIs (Loki §4.3).
 
@@ -313,20 +328,42 @@ def require_operator_terminal() -> None:
     no operator-owned controlling tty, so it fails closed here even if it fakes
     isatty().
     """
-    import sys
-
-    if os.environ.get("WILLOW_IN_KART", "").strip():
-        raise PermissionError("mutation refused inside the Kart sandbox")
-    if not sys.stdin.isatty():
-        raise PermissionError("mutation requires an interactive operator terminal")
-    try:
-        terminal = os.ttyname(sys.stdin.fileno())
-        owner_uid = os.stat(terminal).st_uid
-    except OSError as exc:
-        raise PermissionError(f"operator terminal not verifiable: {exc}")
+    owner_uid = _controlling_tty_owner_uid()
     if owner_uid != os.getuid():
         raise PermissionError(
             "controlling terminal is not owned by the invoking operator"
+        )
+
+
+def require_trust_owner_publication_terminal() -> None:
+    """Operator-presence gate for the sudo publication helper only.
+
+    ``allow-permission`` / ``deny-permission`` call :func:`require_operator_terminal`
+    on the human path before signing. ``_publish-permission`` then runs as the
+    trust owner via ``sudo -u``, so ``getuid()`` is no longer the tty owner — but
+    the controlling terminal must still belong to the operator named in
+    ``SUDO_UID``. That preserves human-terminal proof without refusing the
+    deliberate identity drop.
+    """
+    owner_uid = _controlling_tty_owner_uid()
+    sudo_uid = os.environ.get("SUDO_UID", "").strip()
+    if not sudo_uid:
+        raise PermissionError(
+            "trust-owner publication must be invoked via sudo by the operator; "
+            "run allow-permission / deny-permission as yourself, not inside "
+            "sudo -u <trust-owner>"
+        )
+    try:
+        invoker_uid = int(sudo_uid)
+    except ValueError:
+        raise PermissionError("operator identity from sudo is not a valid uid")
+    if invoker_uid == os.geteuid():
+        raise PermissionError(
+            "trust-owner publication refuses a spoofed SUDO_UID matching this process"
+        )
+    if owner_uid != invoker_uid:
+        raise PermissionError(
+            "controlling terminal is not owned by the operator who invoked sudo"
         )
 
 

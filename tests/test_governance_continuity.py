@@ -468,6 +468,110 @@ def test_operator_terminal_refused_without_tty(monkeypatch):
         raise AssertionError("mutation allowed without an operator terminal")
 
 
+def _fake_tty_stat(monkeypatch, human_session, tty_owner_uid: int):
+    import os as _os
+    import sys as _sys
+
+    tty = "/dev/pts/7"
+    real_stat = human_session.os.stat
+
+    def _stat(path, *args, **kwargs):
+        if path == tty:
+            return _os.stat_result(
+                (0o620, 0, 0, 0, tty_owner_uid, 0, 0, 0, 0, 0)
+            )
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(human_session.os, "ttyname", lambda _fd: tty)
+    monkeypatch.setattr(human_session.os, "stat", _stat)
+    monkeypatch.setattr(_sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(_sys.stdin, "fileno", lambda: 0)
+
+
+def test_trust_owner_publication_accepts_human_tty_under_sudo(monkeypatch):
+    """After sudo -u trust-owner, getuid() is not the tty owner; SUDO_UID is."""
+    from willow_mcp import human_session
+
+    monkeypatch.delenv("WILLOW_IN_KART", raising=False)
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setattr(human_session.os, "geteuid", lambda: 994)
+    monkeypatch.setattr(human_session.os, "getuid", lambda: 994)
+    _fake_tty_stat(monkeypatch, human_session, 1000)
+    human_session.require_trust_owner_publication_terminal()
+
+
+def test_trust_owner_publication_refuses_tty_owner_mismatch(monkeypatch):
+    from willow_mcp import human_session
+
+    monkeypatch.delenv("WILLOW_IN_KART", raising=False)
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setattr(human_session.os, "geteuid", lambda: 994)
+    _fake_tty_stat(monkeypatch, human_session, 1001)
+    try:
+        human_session.require_trust_owner_publication_terminal()
+    except PermissionError as exc:
+        assert "invoked sudo" in str(exc)
+    else:
+        raise AssertionError("publication allowed with wrong tty owner")
+
+
+def test_operator_terminal_refuses_trust_owner_uid_with_human_tty(monkeypatch):
+    """Regression for Loki publish-sudo-tty-ownership: the old check blocked sudo."""
+    from willow_mcp import human_session
+
+    monkeypatch.delenv("WILLOW_IN_KART", raising=False)
+    monkeypatch.setattr(human_session.os, "getuid", lambda: 994)
+    _fake_tty_stat(monkeypatch, human_session, 1000)
+    try:
+        human_session.require_operator_terminal()
+    except PermissionError as exc:
+        assert "invoking operator" in str(exc)
+    else:
+        raise AssertionError("trust-owner uid passed the human-only gate")
+
+
+def test_operator_terminal_script_wrapper_satisfies_gate():
+    """`.github/workflows/tests.yml` runs operator CLIs through this wrapper."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    script = repo / "scripts" / "operator_terminal.sh"
+    assert script.is_file(), "CI smoke depends on scripts/operator_terminal.sh"
+    py_cmd = (
+        "import os; from willow_mcp import human_session; "
+        "os.environ.pop('WILLOW_IN_KART', None); "
+        "human_session.require_operator_terminal(); print('ok')"
+    )
+    proc = subprocess.run(
+        ["bash", str(script), sys.executable, "-c", py_cmd],
+        capture_output=True,
+        text=True,
+        cwd=repo,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert "ok" in proc.stdout
+
+
+def test_operator_terminal_script_propagates_child_exit_code():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    script = repo / "scripts" / "operator_terminal.sh"
+    proc = subprocess.run(
+        ["bash", str(script), sys.executable, "-c", "raise SystemExit(17)"],
+        capture_output=True,
+        text=True,
+        cwd=repo,
+        check=False,
+    )
+    assert proc.returncode == 17
+
+
 # ── §4.2 frank_append / envelope_apply behind the human-orchestrator boundary ─
 
 def test_governance_tools_require_human_orchestrator_for_willow(monkeypatch):

@@ -59,6 +59,31 @@ sudo -u willow-operator willow-mcp grant-net hanuman --ttl 30m --reason "push br
 sudo -u willow-operator willow-mcp consent set internet true
 ```
 
+PGP-enforced manifest changes are deliberately different: run
+`allow-permission` / `deny-permission` as the human whose gpg-agent holds the
+configured key, **not** inside `sudo -u willow-operator`:
+
+```bash
+export WILLOW_PGP_FINGERPRINT=<40-hex operator fingerprint>
+willow-mcp allow-permission hanuman task_queue
+willow-mcp deny-permission hanuman task_queue
+```
+
+The command builds, signs, and verifies the candidate before touching
+`mcp_apps/`, then asks sudo to run only a narrow publication helper as the
+directory owner. It resolves the Python executable before sudo, so sudo's
+restricted `PATH` is irrelevant; the helper receives the expected fingerprint
+and an exported public key explicitly, verifies in an isolated temporary GPG
+home, and never needs the human's `HOME`, gpg-agent socket, or private key.
+Gate readers and the publisher lock the app directory while the manifest and
+detached signature siblings change, so they are observed as one generation.
+
+If `WILLOW_PGP_FINGERPRINT` is absent or malformed while the existing manifest
+has a signature, the command refuses before mutation. If signing, verification,
+sudo, or either publication rename fails, the previous manifest and signature
+bytes remain in place. Do not work around that refusal by unsetting enforcement
+or by running the whole command as the trust-owner uid.
+
 **Verify, as your own (agent/runtime) login uid — not as `willow-operator`:**
 
 ```bash
