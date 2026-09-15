@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **broker:** a bot-opened PR lands on the operator's list ([bbd8b82](https://github.com/willow-memory/willow-mcp/commit/bbd8b82f70e4ca53b725b6bc3580d61e865ee75d))
 * **broker:** a bot-opened PR lands on the operator's list ([ab5583d](https://github.com/willow-memory/willow-mcp/commit/ab5583d952196a41b530889600707c3834fd8b55))
 
 ## [2.42.0](https://github.com/willow-memory/willow-mcp/compare/v2.41.0...v2.42.0) (2026-09-14)
