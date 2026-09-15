@@ -201,17 +201,19 @@ jobs:
           willow-mcp gates --html "${RUNNER_TEMP}/gates.html"
           test -s "${RUNNER_TEMP}/gates.html"
 
-          willow-mcp allow-permission smoketest store_read
+          # Operator-only CLIs require an interactive, operator-owned tty.
+          # Actions `run:` has none; scripts/operator_terminal.sh supplies one.
+          bash scripts/operator_terminal.sh willow-mcp allow-permission smoketest store_read
           grep -q store_read "${WILLOW_HOME}/mcp_apps/smoketest/manifest.json"
-          willow-mcp deny-permission smoketest store_read
+          bash scripts/operator_terminal.sh willow-mcp deny-permission smoketest store_read
 
-          willow-mcp grant-net smoketest --ttl 5m --reason "CI smoke test"
+          bash scripts/operator_terminal.sh willow-mcp grant-net smoketest --ttl 5m --reason "CI smoke test"
           # Captured via command substitution, not a live pipe: net-status
           # prints several lines, and piping straight into `grep -q` races
           # grep's early exit against the still-writing process.
           NET_STATUS="$(willow-mcp net-status smoketest)"
           echo "${NET_STATUS}" | grep -q active
-          willow-mcp revoke-net smoketest
+          bash scripts/operator_terminal.sh willow-mcp revoke-net smoketest
 
           willow-mcp tree smoketest --json > "${RUNNER_TEMP}/tree.json"
           python -c "import json; d=json.load(open('${RUNNER_TEMP}/tree.json')); assert set(d) >= {'trunk','sap','canopy','roots','rings','leaves','litter','stomata'}, d.keys()"

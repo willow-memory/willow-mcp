@@ -530,6 +530,48 @@ def test_operator_terminal_refuses_trust_owner_uid_with_human_tty(monkeypatch):
         raise AssertionError("trust-owner uid passed the human-only gate")
 
 
+def test_operator_terminal_script_wrapper_satisfies_gate():
+    """`.github/workflows/tests.yml` runs operator CLIs through this wrapper."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    script = repo / "scripts" / "operator_terminal.sh"
+    assert script.is_file(), "CI smoke depends on scripts/operator_terminal.sh"
+    py_cmd = (
+        "import os; from willow_mcp import human_session; "
+        "os.environ.pop('WILLOW_IN_KART', None); "
+        "human_session.require_operator_terminal(); print('ok')"
+    )
+    proc = subprocess.run(
+        ["bash", str(script), sys.executable, "-c", py_cmd],
+        capture_output=True,
+        text=True,
+        cwd=repo,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert "ok" in proc.stdout
+
+
+def test_operator_terminal_script_propagates_child_exit_code():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    script = repo / "scripts" / "operator_terminal.sh"
+    proc = subprocess.run(
+        ["bash", str(script), sys.executable, "-c", "raise SystemExit(17)"],
+        capture_output=True,
+        text=True,
+        cwd=repo,
+        check=False,
+    )
+    assert proc.returncode == 17
+
+
 # ── §4.2 frank_append / envelope_apply behind the human-orchestrator boundary ─
 
 def test_governance_tools_require_human_orchestrator_for_willow(monkeypatch):
