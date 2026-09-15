@@ -36,9 +36,8 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* securely publish signed permission updates ([c7392f1](https://github.com/willow-memory/willow-mcp/commit/c7392f1b1d891ba8aff530ae0583ef66e3caa618))
-* securely publish signed permission updates ([65635b0](https://github.com/willow-memory/willow-mcp/commit/65635b000bed6714fef0b2f108bdd3fd0a3d35a1))
 * sudo publication gate matches human-owned TTY topology ([9793772](https://github.com/willow-memory/willow-mcp/commit/9793772472b26e96f28762cb1bd6ef53d6c4c704))
+* securely publish signed permission updates ([65635b0](https://github.com/willow-memory/willow-mcp/commit/65635b000bed6714fef0b2f108bdd3fd0a3d35a1))
 
 ## [2.44.0](https://github.com/willow-memory/willow-mcp/compare/v2.43.0...v2.44.0) (2026-09-15)
 
