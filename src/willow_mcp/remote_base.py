@@ -245,7 +245,7 @@ def preflight_via_compare(
     except (TypeError, ValueError):
         return {
             "ok": False, "errno": "EFETCH",
-            "reason": f"malformed compare response: ahead_by/behind_by not integers",
+            "reason": "malformed compare response: ahead_by/behind_by not integers",
             **common,
         }
     base_sha = ((body.get("merge_base_commit") or {}).get("sha")
