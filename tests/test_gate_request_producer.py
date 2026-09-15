@@ -95,6 +95,48 @@ def test_a_malformed_perm_gate_is_refused(store):
     assert gates_panel.open_requests(store) == []
 
 
+def test_a_push_request_reaches_the_panel_but_is_not_pressable(store):
+    """Gap `5ecb87cfdf56` slice 2b: a brokered-push refusal produces a row on
+    the same surface as every other seam's ask, and that row is informational
+    (one-press-to-ratify is a follow-up bite — see `UNPRESSABLE_PREFIXES`)."""
+    result = gate_request.open_request(
+        "kart", "push.willow-memory/willow-bot:feat/x",
+        task_id="T1", reason="kart asked to push", store=store,
+    )
+    assert result["queued"] is True
+
+    rows = [r for r in gates_panel._request_rows(store)
+            if r.scope == "push.willow-memory/willow-bot:feat/x"]
+    assert len(rows) == 1
+    row = rows[0]
+    # No press grants an envelope propose+ratify; the row must say so rather
+    # than pretend a button will do it.
+    assert gates_actions.describe(row).kind == "none"
+    assert row.action_note and "not pressable" in row.action_note
+    # And the operator sees the exact two-step ritual: propose (MCP tool),
+    # then `willow-mcp envelope ratify ...` from a shell.
+    assert "envelope_propose" in row.action_note
+    assert "willow-mcp envelope ratify" in row.action_note
+
+
+def test_a_malformed_push_gate_is_refused(store):
+    # No branch after the colon.
+    assert gate_request.open_request(
+        "kart", "push.willow-memory/willow-bot:", store=store,
+    )["queued"] is False
+    # No colon at all.
+    assert gate_request.open_request(
+        "kart", "push.willow-memory/willow-bot", store=store,
+    )["queued"] is False
+    # No slash in the repo half — an `owner/repo` shape is what `git.push`
+    # bounds carry, and a gate id that cannot be parsed back into that pair
+    # would surface an ask no operator (or approval half) could route.
+    assert gate_request.open_request(
+        "kart", "push.bare:feat/x", store=store,
+    )["queued"] is False
+    assert gates_panel.open_requests(store) == []
+
+
 def test_requesting_grants_nothing(store, tmp_path, monkeypatch):
     """The invariant in one assertion: after the ask, the gate is still shut.
 

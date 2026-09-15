@@ -236,36 +236,36 @@ def inspect_checkout(checkout: str | Path, *, remote: str = "origin",
 def _file_ask(app_id: str, *, repo: str, branch: str, remote: str, force: bool,
               errno: str, reason: str, fields, task_id: str, store=None) -> dict:
     """Put the ask in front of the operator. Returns ``{"queued": bool, ...}``
-    and never raises — the caller is already refusing."""
-    try:
-        from . import human_loop
-        from .db import Store
+    and never raises — the caller is already refusing.
 
-        if store is None:
-            store = Store()
-        detail = f"{errno}: {reason}"
-        if fields:
-            detail += f" (fields: {', '.join(str(f) for f in fields)})"
-        # `review` is the queue's kind for "a human looks and decides"; the
-        # push identity rides in source_ref (push.<repo>#<branch>) so a panel
-        # can pick these rows out without a new kind in the Forge's list.
-        item = human_loop.enqueue(
-            store,
-            kind="review",
-            title=f"Push request: {repo} {branch} -> {remote}",
-            summary=(
-                f"{app_id or 'an agent'} asked to push branch {branch!r} of {repo} "
-                f"to {remote!r}{' with force' if force else ''} and was refused: "
-                f"{detail}. Ratify a git.push envelope with these bounds "
-                f"(repo={repo!r}, branches=[{branch!r}], remote={remote!r}, "
-                f"force={str(force).lower()}) and the agent can ask again."
-            ),
-            source_agent=app_id or "",
-            source_ref=f"push.{repo}#{branch}" + (f"@{task_id}" if task_id else ""),
-        )
-        return {"queued": True, "id": item.get("id")}
-    except Exception as exc:  # noqa: BLE001 — filing must never turn a refusal into a traceback
-        return {"queued": False, "reason": f"could not enqueue the ask ({exc})"}
+    The row lands on the ``gates`` surface (``kind=consent`` under
+    ``push.<repo>:<branch>``) rather than the review queue: gap
+    ``5ecb87cfdf56``'s finding was that a brokered-push refusal enqueued a
+    ``kind=review`` row that no operator panel picked up as "an agent asked
+    for a push." Every other seam's ask (lease, permission, attestation)
+    goes through :func:`gate_request.open_request`; the push seam is now
+    the fourth. Dedup, TTL, and the ``REQUESTABLE_PREFIXES`` check are the
+    broker's, not this function's — see ``gate_request.py``.
+    """
+    from . import gate_request
+
+    detail = f"{errno}: {reason}"
+    if fields:
+        detail += f" (fields: {', '.join(str(f) for f in fields)})"
+    summary = (
+        f"{app_id or 'an agent'} asked to push branch {branch!r} of {repo} "
+        f"to {remote!r}{' with force' if force else ''} and was refused: "
+        f"{detail}. Ratify a git.push envelope with these bounds "
+        f"(repo={repo!r}, branches=[{branch!r}], remote={remote!r}, "
+        f"force={str(force).lower()}) and the agent can ask again."
+    )
+    return gate_request.open_request(
+        app_id or "",
+        f"push.{repo}:{branch}",
+        task_id=task_id,
+        reason=summary,
+        store=store,
+    )
 
 
 def execute_push(
