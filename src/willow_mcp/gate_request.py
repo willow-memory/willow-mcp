@@ -237,3 +237,61 @@ def request_lease(app_id: str, *, task_id: str = "", reason: str = "",
         ),
         store=store,
     )
+
+
+def request_permission(app_id: str, tool_name: str, *, task_id: str = "",
+                       reason: str = "", store=None) -> dict:
+    """Ask the operator for the permission that admits `tool_name` on `app_id`.
+
+    Gap `5ecb87cfdf56`, slice 2b PR 2: `server._gate()` was the last
+    unmapped denial site. A `permitted()` miss returned an error naming
+    the tool and left the operator to guess which manifest line would
+    admit it. The scope this ask names is picked by
+    :func:`gate.narrowest_requestable_perm_scope` — the narrowest
+    `PERMISSION_GROUPS` entry whose grant would admit the tool (option b),
+    falling through to the literal tool name (option c) when no group
+    fits.
+
+    Gate id shape is `perm.<app_id>.<scope>` — the same
+    `split_permission_gate` grammar every other `perm.` producer speaks,
+    so `gates_actions._request_permission` can route the press without
+    branching on which site filed the ask.
+    """
+    from . import gate
+
+    scope = gate.narrowest_requestable_perm_scope(tool_name)
+    return open_request(
+        app_id,
+        f"perm.{app_id}.{scope}",
+        task_id=task_id,
+        reason=reason or (
+            f"{app_id or 'an app'} was refused {tool_name!r} for want of a "
+            f"manifest permission that admits it — the narrowest requestable "
+            f"scope is {scope!r}"
+        ),
+        store=store,
+    )
+
+
+def note_for_perm_denial(app_id: str, tool_name: str, *, task_id: str = "",
+                         store=None) -> str:
+    """Enqueue the ask, and return the sentence a permission denial adds.
+
+    Same shape as :func:`note_for_lease_denial`: one call, one appended
+    sentence, and the denial itself untouched above it. Returns "" when
+    nothing was queued — a failed enqueue must not put a claim in the
+    operator's face that no row backs.
+    """
+    result = request_permission(app_id, tool_name, task_id=task_id, store=store)
+    if result.get("queued"):
+        return (
+            f" This ask has been queued for the operator as request "
+            f"{result.get('id')} — it appears in `willow-mcp gates` and expires "
+            f"{result.get('expires_at')}."
+        )
+    if result.get("duplicate_of"):
+        return (
+            f" An open request for this is already waiting on the operator "
+            f"(request {result.get('duplicate_of')})."
+        )
+    return ""
