@@ -1,6 +1,12 @@
 """willow-mcp Claude Code hook — PreToolUse.
 
-Eight guards:
+Nine guards:
+- The willow seat does not use Shell (2026-09-14, gap 715d89fe3c90): for the
+  human-orchestrator seat every Bash command is blocked, and the refusal
+  names the fleet tool that replaces it — Read / search_code / detect_changes
+  for reads, task_submit for execution, git_push_execute / pr_open_execute /
+  git_pull_execute for the git acts that leave the box. Specialist seats are
+  not affected; they keep the routing table below (blocks).
 - Bash reaching for raw psql/psycopg2/sqlite3 against a database or store
   willow-mcp owns, instead of going through the MCP tools (blocks).
 - A Write/Edit/MultiEdit whose target file *is* a willow-mcp-owned SQLite
@@ -153,17 +159,18 @@ _GH_MUTATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# The willow human-orchestrator seat. Repo maintenance — commit, PR create — IS
-# that seat's job, so those git/gh routing nudges toward task_submit are pure
-# friction for it. `git push` is NOT exempt: push is a brokered verb
-# (git_push_execute), never raw Shell and never a Kart-held credential.
-# The self-grant guard (egress keys, leases, manifest task_net) runs BEFORE
-# routing and is NEVER lifted. The signal is the server env the SessionStart
-# hook exports into the session (.mcp.json / CLAUDE_ENV_FILE).
+# The willow human-orchestrator seat. Since 2026-09-14 this seat does not use
+# Shell at all — see check_seat_shell: reads go through Read and the code
+# graph, execution through task_submit, and git through the broker verbs.
+# (Before that date the seat was EXEMPT from the git/gh routing below, on the
+# reasoning that repo maintenance is its job; the broker verbs made that
+# reasoning obsolete and the operator retired the exemption.) The self-grant
+# guard (egress keys, leases, manifest task_net) runs BEFORE routing and is
+# NEVER lifted. The signal is the server env the SessionStart hook exports
+# into the session (.mcp.json / CLAUDE_ENV_FILE).
 _ORCHESTRATOR_APP_ID = "willow"
 
-# git/gh routing entries. Push is always steered (broker); pull/mut/gh are
-# lifted for the orchestrator seat only.
+# git/gh routing entries for specialist seats. Push is always steered (broker).
 _ROUTE_GIT_PUSH_RE = re.compile(r"\bgit\s+push\b")
 _ROUTE_GIT_PULL_RE = re.compile(r"\bgit\s+pull\b")
 _ROUTE_GIT_MUT_RE = re.compile(
@@ -252,10 +259,6 @@ _BASH_ROUTING: list[tuple[re.Pattern[str], str, str]] = [
     (_ROUTE_FS_MUTATE_RE, "warn", f"scripted/bulk filesystem change → {_TASK_SUBMIT}"),
 ]
 
-# Orchestrator exemption: commit/PR/pull friction only — never push (brokered).
-_GIT_GH_ROUTING = frozenset({_ROUTE_GIT_PULL_RE, _ROUTE_GIT_MUT_RE, _ROUTE_GH_RE})
-
-
 def _env_declares_orchestrator() -> bool:
     if os.environ.get("WILLOW_HUMAN_ORCHESTRATOR", "").strip() == "1":
         return True
@@ -324,19 +327,84 @@ def _git_gh_inspect_allowed(command: str) -> bool:
     return bool(_GIT_INSPECT_RE.search(c) or _GH_INSPECT_RE.search(c))
 
 
+# ── the willow seat does not use Shell ──────────────────────────────────────
+#
+# Until 2026-09-14 this hook LIFTED the git/gh routing for the orchestrator
+# seat ("repo maintenance IS that seat's job") and said nothing about any other
+# command. On that day the seat ran Shell five times — git diff, pytest,
+# python3 -c twice, wc/tail — and the hook blocked none of them; the operator
+# did, twice: "use the mcps", "use kart, use the fucking mcps that the hooks
+# should be fucking blocking you from". Every one of those acts has a fleet
+# tool now: reads go through Read / search_code / detect_changes, execution
+# through task_submit (Kart, with the repo's .git bound), and the three git
+# acts that leave the box through the broker — git_push_execute,
+# pr_open_execute, git_pull_execute. So for this seat the rule is the
+# operator's, not a nudge: Shell is refused, and the refusal names the door.
+# The exemption is gone with it (gap 715d89fe3c90). Specialist seats keep the
+# routing table below — theirs is a different question.
+
+_SEAT_SHELL_REASON = "willow-mcp: the willow seat does not use Shell (operator, 2026-09-14)"
+
+_SEAT_REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bgit\s+push\b"),
+     "git_push_execute(app_id=..., checkout=..., repo='org/name', branch=...) — the broker pushes"),
+    (re.compile(r"\bgh\s+pr\s+create\b"),
+     "pr_open_execute(app_id=..., repo='org/name', head=..., base=..., title=..., body=...) — the bot opens it"),
+    (re.compile(r"\bgh\s+pr\s+merge\b"),
+     "the merge is the operator's act; watch it with integration_call(name='github', method='GET', ...)"),
+    (re.compile(r"\bgit\s+(pull|fetch)\b"),
+     "git_pull_execute(app_id=..., checkout=..., repo='org/name') or gitsync_sweep — the broker brings it home"),
+    (re.compile(r"\bgit\s+(status|log|diff|show|branch|rev-parse|describe|shortlog|remote)\b"),
+     "detect_changes(project=..., base_branch=...) for the working tree; "
+     "task_submit(app_id=..., task='git -C <repo> ...') for the rest"),
+    (re.compile(r"\bgh\s"),
+     "integration_call(name='github', method='GET', path='/repos/...') to read GitHub; "
+     "pr_open_execute / git_push_execute to act"),
+    (re.compile(r"\bgit\b"),
+     "task_submit(app_id=..., task='cd <repo> && git ...') — Kart has the repo's .git bound"),
+    # Execution before reads: a pipeline that runs something and tails the
+    # output is execution, whatever it is piped through.
+    (re.compile(r"(?:^|&&|;|\|)\s*(python3?|pytest|node|npm|make|ruff|pip3?)(?:\s|$)"),
+     f"{_TASK_SUBMIT} — Kart runs it sandboxed and returns the output"),
+    (re.compile(r"(?:^|&&|;|\|)\s*(cat|head|tail|less|more)(?:\s|$)"),
+     "the Read tool (offset/limit for a slice)"),
+    (re.compile(r"(?:^|&&|;|\|)\s*(grep|rg|ag|find|fd)(?:\s|$)"),
+     "search_code(pattern=..., project=...) / search_graph(...) on the code graph"),
+    (re.compile(r"(?:^|&&|;|\|)\s*(ls|tree|pwd|wc|du|stat)(?:\s|$)"),
+     "the Read tool for a file, search_code(mode='files') for a listing, "
+     f"{_TASK_SUBMIT} for anything else"),
+    (re.compile(r"(?:^|&&|;|\|)\s*(systemctl|journalctl)(?:\s|$)"),
+     "fleet_health / diagnostic_summary; unit state and journals are not readable "
+     "from the seat yet (gap 158600e03598) — ask the operator for the status line"),
+]
+
+
+def check_seat_shell(command: str) -> Optional[tuple[str, str]]:
+    """Refuse Shell for the willow seat and name the tool that replaces it.
+    None for every other seat (their routing table still applies)."""
+    if not _is_orchestrator_seat():
+        return None
+    c = (command or "").strip()
+    for pattern, replacement in _SEAT_REPLACEMENTS:
+        if pattern.search(c):
+            return "block", f"{_SEAT_SHELL_REASON} — use {replacement}"
+    return "block", f"{_SEAT_SHELL_REASON} — use {_TASK_SUBMIT} for execution, the Read tool " \
+                    f"and the code graph (search_code / search_graph) for reads"
+
+
 def check_bash_routing(command: str) -> Optional[tuple[str, str]]:
     """Return (decision, reason) when a Bash habit should redirect to MCP, else None."""
-    if not command or _git_gh_inspect_allowed(command):
+    if not command:
         return None
-    orchestrator = _is_orchestrator_seat()
+    seat = check_seat_shell(command)
+    if seat:
+        return seat
+    if _git_gh_inspect_allowed(command):
+        return None
     for pattern, decision, hint in _BASH_ROUTING:
         if pattern.search(command):
-            # The orchestrator seat is not steered off git/gh; every other
-            # routing entry (psql/sqlite3/ls/…) still applies to it.
-            if orchestrator and pattern in _GIT_GH_ROUTING:
-                continue
             return decision, f"willow-mcp: prefer MCP tools — {hint}"
-    if not orchestrator and (_GIT_MUTATION_RE.search(command) or _GH_MUTATION_RE.search(command)):
+    if _GIT_MUTATION_RE.search(command) or _GH_MUTATION_RE.search(command):
         return "block", f"willow-mcp: prefer MCP tools — git/gh mutation → {_TASK_SUBMIT}"
     return None
 

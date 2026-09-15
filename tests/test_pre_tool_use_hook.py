@@ -806,7 +806,8 @@ def test_is_orchestrator_seat_reads_mcp_json_when_env_absent(tmp_path, monkeypat
     _write_mcp_json(tmp_path, {"WILLOW_APP_ID": "willow", "WILLOW_HUMAN_ORCHESTRATOR": "1"})
     monkeypatch.setattr(pre_tool_use, "_project_dir", lambda: str(tmp_path))
     assert pre_tool_use._is_orchestrator_seat()
-    assert pre_tool_use.check_bash_routing("git commit -m x") is None
+    routed = pre_tool_use.check_bash_routing("git commit -m x")
+    assert routed is not None and routed[0] == "block" and "task_submit" in routed[1]
 
 
 @pytest.fixture
@@ -814,14 +815,47 @@ def orchestrator_seat(monkeypatch):
     monkeypatch.setenv("WILLOW_APP_ID", "willow")
 
 
-@pytest.mark.parametrize("command", [
-    "git commit -m 'x'",
-    "git add -A",
-    "git pull origin main",
-    "gh pr create --title t",
+# ── the willow seat does not use Shell (2026-09-14, gap 715d89fe3c90) ────────
+#
+# The five commands the seat actually ran that day, and the hook let through,
+# are the plants. Each refusal must name the fleet tool that replaces it —
+# a block that only says "no" sends the seat back to guessing.
+
+@pytest.mark.parametrize("command, replacement", [
+    ("git diff --stat", "detect_changes"),
+    ("cd /x && python -m pytest tests/ -q 2>&1 | tail -5", "task_submit"),
+    ("python3 -c \"import json; print(1)\"", "task_submit"),
+    ("wc -l a.jsonl; tail -2 a.jsonl", "Read"),
+    ("git commit -m 'x'", "task_submit"),
+    ("git add -A", "task_submit"),
+    ("git pull origin main", "git_pull_execute"),
+    ("git fetch --prune", "git_pull_execute"),
+    ("gh pr create --title t", "pr_open_execute"),
+    ("gh pr merge 5", "operator"),
+    ("gh pr view 5", "integration_call"),
+    ("git status", "detect_changes"),
+    ("git log --oneline -3", "detect_changes"),
+    ("cat README.md", "Read"),
+    ("grep -rn foo src/", "search_code"),
+    ("ls -la", "Read"),
+    ("systemctl --user status willow-bot-steward.service", "158600e03598"),
+    ("ruff check .", "task_submit"),
+    ("echo hello", "task_submit"),
 ])
-def test_orchestrator_git_gh_mutations_allowed(orchestrator_seat, command):
-    assert pre_tool_use.check_bash_routing(command) is None
+def test_the_willow_seat_is_refused_shell_and_told_the_door(orchestrator_seat, command, replacement):
+    routed = pre_tool_use.check_bash_routing(command)
+    assert routed is not None and routed[0] == "block", (command, routed)
+    assert "does not use Shell" in routed[1]
+    assert replacement in routed[1], (command, routed[1])
+
+
+def test_the_seat_refusal_is_not_lifted_by_the_git_inspect_allowance(orchestrator_seat):
+    """`git status`/`log`/`diff` are read-only and the routing table lets other
+    seats run them; the willow seat still does not — `git diff --stat` was the
+    first Shell the operator rejected on 2026-09-14."""
+    for c in ("git status", "git diff --stat", "gh pr list"):
+        routed = pre_tool_use.check_bash_routing(c)
+        assert routed is not None and routed[0] == "block", c
 
 
 def test_orchestrator_raw_push_is_brokered(orchestrator_seat):
@@ -831,21 +865,27 @@ def test_orchestrator_raw_push_is_brokered(orchestrator_seat):
     assert "git_push_execute" in routed[1]
 
 
-@pytest.mark.parametrize("command, decision", [
-    ("ls -la src/", "warn"),
-    ("psql mydb -c 'select 1'", "block"),
-    ("sqlite3 /tmp/x.db 'select 1'", "block"),
-    ("curl https://example.com", "block"),
-    ("pip install requests", "block"),
-    ("rm -rf build/", "warn"),
+@pytest.mark.parametrize("command", [
+    "psql mydb -c 'select 1'",
+    "sqlite3 /tmp/x.db 'select 1'",
+    "curl https://example.com",
+    "pip install requests",
+    "rm -rf build/",
 ])
-def test_orchestrator_still_routed_off_non_git_habits(orchestrator_seat, command, decision):
-    """The exemption is git/gh only — every other routing nudge still fires,
-    including the Kart (network/background/filesystem) redirects added
-    alongside it: the orchestrator seat's repo-maintenance carve-out doesn't
-    extend to running raw curl or pip against the network."""
+def test_orchestrator_is_refused_everything_else_too(orchestrator_seat, command):
     routed = pre_tool_use.check_bash_routing(command)
-    assert routed is not None and routed[0] == decision
+    assert routed is not None and routed[0] == "block"
+
+
+def test_specialist_seats_keep_the_routing_table(monkeypatch):
+    """The seat rule is the willow seat's. A specialist still gets the
+    inspect allowance and the warn/block table it always had."""
+    monkeypatch.setenv("WILLOW_APP_ID", "ada")
+    monkeypatch.setattr(pre_tool_use, "_project_dir", lambda: None)
+    assert pre_tool_use.check_bash_routing("git status") is None
+    assert pre_tool_use.check_bash_routing("ls -la src/")[0] == "warn"
+    assert pre_tool_use.check_bash_routing("git commit -m x")[0] == "block"
+    assert pre_tool_use.check_seat_shell("anything") is None
 
 
 def test_orchestrator_self_grant_guard_not_lifted(orchestrator_seat):
@@ -855,14 +895,18 @@ def test_orchestrator_self_grant_guard_not_lifted(orchestrator_seat):
         "willow-mcp grant-net willow --ttl 3h") is not None
 
 
-def test_main_allows_orchestrator_commit():
+def test_main_refuses_orchestrator_commit_and_names_kart():
+    """End to end through main(): the harness gets a block, and the reason
+    names task_submit — the same commit, run in Kart with .git bound."""
     code, stdout = _run_hook({
         "tool_name": "Bash",
         "tool_input": {"command": "git commit -m 'ship it'"},
         "session_id": "s1",
     }, env={"WILLOW_APP_ID": "willow"})
     assert code == 0
-    assert stdout == ""
+    body = json.loads(stdout)
+    assert body["decision"] == "block"
+    assert "does not use Shell" in body["reason"] and "task_submit" in body["reason"]
 
 
 def test_main_blocks_orchestrator_push_to_broker():
