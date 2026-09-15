@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **seal-daemon:** SIGTERM cannot be outrun by the run-loop wait ([e60200d](https://github.com/willow-memory/willow-mcp/commit/e60200d5e0f86544e2cab6723b69eee8637824c0))
 * **seal-daemon:** SIGTERM cannot be outrun by the run-loop wait ([386a3cd](https://github.com/willow-memory/willow-mcp/commit/386a3cdff403440f728226ab327df43f743be37a))
 
 ## [2.45.0](https://github.com/willow-memory/willow-mcp/compare/v2.44.1...v2.45.0) (2026-09-15)
