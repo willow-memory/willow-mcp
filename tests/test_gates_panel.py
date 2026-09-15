@@ -23,6 +23,14 @@ def apps_root(tmp_path, monkeypatch):
     root.mkdir()
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(root))
+    # Slice 2b PR 2: an earlier test's `_gate()` denial can now file a perm.*
+    # row into whatever store `Store()` resolves at default. Isolating the
+    # store here keeps `collect()` reading from a fresh directory rather than
+    # inheriting rows queued by the session-wide default (which any test that
+    # hits a `permitted()` miss without setting WILLOW_STORE_ROOT would write
+    # to — several such tests exist, notably `test_server`'s
+    # `test_guarded_denies_unpermitted_app_id`).
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
     monkeypatch.delenv("WILLOW_MCP_STRICT_TRUST_ROOT", raising=False)
     monkeypatch.delenv("WILLOW_HUMAN_ORCHESTRATOR", raising=False)
     monkeypatch.delenv("WILLOW_MCP_FLEET_HOME", raising=False)
