@@ -101,6 +101,13 @@ def check_requestable(gate_id: str) -> Optional[str]:
                 f"{gate_id!r} is not a well-formed push.<owner>/<repo>:<branch> "
                 f"gate"
             )
+    if gate_id.startswith("pr."):
+        repo, base = gates_panel.split_pr_gate(gate_id)
+        if not repo or not base:
+            return (
+                f"{gate_id!r} is not a well-formed pr.<owner>/<repo>:<base> "
+                f"gate"
+            )
     return None
 
 

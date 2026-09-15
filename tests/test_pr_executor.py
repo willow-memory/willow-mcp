@@ -238,7 +238,13 @@ def test_base_outside_bounds_is_refused_cited_and_asked(home, tmp_path, monkeypa
     from willow_mcp import human_loop
     from willow_mcp.db import Store
     rows = human_loop.list_queue(Store())
-    assert any("feat/x" in (r.get("title") or "") for r in rows)
+    # Post-migration (gap 5ecb87cfdf56 follow-up): the gate id carries the
+    # base (`pr.<repo>:<base>` — envelope bounds); the head rides in the
+    # summary alongside the reason. Assert both surface.
+    assert any(
+        "master" in (r.get("title") or "") and "feat/x" in (r.get("summary") or "")
+        for r in rows
+    )
 
 
 def test_foreign_repo_is_refused(home, tmp_path, monkeypatch):

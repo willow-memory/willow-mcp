@@ -137,6 +137,38 @@ def test_a_malformed_push_gate_is_refused(store):
     assert gates_panel.open_requests(store) == []
 
 
+def test_a_pr_request_reaches_the_panel_but_is_not_pressable(store):
+    """Gap `5ecb87cfdf56` follow-up (`pr_executor` migration): the `pr.open`
+    denial-site ask lands on the same surface as `push.`, with the same
+    informational-only posture."""
+    result = gate_request.open_request(
+        "kart", "pr.willow-memory/willow-bot:master",
+        task_id="T1", reason="kart asked to open a PR", store=store,
+    )
+    assert result["queued"] is True
+
+    rows = [r for r in gates_panel._request_rows(store)
+            if r.scope == "pr.willow-memory/willow-bot:master"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert gates_actions.describe(row).kind == "none"
+    assert row.action_note and "not pressable" in row.action_note
+    assert "pr.open envelope" in row.action_note
+
+
+def test_a_malformed_pr_gate_is_refused(store):
+    assert gate_request.open_request(
+        "kart", "pr.willow-memory/willow-bot:", store=store,
+    )["queued"] is False
+    assert gate_request.open_request(
+        "kart", "pr.willow-memory/willow-bot", store=store,
+    )["queued"] is False
+    assert gate_request.open_request(
+        "kart", "pr.bare:master", store=store,
+    )["queued"] is False
+    assert gates_panel.open_requests(store) == []
+
+
 def test_requesting_grants_nothing(store, tmp_path, monkeypatch):
     """The invariant in one assertion: after the ask, the gate is still shut.
 
