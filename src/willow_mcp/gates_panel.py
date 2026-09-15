@@ -536,13 +536,52 @@ REQUEST_QUEUE_KIND = "consent"
 #: watches. A row that says "this seat is blocked, here is the exact line to
 #: paste" is not an approval; it is the ask made visible, which is stage 1's
 #: entire premise applied to a gate whose approval half does not exist yet.
-REQUESTABLE_PREFIXES = ("lease.", "perm.", "attest.")
+#: `push.<repo>:<branch>` is the fourth (gap `5ecb87cfdf56`, slice 2b).
+#: The brokered push refusal at `push_executor._file_ask` already made a
+#: `human_required` row of `kind=review` — visible to a review UI, invisible to
+#: `willow-mcp gates`. Moving it here brings the ask onto the same surface as
+#: every other operator decision the seam catches, and gives the operator a
+#: single place to see "an agent asked for a push". Pressing today is
+#: informational (the row carries the `willow-mcp envelope propose/ratify`
+#: line the operator runs); the one-press-to-ratify wiring is a follow-up
+#: bite. See `docs/design/brokered-push.md` slice 2b.
+REQUESTABLE_PREFIXES = ("lease.", "perm.", "attest.", "push.")
 
 #: Prefixes whose row is informational: it surfaces the ask and carries the
 #: command, and pressing it does nothing. Kept as its own set rather than as a
 #: branch in `describe()` so that "can be asked for" and "can be granted by a
 #: press" stay two separate questions with two separate answers.
-UNPRESSABLE_PREFIXES = ("attest.",)
+#:
+#: `push.` is here for the same reason `attest.` is: the row surfaces the ask,
+#: and one-press-to-ratify (a `propose` + `ratify` sequence that would touch
+#: `pre-approved.json#proposals[]` and `active[]`) needs an attributed
+#: operator session, which `gates_actions.apply()` does not run inside today.
+#: A follow-up bite wires it via a CLI shell-out; until then the row carries
+#: the exact `willow-mcp envelope propose/ratify` invocation.
+UNPRESSABLE_PREFIXES = ("attest.", "push.")
+
+
+def split_push_gate(gate_id: str) -> tuple[str, str]:
+    """`push.<owner>/<repo>:<branch>` -> ``(repo, branch)``, or ``("", "")``
+    if malformed.
+
+    ``:`` (not ``#``) separates repo from branch: a GitHub URL fragment uses
+    ``#`` and would confuse a reader who assumed the gate id was a URL.
+    Branch names may contain ``/`` (`feat/x`) but never ``:``, and repo names
+    contain neither — so one split from the right on ``:`` is unambiguous.
+    """
+    prefix = "push."
+    if not (gate_id or "").startswith(prefix):
+        return "", ""
+    body = gate_id[len(prefix):]
+    if ":" not in body:
+        return "", ""
+    repo, _, branch = body.rpartition(":")
+    repo = repo.strip()
+    branch = branch.strip()
+    if not repo or "/" not in repo or not branch:
+        return "", ""
+    return repo, branch
 
 #: Permission groups a request may never name, at any distance.
 #:
@@ -708,12 +747,28 @@ def _request_rows(store=None) -> list[GateRow]:
             # must stay that way, so it reads this rather than computing it.
             from . import remedy
 
-            session_id = split_attest_gate(gate_id)
-            action_note = (
-                "this one is not pressable — attestation is a signature made "
-                "with the operator's own key, and no press can produce it. Run:"
-                f"\n    {remedy.attestation_command(session_id, keyring_on=remedy.keyring_on())}"
-            )
+            if gate_id.startswith("push."):
+                # No compact CLI form yet: `envelope propose` is orchestrator-
+                # attributed and lives at the MCP tool surface, not the CLI
+                # (see `cli_envelope.py`). Ratify is a CLI, but the propose it
+                # ratifies must come first. Point the operator at the summary
+                # (which carries the exact bounds) and at the two-step ritual
+                # rather than a paste-me line that would be a half-truth.
+                action_note = (
+                    "this one is not pressable — a push envelope needs an "
+                    "attributed operator session. Propose it with the "
+                    "`envelope_propose` MCP tool using the bounds in the "
+                    "summary above, then ratify from a bare shell: "
+                    "`willow-mcp envelope ratify <proposal_id> "
+                    "--verifier <name>`."
+                )
+            else:
+                session_id = split_attest_gate(gate_id)
+                action_note = (
+                    "this one is not pressable — attestation is a signature made "
+                    "with the operator's own key, and no press can produce it. Run:"
+                    f"\n    {remedy.attestation_command(session_id, keyring_on=remedy.keyring_on())}"
+                )
 
         rows.append(GateRow(
             id=f"request.{item['id']}", label="gate request", scope=gate_id,

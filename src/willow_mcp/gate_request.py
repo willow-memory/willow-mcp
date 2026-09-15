@@ -91,6 +91,16 @@ def check_requestable(gate_id: str) -> Optional[str]:
                 f"the system rather than over the work, and adding it stays a "
                 f"deliberate operator act with no agent in the loop"
             )
+    if gate_id.startswith("push."):
+        # Same shape-check discipline as `perm.` above: a request whose gate id
+        # cannot be parsed back into ``(repo, branch)`` would surface an ask no
+        # operator (or later approval half) could route.
+        repo, branch = gates_panel.split_push_gate(gate_id)
+        if not repo or not branch:
+            return (
+                f"{gate_id!r} is not a well-formed push.<owner>/<repo>:<branch> "
+                f"gate"
+            )
     return None
 
 
