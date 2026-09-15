@@ -15,11 +15,12 @@ an editor.
 """
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 from pathlib import Path
 import pwd
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,8 @@ from .gate import (
     _apps_root,
     _validate_app_id,
 )
+
+_REAL_SUBPROCESS_RUN = subprocess.run
 
 #: Same typo-guard reasoning as `gate.store_scope`'s malformed-field check
 #: (B-25): an operator toggling a misspelled permission name would otherwise
@@ -132,6 +135,125 @@ PrivilegedPublisher = Callable[
 
 def _content_digest(content: bytes | None) -> str:
     return _ABSENT_DIGEST if content is None else hashlib.sha256(content).hexdigest()
+
+
+def _cli_python_for_trust_owner() -> Path:
+    """Absolute CLI interpreter path for the trust-owner sudo helper.
+
+    sudo may discard PATH; the bridge must pass an absolute executable. A venv's
+    ``bin/python`` is usually a symlink chain to the system interpreter — resolving
+    that chain hands back a base Python that cannot import ``willow_mcp``. The
+    venv is identified by the path you invoke, not the binary behind it.
+    """
+    raw = os.environ.get("WILLOW_MCP_PYTHON", "").strip() or sys.executable
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(os.path.abspath(str(path)))
+    if not path.is_file():
+        raise RuntimeError(
+            "permission change refused before mutation: CLI python "
+            f"{path} is not a readable file"
+        )
+    return path
+
+
+def _mode_allows(uid: int, gid: int, st: os.stat_result, access: int) -> bool:
+    mode = stat.S_IMODE(st.st_mode)
+    perm = {os.R_OK: 4, os.W_OK: 2, os.X_OK: 1}[access]
+    if uid == st.st_uid:
+        return bool((mode >> 6) & perm)
+    pw = pwd.getpwuid(uid)
+    group_ids = set(os.getgrouplist(pw.pw_name, pw.pw_gid))
+    if st.st_gid in group_ids:
+        return bool((mode >> 3) & perm)
+    return bool(mode & perm)
+
+
+def _uid_can_execute_path(path: Path, uid: int) -> bool:
+    """Whether ``uid`` may traverse ``path`` and execute the final component."""
+    if not path.is_absolute():
+        return False
+    pw = pwd.getpwuid(uid)
+    parts: list[Path] = []
+    cursor = path
+    while True:
+        parts.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    parts.reverse()
+    for idx, component in enumerate(parts):
+        try:
+            st = component.lstat()
+        except OSError:
+            return False
+        is_last = idx == len(parts) - 1
+        if is_last:
+            if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+                return False
+        elif not stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+            return False
+        if not _mode_allows(uid, pw.pw_gid, st, os.X_OK):
+            return False
+    return True
+
+
+def _require_trust_owner_can_invoke_python(python: Path, owner_uid: int) -> None:
+    if not _uid_can_execute_path(python, owner_uid):
+        owner = pwd.getpwuid(owner_uid).pw_name
+        raise PermissionError(
+            "permission change refused before mutation: trust owner "
+            f"{owner!r} cannot execute {python}"
+        )
+
+
+def _require_trust_owner_can_import_willow_mcp(python: Path, trust_owner: str) -> None:
+    """Prove the trust-owner sudo launch can import ``willow_mcp``.
+
+    Runs the same ``sudo -u <owner> -- <python> -c ...`` shape as publication.
+    A probe as the invoking human can succeed while the trust owner cannot —
+    that is the live failure class this closes.
+    """
+    if not python.is_absolute():
+        raise RuntimeError(
+            "permission change refused before mutation: CLI python "
+            f"{python} must be an absolute path"
+        )
+    try:
+        st = python.lstat()
+    except OSError as exc:
+        raise RuntimeError(
+            "permission change refused before mutation: CLI python "
+            f"{python} is not reachable ({exc})"
+        ) from exc
+    if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+        raise RuntimeError(
+            "permission change refused before mutation: CLI python "
+            f"{python} is not a regular file or symlink"
+        )
+
+    command = [
+        "sudo",
+        "-u",
+        trust_owner,
+        "--",
+        str(python),
+        "-c",
+        "import willow_mcp",
+    ]
+    probe = _REAL_SUBPROCESS_RUN(
+        command,
+        check=False,
+        capture_output=True,
+        timeout=60,
+    )
+    if probe.returncode != 0:
+        detail = (probe.stderr or probe.stdout or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(
+            "permission change refused before mutation: "
+            f"trust owner {trust_owner!r} via {python} cannot import willow_mcp "
+            f"({detail or 'nonzero exit'})"
+        )
 
 
 def _replace_bytes(path: Path, content: bytes | None, token: str) -> None:
@@ -298,12 +420,16 @@ def publish_via_trust_owner(
         os.chmod(staged_sig, 0o644)
         os.chmod(staged_public_key, 0o644)
 
+        python = _cli_python_for_trust_owner()
+        _require_trust_owner_can_invoke_python(python, owner_info.pw_uid)
+        _require_trust_owner_can_import_willow_mcp(python, owner_info.pw_name)
+
         command = [
             "sudo",
             "-u",
             owner_info.pw_name,
             "--",
-            str(Path(sys.executable).resolve()),
+            str(python),
             "-m",
             "willow_mcp",
             "_publish-permission",
