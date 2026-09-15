@@ -109,12 +109,44 @@ def _charter(tmp_path, monkeypatch, *, grantee="willow", bases=("master",),
 # ── a fake GitHub ───────────────────────────────────────────────────────────
 
 class _FakeApi:
-    def __init__(self, *, status=201, ok=True, reason=""):
+    """The pr-open executor talks to two endpoints now: ``GET /compare/…``
+    (the remote-base preflight — gap bc9945dd47da) and ``POST /pulls`` (the
+    PR create). ``_FakeApi`` answers each; the default is a compare that
+    reads ``ahead`` (so existing tests continue to reach the POST) and a
+    POST that returns 201 with a synthetic PR body. Tests that exercise
+    the preflight paths configure the compare response explicitly, and
+    tests that exercise a POST refusal keep the compare-passes default.
+    """
+
+    def __init__(self, *, status=201, ok=True, reason="",
+                 compare_status="ahead", compare_ahead_by=5, compare_behind_by=0,
+                 compare_ok=True, compare_http_status=200, compare_reason=""):
         self.calls: list[dict] = []
         self.status, self.ok, self.reason = status, ok, reason
+        self.compare_status = compare_status
+        self.compare_ahead_by = compare_ahead_by
+        self.compare_behind_by = compare_behind_by
+        self.compare_ok = compare_ok
+        self.compare_http_status = compare_http_status
+        self.compare_reason = compare_reason
 
     def __call__(self, method, url, *, bearer, body=None):
         self.calls.append({"method": method, "url": url, "bearer": bearer, "body": body})
+        if "/compare/" in url:
+            if not self.compare_ok:
+                return {"ok": False, "status": self.compare_http_status,
+                        "reason": self.compare_reason}
+            return {
+                "ok": True, "status": self.compare_http_status,
+                "body": {
+                    "status": self.compare_status,
+                    "ahead_by": self.compare_ahead_by,
+                    "behind_by": self.compare_behind_by,
+                    "base_commit": {"sha": "base-sha"},
+                    "merge_base_commit": {"sha": "base-sha"},
+                    "commits": [{"sha": "head-sha"}],
+                },
+            }
         if not self.ok:
             return {"ok": False, "status": self.status, "reason": self.reason}
         return {"ok": True, "status": self.status,
@@ -148,8 +180,12 @@ def test_granted_open_cites_then_posts_as_the_app(home, tmp_path, monkeypatch):
     assert out["ok"] and out["opened"], out
     assert out["number"] == 31 and out["url"].endswith("/pull/31")
     assert out["envelope_id"] == "env-pr.open-test" and out["auth_mode"] == "app"
-    assert len(api.calls) == 1
-    call = api.calls[0]
+    # Two API calls: the remote-base preflight compare, then the POST /pulls.
+    # The preflight runs before the atomic citation (gap bc9945dd47da).
+    assert len(api.calls) == 2
+    assert api.calls[0]["method"] == "GET"
+    assert api.calls[0]["url"].endswith("/compare/master...feat/x")
+    call = api.calls[1]
     assert call["method"] == "POST"
     assert call["url"] == "https://api.github.com/repos/forge-play/Forge/pulls"
     assert call["bearer"] == "ghs_test_token"
@@ -212,7 +248,9 @@ def test_a_spent_single_use_grant_is_edquot(home, tmp_path, monkeypatch):
     assert _open(pg, api)["ok"]
     again = _open(pg, api)
     assert not again["ok"] and again["error"] == "EDQUOT"
-    assert len(api.calls) == 1
+    # Two API calls total: the first (granted) run did compare + POST; the
+    # second (EDQUOT) refused at the cheap bounds check before any network.
+    assert len(api.calls) == 2
 
 
 @pytest.mark.parametrize("bad", [
@@ -309,12 +347,13 @@ def test_the_operator_is_asked_to_review_and_assigned(home, tmp_path, monkeypatc
     assert out["operator"] == {"login": "the-operator", "review_requested": True, "assigned": True}
     urls = [c["url"] for c in api.calls]
     assert urls == [
+        "https://api.github.com/repos/forge-play/Forge/compare/master...feat/x",
         "https://api.github.com/repos/forge-play/Forge/pulls",
         "https://api.github.com/repos/forge-play/Forge/pulls/31/requested_reviewers",
         "https://api.github.com/repos/forge-play/Forge/issues/31/assignees",
     ]
-    assert api.calls[1]["body"] == {"reviewers": ["the-operator"]}
-    assert api.calls[2]["body"] == {"assignees": ["the-operator"]}
+    assert api.calls[2]["body"] == {"reviewers": ["the-operator"]}
+    assert api.calls[3]["body"] == {"assignees": ["the-operator"]}
     assert all(c["bearer"] == "ghs_test_token" for c in api.calls)
 
 
@@ -327,7 +366,10 @@ def test_no_login_configured_is_said_not_pretended(home, tmp_path, monkeypatch):
     assert out["ok"] and out["operator"]["login"] is None
     assert out["operator"]["review_requested"] is False and out["operator"]["assigned"] is False
     assert "WILLOW_OPERATOR_GITHUB_LOGIN" in out["operator"]["detail"]
-    assert len(api.calls) == 1, "no follow-up calls without a login"
+    # Preflight compare + POST /pulls; no follow-up review/assign calls without
+    # a login. The compare is expected — it is the remote-base preflight.
+    assert len(api.calls) == 2, "compare + POST, no follow-ups without a login"
+    assert api.calls[0]["url"].endswith("/compare/master...feat/x")
 
 
 def test_a_refused_followup_does_not_unopen_the_pr(home, tmp_path, monkeypatch):
@@ -346,3 +388,101 @@ def test_a_refused_followup_does_not_unopen_the_pr(home, tmp_path, monkeypatch):
 def test_pr_open_execute_is_gated_as_envelope_apply_by_name():
     catalogue = server._gate_tool_catalogue()
     assert catalogue["pr_open_execute"] == "envelope_apply"
+
+
+# ── remote-base ancestry preflight (gap bc9945dd47da) ────────────────────────
+
+def test_behind_base_is_refused_with_estale_before_citation(home, tmp_path, monkeypatch):
+    """A head that is entirely behind the base on GitHub is stale — the
+    envelope must not be consumed and no POST is attempted."""
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    pg, api = _FakeGovernancePg(), _FakeApi(compare_status="behind",
+                                            compare_ahead_by=0, compare_behind_by=4)
+    out = _open(pg, api)
+    assert out["ok"] is False and out["opened"] is False
+    assert out["error"] == "ESTALE"
+    assert out["preflight"]["state"] == "behind"
+    assert out["preflight"]["behind"] == 4
+    # Only the compare call happened; no POST to /pulls.
+    urls = [c["url"] for c in api.calls]
+    assert urls == ["https://api.github.com/repos/forge-play/Forge/compare/master...feat/x"]
+    # No granted citation — the audit citation from `authorize_and_cite` did
+    # not run because the preflight refused first. (An EAMBIG citation from
+    # the cheap check is also absent because bounds match.)
+    assert _citations(pg) == []
+
+
+def test_diverged_base_is_refused_with_estale(home, tmp_path, monkeypatch):
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    pg, api = _FakeGovernancePg(), _FakeApi(compare_status="diverged",
+                                            compare_ahead_by=2, compare_behind_by=3)
+    out = _open(pg, api)
+    assert out["error"] == "ESTALE"
+    assert out["preflight"]["state"] == "diverged"
+    assert out["preflight"]["ahead"] == 2 and out["preflight"]["behind"] == 3
+    assert _citations(pg) == []
+    assert not any(c["url"].endswith("/pulls") for c in api.calls if c["method"] == "POST")
+
+
+def test_identical_base_is_treated_as_current_and_pushes(home, tmp_path, monkeypatch):
+    """An `identical` compare status (head == base) does not itself refuse —
+    the PR-open call itself will 422 if base and head are the same commit,
+    which the executor reports as EPR. That is a remote refusal AFTER
+    citation, not a preflight refusal BEFORE it."""
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    pg, api = _FakeGovernancePg(), _FakeApi(compare_status="identical",
+                                            compare_ahead_by=0, compare_behind_by=0)
+    out = _open(pg, api)
+    assert out["ok"] is True and out["opened"] is True
+    assert out["preflight"]["state"] == "current"
+
+
+def test_compare_http_failure_is_efetch_before_citation(home, tmp_path, monkeypatch):
+    """A 5xx from GitHub during the preflight compare is EFETCH — refuse
+    before citation and do not attempt the POST."""
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    pg, api = _FakeGovernancePg(), _FakeApi(compare_ok=False,
+                                            compare_http_status=502,
+                                            compare_reason="Bad Gateway")
+    out = _open(pg, api)
+    assert out["error"] == "EFETCH"
+    assert "502" in out["reason"] and "Bad Gateway" in out["reason"]
+    assert _citations(pg) == []
+    urls = [c["url"] for c in api.calls]
+    assert urls == ["https://api.github.com/repos/forge-play/Forge/compare/master...feat/x"]
+
+
+def test_preflight_receipt_rides_on_a_successful_open(home, tmp_path, monkeypatch):
+    """A granted open carries the preflight receipt so the seat can prove the
+    check happened (and see the ahead/behind counts as evidence)."""
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    out = _open(_FakeGovernancePg(),
+                _FakeApi(compare_status="ahead", compare_ahead_by=7, compare_behind_by=0))
+    assert out["ok"] and out["opened"]
+    pf = out["preflight"]
+    assert pf["state"] == "current"
+    assert pf["ahead"] == 7 and pf["behind"] == 0
+
+
+def test_a_stale_preflight_does_not_spend_a_single_use_grant(home, tmp_path, monkeypatch):
+    """The key promise: an ESTALE refusal does NOT consume a max_count=1
+    grant. A second attempt after the head is refreshed can still cite."""
+    _charter(tmp_path, monkeypatch, max_count=1)
+    _app_token(monkeypatch)
+    pg = _FakeGovernancePg()
+    # First: stale head, ESTALE, no consumption.
+    stale_api = _FakeApi(compare_status="behind", compare_ahead_by=0, compare_behind_by=1)
+    first = _open(pg, stale_api)
+    assert first["error"] == "ESTALE"
+    # Second: head refreshed, compare returns `ahead`, grant is still available.
+    fresh_api = _FakeApi()
+    second = _open(pg, fresh_api)
+    assert second["ok"] and second["opened"]
+    # Only the second attempt cited (as `granted`).
+    granted = [c for c in _citations(pg) if c["content"]["outcome"] == "granted"]
+    assert len(granted) == 1

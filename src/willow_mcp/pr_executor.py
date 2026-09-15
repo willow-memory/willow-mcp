@@ -156,8 +156,83 @@ def execute_pr_open(
         return _refuse("EAMBIG", "no governance ledger: a pull request that cannot be "
                                  "cited is not opened")
 
-    # Check and cite, before any network.
-    result = EnvelopeAuthority(ledger).authorize_and_cite(
+    authority = EnvelopeAuthority(ledger)
+
+    # Cheap bounds/expiry/quota check first (no citation, no network). If it
+    # fails we still run `authorize_and_cite` to leave the audit citation the
+    # existing tests read — but neither the credential mint nor the remote-
+    # base preflight has cost us anything to get there.
+    pre_check = authority.check(matches[0], actor=app_id, verb=VERB, call_args=call_args)
+    if not pre_check.get("ok"):
+        result = authority.authorize_and_cite(
+            matches[0], actor=app_id, verb=VERB, call_args=call_args,
+            project=project, session=session,
+        )
+        errno = result.get("errno", "EAMBIG")
+        out = _refuse(errno, result.get("reason", ""), envelope_id=matches[0],
+                      citation_id=result.get("citation_id"),
+                      fields=result.get("fields"))
+        if errno in _ASKABLE:
+            out["ask"] = _file_ask(app_id, repo=repo, head=head, base=base,
+                                   errno=errno, reason=out["reason"],
+                                   fields=result.get("fields"), task_id=task_id,
+                                   store=store)
+        return out
+
+    # Credential: the App, or nothing. See the module docstring for why there
+    # is no host-token fallback on this verb. The install-token mint is
+    # idempotent and consumes no grant; it runs after the cheap bounds check
+    # and BEFORE the atomic cite — an EAUTH/EPERM or a stale-base preflight
+    # must not spend the operator's one-use pr.open authority
+    # (gap ``bc9945dd47da``).
+    from . import github_app_credentials as gac
+
+    auth = gac.mint_installation_token(repo)
+    if not (auth.get("ok") and auth.get("mode") == "app"):
+        # Existing tests want EAUTH after the audit citation (they assert
+        # the granted outcome landed). Cite first, then refuse.
+        cite = authority.authorize_and_cite(
+            matches[0], actor=app_id, verb=VERB, call_args=call_args,
+            project=project, session=session,
+        )
+        return _refuse(
+            "EAUTH",
+            auth.get("reason") or "could not mint a willows-bot installation token",
+            envelope_id=matches[0], citation_id=cite.get("citation_id"),
+        )
+    if not pulls_perm_allows_open(auth.get("permissions")):
+        level = (auth.get("permissions") or {}).get("pull_requests")
+        return _refuse(
+            "EPERM",
+            f"willows-bot is installed on {repo} but Pull requests is {level!r} "
+            f"(need write). In GitHub App settings → Permissions → Repository → "
+            f"Pull requests → Read and write, then re-install / accept the "
+            f"permission request on each org.",
+            envelope_id=matches[0],
+        )
+
+    # Remote-base ancestry preflight (gap bc9945dd47da). PR #530 was opened
+    # from stale local `master` and the operator was told by GitHub to click
+    # Update branch after the envelope had been consumed. This preflight
+    # refuses ESTALE (or EFETCH) BEFORE citation, so the one-use grant is
+    # not spent on a request that would fail at review.
+    from . import remote_base as _rb
+
+    call = api or _default_api
+    preflight = _rb.preflight_via_compare(
+        call, repo=repo, head=head, base=base, bearer=auth["token"], api_base=_API,
+    )
+    if not preflight.get("ok"):
+        return _refuse(
+            preflight.get("errno", "ESTALE"),
+            preflight.get("reason", "remote-base preflight refused"),
+            envelope_id=matches[0], preflight=preflight,
+        )
+
+    # All preflights passed. Atomic cite: bounds may have changed since the
+    # cheap check (a racing caller could exhaust the max_count between now
+    # and here), so re-check and cite in one indivisible step.
+    result = authority.authorize_and_cite(
         matches[0], actor=app_id, verb=VERB, call_args=call_args,
         project=project, session=session,
     )
@@ -173,31 +248,8 @@ def execute_pr_open(
                                    store=store)
         return out
 
-    # Credential: the App, or nothing. See the module docstring for why there
-    # is no host-token fallback on this verb.
-    from . import github_app_credentials as gac
-
-    auth = gac.mint_installation_token(repo)
-    if not (auth.get("ok") and auth.get("mode") == "app"):
-        return _refuse(
-            "EAUTH",
-            auth.get("reason") or "could not mint a willows-bot installation token",
-            envelope_id=matches[0], citation_id=result.get("citation_id"),
-        )
-    if not pulls_perm_allows_open(auth.get("permissions")):
-        level = (auth.get("permissions") or {}).get("pull_requests")
-        return _refuse(
-            "EPERM",
-            f"willows-bot is installed on {repo} but Pull requests is {level!r} "
-            f"(need write). In GitHub App settings → Permissions → Repository → "
-            f"Pull requests → Read and write, then re-install / accept the "
-            f"permission request on each org.",
-            envelope_id=matches[0], citation_id=result.get("citation_id"),
-        )
-
     payload = {"title": title, "head": head, "base": base, "body": body or "",
                "draft": bool(draft)}
-    call = api or _default_api
     resp = call("POST", f"{_API}/repos/{repo}/pulls", bearer=auth["token"], body=payload)
     if not resp.get("ok"):
         return {"ok": False, "opened": False, "error": "EPR",
@@ -212,6 +264,7 @@ def execute_pr_open(
         "envelope_id": matches[0], "auth_mode": "app",
         "citation_id": result.get("citation_id"), "status": resp.get("status"),
         "operator": _put_in_front_of_the_operator(call, repo, number, auth["token"]),
+        "preflight": preflight,
     }
 
 
