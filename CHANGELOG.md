@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.46.0](https://github.com/willow-memory/willow-mcp/compare/v2.45.1...v2.46.0) (2026-09-15)
+
+
+### Added
+
+* **gates:** `push.{repo}:{branch}` joins the request seam ([c6efaec](https://github.com/willow-memory/willow-mcp/commit/c6efaecd484bcecc17a6afd8af4459c5b79e00de))
+* **gates:** `push.<repo>:<branch>` joins the request seam ([bd29fb3](https://github.com/willow-memory/willow-mcp/commit/bd29fb30a0a0ea5f84797f3571310719f8cc4643))
+
 ## [2.45.1](https://github.com/willow-memory/willow-mcp/compare/v2.45.0...v2.45.1) (2026-09-15)
 
 
