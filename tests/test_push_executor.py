@@ -127,7 +127,8 @@ class _FakeGit:
     def __init__(self, *, remote_url="https://github.com/willow-memory/willow-mcp.git",
                  branches=("feat/x", "master"), push_rc=0, push_err="",
                  default_base="master", fetch_rc=0, fetch_err="",
-                 remote_base_sha="base-sha", preflight_ahead=3, preflight_behind=0):
+                 remote_base_sha="base-sha", preflight_ahead=3, preflight_behind=0,
+                 outgoing_files=("README.md",)):
         self.remote_url = remote_url
         self.branches = set(branches)
         self.push_rc = push_rc
@@ -138,6 +139,7 @@ class _FakeGit:
         self.remote_base_sha = remote_base_sha
         self.preflight_ahead = preflight_ahead
         self.preflight_behind = preflight_behind
+        self.outgoing_files = list(outgoing_files)
         self.calls: list[list[str]] = []
 
     @staticmethod
@@ -176,6 +178,10 @@ class _FakeGit:
         if rest[:3] == ["rev-list", "--left-right", "--count"]:
             return subprocess.CompletedProcess(
                 argv, 0, f"{self.preflight_ahead}\t{self.preflight_behind}\n", "",
+            )
+        if rest[:2] == ["diff", "--name-only"]:
+            return subprocess.CompletedProcess(
+                argv, 0, "\n".join(self.outgoing_files) + "\n", "",
             )
         if rest and rest[0] == "push":
             return subprocess.CompletedProcess(argv, self.push_rc, "", self.push_err or "done")
@@ -555,3 +561,121 @@ def test_preflight_runs_before_the_envelope_citation(home, tmp_path, monkeypatch
     out = _push(checkout, pg, git)
     assert "citation_id" not in out or out.get("citation_id") is None
     assert pg.commits == 0
+
+
+# ── workflow-path preflight (gap 3f24d2d4a243) ───────────────────────────────
+
+def _app_with_workflows(monkeypatch, *, workflows="write", contents="write"):
+    """Grant the App workflows and contents permissions per test."""
+    monkeypatch.setattr(
+        "willow_mcp.github_app_credentials.mint_installation_token",
+        lambda repo: {"ok": True, "mode": "app", "token": "ghs_test_token",
+                      "permissions": {"contents": contents, "workflows": workflows},
+                      "installation_id": 1},
+    )
+
+
+def test_a_range_without_workflow_files_is_unaffected(home, tmp_path, monkeypatch, checkout):
+    """A push that touches ordinary code carries a workflow receipt of
+    `state=unaffected`; no App permission is consulted."""
+    _charter(tmp_path, monkeypatch)
+    _app_with_workflows(monkeypatch, workflows="read")  # even read-only, unaffected
+    pg, git = _FakeGovernancePg(), _FakeGit(outgoing_files=("README.md", "src/main.py"))
+    out = _push(checkout, pg, git)
+    assert out["ok"] and out["pushed"]
+    assert out["workflow"]["state"] == "unaffected" and out["workflow"]["files"] == []
+
+
+def test_a_range_touching_workflow_files_and_write_scope_is_permitted(
+    home, tmp_path, monkeypatch, checkout,
+):
+    _charter(tmp_path, monkeypatch)
+    _app_with_workflows(monkeypatch, workflows="write")
+    pg, git = _FakeGovernancePg(), _FakeGit(
+        outgoing_files=("src/main.py", ".github/workflows/tests.yml"),
+    )
+    out = _push(checkout, pg, git)
+    assert out["ok"] and out["pushed"]
+    wf = out["workflow"]
+    assert wf["state"] == "permitted"
+    assert wf["files"] == [".github/workflows/tests.yml"]
+    assert wf["permission"] == "write"
+
+
+def test_a_range_touching_workflow_files_without_scope_is_eworkflow_before_citation(
+    home, tmp_path, monkeypatch, checkout,
+):
+    """The incident that motivated gap 3f24d2d4a243: the reconciled commit
+    touched `.github/workflows/tests.yml`, the App lacked `workflows: write`,
+    and the push consumed its envelope only to have GitHub answer no. The
+    preflight now refuses EWORKFLOW before citation."""
+    _charter(tmp_path, monkeypatch)
+    _app_with_workflows(monkeypatch, workflows="read")
+    pg, git = _FakeGovernancePg(), _FakeGit(
+        outgoing_files=(".github/workflows/tests.yml", "src/main.py"),
+    )
+    out = _push(checkout, pg, git)
+    assert out["ok"] is False and out["pushed"] is False
+    assert out["error"] == "EWORKFLOW"
+    wf = out["workflow"]
+    assert wf["state"] == "denied"
+    assert wf["files"] == [".github/workflows/tests.yml"]
+    assert wf["permission"] == "read"
+    assert "Read and write" in out["reason"]
+    # No envelope consumed, no push attempted.
+    assert _citations(pg) == []
+    assert git.pushes == []
+
+
+def test_workflow_scope_absent_is_denied_not_unknown(home, tmp_path, monkeypatch, checkout):
+    """An App whose permissions dict does not name `workflows` at all is the
+    same denial as `read` — the scope is missing, so a workflow-touching
+    push is refused. The receipt names `permission='absent'` so the seat
+    knows why."""
+    _charter(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "willow_mcp.github_app_credentials.mint_installation_token",
+        lambda repo: {"ok": True, "mode": "app", "token": "ghs_test_token",
+                      "permissions": {"contents": "write"},  # no workflows key
+                      "installation_id": 1},
+    )
+    pg, git = _FakeGovernancePg(), _FakeGit(
+        outgoing_files=(".github/workflows/build.yml",),
+    )
+    out = _push(checkout, pg, git)
+    assert out["error"] == "EWORKFLOW"
+    assert out["workflow"]["permission"] == "absent"
+
+
+def test_workflow_preflight_runs_only_after_the_base_preflight(
+    home, tmp_path, monkeypatch, checkout,
+):
+    """When the base is stale, the executor refuses ESTALE and the workflow
+    preflight never runs — the workflow field is absent from the receipt.
+    A workflow permission miss surfaces only when the head is fresh."""
+    _charter(tmp_path, monkeypatch)
+    _app_with_workflows(monkeypatch, workflows="read")
+    pg, git = _FakeGovernancePg(), _FakeGit(
+        preflight_ahead=0, preflight_behind=2,
+        outgoing_files=(".github/workflows/x.yml",),
+    )
+    out = _push(checkout, pg, git)
+    assert out["error"] == "ESTALE"
+    assert "workflow" not in out or out.get("workflow") is None
+
+
+def test_a_skipped_ancestry_preflight_leaves_workflow_state_unknown(
+    home, tmp_path, monkeypatch, checkout,
+):
+    """When we cannot resolve a base to bound the outgoing range, the
+    workflow preflight cannot list changed files either. Rather than fail
+    open (say "unaffected" when we did not check) or fail closed (refuse
+    every push), the workflow receipt reports `state="unknown"` and the
+    push proceeds — an actual workflow rejection would then land as EPUSH
+    after action, which is the pre-existing behaviour."""
+    _charter(tmp_path, monkeypatch)
+    _app_with_workflows(monkeypatch, workflows="read")
+    pg, git = _FakeGovernancePg(), _FakeGit(default_base="")  # symref returns rc=1
+    out = _push(checkout, pg, git)
+    assert out["ok"] and out["pushed"]
+    assert out["workflow"]["state"] == "unknown"
