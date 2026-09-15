@@ -1,6 +1,9 @@
 """Tests for manifest_admin.py — the local-CLI-only permission toggle backing
 `willow-mcp allow-permission` / `deny-permission`."""
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -307,7 +310,9 @@ def test_publish_via_trust_owner_staging_dir_is_not_world_listable(
     monkeypatch.setattr(
         manifest_admin.pwd,
         "getpwuid",
-        lambda uid: SimpleNamespace(pw_uid=994, pw_name="willow-operator"),
+        lambda uid: SimpleNamespace(
+            pw_uid=994, pw_name="willow-operator", pw_gid=os.getgid()
+        ),
     )
     modes: list[int] = []
     real_chmod = manifest_admin.os.chmod
@@ -321,6 +326,9 @@ def test_publish_via_trust_owner_staging_dir_is_not_world_listable(
         manifest_admin.subprocess,
         "run",
         lambda argv, check: SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(
+        manifest_admin, "_uid_can_execute_path", lambda _path, _uid: True
     )
 
     manifest_admin.publish_via_trust_owner(
@@ -400,13 +408,18 @@ def test_privilege_bridge_uses_absolute_python_and_explicit_fingerprint(
     monkeypatch.setattr(
         manifest_admin.pwd,
         "getpwuid",
-        lambda uid: SimpleNamespace(pw_uid=994, pw_name="willow-operator"),
+        lambda uid: SimpleNamespace(
+            pw_uid=994, pw_name="willow-operator", pw_gid=os.getgid()
+        ),
     )
     calls = []
     monkeypatch.setattr(
         manifest_admin.subprocess,
         "run",
         lambda argv, check: (calls.append(argv) or SimpleNamespace(returncode=0)),
+    )
+    monkeypatch.setattr(
+        manifest_admin, "_uid_can_execute_path", lambda _path, _uid: True
     )
 
     manifest_admin.publish_via_trust_owner(
@@ -427,6 +440,138 @@ def test_privilege_bridge_uses_absolute_python_and_explicit_fingerprint(
     assert command[command.index("--fingerprint") + 1] == "B" * 40
     assert "gpg" not in command
     assert not any(arg.startswith("WILLOW_PGP_FINGERPRINT=") for arg in command)
+
+
+def test_cli_python_for_trust_owner_keeps_venv_symlink(tmp_path, monkeypatch):
+    """Resolved system python must not replace the venv entrypoint."""
+    real = tmp_path / "usr" / "bin" / "python3.14"
+    real.parent.mkdir(parents=True)
+    real.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    os.chmod(real, 0o755)
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python3").symlink_to(real)
+    link = venv_bin / "python"
+    link.symlink_to("python3")
+
+    monkeypatch.setattr(manifest_admin.sys, "executable", str(link))
+    monkeypatch.delenv("WILLOW_MCP_PYTHON", raising=False)
+
+    chosen = manifest_admin._cli_python_for_trust_owner()
+    assert str(chosen) == os.path.abspath(str(link))
+    assert str(chosen) != str(Path(link).resolve())
+
+
+def test_resolved_system_python_cannot_import_willow_mcp(tmp_path):
+    """Live-shape check: venv entrypoint path is not the resolved base binary."""
+    real = Path(sys.executable).resolve()
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(real)
+
+    entry = os.path.abspath(str(venv_python))
+    assert entry != str(real)
+    assert Path(entry).resolve() == real
+
+
+def test_publish_via_trust_owner_uses_venv_symlink_not_resolved_base(
+    apps_root, monkeypatch, tmp_path
+):
+    real = Path(sys.executable).resolve()
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_python = venv_bin / "python"
+    venv_python.symlink_to(real)
+
+    monkeypatch.setattr(manifest_admin.sys, "executable", str(venv_python))
+    monkeypatch.delenv("WILLOW_MCP_PYTHON", raising=False)
+
+    app_dir = apps_root / "app"
+    app_dir.mkdir()
+    path = app_dir / "manifest.json"
+    monkeypatch.setattr(manifest_admin.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        manifest_admin.pwd,
+        "getpwuid",
+        lambda uid: SimpleNamespace(
+            pw_uid=994, pw_name="willow-operator", pw_gid=os.getgid()
+        ),
+    )
+    calls: list[list[str]] = []
+
+    real_run = subprocess.run
+
+    def _run(argv, check=False, **kwargs):
+        if isinstance(argv, list) and argv and argv[0] == "sudo":
+            calls.append(argv)
+            return SimpleNamespace(returncode=0)
+        return real_run(argv, check=check, **kwargs)
+
+    monkeypatch.setattr(manifest_admin.subprocess, "run", _run)
+    monkeypatch.setattr(manifest_admin, "_require_python_imports_willow_mcp", lambda _p: None)
+    monkeypatch.setattr(
+        manifest_admin,
+        "_uid_can_execute_path",
+        lambda _path, _uid: True,
+    )
+
+    manifest_admin.publish_via_trust_owner(
+        path,
+        b'{"permissions": ["store_read"]}',
+        b"SIGNED",
+        b"PUBLIC-KEY",
+        "B" * 40,
+        "absent",
+        "store_read",
+        True,
+    )
+
+    sudo_cmd = calls[0]
+    assert sudo_cmd[4] == os.path.abspath(str(venv_python))
+    assert sudo_cmd[4] != str(real)
+
+
+def test_publish_via_trust_owner_refuses_when_trust_owner_cannot_execute(
+    apps_root, monkeypatch,
+):
+    app_dir = apps_root / "app"
+    app_dir.mkdir()
+    path = app_dir / "manifest.json"
+    monkeypatch.setattr(manifest_admin.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        manifest_admin.pwd,
+        "getpwuid",
+        lambda uid: SimpleNamespace(
+            pw_uid=994, pw_name="willow-operator", pw_gid=os.getgid()
+        ),
+    )
+    monkeypatch.setattr(
+        manifest_admin,
+        "_uid_can_execute_path",
+        lambda _path, _uid: False,
+    )
+
+    real_run = subprocess.run
+
+    def _no_sudo(argv, check=False, **kwargs):
+        if isinstance(argv, list) and argv and argv[0] == "sudo":
+            pytest.fail("sudo should not run")
+        return real_run(argv, check=check, **kwargs)
+
+    monkeypatch.setattr(manifest_admin.subprocess, "run", _no_sudo)
+
+    with pytest.raises(PermissionError, match="cannot execute"):
+        manifest_admin.publish_via_trust_owner(
+            path,
+            b'{"permissions": ["store_read"]}',
+            b"SIGNED",
+            b"PUBLIC-KEY",
+            "B" * 40,
+            "absent",
+            "store_read",
+            True,
+        )
 
 
 def test_publisher_rejects_signed_replay_beyond_requested_permission(
