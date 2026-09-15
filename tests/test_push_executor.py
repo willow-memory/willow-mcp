@@ -111,14 +111,33 @@ def _charter(tmp_path, monkeypatch, *, grantee="willow", branches=("feat/*",),
 # ── a fake git ──────────────────────────────────────────────────────────────
 
 class _FakeGit:
-    """Answers the read verbs the executor asks and records every push."""
+    """Answers the read verbs the executor asks and records every push.
+
+    Gap ``bc9945dd47da`` added a remote-base ancestry preflight that runs
+    before the envelope citation: ``symbolic-ref`` resolves the default
+    base, ``fetch`` refreshes the remote-tracking ref, ``rev-parse`` on
+    ``refs/remotes/<remote>/<base>`` reads its sha, and ``rev-list
+    --left-right --count`` reports ahead/behind. The defaults below make
+    the preflight report ``state="current"`` so existing tests continue to
+    pass without changing their assertions; the preflight-specific tests
+    pass a runner whose ``ahead``/``behind`` numbers exercise the stale
+    and diverged paths.
+    """
 
     def __init__(self, *, remote_url="https://github.com/willow-memory/willow-mcp.git",
-                 branches=("feat/x", "master"), push_rc=0, push_err=""):
+                 branches=("feat/x", "master"), push_rc=0, push_err="",
+                 default_base="master", fetch_rc=0, fetch_err="",
+                 remote_base_sha="base-sha", preflight_ahead=3, preflight_behind=0):
         self.remote_url = remote_url
         self.branches = set(branches)
         self.push_rc = push_rc
         self.push_err = push_err
+        self.default_base = default_base
+        self.fetch_rc = fetch_rc
+        self.fetch_err = fetch_err
+        self.remote_base_sha = remote_base_sha
+        self.preflight_ahead = preflight_ahead
+        self.preflight_behind = preflight_behind
         self.calls: list[list[str]] = []
 
     @staticmethod
@@ -139,10 +158,25 @@ class _FakeGit:
         if rest == ["rev-parse", "HEAD"]:
             return subprocess.CompletedProcess(argv, 0, "abc123\n", "")
         if rest[:3] == ["rev-parse", "--verify", "--quiet"]:
-            ref = rest[3].removeprefix("refs/heads/")
-            if ref in self.branches:
+            ref = rest[3]
+            if ref.startswith("refs/heads/") and ref.removeprefix("refs/heads/") in self.branches:
                 return subprocess.CompletedProcess(argv, 0, "abc123\n", "")
+            if ref.startswith("refs/remotes/") and self.default_base and ref.endswith(f"/{self.default_base}"):
+                return subprocess.CompletedProcess(argv, 0, self.remote_base_sha + "\n", "")
             return subprocess.CompletedProcess(argv, 1, "", "")
+        if rest[:2] == ["symbolic-ref", "--short"] and rest[2:] and rest[2].startswith("refs/remotes/"):
+            remote = rest[2].split("/", 3)[2]
+            if not self.default_base:
+                return subprocess.CompletedProcess(argv, 1, "", "not a valid ref")
+            return subprocess.CompletedProcess(argv, 0, f"{remote}/{self.default_base}\n", "")
+        if rest[:1] == ["fetch"]:
+            return subprocess.CompletedProcess(
+                argv, self.fetch_rc, "", self.fetch_err or "done",
+            )
+        if rest[:3] == ["rev-list", "--left-right", "--count"]:
+            return subprocess.CompletedProcess(
+                argv, 0, f"{self.preflight_ahead}\t{self.preflight_behind}\n", "",
+            )
         if rest and rest[0] == "push":
             return subprocess.CompletedProcess(argv, self.push_rc, "", self.push_err or "done")
         raise AssertionError(f"unexpected git call {sub}")
@@ -424,3 +458,100 @@ def test_tool_without_postgres_refuses(home, tmp_path, monkeypatch, checkout):
     monkeypatch.setattr(server, "get_pg", lambda: None)
     out = server.git_push_execute("loki", str(checkout), "willow-memory/willow-mcp", "feat/x")
     assert out["error"] == "postgres_unavailable"
+
+
+# ── remote-base ancestry preflight (gap bc9945dd47da) ────────────────────────
+
+def test_current_base_passes_preflight_and_pushes(home, tmp_path, monkeypatch, checkout):
+    """The default case: `remote/HEAD` reads `master`, the fetch succeeds,
+    ahead>=0 and behind=0. The push proceeds and the receipt carries the
+    preflight verdict so the seat can prove the check happened."""
+    _charter(tmp_path, monkeypatch)
+    pg, git = _FakeGovernancePg(), _FakeGit(preflight_ahead=5, preflight_behind=0)
+    out = _push(checkout, pg, git)
+    assert out["ok"] and out["pushed"], out
+    pf = out["preflight"]
+    assert pf["state"] == "current"
+    assert pf["base_branch"] == "master"
+    assert pf["ahead"] == 5 and pf["behind"] == 0
+
+
+def test_behind_base_is_refused_with_estale_before_citation(home, tmp_path, monkeypatch, checkout):
+    """A head that is entirely behind the remote base is stale — the
+    envelope must not be consumed and no push is attempted."""
+    _charter(tmp_path, monkeypatch)
+    pg, git = _FakeGovernancePg(), _FakeGit(preflight_ahead=0, preflight_behind=4)
+    out = _push(checkout, pg, git)
+    assert out["ok"] is False and out["pushed"] is False
+    assert out["error"] == "ESTALE"
+    assert out["preflight"]["state"] == "behind"
+    assert out["preflight"]["behind"] == 4
+    assert _citations(pg) == []  # no envelope consumed
+    assert git.pushes == []       # no push attempted
+
+
+def test_diverged_base_is_refused_with_estale(home, tmp_path, monkeypatch, checkout):
+    _charter(tmp_path, monkeypatch)
+    pg, git = _FakeGovernancePg(), _FakeGit(preflight_ahead=2, preflight_behind=3)
+    out = _push(checkout, pg, git)
+    assert out["error"] == "ESTALE"
+    assert out["preflight"]["state"] == "diverged"
+    assert out["preflight"]["ahead"] == 2 and out["preflight"]["behind"] == 3
+    assert _citations(pg) == []
+
+
+def test_explicit_base_wins_over_origin_head(home, tmp_path, monkeypatch, checkout):
+    """A caller who names `base=release` is checked against `origin/release`,
+    not against whatever `refs/remotes/origin/HEAD` points at. The FakeGit's
+    `default_base` is what the symref would answer, but the executor asks
+    for the caller's value instead."""
+    _charter(tmp_path, monkeypatch)
+    # A runner that expects `origin/release` as the resolved base.
+    git = _FakeGit(default_base="release", preflight_ahead=1, preflight_behind=0)
+    pg = _FakeGovernancePg()
+    out = _push(checkout, pg, git, base="release")
+    assert out["ok"] and out["pushed"], out
+    assert out["preflight"]["base_branch"] == "release"
+    # No symbolic-ref call is made when the caller supplied a base.
+    assert not any(c[3:5] == ["symbolic-ref", "--short"] for c in git.calls)
+
+
+def test_no_symref_and_no_base_is_a_skipped_preflight_not_a_refusal(
+    home, tmp_path, monkeypatch, checkout,
+):
+    """A repo whose remote HEAD is not advertised, called with no base,
+    reports `state="skipped"` and the push still proceeds. Honest absence
+    rather than a fabricated verdict — the seat reader sees the missing
+    field named, not a `state="current"` bluff."""
+    _charter(tmp_path, monkeypatch)
+    git = _FakeGit(default_base="")  # symref returns rc=1
+    pg = _FakeGovernancePg()
+    out = _push(checkout, pg, git)
+    assert out["ok"] and out["pushed"], out
+    assert out["preflight"]["state"] == "skipped"
+    assert "no origin/HEAD symref" in out["preflight"]["reason"]
+
+
+def test_fetch_failure_is_efetch_not_estale(home, tmp_path, monkeypatch, checkout):
+    """A network failure during the preflight fetch is EFETCH, distinct from
+    a stale-base ESTALE. Refuse before envelope citation either way — the
+    fetch failed, we cannot claim the base is current."""
+    _charter(tmp_path, monkeypatch)
+    git = _FakeGit(fetch_rc=128, fetch_err="fatal: could not read from remote")
+    pg = _FakeGovernancePg()
+    out = _push(checkout, pg, git)
+    assert out["error"] == "EFETCH"
+    assert "could not read from remote" in out["reason"]
+    assert _citations(pg) == []
+    assert git.pushes == []
+
+
+def test_preflight_runs_before_the_envelope_citation(home, tmp_path, monkeypatch, checkout):
+    """The order matters: a stale head must not consume the one-use push
+    envelope. The receipt names the preflight verdict, not a citation id."""
+    _charter(tmp_path, monkeypatch)
+    git = _FakeGit(preflight_ahead=0, preflight_behind=1)
+    pg = _FakeGovernancePg()
+    out = _push(checkout, pg, git)
+    assert "citation_id" not in out or out.get("citation_id") is None
+    assert pg.commits == 0
