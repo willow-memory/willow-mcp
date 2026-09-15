@@ -4402,6 +4402,7 @@ def git_push_execute(
     branch: str,
     remote: str = "origin",
     force: bool = False,
+    base: str = "",
     envelope_id: str = "",
     project: str = "",
     task_id: str = "",
@@ -4412,12 +4413,16 @@ def git_push_execute(
     broker holds the credential and acts inside a signed envelope, and no
     token ever enters a sandbox. `repo` is `org/name` as the envelope names
     it; the checkout's remote must be that repo. `force` is honoured only
-    when the envelope grants it. A refusal is cited in FRANK with its errno
-    and files the ask in the human-required queue so the operator sees
-    "X wants to push Y to Z" while the work is still waiting. Returns the
-    pushed sha and citation id on success. Gated as envelope_apply: this is
-    an envelope application with the act attached, not a new capability.
-    See docs/design/brokered-push.md."""
+    when the envelope grants it. Before consulting the envelope, the branch
+    is preflighted against `base` (default: `remote/HEAD`) — a stale or
+    diverged head is refused with `ESTALE` and no envelope is consumed, so
+    the operator's one-use grant is not spent on a request that would fail
+    at review anyway (gap `bc9945dd47da`). A refusal is cited in FRANK with
+    its errno and files the ask in the human-required queue so the operator
+    sees "X wants to push Y to Z" while the work is still waiting. Returns
+    the pushed sha, the preflight receipt, and the citation id on success.
+    Gated as envelope_apply: this is an envelope application with the act
+    attached, not a new capability. See docs/design/brokered-push.md."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
@@ -4432,6 +4437,7 @@ def git_push_execute(
             branch=branch,
             remote=remote,
             force=force,
+            base=base,
             envelope_id=envelope_id,
             project=project or repo,
             session=_current_orchestrator_session(),

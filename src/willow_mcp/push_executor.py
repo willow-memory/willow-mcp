@@ -183,6 +183,7 @@ def execute_push(
     branch: str,
     remote: str = "origin",
     force: bool = False,
+    base: str = "",
     envelope_id: str = "",
     project: str,
     session: str = "",
@@ -226,6 +227,26 @@ def execute_push(
     if exists.returncode != 0:
         return _refuse("EINVAL", f"branch {branch!r} does not exist in {facts['path']}")
     sha = (exists.stdout or "").strip()
+
+    # Remote-base ancestry preflight (gap bc9945dd47da). Refuse a stale head
+    # BEFORE the envelope is cited — a preflight refusal must not consume the
+    # one-use push authority. When `base` is empty we fall back to whatever
+    # ``refs/remotes/<remote>/HEAD`` points at; a repo whose remote HEAD is
+    # not advertised produces `state="skipped"` in the preflight receipt,
+    # which is honest absence — the seat reader can tell a passed check from
+    # an absent one.
+    from . import remote_base as _rb
+
+    preflight = _rb.preflight_local_ancestry(
+        Path(facts["path"]), remote=remote, head_ref=branch,
+        base_branch=base, runner=runner,
+    )
+    if not preflight.get("ok"):
+        return _refuse(
+            preflight.get("errno", "ESTALE"),
+            preflight.get("reason", "remote-base preflight refused"),
+            preflight=preflight,
+        )
 
     call_args = {"repo": repo, "branches": [branch], "remote": remote, "force": force}
 
@@ -329,5 +350,5 @@ def execute_push(
         "ok": True, "pushed": True, "repo": repo, "branch": branch, "remote": remote,
         "force": force, "sha": sha, "envelope_id": matches[0], "auth_mode": auth_mode,
         "citation_id": result.get("citation_id"), "git": tail,
-        "checkout": facts["path"],
+        "checkout": facts["path"], "preflight": preflight,
     }
