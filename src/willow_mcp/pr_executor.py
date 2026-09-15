@@ -54,32 +54,34 @@ def pulls_perm_allows_open(permissions: dict | None) -> bool:
 def _file_ask(app_id: str, *, repo: str, head: str, base: str, errno: str,
               reason: str, fields, task_id: str, store=None) -> dict:
     """Put the ask in front of the operator. Never raises — the caller is
-    already refusing."""
-    try:
-        from . import human_loop
-        from .db import Store
+    already refusing.
 
-        if store is None:
-            store = Store()
-        detail = f"{errno}: {reason}"
-        if fields:
-            detail += f" (fields: {', '.join(str(f) for f in fields)})"
-        item = human_loop.enqueue(
-            store,
-            kind="review",
-            title=f"PR request: {repo} {head} -> {base}",
-            summary=(
-                f"{app_id or 'an agent'} asked to open a pull request on {repo} "
-                f"from {head!r} into {base!r} and was refused: {detail}. Ratify a "
-                f"pr.open envelope with these bounds (repo={repo!r}, "
-                f"base_branches=[{base!r}]) and the agent can ask again."
-            ),
-            source_agent=app_id or "",
-            source_ref=f"pr.{repo}#{head}" + (f"@{task_id}" if task_id else ""),
-        )
-        return {"queued": True, "id": item.get("id")}
-    except Exception as exc:  # noqa: BLE001 — filing must never turn a refusal into a traceback
-        return {"queued": False, "reason": f"could not enqueue the ask ({exc})"}
+    The row lands on the ``gates`` surface (``kind=consent`` under
+    ``pr.<repo>:<base>``) rather than the review queue: same migration as
+    ``push_executor._file_ask`` (gap ``5ecb87cfdf56``, slice 2b PR 1). The
+    gate names ``base`` because the ``pr.open`` envelope's bounds are
+    ``base_branches`` — the ratified grant admits any head into that base,
+    so the head is task-specific rather than envelope-specific and belongs
+    in the ask summary alongside the reason.
+    """
+    from . import gate_request
+
+    detail = f"{errno}: {reason}"
+    if fields:
+        detail += f" (fields: {', '.join(str(f) for f in fields)})"
+    summary = (
+        f"{app_id or 'an agent'} asked to open a pull request on {repo} "
+        f"from {head!r} into {base!r} and was refused: {detail}. Ratify a "
+        f"pr.open envelope with these bounds (repo={repo!r}, "
+        f"base_branches=[{base!r}]) and the agent can ask again."
+    )
+    return gate_request.open_request(
+        app_id or "",
+        f"pr.{repo}:{base}",
+        task_id=task_id,
+        reason=summary,
+        store=store,
+    )
 
 
 def _default_api(method: str, url: str, *, bearer: str, body: dict | None = None) -> dict[str, Any]:

@@ -165,7 +165,9 @@ def test_check_requestable_admits_every_prefix_the_task_submit_help_names():
     `anticipated_gates` param says "the same allowlist as denial-site asks".
     That is `REQUESTABLE_PREFIXES` — pinned here so a future prefix added to
     one and not the other fails at test time."""
-    assert gates_panel.REQUESTABLE_PREFIXES == ("lease.", "perm.", "attest.", "push.")
+    assert gates_panel.REQUESTABLE_PREFIXES == (
+        "lease.", "perm.", "attest.", "push.", "pr.",
+    )
 
 
 # ── ownership rule pinned against split_permission_gate's shape ───────────────
