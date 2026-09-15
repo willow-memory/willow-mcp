@@ -109,18 +109,20 @@ def _charter(tmp_path, monkeypatch, *, grantee="willow", bases=("master",),
 # ── a fake GitHub ───────────────────────────────────────────────────────────
 
 class _FakeApi:
-    """The pr-open executor talks to two endpoints now: ``GET /compare/…``
-    (the remote-base preflight — gap bc9945dd47da) and ``POST /pulls`` (the
-    PR create). ``_FakeApi`` answers each; the default is a compare that
-    reads ``ahead`` (so existing tests continue to reach the POST) and a
-    POST that returns 201 with a synthetic PR body. Tests that exercise
-    the preflight paths configure the compare response explicitly, and
-    tests that exercise a POST refusal keep the compare-passes default.
+    """The pr-open executor talks to three endpoints now: ``GET /compare/…``
+    (the remote-base preflight, gap bc9945dd47da), ``GET /contents/…`` (the
+    PR template preflight, gap 378c2e57c3d0), and ``POST /pulls`` (the PR
+    create). ``_FakeApi`` answers each; defaults produce ``ahead`` compare
+    and 404 on every template lookup so existing tests keep landing at
+    ``no_template`` (proceed). Tests that exercise the template path pass a
+    non-empty ``template`` to serve the first well-known path.
     """
 
     def __init__(self, *, status=201, ok=True, reason="",
                  compare_status="ahead", compare_ahead_by=5, compare_behind_by=0,
-                 compare_ok=True, compare_http_status=200, compare_reason=""):
+                 compare_ok=True, compare_http_status=200, compare_reason="",
+                 template="", template_path=".github/pull_request_template.md",
+                 template_from="repo"):
         self.calls: list[dict] = []
         self.status, self.ok, self.reason = status, ok, reason
         self.compare_status = compare_status
@@ -129,6 +131,9 @@ class _FakeApi:
         self.compare_ok = compare_ok
         self.compare_http_status = compare_http_status
         self.compare_reason = compare_reason
+        self.template = template
+        self.template_path = template_path
+        self.template_from = template_from  # "repo" | "org"
 
     def __call__(self, method, url, *, bearer, body=None):
         self.calls.append({"method": method, "url": url, "bearer": bearer, "body": body})
@@ -147,6 +152,19 @@ class _FakeApi:
                     "commits": [{"sha": "head-sha"}],
                 },
             }
+        if "/contents/" in url:
+            if not self.template:
+                return {"ok": False, "status": 404, "reason": "Not Found"}
+            wanted = (f"/repos/forge-play/Forge/contents/{self.template_path}"
+                      if self.template_from == "repo" else
+                      f"/repos/forge-play/.github/contents/{self.template_path}")
+            if wanted in url:
+                import base64
+                content = base64.b64encode(self.template.encode()).decode()
+                return {"ok": True, "status": 200,
+                        "body": {"type": "file", "encoding": "base64",
+                                 "content": content, "path": self.template_path}}
+            return {"ok": False, "status": 404, "reason": "Not Found"}
         if not self.ok:
             return {"ok": False, "status": self.status, "reason": self.reason}
         return {"ok": True, "status": self.status,
@@ -180,16 +198,16 @@ def test_granted_open_cites_then_posts_as_the_app(home, tmp_path, monkeypatch):
     assert out["ok"] and out["opened"], out
     assert out["number"] == 31 and out["url"].endswith("/pull/31")
     assert out["envelope_id"] == "env-pr.open-test" and out["auth_mode"] == "app"
-    # Two API calls: the remote-base preflight compare, then the POST /pulls.
-    # The preflight runs before the atomic citation (gap bc9945dd47da).
-    assert len(api.calls) == 2
-    assert api.calls[0]["method"] == "GET"
-    assert api.calls[0]["url"].endswith("/compare/master...feat/x")
-    call = api.calls[1]
-    assert call["method"] == "POST"
-    assert call["url"] == "https://api.github.com/repos/forge-play/Forge/pulls"
-    assert call["bearer"] == "ghs_test_token"
-    assert call["body"] == {"title": "feat: x", "head": "feat/x", "base": "master",
+    # The remote-base preflight compare runs before the atomic citation, the
+    # PR template preflight runs after (both before citation, gap
+    # bc9945dd47da / 378c2e57c3d0), and the POST /pulls runs last.
+    compares = [c for c in api.calls if "/compare/" in c["url"]]
+    posts = [c for c in api.calls if c["method"] == "POST" and c["url"].endswith("/pulls")]
+    assert len(compares) == 1 and compares[0]["url"].endswith("/compare/master...feat/x")
+    assert len(posts) == 1
+    post = posts[0]
+    assert post["bearer"] == "ghs_test_token"
+    assert post["body"] == {"title": "feat: x", "head": "feat/x", "base": "master",
                             "body": "the body", "draft": False}
     cites = _citations(pg)
     assert len(cites) == 1 and cites[0]["content"]["outcome"] == "granted"
@@ -246,11 +264,14 @@ def test_a_spent_single_use_grant_is_edquot(home, tmp_path, monkeypatch):
     _app_token(monkeypatch)
     pg, api = _FakeGovernancePg(), _FakeApi()
     assert _open(pg, api)["ok"]
+    posts_after_first = [c for c in api.calls if c["method"] == "POST" and c["url"].endswith("/pulls")]
     again = _open(pg, api)
     assert not again["ok"] and again["error"] == "EDQUOT"
-    # Two API calls total: the first (granted) run did compare + POST; the
-    # second (EDQUOT) refused at the cheap bounds check before any network.
-    assert len(api.calls) == 2
+    # Only one POST /pulls ever happened; the second (EDQUOT) refused at the
+    # cheap bounds check before any network preflight or POST.
+    posts_after_second = [c for c in api.calls if c["method"] == "POST" and c["url"].endswith("/pulls")]
+    assert len(posts_after_first) == 1
+    assert len(posts_after_second) == 1  # unchanged — no POST on the EDQUOT retry
 
 
 @pytest.mark.parametrize("bad", [
@@ -345,15 +366,20 @@ def test_the_operator_is_asked_to_review_and_assigned(home, tmp_path, monkeypatc
     out = _open(_FakeGovernancePg(), api)
     assert out["ok"]
     assert out["operator"] == {"login": "the-operator", "review_requested": True, "assigned": True}
+    # The follow-up review/assign calls come after the POST /pulls; the
+    # template preflight lookups happen before it and are not asserted here
+    # (their exact count depends on the resolver's path list).
     urls = [c["url"] for c in api.calls]
-    assert urls == [
-        "https://api.github.com/repos/forge-play/Forge/compare/master...feat/x",
-        "https://api.github.com/repos/forge-play/Forge/pulls",
-        "https://api.github.com/repos/forge-play/Forge/pulls/31/requested_reviewers",
-        "https://api.github.com/repos/forge-play/Forge/issues/31/assignees",
-    ]
-    assert api.calls[2]["body"] == {"reviewers": ["the-operator"]}
-    assert api.calls[3]["body"] == {"assignees": ["the-operator"]}
+    review_urls = [u for u in urls if u.endswith("/requested_reviewers")]
+    assignee_urls = [u for u in urls if u.endswith("/assignees")]
+    pulls_urls = [u for u in urls if u.endswith("/pulls")]
+    assert pulls_urls == ["https://api.github.com/repos/forge-play/Forge/pulls"]
+    assert review_urls == ["https://api.github.com/repos/forge-play/Forge/pulls/31/requested_reviewers"]
+    assert assignee_urls == ["https://api.github.com/repos/forge-play/Forge/issues/31/assignees"]
+    review_call = next(c for c in api.calls if c["url"].endswith("/requested_reviewers"))
+    assignee_call = next(c for c in api.calls if c["url"].endswith("/assignees"))
+    assert review_call["body"] == {"reviewers": ["the-operator"]}
+    assert assignee_call["body"] == {"assignees": ["the-operator"]}
     assert all(c["bearer"] == "ghs_test_token" for c in api.calls)
 
 
@@ -366,10 +392,12 @@ def test_no_login_configured_is_said_not_pretended(home, tmp_path, monkeypatch):
     assert out["ok"] and out["operator"]["login"] is None
     assert out["operator"]["review_requested"] is False and out["operator"]["assigned"] is False
     assert "WILLOW_OPERATOR_GITHUB_LOGIN" in out["operator"]["detail"]
-    # Preflight compare + POST /pulls; no follow-up review/assign calls without
-    # a login. The compare is expected — it is the remote-base preflight.
-    assert len(api.calls) == 2, "compare + POST, no follow-ups without a login"
-    assert api.calls[0]["url"].endswith("/compare/master...feat/x")
+    # No follow-up review/assign calls without a login; the POST /pulls
+    # itself and the preflight lookups still happened.
+    urls = [c["url"] for c in api.calls]
+    assert not any(u.endswith("/requested_reviewers") for u in urls)
+    assert not any(u.endswith("/assignees") for u in urls)
+    assert any(u.endswith("/pulls") for u in urls)
 
 
 def test_a_refused_followup_does_not_unopen_the_pr(home, tmp_path, monkeypatch):
@@ -486,3 +514,143 @@ def test_a_stale_preflight_does_not_spend_a_single_use_grant(home, tmp_path, mon
     # Only the second attempt cited (as `granted`).
     granted = [c for c in _citations(pg) if c["content"]["outcome"] == "granted"]
     assert len(granted) == 1
+
+
+# ── PR template enforcement (gap 378c2e57c3d0) ───────────────────────────────
+
+_TEMPLATE = """## Bite
+
+_a one-line summary of what this PR delivers_
+
+## What was done
+
+_the change, in commits_
+
+## Evidence
+
+_receipts_
+
+## Out of scope
+
+_what is deliberately not here_
+
+## Next bite
+
+_the follow-up_
+"""
+
+
+_GOOD_BODY = """## Bite
+
+Ancestry preflight.
+
+## What was done
+
+The base preflight refuses stale heads.
+
+## Evidence
+
+Tests pass.
+
+## Out of scope
+
+Workflow preflight (separate PR).
+
+## Next bite
+
+Ship it.
+"""
+
+_MISSING_EVIDENCE = """## Bite
+
+Ancestry preflight.
+
+## What was done
+
+The base preflight refuses stale heads.
+
+## Out of scope
+
+Workflow preflight.
+
+## Next bite
+
+Ship it.
+"""
+
+
+def test_a_body_matching_the_template_is_accepted(home, tmp_path, monkeypatch):
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    pg, api = _FakeGovernancePg(), _FakeApi(template=_TEMPLATE)
+    out = _open(pg, api, body=_GOOD_BODY)
+    assert out["ok"] and out["opened"], out
+    tpl = out["template"]
+    assert tpl["state"] == "complete"
+    assert tpl["template_source"] == "repo:.github/pull_request_template.md"
+    assert set(tpl["sections"]) >= {"bite", "what was done", "evidence", "out of scope", "next bite"}
+
+
+def test_a_body_missing_a_required_section_is_ebody_before_citation(home, tmp_path, monkeypatch):
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    pg, api = _FakeGovernancePg(), _FakeApi(template=_TEMPLATE)
+    out = _open(pg, api, body=_MISSING_EVIDENCE)
+    assert out["ok"] is False and out["opened"] is False
+    assert out["error"] == "EBODY"
+    tpl = out["template"]
+    assert tpl["state"] == "missing_sections"
+    assert tpl["missing"] == ["evidence"]
+    # No POST — the envelope was NOT consumed.
+    urls = [c["url"] for c in api.calls]
+    assert not any(u.endswith("/pulls") for u in urls)
+    granted = [c for c in _citations(pg) if c["content"]["outcome"] == "granted"]
+    assert granted == []
+
+
+def test_absent_template_is_not_a_refusal_but_a_no_template_state(home, tmp_path, monkeypatch):
+    """A repo with no PR template (and no org-level one) opens PRs with any
+    body — there is no shape to enforce. The template receipt names the
+    absence explicitly rather than pretending the check passed."""
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    pg, api = _FakeGovernancePg(), _FakeApi(template="")  # 404 on every contents lookup
+    out = _open(pg, api, body="anything")
+    assert out["ok"] and out["opened"]
+    assert out["template"]["state"] == "no_template"
+
+
+def test_a_template_with_no_headings_enforces_no_sections(home, tmp_path, monkeypatch):
+    """A template that is prose only (no `##` headings) is a template that
+    names no required sections. The preflight passes with `no_headings`."""
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    pg, api = _FakeGovernancePg(), _FakeApi(template="Please describe your changes.")
+    out = _open(pg, api, body="did the thing")
+    assert out["ok"] and out["opened"]
+    assert out["template"]["state"] == "no_headings"
+
+
+def test_org_fallback_is_used_when_the_repo_has_no_template(home, tmp_path, monkeypatch):
+    """The repo has no template, but ``forge-play/.github`` carries one — the
+    resolver uses the org fallback."""
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    pg, api = _FakeGovernancePg(), _FakeApi(template=_TEMPLATE, template_from="org")
+    out = _open(pg, api, body=_GOOD_BODY)
+    assert out["ok"] and out["opened"]
+    assert out["template"]["template_source"].startswith("org:")
+
+
+def test_enforce_template_can_be_disabled(home, tmp_path, monkeypatch):
+    """Some workflows (a bot opening a series of tiny follow-up PRs against
+    a repo with a heavyweight template) need to bypass the shape check;
+    `enforce_template=False` skips it entirely, and the receipt names why."""
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    pg, api = _FakeGovernancePg(), _FakeApi(template=_TEMPLATE)
+    out = _open(pg, api, body="empty", enforce_template=False)
+    assert out["ok"] and out["opened"]
+    assert out["template"]["state"] == "not_enforced"
+    # No /contents/ calls happened — the resolver never ran.
+    assert not any("/contents/" in c["url"] for c in api.calls)
