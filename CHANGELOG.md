@@ -36,7 +36,8 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **pull_executor:** resolve trigger clones case-insensitively; no ~/.willow fallback in bot_status / trigger_dir ([68d7ae6](https://github.com/willow-memory/willow-mcp/commit/68d7ae62d0ee912f59a1c3a9d9f10f37c34b0d75))
+* **paths:** route bot_status and pull_executor off raw ~/.willow ([0d7b38f](https://github.com/willow-memory/willow-mcp/commit/0d7b38fa1cb6db8feefa1e96d815aa492f81d4d8))
+* **pull_executor:** resolve gitsync trigger clones case-insensitively ([0436787](https://github.com/willow-memory/willow-mcp/commit/0436787d769e030c15fa1a7f944562afeec2f84b))
 
 ## [2.52.0](https://github.com/willow-memory/willow-mcp/compare/v2.51.0...v2.52.0) (2026-09-16)
 
