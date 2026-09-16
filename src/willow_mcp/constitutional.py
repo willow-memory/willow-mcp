@@ -19,6 +19,16 @@ missing existing row) is a refusal, never a merge: this is a sync of an
 additive ratification, not a general reconciler, and a live table that has
 diverged from the bundle any other way needs the operator's eyes, not code
 guessing which side is right.
+
+"Modified" is judged on a row's STRUCTURAL fields only — ``id``, ``verb``,
+``bounds``, ``enforcement``, ``enforced_by``, ``min_ring`` — never ``note``
+or ``summary`` (row 16, ``pr.update``, sealed ``783bab4e``). A row's prose
+gets corrected in the same PR that adds an unrelated row surprisingly often
+(row 15's own lineage note went from a ``PR <#>`` placeholder to ``PR #555``
+in the very commit that appended row 16), and a sync that refused on that
+diff would hold a real additive ratification hostage to a footnote. A
+rewritten bound, ring, or enforcement wall is still a modification and still
+refuses — narrative text is the only thing exempted.
 """
 from __future__ import annotations
 
@@ -114,6 +124,21 @@ def _rows_by_id(table: dict) -> dict[int, dict]:
     }
 
 
+#: Fields that decide whether a row was "modified" for the additive-diff
+#: check. ``note`` and ``summary`` are narrative — they name a gap, a seal, a
+#: PR number, or reword a description — and none of that changes what the
+#: row actually grants. Row 16 (``pr.update``, sealed ``783bab4e``): a note
+#: fixed up in the same PR that adds a new row must not block the add.
+_STRUCTURAL_FIELDS = ("id", "verb", "bounds", "enforcement", "enforced_by", "min_ring")
+
+
+def _structural(row: dict) -> dict:
+    """``row``, narrowed to the fields an additive sync treats as identity —
+    everything except ``note``/``summary``. Two rows that differ only in
+    prose compare equal here."""
+    return {k: row.get(k) for k in _STRUCTURAL_FIELDS}
+
+
 def _extract_seal_id(note: str) -> str:
     m = _SEAL_RE.search(note or "")
     return m.group(1) if m else ""
@@ -151,11 +176,15 @@ def sync_syscall_table_from_bundle(
     group-writable checkout must not make this sync refuse the very
     artifact it exists to apply. The sync refuses without writing anything
     unless the bundle is a STRICT superset of the live table by row
-    content: every id the live table carries must appear in the bundle
-    with byte-identical fields (compared by id AND verb, so a row that
+    STRUCTURE: every id the live table carries must appear in the bundle
+    with identical ``id``/``verb``/``bounds``/``enforcement``/
+    ``enforced_by``/``min_ring`` (compared by id AND verb, so a row that
     reused an id under a different verb name is a modification, not a
-    match). Under that condition the live table is overwritten with the
-    bundle's content and a FRANK ``constitutional_sync`` event is appended
+    match). ``note`` and ``summary`` are excluded from that comparison —
+    see :func:`_structural` — so a row whose prose was corrected in the same
+    PR that adds an unrelated row does not block the add. Under that
+    condition the live table is overwritten with the bundle's content
+    (prose included) and a FRANK ``constitutional_sync`` event is appended
     naming the new verb ids and the seal id read off each new row's
     ``note``.
 
@@ -239,7 +268,8 @@ def sync_syscall_table_from_bundle(
         return result
 
     changed = sorted(
-        vid for vid in live_rows if live_rows[vid] != bundle_rows[vid]
+        vid for vid in live_rows
+        if _structural(live_rows[vid]) != _structural(bundle_rows[vid])
     )
     if changed:
         reason = (f"bundle row(s) {changed} differ from the live table's "
