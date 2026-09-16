@@ -41,7 +41,6 @@ DESK_CORE: frozenset[str] = frozenset(
         "handoff_read",
         "handoff_write_v4",
         "verify_handoff",
-        "agent_clear",
         "specialist_list",
         "specialist_get",
         # fleet / frank
@@ -85,9 +84,14 @@ DESK_CORE: frozenset[str] = frozenset(
         # web (MCP path; native web tools redirect here)
         "willow_web_search",
         "willow_web_fetch",
-        # brokered git (willows-bot) — desk initiates; broker holds the key
+        # brokered git (willows-bot) — desk initiates; broker holds the key.
+        # Pull and sweep sit beside push and PR-open: a desk that can send
+        # code out but cannot bring merged code home is the gitsync-trigger-
+        # has-no-consumer shape one layer up (gap 83af08a4deda).
         "git_push_execute",
         "pr_open_execute",
+        "git_pull_execute",
+        "gitsync_sweep",
     }
 )
 
@@ -107,9 +111,7 @@ def _manifest_advertise_mode(app_id: str) -> Optional[str]:
     if raw is None:
         return None
     if not isinstance(raw, str):
-        logger.warning(
-            "advertise: malformed %r for %r — ignoring", ADVERTISE_MANIFEST_KEY, app_id
-        )
+        logger.warning("advertise: malformed %r for %r — ignoring", ADVERTISE_MANIFEST_KEY, app_id)
         return None
     return raw.strip().lower() or None
 
@@ -131,9 +133,7 @@ def resolve_advertise_mode(app_id: str) -> str:
     return "manifest"
 
 
-def advertised_tools(
-    app_id: str, tool_gate_names: dict[str, str]
-) -> tuple[list[str], str]:
+def advertised_tools(app_id: str, tool_gate_names: dict[str, str]) -> tuple[list[str], str]:
     """``(sorted tool names to advertise, mode used)``.
 
     For ``desk_core``, the set is ``DESK_CORE ∩ visible_tools`` plus any
@@ -159,9 +159,7 @@ def advertised_tools(
     return sorted(core), "desk_core"
 
 
-def filter_tool_iterable(
-    tools: Iterable[object], allowed_names: set[str]
-) -> list[object]:
+def filter_tool_iterable(tools: Iterable[object], allowed_names: set[str]) -> list[object]:
     """Keep tools whose ``.name`` (or ``[\"name\"]``) is in ``allowed_names``."""
     kept: list[object] = []
     for tool in tools:
