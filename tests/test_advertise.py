@@ -29,16 +29,20 @@ def test_desk_core_size_cap():
     assert len(advertise.DESK_CORE) <= 50
 
 
+def test_desk_core_advertises_the_whole_brokered_git_loop():
+    # A desk that can push and open PRs but cannot pull is the
+    # gitsync-trigger-has-no-consumer shape one layer up (gap 83af08a4deda).
+    for verb in ("git_push_execute", "pr_open_execute", "git_pull_execute", "gitsync_sweep"):
+        assert verb in advertise.DESK_CORE, verb
+
+
 def test_willow_defaults_to_desk_core(apps_root):
     _write_manifest(
         apps_root,
         "willow",
         {"permissions": ["full_access"], "human_only": True},
     )
-    catalogue = {
-        name: name
-        for name in list(advertise.DESK_CORE) + ["store_purge_collection", "lineage_why"]
-    }
+    catalogue = {name: name for name in list(advertise.DESK_CORE) + ["store_purge_collection", "lineage_why"]}
     names, mode = advertise.advertised_tools("willow", catalogue)
     assert mode == "desk_core"
     assert len(names) <= 50
@@ -151,9 +155,7 @@ def test_middleware_desk_core_filters_list(apps_root, monkeypatch):
     )
     import asyncio
 
-    out = asyncio.run(
-        request_context.AdvertiseFilterMiddleware()(Ctx(), call_next)
-    )
+    out = asyncio.run(request_context.AdvertiseFilterMiddleware()(Ctx(), call_next))
     names = [t.name for t in out.tools]
     assert "dispatch_send" in names
     assert "whoami" in names  # ungated desk_core member
@@ -184,9 +186,7 @@ def test_middleware_full_passes_through(apps_root, monkeypatch):
 
     import asyncio
 
-    out = asyncio.run(
-        request_context.AdvertiseFilterMiddleware()(Ctx(), call_next)
-    )
+    out = asyncio.run(request_context.AdvertiseFilterMiddleware()(Ctx(), call_next))
     assert [t.name for t in out.tools] == [
         "store_purge_collection",
         "dispatch_send",
