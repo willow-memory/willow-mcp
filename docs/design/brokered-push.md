@@ -62,6 +62,21 @@ envelope application with the act attached, not a new capability. A group of
 its own needs a `gate.py` edit and a manifest re-sign, which is outside this
 slice's envelope.
 
+`pr_update_executor.py` (`pr_update_execute`) joins them for verb 16,
+`pr.update`, sealed `783bab4e` — gap `8d1bcb2b7c02`: `pr.open` could open a
+PR but nothing could touch it again, so a `pr-title.yml` failure after a
+commit retype (or a body that needed a correction, or a bot-owned label the
+review picked up) was a click the seat could not make. It edits title, body,
+and/or bot-owned (`willow-bot/`) labels only — never merge, approve, close,
+request-review, or assignee, which stay verb 5 or ENOSYS. Before citation it
+checks the PR exists and is open (`ENOENT`/`ECLOSED`) and that its author is
+the App itself (`EAUTHOR` otherwise — there is no `any_author` bound; a PR
+`pr.update` did not open is not one it may touch), then runs the same
+`pr_template.preflight` `pr.open` uses when a new body is supplied
+(`EBODY`). Refusals file the ask under `pr.<repo>#<number>` — the `#`
+(naming a specific PR) distinguishes it from `pr.open`'s `pr.<repo>:<base>`
+(naming a base branch) on the same `pr.` gate-request prefix.
+
 ## Slice 2: the explicit ask
 
 `gate_request` (`open_request`, `request_lease`, `note_for_lease_denial`)
