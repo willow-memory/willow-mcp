@@ -44,6 +44,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import paths
+
 EVENT = "git_pull"
 
 _GIT_TIMEOUT_S = 180
@@ -242,9 +244,13 @@ def execute_pull(
 # ── the trigger consumer ─────────────────────────────────────────────────────
 
 def trigger_dir() -> Path:
-    home = (os.environ.get("WILLOW_HOME") or "").strip()
-    base = Path(home).expanduser() if home else Path.home() / ".willow"
-    return base / "gitsync"
+    """``$WILLOW_HOME/gitsync`` — where willow-bot's bridge writes trigger
+    flags. Routed through :func:`paths.willow_home`, which raises
+    :class:`paths.RetiredHomeError` when ``WILLOW_HOME`` is unset and the
+    implicit default has been retired — callers with a receipt to fill (e.g.
+    :func:`sweep_triggers`) turn that into a structured ``unreachable``, never
+    an empty success reaching a dead directory."""
+    return paths.willow_home() / "gitsync"
 
 
 def _github_root() -> Path:
@@ -255,24 +261,64 @@ def _github_root() -> Path:
     return Path.home() / "github"
 
 
-def resolve_clone(repo: str, *, root: Optional[Path] = None,
-                  runner: Optional[Callable] = None) -> Optional[Path]:
+def _case_insensitive_dirs(parent: Path, target: str) -> list[Path]:
+    """Child directories of ``parent`` whose name matches ``target`` case-
+    insensitively — GitHub owner and repo names are case-insensitive, but two
+    checkouts differing only by case are two different directories on disk."""
+    if not parent.is_dir():
+        return []
+    lowered = target.lower()
+    return sorted(p for p in parent.iterdir() if p.is_dir() and p.name.lower() == lowered)
+
+
+def resolve_clone_status(repo: str, *, root: Optional[Path] = None,
+                         runner: Optional[Callable] = None) -> dict:
     """``org/name`` -> the checkout under the github root whose ``origin`` is
-    that repo: ``<root>/<org>/<name>`` first (the org layout this box uses),
-    then the flat ``<root>/<name>`` willow-bot's bridge knows. Verified by
-    remote URL, never by folder name alone."""
+    that repo, matching the owner directory and the repo directory case-
+    insensitively (GitHub owner/repo names are case-insensitive; the clone on
+    disk need not match the case willow-bot's trigger names): ``<root>/<org>/
+    <name>`` first (the org layout this box uses), then the flat
+    ``<root>/<name>``. Verified by remote URL, never by folder name alone.
+    Exactly one verified match wins a layout; two candidates differing only
+    by case is ``EAMBIG`` naming both, never a guess.
+
+    Returns ``{"clone": Path|None, "error": None|"EAMBIG", "candidates": [...]}``.
+    """
     from .push_executor import _repo_matches_remote, inspect_checkout
 
     if repo.count("/") != 1:
-        return None
+        return {"clone": None, "error": None, "candidates": []}
     owner, name = repo.split("/", 1)
     root = root or _github_root()
-    for cand in (root / owner / name, root / name, root / name.lower()):
-        if (cand / ".git").exists():
-            facts = inspect_checkout(cand, runner=runner)
-            if facts.get("ok") and _repo_matches_remote(facts["remote_url"], repo):
-                return cand
-    return None
+
+    def _verified(cand: Path) -> bool:
+        if not (cand / ".git").exists():
+            return False
+        facts = inspect_checkout(cand, runner=runner)
+        return bool(facts.get("ok")) and _repo_matches_remote(facts["remote_url"], repo)
+
+    org_matches: list[Path] = []
+    for owner_dir in _case_insensitive_dirs(root, owner):
+        org_matches.extend(d for d in _case_insensitive_dirs(owner_dir, name) if _verified(d))
+    if len(org_matches) == 1:
+        return {"clone": org_matches[0], "error": None, "candidates": []}
+    if len(org_matches) > 1:
+        return {"clone": None, "error": "EAMBIG", "candidates": [str(m) for m in org_matches]}
+
+    flat_matches = [d for d in _case_insensitive_dirs(root, name) if _verified(d)]
+    if len(flat_matches) == 1:
+        return {"clone": flat_matches[0], "error": None, "candidates": []}
+    if len(flat_matches) > 1:
+        return {"clone": None, "error": "EAMBIG", "candidates": [str(m) for m in flat_matches]}
+
+    return {"clone": None, "error": None, "candidates": []}
+
+
+def resolve_clone(repo: str, *, root: Optional[Path] = None,
+                  runner: Optional[Callable] = None) -> Optional[Path]:
+    """Backward-compatible wrapper over :func:`resolve_clone_status`: the
+    resolved checkout, or ``None`` on no match or ambiguity."""
+    return resolve_clone_status(repo, root=root, runner=runner)["clone"]
 
 
 def sweep_triggers(app_id: str, *, project: str, session: str = "", ledger=None,
@@ -282,7 +328,14 @@ def sweep_triggers(app_id: str, *, project: str, session: str = "", ledger=None,
     the clone, pull it home, remove the flag on success. A refusal leaves the
     flag in place (so the next sweep tries again once the tree is clean) and
     is reported, never swallowed. Empty dir → ``{"swept": []}``, honestly."""
-    tdir = triggers or trigger_dir()
+    if triggers is not None:
+        tdir = triggers
+    else:
+        try:
+            tdir = trigger_dir()
+        except paths.RetiredHomeError as exc:
+            return {"ok": False, "state": "unreachable", "reason": "retired_home",
+                    "detail": str(exc), "swept": []}
     if not tdir.is_dir():
         return {"ok": True, "triggers_dir": str(tdir), "present": False, "swept": []}
     results = []
@@ -291,17 +344,30 @@ def sweep_triggers(app_id: str, *, project: str, session: str = "", ledger=None,
         # willow-bot writes owner-repo with '/' -> '-'; owners do not contain
         # '-' in this fleet's orgs except as a real hyphen, so split on the
         # first '-' that yields an existing clone.
-        repo, clone = "", None
+        repo, clone, ambiguous = "", None, None
         parts = stem.split("-")
         for i in range(1, len(parts)):
             cand = f"{'-'.join(parts[:i])}/{'-'.join(parts[i:])}"
-            c = resolve_clone(cand, root=root, runner=runner)
-            if c is not None:
-                repo, clone = cand, c
+            status = resolve_clone_status(cand, root=root, runner=runner)
+            if status["clone"] is not None:
+                repo, clone = cand, status["clone"]
+                break
+            if status["error"] == "EAMBIG":
+                repo, ambiguous = cand, status["candidates"]
                 break
         if clone is None:
-            results.append({"flag": flag.name, "ok": False, "error": "ENOCLONE",
-                            "reason": f"no checkout under {root or _github_root()} for {stem!r}"})
+            if ambiguous is not None:
+                results.append({
+                    "flag": flag.name, "ok": False, "error": "EAMBIG",
+                    "reason": (
+                        f"{len(ambiguous)} checkouts under {root or _github_root()} "
+                        f"match {repo!r} case-insensitively: {', '.join(ambiguous)}"
+                    ),
+                    "candidates": ambiguous,
+                })
+            else:
+                results.append({"flag": flag.name, "ok": False, "error": "ENOCLONE",
+                                "reason": f"no checkout under {root or _github_root()} for {stem!r}"})
             continue
         out = execute_pull(app_id, checkout=clone, repo=repo, project=project,
                            session=session, ledger=ledger, runner=runner)

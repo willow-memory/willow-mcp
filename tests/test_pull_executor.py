@@ -106,6 +106,13 @@ def _no_app(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _clear_retired_home_cache():
+    plx.paths._retired_home_cache.clear()
+    yield
+    plx.paths._retired_home_cache.clear()
+
+
 @pytest.fixture
 def checkout(tmp_path):
     d = tmp_path / "Forge"
@@ -325,6 +332,103 @@ def test_resolve_clone_prefers_org_layout_and_verifies_origin(tmp_path):
     assert plx.resolve_clone("forge-play/Forge", root=root, runner=git) == org
     assert plx.resolve_clone("rudi193-cmd/Forge", root=root, runner=git) == flat
     assert plx.resolve_clone("nobody/Forge", root=root, runner=git) is None
+
+
+# ── the resolver is case-insensitive (gap 6fbf1453f029) ─────────────────────
+
+def test_resolve_clone_matches_owner_and_repo_case_insensitively(tmp_path):
+    """The clone on disk is `Die-Namic-Systems/nestor`; GitHub, and the
+    trigger flag willow-bot writes, name it `Die-Namic-Systems/Nestor`."""
+    root = tmp_path / "github"
+    nestor = _make_clone(root, "Die-Namic-Systems", "nestor", "")
+    git = _MultiGit({str(nestor): _FakeGit(
+        remote_url="https://github.com/Die-Namic-Systems/Nestor.git")})
+    assert plx.resolve_clone("Die-Namic-Systems/Nestor", root=root, runner=git) == nestor
+
+
+def test_resolve_clone_refuses_two_case_variants_as_ambiguous(tmp_path):
+    root = tmp_path / "github"
+    lower = _make_clone(root, "Die-Namic-Systems", "nestor", "")
+    upper = _make_clone(root, "Die-Namic-Systems", "Nestor", "")
+    git = _MultiGit({
+        str(lower): _FakeGit(remote_url="https://github.com/Die-Namic-Systems/Nestor.git"),
+        str(upper): _FakeGit(remote_url="https://github.com/Die-Namic-Systems/Nestor.git"),
+    })
+    status = plx.resolve_clone_status("Die-Namic-Systems/Nestor", root=root, runner=git)
+    assert status["clone"] is None and status["error"] == "EAMBIG"
+    assert set(status["candidates"]) == {str(lower), str(upper)}
+    # the backward-compatible wrapper never guesses between them
+    assert plx.resolve_clone("Die-Namic-Systems/Nestor", root=root, runner=git) is None
+
+
+def test_resolve_clone_missing_stays_enoclone(tmp_path):
+    root = tmp_path / "github"
+    root.mkdir()
+    status = plx.resolve_clone_status("someone/nowhere", root=root, runner=_MultiGit({}))
+    assert status["clone"] is None and status["error"] is None
+
+
+def test_sweep_resolves_a_case_variant_clone_via_the_flag_name(tmp_path):
+    root = tmp_path / "github"
+    nestor = _make_clone(root, "Die-Namic-Systems", "nestor", "")
+    triggers = tmp_path / "gitsync"
+    triggers.mkdir()
+    (triggers / "trigger-Die-Namic-Systems-Nestor.flag").write_text("x\n")
+    git = _MultiGit({str(nestor): _FakeGit(
+        remote_url="https://github.com/Die-Namic-Systems/Nestor.git", current="master")})
+    out = plx.sweep_triggers("willow", project="fleet", root=root, triggers=triggers, runner=git)
+    r = out["swept"][0]
+    assert r["ok"] and r["checkout"] == str(nestor), "the receipt names the resolved path"
+
+
+def test_sweep_reports_eambig_for_two_case_variant_clones(tmp_path):
+    root = tmp_path / "github"
+    lower = _make_clone(root, "Die-Namic-Systems", "nestor", "")
+    upper = _make_clone(root, "Die-Namic-Systems", "Nestor", "")
+    triggers = tmp_path / "gitsync"
+    triggers.mkdir()
+    flag = triggers / "trigger-Die-Namic-Systems-Nestor.flag"
+    flag.write_text("x\n")
+    git = _MultiGit({
+        str(lower): _FakeGit(remote_url="https://github.com/Die-Namic-Systems/Nestor.git"),
+        str(upper): _FakeGit(remote_url="https://github.com/Die-Namic-Systems/Nestor.git"),
+    })
+    out = plx.sweep_triggers("willow", project="fleet", root=root, triggers=triggers, runner=git)
+    r = out["swept"][0]
+    assert r["error"] == "EAMBIG" and set(r["candidates"]) == {str(lower), str(upper)}
+    assert flag.exists(), "an ambiguous match is not a guess; the flag stays for a human"
+
+
+# ── trigger_dir routes through paths.willow_home() (no ~/.willow fallback) ──
+
+def test_trigger_dir_resolves_when_home_is_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "live"))
+    assert plx.trigger_dir() == tmp_path / "live" / "gitsync"
+
+
+def test_trigger_dir_raises_on_a_retired_implicit_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("WILLOW_HOME", raising=False)
+    monkeypatch.setattr(plx.paths.Path, "home", staticmethod(lambda: tmp_path))
+    home = tmp_path / ".willow"
+    home.mkdir()
+    (home / plx.paths.TOMBSTONE_MARKER).write_text("retired\n")
+    with pytest.raises(plx.paths.RetiredHomeError):
+        plx.trigger_dir()
+
+
+def test_sweep_triggers_reports_unreachable_for_a_retired_home(tmp_path, monkeypatch):
+    """Unset WILLOW_HOME plus a tombstoned `~/.willow` must surface as a
+    structured unreachable — never a raise, never an empty `{"swept": []}`
+    that looks like a clean sweep of nothing."""
+    monkeypatch.delenv("WILLOW_HOME", raising=False)
+    monkeypatch.setattr(plx.paths.Path, "home", staticmethod(lambda: tmp_path))
+    home = tmp_path / ".willow"
+    home.mkdir()
+    (home / plx.paths.TOMBSTONE_MARKER).write_text("retired\n")
+    out = plx.sweep_triggers("willow", project="fleet")
+    assert out["ok"] is False
+    assert out["state"] == "unreachable" and out["reason"] == "retired_home"
+    assert out["swept"] == []
 
 
 # ── the tools are wired like the push and the PR ────────────────────────────
