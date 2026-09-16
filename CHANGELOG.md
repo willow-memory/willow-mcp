@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.51.0](https://github.com/willow-memory/willow-mcp/compare/v2.50.0...v2.51.0) (2026-09-16)
+
+
+### Added
+
+* **mcp:** bot_status — the desk reads the steward without a shell ([78b5e8e](https://github.com/willow-memory/willow-mcp/commit/78b5e8e25fcfd45c20e2dd319040abdef3fd3423))
+
 ## [2.50.0](https://github.com/willow-memory/willow-mcp/compare/v2.49.0...v2.50.0) (2026-09-16)
 
 
