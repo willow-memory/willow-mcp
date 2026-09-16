@@ -129,8 +129,8 @@ def run_embed_tick(
     if not cols.get(COL_EMBEDDING):
         receipt["reason"] = (
             "knowledge table has no embedding column — apply "
-            "docs/schema/knowledge_embed.migrate.sql (or recreate from "
-            "knowledge.postgres.sql)"
+            "docs/schema/knowledge_embed.migrate.sql "
+            "(fresh knowledge.postgres.sql stays extension-free for CI)"
         )
         receipt["elapsed_s"] = round(time.monotonic() - started, 3)
         return receipt

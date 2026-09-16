@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from willow_mcp import advertise, gate, request_context, server
+from willow_mcp import advertise, request_context, server
 
 
 @pytest.fixture
