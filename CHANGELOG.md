@@ -31,6 +31,19 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.53.0](https://github.com/willow-memory/willow-mcp/compare/v2.52.1...v2.53.0) (2026-09-16)
+
+
+### Added
+
+* **server:** register pr_checks_read beside bot_status (gap a50c3d9c9a71) ([8cedd05](https://github.com/willow-memory/willow-mcp/commit/8cedd056866baa5288709ce916108996a653b10c))
+* **pr_checks:** read-only broker verb for red CI checks (gap a50c3d9c9a71) ([3e33b02](https://github.com/willow-memory/willow-mcp/commit/3e33b022bb0b8a5918139bfbf4e190c2cd6cf8a6))
+
+
+### Fixed
+
+* **constitutional:** read the shipped bundle table plainly, ink every refusal ([b98b149](https://github.com/willow-memory/willow-mcp/commit/b98b14952603a8322c002f087988d738709d42c9))
+
 ## [2.52.1](https://github.com/willow-memory/willow-mcp/compare/v2.52.0...v2.52.1) (2026-09-16)
 
 
