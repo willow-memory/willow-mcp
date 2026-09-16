@@ -4798,6 +4798,57 @@ def unit_reload_execute(
 
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("envelope_apply")
+def pr_update_execute(
+    app_id: str,
+    repo: str,
+    number: int,
+    title: str = "",
+    body: str = "",
+    labels: Optional[list[str]] = None,
+    envelope_id: str = "",
+    project: str = "",
+    task_id: str = "",
+) -> dict:
+    """Edit the title, body, and/or bot-owned labels of pull request
+    `repo`#`number`, performed by THIS process as willows-bot under the
+    `pr.update` envelope that governs `app_id` (verb 16, sealed `783bab4e`)
+    — `pr_open_execute`'s sibling for the PR the broker already opened.
+    Refuses before any PATCH: at least one of title/body/labels must be set
+    (`EINVAL`); a label outside the bot's own `willow-bot/` prefix
+    (`ELABEL`); the PR missing or not open (`ENOENT`/`ECLOSED`); the PR not
+    authored by the App (`EAUTHOR` — there is no `any_author` escape hatch);
+    a new body missing a required template section (`EBODY`). NOT merge,
+    approve, close, request-review, or assignee — those are verb 5 or
+    ENOSYS. A refusal is cited in FRANK with its errno and files the ask in
+    the human-required queue under `pr.<repo>#<number>`. Returns the
+    before/after title, body hash, and labels, and the citation id on
+    success. Gated as envelope_apply, beside `pr_open_execute`."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import pr_update_executor
+        from .governance_ledger import GovernanceLedger
+
+        return pr_update_executor.execute_pr_update(
+            app_id,
+            repo=repo,
+            number=number,
+            title=title,
+            body=body,
+            labels=labels,
+            envelope_id=envelope_id,
+            project=project or repo,
+            session=_current_orchestrator_session(),
+            task_id=task_id,
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "updated": False, "error": f"pr_update_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
 def gitsync_sweep(app_id: str, project: str = "") -> dict:
     """Consume willow-bot's gitsync triggers: for every
     `$WILLOW_HOME/gitsync/trigger-<owner>-<repo>.flag` the bridge wrote on a

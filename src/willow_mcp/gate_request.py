@@ -102,12 +102,17 @@ def check_requestable(gate_id: str) -> Optional[str]:
                 f"gate"
             )
     if gate_id.startswith("pr."):
+        # Two shapes share the `pr.` prefix: `pr.open`'s `:<base>` and
+        # `pr.update`'s `#<number>` (verb 16, sealed `783bab4e`). Either
+        # parsing cleanly is well-formed; only failing both is refused.
         repo, base = gates_panel.split_pr_gate(gate_id)
         if not repo or not base:
-            return (
-                f"{gate_id!r} is not a well-formed pr.<owner>/<repo>:<base> "
-                f"gate"
-            )
+            repo, number = gates_panel.split_pr_update_gate(gate_id)
+            if not repo or not number:
+                return (
+                    f"{gate_id!r} is not a well-formed pr.<owner>/<repo>:<base> "
+                    f"or pr.<owner>/<repo>#<number> gate"
+                )
     return None
 
 

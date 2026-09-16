@@ -173,8 +173,20 @@ def mint_installation_token(repo: str) -> dict[str, Any]:
         "permissions": perms,
         "installation_id": installation_id,
         "app_id": creds["app_id"],
+        "app_slug": inst["body"].get("app_slug"),
         "repo": repo,
     }
+
+
+def bot_login(auth: dict | None) -> str:
+    """The willows-bot App's own PR-author identity: ``<app_slug>[bot]`` —
+    the login GitHub attributes a bot-authored PR to, the same shape every
+    ``user.login`` on a bot-opened PR carries. Empty when the mint response
+    (a fake in tests, or a real one predating this field) carries no
+    ``app_slug`` — callers treat that as "cannot verify", never as a match.
+    """
+    slug = ((auth or {}).get("app_slug") or "").strip()
+    return f"{slug}[bot]" if slug else ""
 
 
 def contents_perm_allows_push(permissions: dict | None) -> bool:

@@ -555,6 +555,11 @@ REQUEST_QUEUE_KIND = "consent"
 #: `06075e99`): `unit_reload_executor._file_ask` shares the same
 #: `kind=review` invisibility the push/PR asks had before their own
 #: migration here, and there is nothing verb-specific about the fix.
+#: `pr.<repo>#<number>` (verb 16, `pr.update`, sealed `783bab4e`) rides the
+#: same `pr.` prefix as `pr.open`'s `pr.<repo>:<base>` — the two are told
+#: apart by separator (`#` names a specific PR, `:` names a base branch),
+#: not by prefix, since `pr.update` edits a PR `pr.open` already made rather
+#: than naming a new capability.
 REQUESTABLE_PREFIXES = ("lease.", "perm.", "attest.", "push.", "pr.", "unit.")
 
 #: Prefixes whose row is informational: it surfaces the ask and carries the
@@ -620,6 +625,32 @@ def split_pr_gate(gate_id: str) -> tuple[str, str]:
     if not repo or "/" not in repo or not base:
         return "", ""
     return repo, base
+
+
+def split_pr_update_gate(gate_id: str) -> tuple[str, str]:
+    """`pr.<owner>/<repo>#<number>` -> ``(repo, number)``, or ``("", "")`` if
+    malformed.
+
+    `pr.update` (verb 16, sealed `783bab4e`) shares the `pr.` prefix with
+    `pr.open` but names a specific PR rather than a base branch, so it needs
+    its own separator: `#` (a PR number, GitHub-shaped) rather than `:` (a
+    branch name, which itself may contain `/` but never `#`). Splitting on
+    the rightmost `#` is unambiguous for the same reason `split_pr_gate`
+    splits on the rightmost `:` — `owner/repo` never contains either
+    character.
+    """
+    prefix = "pr."
+    if not (gate_id or "").startswith(prefix):
+        return "", ""
+    body = gate_id[len(prefix):]
+    if "#" not in body:
+        return "", ""
+    repo, _, number = body.rpartition("#")
+    repo = repo.strip()
+    number = number.strip()
+    if not repo or "/" not in repo or not number.isdigit():
+        return "", ""
+    return repo, number
 
 #: Permission groups a request may never name, at any distance.
 #:
@@ -792,9 +823,14 @@ def _request_rows(store=None) -> list[GateRow]:
                 # ratifies must come first. Point the operator at the summary
                 # (which carries the exact bounds) and at the two-step ritual
                 # rather than a paste-me line that would be a half-truth.
-                envelope_kind = ("push" if gate_id.startswith("push.")
-                                  else "pr.open" if gate_id.startswith("pr.")
-                                  else "unit.reload")
+                envelope_kind = (
+                    "push" if gate_id.startswith("push.")
+                    else "unit.reload" if gate_id.startswith("unit.")
+                    # `pr.` splits by separator, not prefix: `#<number>` is
+                    # `pr.update` (verb 16); `:<base>` is `pr.open` (verb 4).
+                    else "pr.update" if "#" in gate_id
+                    else "pr.open"
+                )
                 action_note = (
                     f"this one is not pressable — a {envelope_kind} envelope "
                     "needs an attributed operator session. Propose it with "
