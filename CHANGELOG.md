@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.52.1](https://github.com/willow-memory/willow-mcp/compare/v2.52.0...v2.52.1) (2026-09-16)
+
+
+### Fixed
+
+* **pull_executor:** resolve trigger clones case-insensitively; no ~/.willow fallback in bot_status / trigger_dir ([68d7ae6](https://github.com/willow-memory/willow-mcp/commit/68d7ae62d0ee912f59a1c3a9d9f10f37c34b0d75))
+
 ## [2.52.0](https://github.com/willow-memory/willow-mcp/compare/v2.51.0...v2.52.0) (2026-09-16)
 
 
