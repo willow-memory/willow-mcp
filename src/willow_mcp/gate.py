@@ -115,7 +115,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     }),
     "fleet_read": frozenset({
         "fleet_status", "fleet_health", "frank_read", "frank_verify",
-        "bot_status",
+        "bot_status", "pr_checks_read",
     }),
     # Grove — the fleet's shared messaging room (legacy fleet monolith's sap/grove_tools.py
     # successor; see willow_mcp/grove_tools.py). Read/write mirror the
@@ -394,7 +394,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # Fleet (read-only)
         "fleet_status", "fleet_health",
         "frank_read", "frank_verify",
-        "bot_status",
+        "bot_status", "pr_checks_read",
         # Grove — the fleet's shared messaging room (read + write; no egress
         # concern like web_net/integration_net/mcp_federation, so unlike those
         # this rides full_access, same reasoning as knowledge_read/write above)

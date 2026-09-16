@@ -4844,6 +4844,38 @@ def bot_status(app_id: str) -> dict:
         return {"state": "unreachable", "reason": f"bot_status_failed: {exc}"}
 
 
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("pr_checks_read")
+def pr_checks_read(app_id: str, repo: str, ref: str = "", pr: int = 0,
+                    log_tail: int = 120, project: str = "") -> dict:
+    """The desk reads why a CI check is red without a shell (gap
+    `a50c3d9c9a71`): willow-bot files "CI red: <leg>" with a job URL, but
+    nothing on the desk could open it — no lease for the operator's own
+    GitHub session, and the App token lived only in `pr_executor`/
+    `push_executor`. Names a commit by `pr` (a PR number, resolved to its
+    head sha) or `ref` (a sha or branch name, used as given) — passing
+    neither is `EINVAL`. Mints the willows-bot App install token (App only,
+    no host-token fallback), lists that commit's check-runs (paginated past
+    100) with annotations for any non-quiet run, and tails the Actions job
+    log (bounded, redirect-followed without leaking the bearer to the blob
+    host) for any run that actually failed. `state` is `populated` (at
+    least one check-run), `empty` (the head resolved, zero check-runs
+    reported yet), or `unreachable` (`reason` names the cause: `token`,
+    `permission_absent`, `not_found`, `timeout`, `http_<status>`); a
+    per-run `log_tail` carries its OWN state the same way. `red` collects
+    one line per failing leg: `{name, conclusion, job_url,
+    first_error_line}`. Read-only: no writes, no envelope, no FRANK
+    citation."""
+    from . import pr_checks as _pr_checks
+
+    try:
+        return _pr_checks.read_pr_checks(
+            app_id, repo=repo, ref=ref, pr=pr, log_tail=log_tail, project=project,
+        )
+    except Exception as exc:
+        return {"state": "unreachable", "reason": f"pr_checks_read_failed: {exc}"}
+
+
 # ---------------------------------------------------------------------------
 # Envelope authoring (PR5 of the envelope-accrual plan).
 #
