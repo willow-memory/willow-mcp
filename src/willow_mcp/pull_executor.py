@@ -44,6 +44,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import paths
+
 EVENT = "git_pull"
 
 _GIT_TIMEOUT_S = 180
@@ -242,9 +244,13 @@ def execute_pull(
 # ── the trigger consumer ─────────────────────────────────────────────────────
 
 def trigger_dir() -> Path:
-    home = (os.environ.get("WILLOW_HOME") or "").strip()
-    base = Path(home).expanduser() if home else Path.home() / ".willow"
-    return base / "gitsync"
+    """``$WILLOW_HOME/gitsync`` — where willow-bot's bridge writes trigger
+    flags. Routed through :func:`paths.willow_home`, which raises
+    :class:`paths.RetiredHomeError` when ``WILLOW_HOME`` is unset and the
+    implicit default has been retired — callers with a receipt to fill (e.g.
+    :func:`sweep_triggers`) turn that into a structured ``unreachable``, never
+    an empty success reaching a dead directory."""
+    return paths.willow_home() / "gitsync"
 
 
 def _github_root() -> Path:
@@ -322,7 +328,14 @@ def sweep_triggers(app_id: str, *, project: str, session: str = "", ledger=None,
     the clone, pull it home, remove the flag on success. A refusal leaves the
     flag in place (so the next sweep tries again once the tree is clean) and
     is reported, never swallowed. Empty dir → ``{"swept": []}``, honestly."""
-    tdir = triggers or trigger_dir()
+    if triggers is not None:
+        tdir = triggers
+    else:
+        try:
+            tdir = trigger_dir()
+        except paths.RetiredHomeError as exc:
+            return {"ok": False, "state": "unreachable", "reason": "retired_home",
+                    "detail": str(exc), "swept": []}
     if not tdir.is_dir():
         return {"ok": True, "triggers_dir": str(tdir), "present": False, "swept": []}
     results = []

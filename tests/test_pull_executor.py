@@ -106,6 +106,13 @@ def _no_app(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _clear_retired_home_cache():
+    plx.paths._retired_home_cache.clear()
+    yield
+    plx.paths._retired_home_cache.clear()
+
+
 @pytest.fixture
 def checkout(tmp_path):
     d = tmp_path / "Forge"
@@ -390,6 +397,38 @@ def test_sweep_reports_eambig_for_two_case_variant_clones(tmp_path):
     r = out["swept"][0]
     assert r["error"] == "EAMBIG" and set(r["candidates"]) == {str(lower), str(upper)}
     assert flag.exists(), "an ambiguous match is not a guess; the flag stays for a human"
+
+
+# ── trigger_dir routes through paths.willow_home() (no ~/.willow fallback) ──
+
+def test_trigger_dir_resolves_when_home_is_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "live"))
+    assert plx.trigger_dir() == tmp_path / "live" / "gitsync"
+
+
+def test_trigger_dir_raises_on_a_retired_implicit_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("WILLOW_HOME", raising=False)
+    monkeypatch.setattr(plx.paths.Path, "home", staticmethod(lambda: tmp_path))
+    home = tmp_path / ".willow"
+    home.mkdir()
+    (home / plx.paths.TOMBSTONE_MARKER).write_text("retired\n")
+    with pytest.raises(plx.paths.RetiredHomeError):
+        plx.trigger_dir()
+
+
+def test_sweep_triggers_reports_unreachable_for_a_retired_home(tmp_path, monkeypatch):
+    """Unset WILLOW_HOME plus a tombstoned `~/.willow` must surface as a
+    structured unreachable — never a raise, never an empty `{"swept": []}`
+    that looks like a clean sweep of nothing."""
+    monkeypatch.delenv("WILLOW_HOME", raising=False)
+    monkeypatch.setattr(plx.paths.Path, "home", staticmethod(lambda: tmp_path))
+    home = tmp_path / ".willow"
+    home.mkdir()
+    (home / plx.paths.TOMBSTONE_MARKER).write_text("retired\n")
+    out = plx.sweep_triggers("willow", project="fleet")
+    assert out["ok"] is False
+    assert out["state"] == "unreachable" and out["reason"] == "retired_home"
+    assert out["swept"] == []
 
 
 # ── the tools are wired like the push and the PR ────────────────────────────

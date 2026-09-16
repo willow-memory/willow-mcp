@@ -142,6 +142,45 @@ def test_resolve_binary_derives_from_willow_home(monkeypatch):
     assert bs.resolve_binary() == "/srv/willow/venvs/willow-bot/bin/willow-bot-steward"
 
 
+# ── no ~/.willow fallback: routed through paths.willow_home() ──────────────
+
+@pytest.fixture(autouse=True)
+def _clear_retired_home_cache():
+    bs.paths._retired_home_cache.clear()
+    yield
+    bs.paths._retired_home_cache.clear()
+
+
+def test_resolve_binary_raises_on_a_retired_implicit_default(tmp_path, monkeypatch):
+    monkeypatch.delenv(bs.BINARY_ENV, raising=False)
+    monkeypatch.delenv("WILLOW_HOME", raising=False)
+    monkeypatch.setattr(bs.paths.Path, "home", staticmethod(lambda: tmp_path))
+    home = tmp_path / ".willow"
+    home.mkdir()
+    (home / bs.paths.TOMBSTONE_MARKER).write_text("retired\n")
+    with pytest.raises(bs.paths.RetiredHomeError):
+        bs.resolve_binary()
+
+
+def test_read_status_reports_unreachable_for_a_retired_home(tmp_path, monkeypatch):
+    """Unset WILLOW_HOME plus a tombstoned `~/.willow` must surface as the
+    same three-state `unreachable` every other refusal here uses — never a
+    raise out of `read_status`, and never a subprocess launched against a
+    binary path built on a dead home."""
+    monkeypatch.delenv(bs.BINARY_ENV, raising=False)
+    monkeypatch.delenv("WILLOW_HOME", raising=False)
+    monkeypatch.setattr(bs.paths.Path, "home", staticmethod(lambda: tmp_path))
+    home = tmp_path / ".willow"
+    home.mkdir()
+    (home / bs.paths.TOMBSTONE_MARKER).write_text("retired\n")
+
+    def _boom(argv, **kw):
+        raise AssertionError("must not run a subprocess against a retired home")
+
+    out = bs.read_status(runner=_boom)
+    assert out["state"] == "unreachable" and out["reason"] == "retired_home"
+
+
 def test_bot_status_tool_gate_and_visibility(mk_app, monkeypatch):
     denied = mk_app("hanuman", ["store_read"])
     allowed = mk_app("frigg", ["fleet_read"])

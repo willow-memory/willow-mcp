@@ -32,6 +32,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import paths
+
 #: Env override for tests and non-default installs — checked before the
 #: derived `$WILLOW_HOME/venvs/willow-bot/bin/willow-bot-steward` path, the
 #: same override-then-derive shape `pull_executor._github_root` uses.
@@ -41,15 +43,21 @@ _DEFAULT_TIMEOUT_S = 5.0
 
 
 def _willow_home() -> Path:
-    home = (os.environ.get("WILLOW_HOME") or "").strip()
-    return Path(home).expanduser() if home else Path.home() / ".willow"
+    """``$WILLOW_HOME``, routed through :func:`paths.willow_home` so an
+    unset variable falling back to a retired ``~/.willow`` raises
+    :class:`paths.RetiredHomeError` instead of silently resolving to a
+    tombstoned tree. ``resolve_binary`` and ``read_status`` are the only
+    callers, and ``read_status`` is where that raise turns into a structured
+    ``unreachable``."""
+    return paths.willow_home()
 
 
 def resolve_binary() -> str:
     """The steward CLI to run: ``$WILLOW_BOT_STEWARD_BIN`` if set, else the
     installed entrypoint under the bot's own venv beneath ``$WILLOW_HOME``.
     Never hardcodes an operator home — ``_willow_home`` is the one place
-    that falls back to ``~/.willow``, matching ``pull_executor.trigger_dir``."""
+    that falls back to ``~/.willow`` (via ``paths.willow_home``), matching
+    ``pull_executor.trigger_dir``. May raise ``paths.RetiredHomeError``."""
     override = (os.environ.get(BINARY_ENV) or "").strip()
     if override:
         return override
@@ -78,7 +86,14 @@ def read_status(
     it must raise ``FileNotFoundError`` / ``subprocess.TimeoutExpired`` the
     way the real one does, since those are exactly the states this function
     tells apart."""
-    resolved = binary or resolve_binary()
+    try:
+        resolved = binary or resolve_binary()
+    except paths.RetiredHomeError as exc:
+        return {
+            "state": "unreachable",
+            "reason": "retired_home",
+            "detail": str(exc),
+        }
     run = runner or subprocess.run
     try:
         proc = run(
