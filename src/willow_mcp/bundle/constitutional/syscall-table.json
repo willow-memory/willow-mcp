@@ -13,7 +13,7 @@
     "roster": "fleet.json",
     "charter": "PROTECTED_AGENTS.md"
   },
-  "updated": "2026-08-11",
+  "updated": "2026-09-16",
   "invariants": [
     "Envelopes cite verbs by id; free text never appears on the checking path.",
     "The check is field-by-field validation of call args against envelope bounds. No interpretation. A near-miss is a fault (EAMBIG), not a stretch.",
@@ -257,9 +257,21 @@
       "enforced_by": "PROTECTED_AGENTS.md is this verb's law; roster fleet.json is /etc/passwd",
       "min_ring": "root",
       "note": "tier_change is privilege escalation by definition. There is no userdel in this system: retirement-with-record only (PROTECTED_AGENTS \u00a77); deletion-without-record is not a denied call, it is unexpressible. agent_create exists today as a live MCP verb with no envelope discipline \u2014 this row puts it under law."
+    },
+    {
+      "id": 15,
+      "verb": "unit.reload",
+      "summary": "Restart a systemd --user unit onto code a git_pull receipt already brought home.",
+      "bounds": {
+        "units": "list[unit-name] \u2014 systemd --user units; the broker's own unit (the willow-mcp server / serve unit) is never a grantable member"
+      },
+      "enforcement": "soft",
+      "enforced_by": null,
+      "min_ring": "ENGINEER",
+      "note": "Gap c96dc96927e8: nothing connected a merge landing to the process serving it restarting. Sealed under governance decision (seal 06075e99; Nestor pair 06075e99-c16d-4703-88c5-52b70fae7cf2), operator, 2026-09-16. Preflight before citation: refuses unless the checkout's git_pull FRANK receipt exists and is newer than the unit's own ActiveEnterTimestamp \u2014 a reload never runs ahead of a pull this broker actually performed. The fourth verb of the brokered merge loop: push (3) leaves the box, pr.open (4) proposes the merge, pull is receipt-only (unenveloped by design \u2014 see pull_executor.py), and reload (15) is the last mile, the unit noticing."
     }
   ],
   "lineage": {
-    "note": "Drafted 2026-07-06 in session e2b05d0a (Willow, orchestrator-seat design). Operator ratified thirteen verbs (twelve drafted + agent.lifecycle). This draft carries fourteen rows: pr.open (id 4) was added during drafting as the cheap reversible sibling of pr.merge, so that opening a PR against a foreign repo is expressible-and-boundable rather than falling to ENOSYS. Operator ratified fourteen 2026-07-06 ('keep it at 14'), with notice that the schema will change \u2014 that is what draft status is for."
+    "note": "Drafted 2026-07-06 in session e2b05d0a (Willow, orchestrator-seat design). Operator ratified thirteen verbs (twelve drafted + agent.lifecycle). This draft carries fourteen rows: pr.open (id 4) was added during drafting as the cheap reversible sibling of pr.merge, so that opening a PR against a foreign repo is expressible-and-boundable rather than falling to ENOSYS. Operator ratified fourteen 2026-07-06 ('keep it at 14'), with notice that the schema will change \u2014 that is what draft status is for. Row 15 unit.reload added 2026-09-16 under sealed decision 06075e99 (operator), PR <#>."
   }
 }
