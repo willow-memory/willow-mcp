@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.50.0](https://github.com/willow-memory/willow-mcp/compare/v2.49.0...v2.50.0) (2026-09-16)
+
+
+### Added
+
+* **advertise:** desk_core carries the whole brokered git loop ([97cbf7a](https://github.com/willow-memory/willow-mcp/commit/97cbf7a5aac729e3fa45395f42e37fd7391bb745))
+
 ## [2.49.0](https://github.com/willow-memory/willow-mcp/compare/v2.48.0...v2.49.0) (2026-09-16)
 
 
