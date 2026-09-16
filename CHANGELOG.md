@@ -38,7 +38,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 * advertise brokered push/PR tools on the desk core surface ([bae9dc6](https://github.com/willow-memory/willow-mcp/commit/bae9dc69d873720c84a6c9f27c59a52211600c4c))
 * desk_core advertise, WAKE draft, and bounded local embed ticks ([f8f8fd9](https://github.com/willow-memory/willow-mcp/commit/f8f8fd9b8553d84565923de4c94059e102b4aec5))
-* local embed ticks + desk_core broker verbs ([02330dd](https://github.com/willow-memory/willow-mcp/commit/02330dd9868f89f85b2c5a37c4911e5b504f3635))
 
 
 ### Fixed
