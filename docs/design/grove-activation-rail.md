@@ -30,6 +30,13 @@ Three gaps, closed here:
 
 ## The rail, end to end
 
+After the ``[WAKE]`` log line, ``build_activate`` also attempts a loopback
+``nestor.engine.OllamaEngine.draft_task`` triage of the wake prompt. The
+draft is written to ``$WILLOW_HOME/logs/wake-draft-<dispatch_id>.json`` and
+a ``[WAKE-DRAFT] local_draft=ok|empty|unreachable`` line. There is no cloud
+fallback and no auto-spawn. Set ``WILLOW_ACTIVATION_SKIP_LOCAL_DRAFT=1`` to
+skip the attempt (tests).
+
 ```
 dispatch_send(from_app, to_app, ...)
     │
@@ -66,6 +73,9 @@ dispatch_send(from_app, to_app, ...)
        — the exact file willow_mcp.grove_listen already writes and
        skills/session-start.md already documents a Claude Code session
        tailing with Monitor.
+       THEN attempts loopback OllamaEngine.draft_task; writes
+       wake-draft-<dispatch_id>.json + `[WAKE-DRAFT] local_draft=…`
+       (ok | empty | unreachable). No cloud fallback. No spawn.
             │
             ▼
     A session already watching that log (or one that starts watching it)

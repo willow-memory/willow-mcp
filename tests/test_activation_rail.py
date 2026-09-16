@@ -211,7 +211,8 @@ def _wake_envelope(**overrides):
     return build_envelope(**kwargs)
 
 
-def test_build_activate_writes_a_wake_line_to_the_grove_listen_log(tmp_path):
+def test_build_activate_writes_a_wake_line_to_the_grove_listen_log(tmp_path, monkeypatch):
+    monkeypatch.setenv(activation.SKIP_LOCAL_DRAFT_ENV, "1")
     log_path = tmp_path / "logs" / "grove-listen-hanuman.log"
     activate = activation.build_activate("hanuman", log_path=log_path)
     env = _wake_envelope()
@@ -220,15 +221,24 @@ def test_build_activate_writes_a_wake_line_to_the_grove_listen_log(tmp_path):
 
     assert "tr-testtrace" in trace
     assert log_path.exists()
-    line = log_path.read_text(encoding="utf-8").strip()
-    assert line.startswith("[WAKE]")
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    wake_lines = [ln for ln in lines if ln.startswith("[WAKE] ")]
+    assert len(wake_lines) == 1
+    line = wake_lines[0]
     assert "trace=tr-testtrace" in line
     assert "willow -> hanuman" in line
     assert "dispatch=ABCD1234" in line
     assert "a packet is waiting for you" in line
+    assert any(ln.startswith("[WAKE-DRAFT]") for ln in lines)
+    assert "local_draft=unreachable" in trace
+    artifact = tmp_path / "logs" / "wake-draft-ABCD1234.json"
+    assert artifact.exists()
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    assert payload["status"] == "unreachable"
 
 
 def test_build_activate_uses_grove_listen_default_log_path(monkeypatch, tmp_path):
+    monkeypatch.setenv(activation.SKIP_LOCAL_DRAFT_ENV, "1")
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     from willow_mcp import grove_listen
     expected = grove_listen.default_log_path("hanuman")
@@ -239,18 +249,21 @@ def test_build_activate_uses_grove_listen_default_log_path(monkeypatch, tmp_path
     assert expected.exists()
 
 
-def test_build_activate_appends_multiple_wakes(tmp_path):
+def test_build_activate_appends_multiple_wakes(tmp_path, monkeypatch):
+    monkeypatch.setenv(activation.SKIP_LOCAL_DRAFT_ENV, "1")
     log_path = tmp_path / "wake.log"
     activate = activation.build_activate("hanuman", log_path=log_path)
     activate(_wake_envelope(trace_id="tr-one"))
     activate(_wake_envelope(trace_id="tr-two"))
     lines = log_path.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 2
-    assert "tr-one" in lines[0]
-    assert "tr-two" in lines[1]
+    wake_lines = [ln for ln in lines if ln.startswith("[WAKE] ")]
+    assert len(wake_lines) == 2
+    assert "tr-one" in wake_lines[0]
+    assert "tr-two" in wake_lines[1]
 
 
-def test_build_activate_never_raises_on_write_failure(tmp_path, caplog):
+def test_build_activate_never_raises_on_write_failure(tmp_path, caplog, monkeypatch):
+    monkeypatch.setenv(activation.SKIP_LOCAL_DRAFT_ENV, "1")
     # Point the log "directory" at a path that is actually a file, so
     # mkdir(parents=True) raises NotADirectoryError/FileExistsError (an
     # OSError) instead of ever opening a real log file.
@@ -268,6 +281,8 @@ def test_build_activate_never_raises_on_write_failure(tmp_path, caplog):
 
 def test_build_activate_spawns_nothing(tmp_path, monkeypatch):
     """Surface-only: no subprocess, no Popen, anywhere in the activate path."""
+    monkeypatch.setenv(activation.SKIP_LOCAL_DRAFT_ENV, "1")
+
     def boom(*a, **k):
         raise AssertionError("activate must never spawn a process")
 
@@ -279,7 +294,42 @@ def test_build_activate_spawns_nothing(tmp_path, monkeypatch):
     assert log_path.exists()
 
 
-# ── 3. grove_tools.build_mcp_call ───────────────────────────────────────────
+def test_build_activate_local_draft_ok(tmp_path, monkeypatch):
+    monkeypatch.delenv(activation.SKIP_LOCAL_DRAFT_ENV, raising=False)
+
+    class _Prov:
+        def __init__(self):
+            self.provider = "ollama"
+            self.model = "fake:1b"
+
+    class _Draft:
+        text = "1. Read the packet\n2. Build the bite"
+        engine = "ollama:fake:1b"
+        provenance = _Prov()
+
+    class _Engine:
+        def draft_task(self, task, **kwargs):
+            assert "ABCD1234" in task
+            return _Draft()
+
+    import sys
+    import types
+
+    fake_engine_mod = types.ModuleType("nestor.engine")
+    fake_engine_mod.OllamaEngine = lambda: _Engine()
+    fake_nestor = types.ModuleType("nestor")
+    fake_nestor.engine = fake_engine_mod
+    monkeypatch.setitem(sys.modules, "nestor", fake_nestor)
+    monkeypatch.setitem(sys.modules, "nestor.engine", fake_engine_mod)
+
+    log_path = tmp_path / "wake.log"
+    activate = activation.build_activate("hanuman", log_path=log_path)
+    trace = activate(_wake_envelope())
+    assert "local_draft=ok" in trace
+    artifact = tmp_path / "wake-draft-ABCD1234.json"
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    assert payload["status"] == "ok"
+    assert "Build the bite" in payload["text"]
 
 def test_mcp_call_shim_denies_without_grove_read(tmp_path, monkeypatch):
     _grant(tmp_path, monkeypatch, "hanuman", ["store_read"])

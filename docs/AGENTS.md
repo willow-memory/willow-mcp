@@ -98,6 +98,8 @@ Include: slice order, files to touch, PR strategy, CI notes.
 - **Never** pass `dispatch_id` to `session_enter` for willow — `orchestrator_human_only`.
 - Close with `session_handoff_write`, not dispatch v4 closeout.
 - Orchestrator MCP config: `WILLOW_HUMAN_ORCHESTRATOR=1`. Specialist configs must omit it.
+- Prefer `nestor_draft` (loopback Ollama) for classify / summarize / patch-suggestion before cloud subagents or Cursor Task.
+- `tools/list` for willow advertises **desk_core** (≤50 verbs), not the full call ACL. Escape: `WILLOW_MCP_ADVERTISE=full`.
 
 ---
 
