@@ -42,12 +42,68 @@ def _default_bundle_path() -> Path:
     return paths.bundle_dir() / "constitutional" / "syscall-table.json"
 
 
-def _load(path: Path) -> dict:
+def _load_bundle(path: Path) -> dict:
+    """Read the shipped bundle table plainly.
+
+    The bundle is package code — tracked, reviewed, merged; its trust is git
+    history, not filesystem ownership bits. On an editable install the
+    checkout can legitimately be group-writable (umask-002 era trees), and on
+    a pip install it sits in site-packages where ``trusted_read`` would pass
+    by accident, not by design. Running the same strict check on it here was
+    the bug: it made this sync refuse on the very artifact it exists to
+    apply.
+    """
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path.name} must contain an object")
+    return data
+
+
+def _load_live(path: Path) -> dict:
+    """Read the live table — the file this function writes and the enforcer
+    reads. This one stays behind ``paths.trusted_read``: it is a governance
+    input an operator (or nothing else) may replace."""
     paths.trusted_read(path)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"{path.name} must contain an object")
     return data
+
+
+def _row_count(rows: Optional[dict[int, dict]]) -> Optional[int]:
+    return None if rows is None else len(rows)
+
+
+def _ink_refusal(
+    ledger,
+    project: str,
+    actor: str,
+    *,
+    reason: str,
+    live_path: Path,
+    bundle_path: Path,
+    live_rows: Optional[dict[int, dict]] = None,
+    bundle_rows: Optional[dict[int, dict]] = None,
+) -> Optional[dict]:
+    """Every refusal writes FRANK ink when a ledger is given — the operator
+    should never again find out about a refused sync by counting rows.
+    Returns the receipt fields to fold into the response, or ``None`` when no
+    ledger was passed."""
+    if ledger is None:
+        return None
+    content = {
+        "actor": actor,
+        "reason": reason,
+        "live_path": str(live_path),
+        "bundle_path": str(bundle_path),
+        "live_rows": _row_count(live_rows),
+        "bundle_rows": _row_count(bundle_rows),
+    }
+    try:
+        record_id = ledger.append(project, "constitutional_sync_refused", content)
+        return {"receipt_id": record_id}
+    except Exception as exc:  # noqa: BLE001 — the refusal happened; the receipt failing is reported, not hidden
+        return {"receipt_error": f"{type(exc).__name__}: {exc}"}
 
 
 def _rows_by_id(table: dict) -> dict[int, dict]:
@@ -87,16 +143,21 @@ def sync_syscall_table_from_bundle(
 ) -> dict:
     """Apply an additive bundle-vs-live syscall table diff to the live table.
 
-    Reads both tables through ``paths.trusted_read`` — the same trust
-    contract every other governance-input read uses — and refuses without
-    writing anything unless the bundle is a STRICT superset of the live
-    table by row content: every id the live table carries must appear in
-    the bundle with byte-identical fields (compared by id AND verb, so a
-    row that reused an id under a different verb name is a modification,
-    not a match). Under that condition the live table is overwritten with
-    the bundle's content and a FRANK ``constitutional_sync`` event is
-    appended naming the new verb ids and the seal id read off each new
-    row's ``note``.
+    The live table is read through ``paths.trusted_read`` — the same trust
+    contract every other governance-input read uses, since it is the file
+    this function writes and the enforcer reads. The bundle table is read
+    plainly: it is package code (tracked, reviewed, merged), and its trust
+    is git history, not filesystem ownership bits — an editable install's
+    group-writable checkout must not make this sync refuse the very
+    artifact it exists to apply. The sync refuses without writing anything
+    unless the bundle is a STRICT superset of the live table by row
+    content: every id the live table carries must appear in the bundle
+    with byte-identical fields (compared by id AND verb, so a row that
+    reused an id under a different verb name is a modification, not a
+    match). Under that condition the live table is overwritten with the
+    bundle's content and a FRANK ``constitutional_sync`` event is appended
+    naming the new verb ids and the seal id read off each new row's
+    ``note``.
 
     Returns one of:
 
@@ -105,8 +166,13 @@ def sync_syscall_table_from_bundle(
     * ``{"ok": True, "added": [...], "verbs": [...], "seals": {...}, ...}``
       — synced.
     * ``{"ok": False, "refused": True, "reason": "..."}`` — the live table
-      is untouched: a live row is missing from the bundle, or a row the
-      bundle also carries has different content there.
+      is untouched: a live row is missing from the bundle, a row the
+      bundle also carries has different content there, the live table
+      fails ``trusted_read`` (``reason`` starts with
+      ``"live_table_untrusted"``), or either table is missing/unreadable.
+      Every refusal shape here writes a FRANK ``constitutional_sync_refused``
+      event when a ledger is given, naming the reason and both paths — the
+      one honest silence is the "tables already agree" no-op.
 
     Never raises for a missing live table specifically — an install with
     none yet is exactly what ``home_init.ensure_home_layout()`` already
@@ -126,37 +192,66 @@ def sync_syscall_table_from_bundle(
                       "bundle on first install",
         }
     if not bundle_path.exists():
-        return {"ok": False, "refused": True,
-                "reason": f"bundle table missing: {bundle_path}"}
+        reason = f"bundle table missing: {bundle_path}"
+        result = {"ok": False, "refused": True, "reason": reason}
+        receipt = _ink_refusal(ledger, project, actor, reason=reason,
+                                live_path=live_path, bundle_path=bundle_path)
+        if receipt:
+            result.update(receipt)
+        return result
 
     try:
-        live = _load(live_path)
-        bundle = _load(bundle_path)
+        live = _load_live(live_path)
     except (OSError, PermissionError, ValueError) as exc:
-        return {"ok": False, "refused": True,
-                "reason": f"could not read tables: {exc}"}
+        reason = f"live_table_untrusted: could not read live table {live_path}: {exc}"
+        result = {"ok": False, "refused": True, "reason": reason}
+        receipt = _ink_refusal(ledger, project, actor, reason=reason,
+                                live_path=live_path, bundle_path=bundle_path)
+        if receipt:
+            result.update(receipt)
+        return result
+
+    try:
+        bundle = _load_bundle(bundle_path)
+    except (OSError, ValueError) as exc:
+        reason = f"could not read bundle table: {exc}"
+        result = {"ok": False, "refused": True, "reason": reason}
+        receipt = _ink_refusal(ledger, project, actor, reason=reason,
+                                live_path=live_path, bundle_path=bundle_path,
+                                live_rows=_rows_by_id(live))
+        if receipt:
+            result.update(receipt)
+        return result
 
     live_rows = _rows_by_id(live)
     bundle_rows = _rows_by_id(bundle)
 
     missing = sorted(set(live_rows) - set(bundle_rows))
     if missing:
-        return {
-            "ok": False, "refused": True,
-            "reason": f"bundle is missing live row id(s) {missing} — not a "
-                      f"strict superset, refusing to touch the live table",
-        }
+        reason = (f"bundle is missing live row id(s) {missing} — not a "
+                  f"strict superset, refusing to touch the live table")
+        result = {"ok": False, "refused": True, "reason": reason}
+        receipt = _ink_refusal(ledger, project, actor, reason=reason,
+                                live_path=live_path, bundle_path=bundle_path,
+                                live_rows=live_rows, bundle_rows=bundle_rows)
+        if receipt:
+            result.update(receipt)
+        return result
 
     changed = sorted(
         vid for vid in live_rows if live_rows[vid] != bundle_rows[vid]
     )
     if changed:
-        return {
-            "ok": False, "refused": True,
-            "reason": f"bundle row(s) {changed} differ from the live table's "
-                      f"existing content — a modification is not a merge; "
-                      f"refusing to touch the live table",
-        }
+        reason = (f"bundle row(s) {changed} differ from the live table's "
+                  f"existing content — a modification is not a merge; "
+                  f"refusing to touch the live table")
+        result = {"ok": False, "refused": True, "reason": reason}
+        receipt = _ink_refusal(ledger, project, actor, reason=reason,
+                                live_path=live_path, bundle_path=bundle_path,
+                                live_rows=live_rows, bundle_rows=bundle_rows)
+        if receipt:
+            result.update(receipt)
+        return result
 
     added = sorted(set(bundle_rows) - set(live_rows))
     if not added:

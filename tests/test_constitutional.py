@@ -163,3 +163,119 @@ def test_bundle_missing_entirely_is_refused(tables):
 
     out = constitutional.sync_syscall_table_from_bundle(live_path=live, bundle_path=bundle)
     assert out["ok"] is False and out["refused"] is True
+
+
+# ── the bundle is package code: read plainly, not through trusted_read ────────
+
+def test_group_writable_bundle_still_syncs(tables):
+    """The editable-install bug: an umask-002 checkout leaves the shipped
+    bundle 775/664. That must not make the sync refuse — the bundle's trust
+    is git history, not filesystem ownership bits."""
+    live, bundle = tables
+    row14 = _row(14)
+    row15 = _row(15, "unit.reload")
+    _write_table(live, [row14])
+    _write_table(bundle, [row14, row15])
+    bundle.parent.chmod(0o775)
+    bundle.chmod(0o664)
+
+    out = constitutional.sync_syscall_table_from_bundle(live_path=live, bundle_path=bundle)
+
+    assert out["ok"] is True
+    assert out["added"] == [15]
+
+
+def test_group_writable_live_table_refuses_live_table_untrusted(tables):
+    """The live table is a governance input; it stays behind trusted_read."""
+    live, bundle = tables
+    row14 = _row(14)
+    row15 = _row(15, "unit.reload")
+    _write_table(live, [row14])
+    _write_table(bundle, [row14, row15])
+    live.parent.chmod(0o775)
+    live.chmod(0o664)
+
+    ledger = _FakeLedger()
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, ledger=ledger, project="fleet")
+
+    assert out["ok"] is False and out["refused"] is True
+    assert "live_table_untrusted" in out["reason"]
+
+    assert len(ledger.rows) == 1
+    ev = ledger.rows[0]
+    assert ev["event_type"] == "constitutional_sync_refused"
+    assert ev["content"]["reason"] == out["reason"]
+    assert ev["content"]["live_path"] == str(live)
+    assert ev["content"]["bundle_path"] == str(bundle)
+
+
+# ── every refusal writes FRANK ink; the one honest silence is agreement ──────
+
+def test_modified_existing_row_refusal_writes_frank_ink(tables):
+    live, bundle = tables
+    row3_live = _row(3, "git.push", note="original")
+    row3_bundle = _row(3, "git.push", note="edited out of band")
+    _write_table(live, [row3_live])
+    _write_table(bundle, [row3_bundle])
+
+    ledger = _FakeLedger()
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, ledger=ledger, project="fleet")
+
+    assert out["ok"] is False and out["refused"] is True
+    assert len(ledger.rows) == 1
+    ev = ledger.rows[0]
+    assert ev["event_type"] == "constitutional_sync_refused"
+    assert ev["content"]["reason"] == out["reason"]
+    assert ev["content"]["live_rows"] == 1
+    assert ev["content"]["bundle_rows"] == 1
+
+
+def test_bundle_missing_a_live_row_refusal_writes_frank_ink(tables):
+    live, bundle = tables
+    row14 = _row(14)
+    row15 = _row(15, "unit.reload")
+    _write_table(live, [row14, row15])
+    _write_table(bundle, [row14])
+
+    ledger = _FakeLedger()
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, ledger=ledger, project="fleet")
+
+    assert out["ok"] is False and out["refused"] is True
+    assert len(ledger.rows) == 1
+    ev = ledger.rows[0]
+    assert ev["event_type"] == "constitutional_sync_refused"
+    assert ev["content"]["reason"] == out["reason"]
+    assert ev["content"]["live_rows"] == 2
+    assert ev["content"]["bundle_rows"] == 1
+
+
+def test_bundle_missing_entirely_refusal_writes_frank_ink(tables):
+    live, bundle = tables
+    _write_table(live, [_row(14)])
+    # bundle_path deliberately left unwritten
+
+    ledger = _FakeLedger()
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, ledger=ledger, project="fleet")
+
+    assert out["ok"] is False and out["refused"] is True
+    assert len(ledger.rows) == 1
+    assert ledger.rows[0]["event_type"] == "constitutional_sync_refused"
+
+
+def test_identical_tables_write_no_frank_ink(tables):
+    """The one honest silence: nothing to sync, nothing to ink."""
+    live, bundle = tables
+    rows = [_row(14), _row(15, "unit.reload")]
+    _write_table(live, rows)
+    _write_table(bundle, rows)
+
+    ledger = _FakeLedger()
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, ledger=ledger, project="fleet")
+
+    assert out["ok"] is True and out["added"] == []
+    assert ledger.rows == []
