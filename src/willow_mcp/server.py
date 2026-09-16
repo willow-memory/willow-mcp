@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 126 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 127 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -4744,6 +4744,56 @@ def git_pull_execute(
         )
     except Exception as exc:
         return {"ok": False, "pulled": False, "error": f"git_pull_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def unit_reload_execute(
+    app_id: str,
+    unit: str,
+    checkout: str,
+    repo: str,
+    envelope_id: str = "",
+    project: str = "",
+    task_id: str = "",
+) -> dict:
+    """Restart a systemd `--user` unit onto code a `git_pull_execute` receipt
+    already brought home, performed by THIS process under the `unit.reload`
+    envelope that governs `app_id` (verb 15, sealed `06075e99`) — the fourth
+    verb of the brokered merge loop, after `git_push_execute` and
+    `pr_open_execute`; `git_pull_execute` is the third act, receipt-only.
+    Refuses before any restart: the unit's own state unreachable (`EUNREACH`,
+    cause distinct per bus/unit/binary/timeout), no `git_pull` FRANK receipt
+    for `repo`+`checkout` (`ENORECEIPT`), the unit already active since no
+    earlier than that receipt (`EALREADY` — nothing to reload onto), the
+    checkout's HEAD drifted past the receipt's sha (`EDRIFT`), or `unit`
+    naming the broker's own unit (`EPERM`, regardless of bounds). A refusal
+    is cited in FRANK with its errno and files the ask in the human-required
+    queue. Returns the restarted unit's before/after state, the pull receipt
+    it reloaded onto, and the citation id on success — plus the willow-bot
+    steward's own status when `unit` is a willow-bot unit. Gated as
+    envelope_apply, beside `git_pull_execute`: an envelope application with
+    the act attached, not a new capability."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import unit_reload_executor
+        from .governance_ledger import GovernanceLedger
+
+        return unit_reload_executor.execute_unit_reload(
+            app_id,
+            unit=unit,
+            checkout=checkout,
+            repo=repo,
+            envelope_id=envelope_id,
+            project=project or repo,
+            session=_current_orchestrator_session(),
+            task_id=task_id,
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "reloaded": False, "error": f"unit_reload_execute_failed: {exc}"}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -9782,6 +9832,38 @@ def _main():
             file=sys.stderr,
         )
         raise SystemExit(1)
+
+    # Seal-driven live-table sync (verb 15 unit.reload, gap c96dc96927e8,
+    # Part 3): home_init only ever copies the bundle syscall table into
+    # $WILLOW_HOME when the live one is MISSING, so a verb the operator
+    # ratifies into the shipped bundle table never reaches an already-
+    # installed box's live table on its own — the merge lands in git, this
+    # process restarts on the new code, and the table it actually reads is
+    # still the one `willow-mcp-init` wrote months ago. Apply the additive
+    # case here, on the very restart that pulled the merge in. Fail-soft:
+    # this is a convenience sync, not a security gate, so a refusal or read
+    # error is logged and the server still starts on whatever table it
+    # already had.
+    try:
+        from . import constitutional as _constitutional
+        from .governance_ledger import GovernanceLedger as _GovernanceLedger
+        _pg_for_sync = get_pg()
+        _sync_ledger = _GovernanceLedger(_pg_for_sync) if _pg_for_sync else None
+        _sync_result = _constitutional.sync_syscall_table_from_bundle(ledger=_sync_ledger)
+        if _sync_result.get("added"):
+            print(
+                f"willow-mcp: synced syscall table verb id(s) "
+                f"{_sync_result['added']} ({', '.join(_sync_result.get('verbs') or [])}) "
+                f"from the bundle — seals: {_sync_result.get('seals') or {}}",
+                file=sys.stderr,
+            )
+        elif not _sync_result.get("ok"):
+            print(
+                f"willow-mcp: syscall table sync refused: {_sync_result.get('reason')}",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001 — never block startup on this convenience sync
+        print(f"willow-mcp: syscall table sync failed: {exc}", file=sys.stderr)
 
     # Serve mode is SINGLE-INSTANCE per WILLOW_HOME — agent sessions, rate-limit
     # buckets and in-flight OAuth state are process memory, so a second replica
