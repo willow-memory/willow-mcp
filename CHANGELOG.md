@@ -36,14 +36,12 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **mcp:** pr_checks_read — the desk reads why a check is red ([862d558](https://github.com/willow-memory/willow-mcp/commit/862d5584f35131c0d79f0109b0616096240dbf95))
-* **pr_checks:** read-only broker verb for red CI checks (gap a50c3d9c9a71) ([3e33b02](https://github.com/willow-memory/willow-mcp/commit/3e33b022bb0b8a5918139bfbf4e190c2cd6cf8a6))
 * **server:** register pr_checks_read beside bot_status (gap a50c3d9c9a71) ([8cedd05](https://github.com/willow-memory/willow-mcp/commit/8cedd056866baa5288709ce916108996a653b10c))
+* **pr_checks:** read-only broker verb for red CI checks (gap a50c3d9c9a71) ([3e33b02](https://github.com/willow-memory/willow-mcp/commit/3e33b022bb0b8a5918139bfbf4e190c2cd6cf8a6))
 
 
 ### Fixed
 
-* **constitutional:** read the shipped bundle table plainly, ink every refusal ([aeca7b2](https://github.com/willow-memory/willow-mcp/commit/aeca7b2c935ea437a670bf6467660f9b5369e6a9))
 * **constitutional:** read the shipped bundle table plainly, ink every refusal ([b98b149](https://github.com/willow-memory/willow-mcp/commit/b98b14952603a8322c002f087988d738709d42c9))
 
 ## [2.52.1](https://github.com/willow-memory/willow-mcp/compare/v2.52.0...v2.52.1) (2026-09-16)
