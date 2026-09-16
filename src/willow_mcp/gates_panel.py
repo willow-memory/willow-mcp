@@ -551,7 +551,11 @@ REQUEST_QUEUE_KIND = "consent"
 #: `pr.open` envelope bounds are `base_branches` — the head is
 #: task-specific, not envelope-specific, so it belongs in the summary and
 #: not in the gate id.
-REQUESTABLE_PREFIXES = ("lease.", "perm.", "attest.", "push.", "pr.")
+#: `unit.<unit-name>` is the sixth (verb 15, `unit.reload`, sealed
+#: `06075e99`): `unit_reload_executor._file_ask` shares the same
+#: `kind=review` invisibility the push/PR asks had before their own
+#: migration here, and there is nothing verb-specific about the fix.
+REQUESTABLE_PREFIXES = ("lease.", "perm.", "attest.", "push.", "pr.", "unit.")
 
 #: Prefixes whose row is informational: it surfaces the ask and carries the
 #: command, and pressing it does nothing. Kept as its own set rather than as a
@@ -564,7 +568,9 @@ REQUESTABLE_PREFIXES = ("lease.", "perm.", "attest.", "push.", "pr.")
 #: attributed operator session, which `gates_actions.apply()` does not run
 #: inside today. A follow-up bite wires it via a CLI shell-out; until then
 #: the row carries the exact `willow-mcp envelope propose/ratify` invocation.
-UNPRESSABLE_PREFIXES = ("attest.", "push.", "pr.")
+#: `unit.` joins them for the same reason: a `unit.reload` envelope is
+#: proposed and ratified the same two-step way, not pressed.
+UNPRESSABLE_PREFIXES = ("attest.", "push.", "pr.", "unit.")
 
 
 def split_push_gate(gate_id: str) -> tuple[str, str]:
@@ -779,14 +785,16 @@ def _request_rows(store=None) -> list[GateRow]:
             # must stay that way, so it reads this rather than computing it.
             from . import remedy
 
-            if gate_id.startswith("push.") or gate_id.startswith("pr."):
+            if gate_id.startswith("push.") or gate_id.startswith("pr.") or gate_id.startswith("unit."):
                 # No compact CLI form yet: `envelope propose` is orchestrator-
                 # attributed and lives at the MCP tool surface, not the CLI
                 # (see `cli_envelope.py`). Ratify is a CLI, but the propose it
                 # ratifies must come first. Point the operator at the summary
                 # (which carries the exact bounds) and at the two-step ritual
                 # rather than a paste-me line that would be a half-truth.
-                envelope_kind = "push" if gate_id.startswith("push.") else "pr.open"
+                envelope_kind = ("push" if gate_id.startswith("push.")
+                                  else "pr.open" if gate_id.startswith("pr.")
+                                  else "unit.reload")
                 action_note = (
                     f"this one is not pressable — a {envelope_kind} envelope "
                     "needs an attributed operator session. Propose it with "

@@ -369,3 +369,35 @@ class GovernanceLedger:
         rows = [dict(row) for row in cur.fetchall()]
         cur.close()
         return rows
+
+    def latest_event(self, event_type: str, *, match: dict) -> dict | None:
+        """The most recent row of `event_type` whose content carries every
+        key/value in `match`, or ``None`` if none matches.
+
+        Read-only, no advisory lock — this is a lookup, not a mutation.
+        Filtering happens in Python rather than a JSONB `@>` predicate so a
+        caller (``unit_reload_executor``, matching a `git_pull` receipt by
+        `repo`+`checkout`) does not need its own SQL: `content` is already
+        a plain dict by the time `_chain_insert` wrote it, and every other
+        reader in this module (`citation_count`, `citations`) filters the
+        same way via `->>'` on individual keys. Rows are walked newest
+        first and the first match wins, so "latest" means what it says
+        even though the table has no per-event-type index to lean on.
+        """
+        cur = self.pg.cursor()
+        try:
+            cur.execute(
+                f"SELECT content, created_at FROM {TABLE} "  # nosec B608 - TABLE is the module-level constant "frank_ledger"; event_type is a bound param
+                "WHERE event_type = %s ORDER BY created_at DESC",
+                (event_type,),
+            )
+            for content, created_at in cur.fetchall():
+                if isinstance(content, str):
+                    content = json.loads(content)
+                if isinstance(content, dict) and all(
+                    content.get(k) == v for k, v in match.items()
+                ):
+                    return {"content": content, "created_at": created_at}
+            return None
+        finally:
+            cur.close()
