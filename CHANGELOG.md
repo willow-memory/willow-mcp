@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **mcp:** bot_status — the desk reads the steward without a shell ([d3999ad](https://github.com/willow-memory/willow-mcp/commit/d3999ad8a9f09a60eb40d77579deda1e78d1150a))
 * **mcp:** bot_status — the desk reads the steward without a shell ([78b5e8e](https://github.com/willow-memory/willow-mcp/commit/78b5e8e25fcfd45c20e2dd319040abdef3fd3423))
 
 ## [2.50.0](https://github.com/willow-memory/willow-mcp/compare/v2.49.0...v2.50.0) (2026-09-16)
