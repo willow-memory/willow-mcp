@@ -31,6 +31,15 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.52.0](https://github.com/willow-memory/willow-mcp/compare/v2.51.0...v2.52.0) (2026-09-16)
+
+
+### Added
+
+* **mcp:** seal-driven live-table sync for the syscall table ([d039670](https://github.com/willow-memory/willow-mcp/commit/d0396707591a19e172832fad3fd32b0aad5d4748))
+* **mcp:** unit_reload_execute — brokered systemd --user restart (verb 15) ([4b9ddb3](https://github.com/willow-memory/willow-mcp/commit/4b9ddb3e26cc134370c3f3216dda7ee7d4390022))
+* **governance:** syscall-table row 15 — unit.reload (sealed 06075e99) ([1241947](https://github.com/willow-memory/willow-mcp/commit/124194784d4dbe9dba1371582fcafb7503da425e))
+
 ## [2.51.0](https://github.com/willow-memory/willow-mcp/compare/v2.50.0...v2.51.0) (2026-09-16)
 
 
