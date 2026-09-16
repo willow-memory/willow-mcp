@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 125 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 126 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -4772,6 +4772,26 @@ def gitsync_sweep(app_id: str, project: str = "") -> dict:
         )
     except Exception as exc:
         return {"ok": False, "error": f"gitsync_sweep_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("bot_status")
+def bot_status(app_id: str) -> dict:
+    """The desk reads the willow-bot steward without a shell (gap
+    `158600e03598`): run `willow-bot-steward status`, bounded, and translate
+    the bot's own three-state report into the same contract at the top
+    level. `state` is `populated` (the bot ran and has something to report),
+    `empty` (the bot ran cleanly but has nothing yet — a fresh install), or
+    `unreachable` (`reason` names why: `binary_missing`, `nonzero_exit`,
+    `timeout`, or `unparseable` — never collapsed into an empty success,
+    INVARIANTS §1). The full bot report rides under `report` when reachable.
+    Read-only: no writes, no envelope, no FRANK citation."""
+    from . import bot_status as _bot_status
+
+    try:
+        return _bot_status.read_status()
+    except Exception as exc:
+        return {"state": "unreachable", "reason": f"bot_status_failed: {exc}"}
 
 
 # ---------------------------------------------------------------------------
