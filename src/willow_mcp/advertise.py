@@ -85,9 +85,9 @@ DESK_CORE: frozenset[str] = frozenset(
         # web (MCP path; native web tools redirect here)
         "willow_web_search",
         "willow_web_fetch",
-        # light context
-        "context_get",
-        "context_list",
+        # brokered git (willows-bot) — desk initiates; broker holds the key
+        "git_push_execute",
+        "pr_open_execute",
     }
 )
 
