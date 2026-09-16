@@ -327,6 +327,71 @@ def test_resolve_clone_prefers_org_layout_and_verifies_origin(tmp_path):
     assert plx.resolve_clone("nobody/Forge", root=root, runner=git) is None
 
 
+# ── the resolver is case-insensitive (gap 6fbf1453f029) ─────────────────────
+
+def test_resolve_clone_matches_owner_and_repo_case_insensitively(tmp_path):
+    """The clone on disk is `Die-Namic-Systems/nestor`; GitHub, and the
+    trigger flag willow-bot writes, name it `Die-Namic-Systems/Nestor`."""
+    root = tmp_path / "github"
+    nestor = _make_clone(root, "Die-Namic-Systems", "nestor", "")
+    git = _MultiGit({str(nestor): _FakeGit(
+        remote_url="https://github.com/Die-Namic-Systems/Nestor.git")})
+    assert plx.resolve_clone("Die-Namic-Systems/Nestor", root=root, runner=git) == nestor
+
+
+def test_resolve_clone_refuses_two_case_variants_as_ambiguous(tmp_path):
+    root = tmp_path / "github"
+    lower = _make_clone(root, "Die-Namic-Systems", "nestor", "")
+    upper = _make_clone(root, "Die-Namic-Systems", "Nestor", "")
+    git = _MultiGit({
+        str(lower): _FakeGit(remote_url="https://github.com/Die-Namic-Systems/Nestor.git"),
+        str(upper): _FakeGit(remote_url="https://github.com/Die-Namic-Systems/Nestor.git"),
+    })
+    status = plx.resolve_clone_status("Die-Namic-Systems/Nestor", root=root, runner=git)
+    assert status["clone"] is None and status["error"] == "EAMBIG"
+    assert set(status["candidates"]) == {str(lower), str(upper)}
+    # the backward-compatible wrapper never guesses between them
+    assert plx.resolve_clone("Die-Namic-Systems/Nestor", root=root, runner=git) is None
+
+
+def test_resolve_clone_missing_stays_enoclone(tmp_path):
+    root = tmp_path / "github"
+    root.mkdir()
+    status = plx.resolve_clone_status("someone/nowhere", root=root, runner=_MultiGit({}))
+    assert status["clone"] is None and status["error"] is None
+
+
+def test_sweep_resolves_a_case_variant_clone_via_the_flag_name(tmp_path):
+    root = tmp_path / "github"
+    nestor = _make_clone(root, "Die-Namic-Systems", "nestor", "")
+    triggers = tmp_path / "gitsync"
+    triggers.mkdir()
+    (triggers / "trigger-Die-Namic-Systems-Nestor.flag").write_text("x\n")
+    git = _MultiGit({str(nestor): _FakeGit(
+        remote_url="https://github.com/Die-Namic-Systems/Nestor.git", current="master")})
+    out = plx.sweep_triggers("willow", project="fleet", root=root, triggers=triggers, runner=git)
+    r = out["swept"][0]
+    assert r["ok"] and r["checkout"] == str(nestor), "the receipt names the resolved path"
+
+
+def test_sweep_reports_eambig_for_two_case_variant_clones(tmp_path):
+    root = tmp_path / "github"
+    lower = _make_clone(root, "Die-Namic-Systems", "nestor", "")
+    upper = _make_clone(root, "Die-Namic-Systems", "Nestor", "")
+    triggers = tmp_path / "gitsync"
+    triggers.mkdir()
+    flag = triggers / "trigger-Die-Namic-Systems-Nestor.flag"
+    flag.write_text("x\n")
+    git = _MultiGit({
+        str(lower): _FakeGit(remote_url="https://github.com/Die-Namic-Systems/Nestor.git"),
+        str(upper): _FakeGit(remote_url="https://github.com/Die-Namic-Systems/Nestor.git"),
+    })
+    out = plx.sweep_triggers("willow", project="fleet", root=root, triggers=triggers, runner=git)
+    r = out["swept"][0]
+    assert r["error"] == "EAMBIG" and set(r["candidates"]) == {str(lower), str(upper)}
+    assert flag.exists(), "an ambiguous match is not a guess; the flag stays for a human"
+
+
 # ── the tools are wired like the push and the PR ────────────────────────────
 
 def test_the_pull_tools_are_gated_as_envelope_apply_by_name():
