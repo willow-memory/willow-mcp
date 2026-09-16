@@ -31,6 +31,19 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.49.0](https://github.com/willow-memory/willow-mcp/compare/v2.48.0...v2.49.0) (2026-09-16)
+
+
+### Added
+
+* advertise brokered push/PR tools on the desk core surface ([bae9dc6](https://github.com/willow-memory/willow-mcp/commit/bae9dc69d873720c84a6c9f27c59a52211600c4c))
+* desk_core advertise, WAKE draft, and bounded local embed ticks ([f8f8fd9](https://github.com/willow-memory/willow-mcp/commit/f8f8fd9b8553d84565923de4c94059e102b4aec5))
+
+
+### Fixed
+
+* keep knowledge DDL extension-free for CI Postgres ([f495b61](https://github.com/willow-memory/willow-mcp/commit/f495b6135b1915118dd0ad1c0eba2b2b565198e0))
+
 ## [2.48.0](https://github.com/willow-memory/willow-mcp/compare/v2.47.0...v2.48.0) (2026-09-15)
 
 
