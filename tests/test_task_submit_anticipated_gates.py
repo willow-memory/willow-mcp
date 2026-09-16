@@ -166,7 +166,7 @@ def test_check_requestable_admits_every_prefix_the_task_submit_help_names():
     That is `REQUESTABLE_PREFIXES` — pinned here so a future prefix added to
     one and not the other fails at test time."""
     assert gates_panel.REQUESTABLE_PREFIXES == (
-        "lease.", "perm.", "attest.", "push.", "pr.",
+        "lease.", "perm.", "attest.", "push.", "pr.", "unit.",
     )
 
 
