@@ -57,7 +57,7 @@ TOOL_CLASS: dict[str, str] = {
     "specialist_list": READ, "specialist_get": READ,
     "exposure_config_get": READ, "exposure_slice": READ,
     "fleet_status": READ, "fleet_health": READ, "frank_read": READ,
-    "frank_verify": READ, "bot_status": READ,
+    "frank_verify": READ, "bot_status": READ, "pr_checks_read": READ,
     "integration_list": READ, "integration_status": READ,
     # Federated MCP inventory — discovery (shadow-IT scan) and the ratified
     # server list are both read-only, no subprocess spawned.

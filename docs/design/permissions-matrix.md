@@ -42,7 +42,7 @@ Companion: `specialist-registry.md` · `human-orchestrator.md` · `gate.py`
 | `dispatch_read` | dispatch_read, dispatch_list, handoff_read, session_read, session_enter |
 | `dispatch_write` | dispatch_send, dispatch_accept, handoff_write_v4, session_handoff_write — deliberately excludes verify_handoff/agent_clear (B-51, #240): those are the orchestrator's quality-gate step, reachable only via `orchestrator` |
 | `orchestrator` | Desk + dispatch + context + fleet read + limited store/kb read |
-| `fleet_read` | fleet_status, fleet_health |
+| `fleet_read` | fleet_status, fleet_health, bot_status, pr_checks_read |
 | `context` | context_save, context_get, context_list, context_expire |
 | `gap_write` | gap_log, gap_resolve, gap_delete |
 | `gap_purge` | gap_purge_topic (bulk, fleet-shared — its own opt-in line) |
