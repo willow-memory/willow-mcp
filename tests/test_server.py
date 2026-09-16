@@ -376,7 +376,9 @@ _KNOWLEDGE_COLUMNS_NO_TAGS = [
 
 
 def test_knowledge_search_empty_query_short_circuits(app_id):
-    assert server.knowledge_search(app_id=app_id, query="   ") == {"results": []}
+    assert server.knowledge_search(app_id=app_id, query="   ") == {
+        "results": [], "search_mode": "ilike",
+    }
 
 
 def test_postgres_unavailable_call_sites_all_use_the_shared_helper():
@@ -428,6 +430,7 @@ def test_knowledge_search_maps_columns_casts_jsonb_and_returns_shaped_results(ap
         {"id": "A1", "content": {"x": 1}, "domain": "general", "source": "session", "tags": None}
     ]
     assert result["_unmapped"] == ["tags"]
+    assert result["search_mode"] == "ilike"
 
     select_sql, params = fake.executed[-1]
     assert '"content"::text ILIKE' in select_sql   # jsonb column cast for ILIKE

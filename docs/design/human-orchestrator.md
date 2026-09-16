@@ -38,6 +38,16 @@ The orchestrator is the **seat the human sits in** — not a proxy that only ass
 
 The "human's proxy for separation of duties" framing was aspirational; in practice the operator was already doing operator-scope writes and had to work around the manifest to do them. PR12 aligns the permission set with the seat's actual job. See `docs/design/permissions-matrix.md` §4 for the full ratified permission list.
 
+## Desk tool advertisement (Glama-shaped)
+
+`tools/list` for `app_id=willow` advertises **desk_core** (≤50 verbs in
+`willow_mcp.advertise.DESK_CORE`), not the full callable ACL under
+`full_access`. Call ACL is unchanged: a permitted tool that is not advertised
+remains callable when named. Escape hatches: `WILLOW_MCP_ADVERTISE=full`, or
+manifest `"advertise": "full"`. Specialists default to advertising their
+honest `visible_tools` set (`advertise: "manifest"`). `whoami` reports
+`tools_advertised` and `advertise_mode` alongside `tools_allowed`.
+
 ---
 
 ## `session_enter` behavior

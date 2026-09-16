@@ -36,7 +36,13 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import logging
+import os
 from typing import Any, Iterator, Optional
+
+from . import advertise as _advertise
+
+logger = logging.getLogger(__name__)
 
 #: Set by `RequestContextMiddleware` for the duration of each inbound request.
 #: `None` outside one — a CLI invocation, a test calling a tool directly, or
@@ -76,6 +82,94 @@ class RequestContextMiddleware:
     async def __call__(self, ctx: Any, call_next: Any) -> Any:
         with active(ctx):
             return await call_next(ctx)
+
+
+def _list_identity_app_id() -> Optional[str]:
+    """App id that owns this ``tools/list`` response.
+
+    Stdio: process ``WILLOW_APP_ID`` (one seat per MCP process).
+    Serve: OAuth-bound identity via ``server._resolve_serve_identity``.
+    Missing identity in serve mode → ``None`` (fail closed to empty list).
+    """
+    from . import server as _server
+
+    if _server._serve_mode():
+        bound, _err = _server._resolve_serve_identity()
+        return bound
+    return (os.environ.get("WILLOW_APP_ID") or "").strip() or None
+
+
+def _filter_list_tools_result(result: Any, allowed: set[str]) -> Any:
+    """Return ``result`` with ``tools`` filtered to ``allowed`` names."""
+    if result is None:
+        return result
+    if isinstance(result, dict):
+        tools = result.get("tools")
+        if isinstance(tools, list):
+            return {
+                **result,
+                "tools": _advertise.filter_tool_iterable(tools, allowed),
+            }
+        return result
+    tools = getattr(result, "tools", None)
+    if tools is None:
+        return result
+    filtered = _advertise.filter_tool_iterable(tools, allowed)
+    model_copy = getattr(result, "model_copy", None)
+    if callable(model_copy):
+        return model_copy(update={"tools": filtered})
+    try:
+        result.tools = filtered  # type: ignore[attr-defined]
+    except Exception:
+        logger.exception("advertise: could not rewrite list_tools result in place")
+    return result
+
+
+class AdvertiseFilterMiddleware:
+    """Shrink ``tools/list`` to the seat's advertised set (desk_core / ACL).
+
+    Does not change call ACL — a permitted but non-advertised tool remains
+    callable when named. See ``willow_mcp.advertise``.
+    """
+
+    async def __call__(self, ctx: Any, call_next: Any) -> Any:
+        result = await call_next(ctx)
+        method = getattr(ctx, "method", None)
+        if method != "tools/list":
+            return result
+        from . import server as _server
+
+        app_id = _list_identity_app_id()
+        if not app_id:
+            # Serve with no binding, or stdio with unset WILLOW_APP_ID:
+            # advertise nothing rather than the full kitchen sink.
+            logger.warning(
+                "advertise: tools/list with no seat identity — returning empty list"
+            )
+            return _filter_list_tools_result(result, set())
+        catalogue = _server._gate_tool_catalogue()
+        names, mode = _advertise.advertised_tools(app_id, catalogue)
+        if mode == "full":
+            return result
+        allowed = set(names)
+        if mode == "manifest":
+            # Keep ungated tools (registered but not in the gate catalogue).
+            tools = getattr(result, "tools", None)
+            if tools is None and isinstance(result, dict):
+                tools = result.get("tools") or []
+            for tool in tools or []:
+                name = getattr(tool, "name", None)
+                if name is None and isinstance(tool, dict):
+                    name = tool.get("name")
+                if name and name not in catalogue:
+                    allowed.add(name)
+        logger.debug(
+            "advertise: tools/list app_id=%s mode=%s count=%d",
+            app_id,
+            mode,
+            len(allowed),
+        )
+        return _filter_list_tools_result(result, allowed)
 
 
 def current() -> Optional[Any]:

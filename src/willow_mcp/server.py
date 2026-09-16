@@ -578,13 +578,15 @@ def _transport_security():
     )
 
 
-from .request_context import RequestContextMiddleware
+from .request_context import AdvertiseFilterMiddleware, RequestContextMiddleware
 
 _common_kwargs: dict[str, Any] = dict(
     # Outermost: publishes the per-request context on a ContextVar we own,
     # which is how _read_call_credential reaches `_meta` now that SDK 2.0
-    # removed the ambient request contextvar.
-    middleware=[RequestContextMiddleware()],
+    # removed the ambient request contextvar. AdvertiseFilterMiddleware
+    # runs inside that bind so tools/list can read seat identity and shrink
+    # discovery (desk_core) without changing call ACL.
+    middleware=[RequestContextMiddleware(), AdvertiseFilterMiddleware()],
     instructions=(
         "Willow sovereign agent platform (willow-mcp). "
         "FIRST CALL of every session: session_enter(app_id, session_id) — it returns your "
@@ -599,7 +601,9 @@ _common_kwargs: dict[str, Any] = dict(
         "the task_net capability in your manifest, the operator's consent.internet, and an "
         "unexpired operator-issued lease (willow-mcp grant-net). No MCP tool can mint a lease; "
         "ask the operator. "
-        "Pass app_id on every call — it matches your manifest in $WILLOW_HOME/mcp_apps/<app_id>/manifest.json."
+        "Pass app_id on every call — it matches your manifest in $WILLOW_HOME/mcp_apps/<app_id>/manifest.json. "
+        "tools/list for the willow desk advertises desk_core (≤50 verbs), not the full "
+        "callable ACL; set WILLOW_MCP_ADVERTISE=full to restore the full listing."
     ),
 )
 
@@ -1821,16 +1825,32 @@ def _knowledge_ingest_core(
     if fields["tags"]["column"]:
         values["tags"] = tags or []
 
-    cols = ", ".join(f'"{fields[f]["column"]}"' for f in values)
-    placeholders = ", ".join(["%s"] * len(values))
+    # Optional pgvector columns (exact names when present). Not part of the
+    # confirmed canonical mapping — discovered, never guessed.
+    from . import knowledge_embed as kemb
+    embed_cols = kemb.discover_embed_cols(pg)
+    extra = kemb.ingest_embed_values(content, embed_cols)
+    # Build INSERT from mapped fields + optional embed columns.
+    col_names = [fields[f]["column"] for f in values]
     params = [_write_param(fields[f], v) for f, v in values.items()]
+    for col, val in extra.items():
+        col_names.append(col)
+        params.append(val)
+
+    cols = ", ".join(f'"{c}"' for c in col_names)
+    placeholders = ", ".join(
+        ["%s::vector" if c == kemb.COL_EMBEDDING else "%s" for c in col_names]
+    )
     cur = pg.cursor()
     cur.execute(
-        f"INSERT INTO knowledge ({cols}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",  # nosec B608 - cols come from the confirmed schema_profile field mapping, not request input; placeholders is a fixed "%s" repeat; all values are bound params
+        f"INSERT INTO knowledge ({cols}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",  # nosec B608 - cols come from the confirmed schema_profile field mapping (+ optional introspected embed cols); placeholders are fixed %s / %s::vector; all values are bound params
         params,
     )
     cur.close()
-    return {"id": kid}
+    out = {"id": kid}
+    if extra:
+        out["embedded"] = True
+    return out
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -2274,13 +2294,16 @@ def knowledge_search(
     domain: Optional[str] = None,
     limit: int = 10,
 ) -> dict:
-    """Search the fleet Postgres knowledge base by content: the query is
-    whitespace-split and ALL tokens must appear in an atom (AND logic).
-    `domain` narrows to one domain (e.g. 'journal', 'continuity'). Returns up
-    to `limit` atoms. Read-only; use kb_at to fetch a known atom by ID."""
+    """Search the fleet Postgres knowledge base.
+
+    Prefers cosine ranking on ``embedding`` when the column is populated and
+    Ollama can embed the query; otherwise whitespace-split AND ``ILIKE`` on
+    content (legacy path). ``domain`` narrows either path. Returns up to
+    ``limit`` atoms plus ``search_mode`` (``semantic`` / ``ilike`` /
+    ``ilike_fallback``). Read-only; use kb_at to fetch a known atom by ID."""
     tokens = query.split()
     if not tokens:
-        return {"results": []}
+        return {"results": [], "search_mode": "ilike"}
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
@@ -2293,12 +2316,32 @@ def knowledge_search(
         return {"error": "schema_unusable: 'knowledge' table has no mappable 'id' or 'content' column"}
 
     select_clause, present, unmapped = _build_select(_KNOWLEDGE_FIELDS, fields)
-    content_ref = sp.cast_for_ilike(fields["content"])
-    conditions = " AND ".join([f"{content_ref} ILIKE %s"] * len(tokens))
-    params: list = [f"%{t}%" for t in tokens]
     tags_col = fields["tags"]["column"]
     cols_by_name = {c.name: c for c in sp.introspect(pg, "knowledge")}
     retract_sql, retract_params = kbc.sql_exclude_retracted(tags_col, cols_by_name)
+
+    from . import knowledge_embed as kemb
+    sem = kemb.search_semantic(
+        pg,
+        select_clause=select_clause,
+        present=present,
+        unmapped=unmapped,
+        fields=fields,
+        query=query,
+        domain=domain,
+        limit=limit,
+        retract_sql=retract_sql,
+        retract_params=retract_params,
+    )
+    if sem is not None and sem.get("search_mode") == "semantic" and sem.get("results"):
+        if unmapped:
+            sem["_unmapped"] = unmapped
+        return sem
+
+    # ILIKE path (primary when no embed column; fallback when semantic empty/unreachable).
+    content_ref = sp.cast_for_ilike(fields["content"])
+    conditions = " AND ".join([f"{content_ref} ILIKE %s"] * len(tokens))
+    params: list = [f"%{t}%" for t in tokens]
     sql = f"SELECT {select_clause} FROM knowledge WHERE {conditions}{retract_sql}"  # nosec B608 - select_clause/retract_sql are built from the confirmed schema_profile field mapping, not request input; conditions is a fixed "X ILIKE %s" repeat; all values are bound params
     params.extend(retract_params)
     if domain and fields["domain"]["column"]:
@@ -2312,7 +2355,15 @@ def knowledge_search(
     rows = cur.fetchall()
     cur.close()
 
-    result = {"results": [kbc.enrich_atom(_row_to_dict(r, present, unmapped)) for r in rows]}
+    mode = "ilike"
+    if sem is not None and sem.get("_fallback") == "ilike":
+        mode = "ilike_fallback"
+    result = {
+        "results": [kbc.enrich_atom(_row_to_dict(r, present, unmapped)) for r in rows],
+        "search_mode": mode,
+    }
+    if sem is not None and sem.get("reason"):
+        result["embed_reason"] = sem["reason"]
     if unmapped:
         result["_unmapped"] = unmapped
     return result
@@ -6429,6 +6480,13 @@ def whoami(app_id: str = "") -> dict:
     # envelope_apply) used to pass the gate while staying invisible here.
     # It now shows up in both tools_allowed and name_gated_orphans.
     allowed, orphans = gate.visible_tools(app_id, _gate_tool_catalogue())
+    from . import advertise as _advertise
+    advertised, advertise_mode = _advertise.advertised_tools(
+        app_id, _gate_tool_catalogue()
+    )
+    if advertise_mode == "full":
+        # Middleware does not filter; report the call ACL as the advertised set.
+        advertised = sorted(allowed)
     deny = manifest.get("deny_tools") or []
     return {
         "app_id": app_id,
@@ -6436,6 +6494,11 @@ def whoami(app_id: str = "") -> dict:
         "human_only": bool(manifest.get("human_only", False)),
         "permissions": perms,
         "tools_allowed": sorted(allowed),
+        # Discovery subset (tools/list). Advertise ≠ call ACL: a permitted
+        # tool absent here remains callable when named. Escape:
+        # WILLOW_MCP_ADVERTISE=full or manifest advertise=full.
+        "tools_advertised": advertised,
+        "advertise_mode": advertise_mode,
         "deny_tools": deny if isinstance(deny, list) else [],
         "store_scope": manifest.get("store_scope"),
         # Tools admitted above whose registered name is a member of no
@@ -8011,6 +8074,37 @@ def _cmd_onboard(args) -> None:
         print(f"6. Enable egress: {cli} consent set internet true")
 
 
+def _cmd_nest_centroid_tick(args) -> None:
+    """`willow-mcp nest-centroid-tick` — warm nest taxonomy centroids."""
+    from .nest import centroid_tick
+
+    code = centroid_tick.main([
+        *(["--model", args.model] if getattr(args, "model", "") else []),
+        *(["--force"] if getattr(args, "force", False) else []),
+        *(["--json"] if getattr(args, "json", False) else []),
+    ])
+    raise SystemExit(code)
+
+
+def _cmd_knowledge_embed_tick(args) -> None:
+    """`willow-mcp knowledge-embed-tick` — warm knowledge.embedding."""
+    from . import knowledge_embed
+
+    argv = [
+        "--budget-s", str(args.budget_s),
+        "--limit", str(args.limit),
+    ]
+    if getattr(args, "model", ""):
+        argv += ["--model", args.model]
+    if getattr(args, "domain", ""):
+        argv += ["--domain", args.domain]
+    if getattr(args, "json", False):
+        argv.append("--json")
+    if getattr(args, "dsn", ""):
+        argv += ["--dsn", args.dsn]
+    raise SystemExit(knowledge_embed.main(argv))
+
+
 def _cmd_doctor(args) -> None:
     """`willow-mcp doctor` — human-readable install health + copy/paste fixes."""
     app_id = args.app_id or os.environ.get("WILLOW_APP_ID", "willow")
@@ -8991,6 +9085,8 @@ _COMMANDS: dict[str, str] = {
     "deny-permission": "_cmd_deny_permission",
     "_publish-permission": "_cmd_publish_permission",
     "federation": "_cmd_federation",
+    "nest-centroid-tick": "_cmd_nest_centroid_tick",
+    "knowledge-embed-tick": "_cmd_knowledge_embed_tick",
     "tree": "_cmd_tree",
     "compile-agents": "_cmd_compile_agents",
     "compile-persona": "_cmd_compile_persona",
@@ -9560,6 +9656,30 @@ def _build_parser():
     fed_rat_p.add_argument("--root", default="", help="scan root (default: $HOME)")
     fed_rev_p = federation_sub.add_parser("revoke", help="Remove a server's ratification")
     fed_rev_p.add_argument("server_id")
+
+    nest_cent_p = subparsers.add_parser(
+        "nest-centroid-tick",
+        help="Warm nest taxonomy centroids (Ollama) so the first nest_scan is not cold",
+    )
+    nest_cent_p.add_argument("--model", default="",
+                             help="embed model (default: NEST_EMBED_MODEL / nomic-embed-text)")
+    nest_cent_p.add_argument("--force", action="store_true",
+                             help="rebuild even when a current cache file exists")
+    nest_cent_p.add_argument("--json", action="store_true", help="machine-readable receipt")
+
+    kemb_p = subparsers.add_parser(
+        "knowledge-embed-tick",
+        help="Warm knowledge.embedding (pgvector) under a wall-clock budget",
+    )
+    kemb_p.add_argument("--budget-s", type=float, default=30.0)
+    kemb_p.add_argument("--limit", type=int, default=64)
+    kemb_p.add_argument("--model", default="",
+                        help="embed model (default: NEST_EMBED_MODEL / nomic-embed-text)")
+    kemb_p.add_argument("--domain", default="", help="limit to one domain")
+    kemb_p.add_argument("--dsn", default="",
+                        help="Postgres DSN (default: WILLOW_DB_URL, else "
+                             "WILLOW_PG_DB / settings.global.json)")
+    kemb_p.add_argument("--json", action="store_true", help="machine-readable receipt")
 
     tree_p = subparsers.add_parser(
         "tree",
