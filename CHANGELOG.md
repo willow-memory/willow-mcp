@@ -36,9 +36,8 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **governance:** syscall-table row 16 — pr.update (sealed 783bab4e) ([e203d75](https://github.com/willow-memory/willow-mcp/commit/e203d7540917f37fe89f34bf7470dab4af0d97e7))
-* **governance:** syscall-table row 16 pr.update + pr_update_execute ([40d868c](https://github.com/willow-memory/willow-mcp/commit/40d868cbb4633d5b6fc4d568a5d932f2f93a5fad))
 * **mcp:** pr_update_execute — brokered PR title/body/label edit (verb 16) ([c6d382b](https://github.com/willow-memory/willow-mcp/commit/c6d382b06b01c52a0b0c14d3b4625e2ad72529f1))
+* **governance:** syscall-table row 16 — pr.update (sealed 783bab4e) ([e203d75](https://github.com/willow-memory/willow-mcp/commit/e203d7540917f37fe89f34bf7470dab4af0d97e7))
 
 ## [2.53.0](https://github.com/willow-memory/willow-mcp/compare/v2.52.1...v2.53.0) (2026-09-16)
 
