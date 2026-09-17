@@ -260,9 +260,12 @@ def test_group_writable_live_table_refuses_live_table_untrusted(tables):
 # ── every refusal writes FRANK ink; the one honest silence is agreement ──────
 
 def test_modified_existing_row_refusal_writes_frank_ink(tables):
+    # A STRUCTURAL change on an existing row (here min_ring) refuses and
+    # inks. A note-only change would not — that is `_structural`'s job and
+    # its own test; this one must keep exercising the refusal path.
     live, bundle = tables
-    row3_live = _row(3, "git.push", note="original")
-    row3_bundle = _row(3, "git.push", note="edited out of band")
+    row3_live = _row(3, "git.push", min_ring="ENGINEER")
+    row3_bundle = _row(3, "git.push", min_ring="WORKER")
     _write_table(live, [row3_live])
     _write_table(bundle, [row3_bundle])
 
