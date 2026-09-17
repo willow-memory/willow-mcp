@@ -84,7 +84,24 @@ def manifest_from_row(
     aliases = dict(collection_aliases or {})
     aliases.update(row.get("collection_aliases") or {})
     if aliases:
-        manifest["collection_aliases"] = aliases
+        # Gap 982594e01ab3: registry-level aliases often name projects_willow_*;
+        # a specialist with store_scope like jeles_* must not inherit those as
+        # reachable logical names. Filter against the row's own scope at compile
+        # time so the written manifest matches what gate.collection_aliases
+        # will serve.
+        from .db import collection_in_scope
+
+        scope = manifest.get("store_scope")
+        if scope is not None:
+            aliases = {
+                logical: physical
+                for logical, physical in aliases.items()
+                if isinstance(logical, str)
+                and isinstance(physical, str)
+                and collection_in_scope(physical, scope)
+            }
+        if aliases:
+            manifest["collection_aliases"] = aliases
     return manifest
 
 

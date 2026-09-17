@@ -788,9 +788,18 @@ _LOGICAL_COLLECTION_RE = re.compile(
 
 
 def collection_aliases(app_id: str) -> dict[str, str]:
-    """Return validated explicit logical→physical aliases from the manifest."""
+    """Return validated explicit logical→physical aliases from the manifest.
+
+    Aliases whose physical target sits outside this app's ``store_scope`` are
+    dropped (gap 982594e01ab3 / H4): registry-level ``projects_willow_*``
+    aliases are often merged into every specialist manifest, and serving them
+    made orientation report ``collection_denied`` by construction. An out-of-
+    scope alias is not an alias for that seat — callers see
+    ``alias_not_configured`` instead of a permission wall they cannot clear.
+    """
     try:
-        manifest = _load_manifest(_validate_app_id(app_id))
+        app_id = _validate_app_id(app_id)
+        manifest = _load_manifest(app_id)
     except ValueError:
         return {}
     raw = (manifest or {}).get("collection_aliases") or {}
@@ -822,7 +831,14 @@ def collection_aliases(app_id: str) -> dict[str, str]:
             )
             return {}
         aliases[logical] = physical
-    return aliases
+    # Drop targets the seat cannot read — same rule as collection_permitted,
+    # applied at alias surface so orientation never invents a denial for a
+    # collection the seat was never meant to name.
+    return {
+        logical: physical
+        for logical, physical in aliases.items()
+        if collection_permitted(app_id, physical)
+    }
 
 
 def resolve_collection_alias(

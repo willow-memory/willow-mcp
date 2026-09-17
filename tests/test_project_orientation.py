@@ -75,10 +75,61 @@ def test_identity_gate_runs_before_unknown_alias_error(tmp_path, monkeypatch):
 
 
 def test_alias_scope_is_enforced_on_physical_target(tmp_path, monkeypatch):
+    """Out-of-scope logical aliases are not served (gap 982594e01ab3).
+
+    Direct physical names still hit collection_permitted; the alias surface
+    itself must not advertise a name the seat cannot read.
+    """
     _manifest(tmp_path, monkeypatch, scope=["projects_willow_stack"])
     monkeypatch.setattr(server, "_store", Store(tmp_path / "store"))
-    result = server.store_list(app_id="willow", collection="pm/portfolio")
-    assert "projects_willow_pm_portfolio" in result["items"][0]["error"]
+    assert "pm/portfolio" not in gate.collection_aliases("willow")
+    assert "stack" in gate.collection_aliases("willow")
+    result = server.store_list(
+        app_id="willow", collection="pm/portfolio"
+    )
+    err = result["items"][0]["error"]
+    assert "unknown collection alias" in err or "pm/portfolio" in err
+
+
+def test_specialist_orientation_does_not_collection_deny_willow_aliases(
+    tmp_path, monkeypatch
+):
+    """gap 982594e01ab3 / H4: a specialist scoped to its own prefix must not
+    inherit registry projects_willow_* aliases as orientation denials."""
+    _manifest(
+        tmp_path,
+        monkeypatch,
+        app="jeles",
+        scope=["jeles_*"],
+    )
+    # Simulate the registry merge that used to land willow aliases on every seat.
+    path = tmp_path / "mcp_apps" / "jeles" / "manifest.json"
+    data = json.loads(path.read_text())
+    data["collection_aliases"] = dict(ALIASES)
+    path.write_text(json.dumps(data))
+
+    monkeypatch.setattr(server, "_store", Store(tmp_path / "store"))
+    project = tmp_path / "charter"
+    project.mkdir()
+    entered = server.session_enter(
+        app_id="jeles",
+        session_id="specialist-orient",
+        project="charter",
+        workspace=str(project),
+    )
+    assert entered["orientation"]["collection_aliases"] == {}
+    for logical in (
+        "stack",
+        "pm/portfolio",
+        "pm/milestones",
+        "pa/commitments",
+        "governance/flags",
+    ):
+        record = entered["orientation"]["records"][logical]
+        assert record.get("error") == "alias_not_configured", (
+            f"{logical}: expected alias_not_configured, got {record!r}"
+        )
+        assert "collection_denied" not in str(record)
 
 
 def test_project_orientation_reads_every_declared_collection(tmp_path, monkeypatch):
