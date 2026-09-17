@@ -74,6 +74,77 @@ def test_split_pr_gate_parses_owner_repo_base():
     assert gates_panel.split_pr_gate("pr.bare:master") == ("", "")
 
 
+def test_split_pr_update_gate_parses_owner_repo_number():
+    """`pr.<owner>/<repo>#<number>` (verb 16, `pr.update`, sealed
+    `783bab4e`) parses back into ``(repo, number)``; a malformed one parses
+    to the empty pair. Shares the `pr.` prefix with `pr.open`'s `:<base>`
+    shape, told apart by separator."""
+    assert gates_panel.split_pr_update_gate(
+        "pr.willow-memory/willow-bot#31") == ("willow-memory/willow-bot", "31")
+    # Wrong prefix.
+    assert gates_panel.split_pr_update_gate("lease.willow") == ("", "")
+    # No number.
+    assert gates_panel.split_pr_update_gate("pr.willow-memory/willow-bot#") == ("", "")
+    # No `#` at all.
+    assert gates_panel.split_pr_update_gate("pr.willow-memory/willow-bot") == ("", "")
+    # No `owner/` in the repo half.
+    assert gates_panel.split_pr_update_gate("pr.bare#31") == ("", "")
+    # Non-numeric "number".
+    assert gates_panel.split_pr_update_gate("pr.willow-memory/willow-bot#thirty-one") == ("", "")
+
+
+def test_pr_update_gate_is_requestable_and_not_pressable():
+    from willow_mcp import gate_request
+
+    assert gate_request.check_requestable("pr.willow-memory/willow-bot#31") is None
+    assert not gates_panel.is_pressable("pr.willow-memory/willow-bot#31")
+
+
+def test_malformed_pr_gate_is_refused_by_neither_shape():
+    from willow_mcp import gate_request
+
+    refusal = gate_request.check_requestable("pr.willow-memory/willow-bot")
+    assert refusal is not None
+    assert "pr.<owner>/<repo>:<base>" in refusal and "pr.<owner>/<repo>#<number>" in refusal
+
+
+def test_the_row_names_the_pr_update_envelope_for_the_hash_shape(monkeypatch, tmp_path):
+    """The `#<number>` shape surfaces the `pr.update` ritual, not
+    `pr.open`'s — the operator needs to know which envelope kind to
+    propose."""
+    home = tmp_path / "box"
+    home.mkdir()
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+
+    item = {
+        "id": "43",
+        "source_agent": "hanuman",
+        "summary": (
+            "hanuman asked to update pull request willow-memory/willow-bot#31 "
+            "and was refused: EAMBIG: outside the envelope's bounds. Ratify a "
+            "pr.update envelope with these bounds (repo="
+            "'willow-memory/willow-bot', fields=[...]) and the agent can ask "
+            "again."
+        ),
+        "source_ref": gates_panel.encode_request(
+            gate_id="pr.willow-memory/willow-bot#31",
+            task_id="T1", nonce="n",
+            expires_at="2099-01-01T00:00:00Z"),
+    }
+    monkeypatch.setattr(gates_panel, "open_requests",
+                        lambda store=None: [{**item, "request":
+                                             gates_panel.decode_request(item["source_ref"])}])
+
+    row = gates_panel._request_rows()[0]
+    assert row.state == "off"
+    assert row.scope == "pr.willow-memory/willow-bot#31"
+    assert "not pressable" in row.action_note
+    assert "pr.update envelope" in row.action_note
+    assert "pr.open envelope" not in row.action_note
+    assert "envelope_propose" in row.action_note
+    assert "willow-mcp envelope ratify" in row.action_note
+
+
 def test_the_row_names_the_pr_open_envelope_in_the_action_note(monkeypatch, tmp_path):
     """The two-step ritual the row surfaces is specifically ``pr.open`` (not
     ``push``), because `envelope_propose` needs to hear which envelope kind

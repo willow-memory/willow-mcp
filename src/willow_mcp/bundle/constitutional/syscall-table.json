@@ -269,9 +269,22 @@
       "enforced_by": null,
       "min_ring": "ENGINEER",
       "note": "Gap c96dc96927e8: nothing connected a merge landing to the process serving it restarting. Sealed under governance decision (seal 06075e99; Nestor pair 06075e99-c16d-4703-88c5-52b70fae7cf2), operator, 2026-09-16. Preflight before citation: refuses unless the checkout's git_pull FRANK receipt exists and is newer than the unit's own ActiveEnterTimestamp \u2014 a reload never runs ahead of a pull this broker actually performed. The fourth verb of the brokered merge loop: push (3) leaves the box, pr.open (4) proposes the merge, pull is receipt-only (unenveloped by design \u2014 see pull_executor.py), and reload (15) is the last mile, the unit noticing."
+    },
+    {
+      "id": 16,
+      "verb": "pr.update",
+      "summary": "Edit the title, body, or bot-owned labels of a pull request the broker opened.",
+      "bounds": {
+        "repo": "org/name",
+        "fields": "list[title | body | labels] \u2014 the subset this envelope may change"
+      },
+      "enforcement": "soft",
+      "enforced_by": null,
+      "min_ring": "ENGINEER",
+      "note": "Gap 8d1bcb2b7c02: no broker verb edited a PR title; a pr-title.yml failure after a commit retype was a click the seat could not make. Sealed under governance decision (seal 783bab4e; Nestor pair 783bab4e-90e2-4735-b83b-a52108d411c3), operator, 2026-09-16. Excludes merge, approve, close, request-review, and assignee \u2014 those are verb 5 or ENOSYS; a near-miss is a fault (EAMBIG), never stretched onto verb 4 or verb 5."
     }
   ],
   "lineage": {
-    "note": "Drafted 2026-07-06 in session e2b05d0a (Willow, orchestrator-seat design). Operator ratified thirteen verbs (twelve drafted + agent.lifecycle). This draft carries fourteen rows: pr.open (id 4) was added during drafting as the cheap reversible sibling of pr.merge, so that opening a PR against a foreign repo is expressible-and-boundable rather than falling to ENOSYS. Operator ratified fourteen 2026-07-06 ('keep it at 14'), with notice that the schema will change \u2014 that is what draft status is for. Row 15 unit.reload added 2026-09-16 under sealed decision 06075e99 (operator), PR <#>."
+    "note": "Drafted 2026-07-06 in session e2b05d0a (Willow, orchestrator-seat design). Operator ratified thirteen verbs (twelve drafted + agent.lifecycle). This draft carries fourteen rows: pr.open (id 4) was added during drafting as the cheap reversible sibling of pr.merge, so that opening a PR against a foreign repo is expressible-and-boundable rather than falling to ENOSYS. Operator ratified fourteen 2026-07-06 ('keep it at 14'), with notice that the schema will change \u2014 that is what draft status is for. Row 15 unit.reload added 2026-09-16 under sealed decision 06075e99 (operator), PR #555. Row 16 pr.update added 2026-09-16 under sealed decision 783bab4e (operator), PR <#>."
   }
 }

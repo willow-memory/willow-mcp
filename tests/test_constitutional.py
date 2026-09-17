@@ -105,9 +105,13 @@ def test_no_ledger_still_syncs_without_writing_frank_ink(tables):
 # ── the two refusal shapes: live untouched ────────────────────────────────────
 
 def test_modified_existing_row_is_refused_live_untouched(tables):
+    """A STRUCTURAL diff (bounds, here) is still a modification and still
+    refuses — only `note`/`summary` are exempted (row 16, `pr.update`,
+    sealed 783bab4e; see test_note_only_diff_on_an_existing_row_still_syncs
+    below for the field that is NOT this)."""
     live, bundle = tables
-    row3_live = _row(3, "git.push", note="original")
-    row3_bundle = _row(3, "git.push", note="edited out of band")
+    row3_live = _row(3, "git.push", bounds={"repo": "org/name"})
+    row3_bundle = _row(3, "git.push", bounds={"repo": "org/other"})
     _write_table(live, [row3_live])
     _write_table(bundle, [row3_bundle])
     before = live.read_text()
@@ -116,6 +120,49 @@ def test_modified_existing_row_is_refused_live_untouched(tables):
 
     assert out["ok"] is False and out["refused"] is True
     assert "3" in out["reason"] or "[3]" in out["reason"]
+    assert live.read_text() == before
+
+
+def test_note_only_diff_on_an_existing_row_does_not_block_an_addition(tables):
+    """The real shape row 16 introduced: row 15's own lineage note picked up
+    a `PR #555` in the same commit that appended row 16. A note-only diff on
+    an EXISTING row must not hold the new row's sync hostage — the bundle
+    (prose-and-all) is what lands, not a partial write."""
+    live, bundle = tables
+    row14 = _row(14, "agent.lifecycle")
+    row15_live = _row(15, "unit.reload", note="sealed under decision (seal 06075e99), PR <#>")
+    row15_bundle = _row(15, "unit.reload", note="sealed under decision (seal 06075e99), PR #555")
+    row16 = _row(16, "pr.update", note="sealed under decision (seal 783bab4e)")
+    _write_table(live, [row14, row15_live])
+    _write_table(bundle, [row14, row15_bundle, row16])
+
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, ledger=_FakeLedger(), project="fleet")
+
+    assert out["ok"] is True, out
+    assert out["added"] == [16]
+    assert out["seals"] == {16: "783bab4e"}
+    written = json.loads(live.read_text())
+    by_id = {r["id"]: r for r in written["verbs"]}
+    # The bundle's corrected note for row 15 landed too — a successful sync
+    # writes the whole bundle, prose included.
+    assert by_id[15]["note"] == "sealed under decision (seal 06075e99), PR #555"
+    assert by_id[16]["verb"] == "pr.update"
+
+
+def test_note_only_diff_with_no_addition_is_a_clean_noop(tables):
+    """No new row at all, just a reworded note on an existing one — nothing
+    to add, so the sync is a no-op rather than a refusal or a write."""
+    live, bundle = tables
+    row15_live = _row(15, "unit.reload", note="old wording")
+    row15_bundle = _row(15, "unit.reload", note="new wording")
+    _write_table(live, [row15_live])
+    _write_table(bundle, [row15_bundle])
+    before = live.read_text()
+
+    out = constitutional.sync_syscall_table_from_bundle(live_path=live, bundle_path=bundle)
+
+    assert out["ok"] is True and out["added"] == []
     assert live.read_text() == before
 
 
@@ -213,9 +260,12 @@ def test_group_writable_live_table_refuses_live_table_untrusted(tables):
 # ── every refusal writes FRANK ink; the one honest silence is agreement ──────
 
 def test_modified_existing_row_refusal_writes_frank_ink(tables):
+    # A STRUCTURAL change on an existing row (here min_ring) refuses and
+    # inks. A note-only change would not — that is `_structural`'s job and
+    # its own test; this one must keep exercising the refusal path.
     live, bundle = tables
-    row3_live = _row(3, "git.push", note="original")
-    row3_bundle = _row(3, "git.push", note="edited out of band")
+    row3_live = _row(3, "git.push", min_ring="ENGINEER")
+    row3_bundle = _row(3, "git.push", min_ring="WORKER")
     _write_table(live, [row3_live])
     _write_table(bundle, [row3_bundle])
 
