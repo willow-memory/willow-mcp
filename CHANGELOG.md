@@ -31,6 +31,15 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.54.1](https://github.com/willow-memory/willow-mcp/compare/v2.54.0...v2.54.1) (2026-09-17)
+
+
+### Fixed
+
+* **hooks:** resolve seat from .mcp.json; refuse env mismatch ([0e642e9](https://github.com/willow-memory/willow-mcp/commit/0e642e9594163778a7bcd460f24353505e69b095))
+* **hooks:** drop collection aliases outside store_scope ([9e72916](https://github.com/willow-memory/willow-mcp/commit/9e729162852d96611ea9f867978f8c67518c166e))
+* **hooks:** block python3 - << in bash routing ([4589c69](https://github.com/willow-memory/willow-mcp/commit/4589c69980ecf55799a730c676bd3f1d29803122))
+
 ## [2.54.0](https://github.com/willow-memory/willow-mcp/compare/v2.53.0...v2.54.0) (2026-09-17)
 
 
