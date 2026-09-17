@@ -1708,6 +1708,25 @@ def test_python_heredoc_at_command_position_is_still_routed():
     assert "heredoc" in decision[1].lower()
 
 
+def test_python_heredoc_with_bare_stdin_dash_is_routed():
+    """gap aad87628554c: `python3 - <<` is the common stdin form; H1's first
+    pattern required `-\\S+` and let the bare dash through."""
+    decision = pre_tool_use.check_bash_routing(
+        "python3 - <<'PY'\nprint(1)\nPY"
+    )
+    assert decision is not None
+    assert decision[0] == "block"
+    assert "heredoc" in decision[1].lower()
+
+
+def test_python_heredoc_with_flag_before_redirect_is_routed():
+    decision = pre_tool_use.check_bash_routing(
+        "python3 -u <<'EOF'\nprint(1)\nEOF"
+    )
+    assert decision is not None
+    assert decision[0] == "block"
+
+
 # ── H3: self-grant is tool-level, not only group-level (gap 7c3f45e495b4) ───
 
 
