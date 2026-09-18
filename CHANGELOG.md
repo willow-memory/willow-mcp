@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **nest:** log every tier-3 escalation; self-training loop reachable from nest_scan ([4d23ea4](https://github.com/willow-memory/willow-mcp/commit/4d23ea4e9d4fd39758ad57049458fd339512bdf5))
 * **nest:** log every tier-3 escalation; self-training loop reachable from nest_scan ([0a71c83](https://github.com/willow-memory/willow-mcp/commit/0a71c834ea2ed7685663f381daa8516060cf5475))
 
 ## [2.54.1](https://github.com/willow-memory/willow-mcp/compare/v2.54.0...v2.54.1) (2026-09-17)
