@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.55.0](https://github.com/willow-memory/willow-mcp/compare/v2.54.1...v2.55.0) (2026-09-18)
+
+
+### Added
+
+* **nest:** log every tier-3 escalation; self-training loop reachable from nest_scan ([4d23ea4](https://github.com/willow-memory/willow-mcp/commit/4d23ea4e9d4fd39758ad57049458fd339512bdf5))
+* **nest:** log every tier-3 escalation; self-training loop reachable from nest_scan ([0a71c83](https://github.com/willow-memory/willow-mcp/commit/0a71c834ea2ed7685663f381daa8516060cf5475))
+
 ## [2.54.1](https://github.com/willow-memory/willow-mcp/compare/v2.54.0...v2.54.1) (2026-09-17)
 
 
