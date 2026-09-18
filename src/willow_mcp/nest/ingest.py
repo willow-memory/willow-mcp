@@ -10,12 +10,14 @@ try:  # works both as a package (apps.nest_seed) and as a plain script dir
     from . import db as _db
     from . import ocr as _ocr
     from . import classify as _classify
+    from . import llm as _llm
     from . import taxonomy as _tax
     from . import selflearn as _learn
 except ImportError:
     import db as _db
     import ocr as _ocr
     import classify as _classify
+    import llm as _llm
     import taxonomy as _tax
     import selflearn as _learn
 
@@ -44,8 +46,10 @@ def run(folder: Path, db_path: Path, owner: str, dry_run: bool = False,
                   file=sys.stderr)
 
     # Recorder collects per-doc observations (reusing the embedding the
-    # classifier already computes) for self-learning and clustering discovery.
-    recorder = _learn.Recorder() if (learn or discover or promote) else None
+    # classifier already computes) for self-learning and clustering discovery,
+    # and every tier-3 escalation when the LLM tier is on — the escalation log
+    # accumulates from normal operation, not only from a --learn run.
+    recorder = _learn.Recorder() if (learn or discover or promote or use_llm) else None
 
     supported = _ocr.supported_suffixes()
     files = [p for p in sorted(folder.rglob("*"))
@@ -81,13 +85,16 @@ def run(folder: Path, db_path: Path, owner: str, dry_run: bool = False,
 
         counts["extracted"] += 1
         sink = None
+        esc_sink = None
         if recorder is not None:
-            sink = recorder.sink_for(key=_db.file_hash(path), snippet=text[:140])
+            key = _db.file_hash(path)
+            sink = recorder.sink_for(key=key, snippet=text[:140])
+            esc_sink = recorder.escalation_sink_for(key=key)
         frags = _classify.classify(text, filename=path.name, path=path,
                                    use_llm=use_llm, use_embed=use_embed,
                                    centroids=centroids, text_model=text_model,
                                    vision_model=vision_model, embed_model=embed_model,
-                                   learn_sink=sink)
+                                   learn_sink=sink, escalation_sink=esc_sink)
         counts["fragments"] += len(frags)
 
         if verbose:
@@ -111,6 +118,27 @@ def run(folder: Path, db_path: Path, owner: str, dry_run: bool = False,
     if conn:
         counts["db_stats"] = _db.stats(conn)
         conn.close()
+
+    # Escalation log, three-state: off (LLM tier not requested), on with a count
+    # (possibly zero — every doc resolved on the embedding tier), or on and the
+    # log itself could not be written. Written even on a dry run: the tuple was
+    # computed and the teacher was paid for either way.
+    if recorder is None or not use_llm:
+        counts["escalations"] = {"state": "off", "escalated": 0, "logged": 0}
+    else:
+        escalated = len(recorder.escalations)
+        unanswered = sum(1 for r in recorder.escalations if r.get("verdict") is None)
+        flushed = recorder.flush_escalations(text_model or _llm.DEFAULT_TEXT_MODEL)
+        counts["escalations"] = {
+            "state": "unreachable" if flushed.get("error") else "on",
+            "escalated": escalated,
+            "unanswered": unanswered,
+            "logged": flushed.get("logged", 0),
+            "path": flushed.get("path"),
+            **({"error": flushed["error"]} if flushed.get("error") else {}),
+        }
+        if verbose:
+            print(f"  [escalations] {counts['escalations']}", file=sys.stderr)
 
     # Fold this run's confident classifications into the learned centroids, so
     # the next run starts adapted to the user's own documents.

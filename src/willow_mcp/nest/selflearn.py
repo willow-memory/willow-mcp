@@ -34,6 +34,7 @@ import json
 import math
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -61,6 +62,11 @@ DISCOVERED_PREFIX = "auto:"
 # Type of the per-doc hook classify() calls: (category, vec, margin, confidence).
 LearnSink = Callable[[str, list, float, str], None]
 
+# Type of the tier-3 hook classify() calls once per LLM escalation. The dict is
+# the (excerpt, margin, candidates, verdict, teacher_model) tuple the cascade
+# already computes — the distillation corpus for a future tier-2.5 student.
+EscalationSink = Callable[[dict], None]
+
 
 # --- learned-member store ---------------------------------------------------
 
@@ -71,6 +77,33 @@ def _cache_dir() -> Path:
 def _learned_path(model: str) -> Path:
     safe = model.replace("/", "_").replace(":", "_")
     return _cache_dir() / f"learned_{safe}.json"
+
+
+def _escalation_path(model: str) -> Path:
+    safe = model.replace("/", "_").replace(":", "_")
+    return _cache_dir() / f"escalations_{safe}.jsonl"
+
+
+def append_escalations(model: str, rows: list[dict]) -> dict:
+    """Append tier-3 escalation rows to the JSONL log for `model` (the teacher).
+
+    One line per escalation: {ts, hash, excerpt, margin, candidates, verdict,
+    teacher_model, embed_model}. `verdict` is None when the teacher was asked
+    and did not answer — logged, not dropped, so an unreachable teacher reads
+    as unreachable rather than as "nothing escalated". Append-only; never
+    rewrites. Returns {logged, path} or {logged: 0, error} on an OS failure.
+    """
+    if not rows:
+        return {"logged": 0, "path": str(_escalation_path(model))}
+    p = _escalation_path(model)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, sort_keys=True) + "\n")
+    except OSError as e:
+        return {"logged": 0, "path": str(p), "error": f"{type(e).__name__}: {e}"}
+    return {"logged": len(rows), "path": str(p)}
 
 
 def load_learned(model: str) -> dict[str, list[dict]]:
@@ -241,6 +274,8 @@ class Recorder:
     def __init__(self) -> None:
         self.confident: list[dict] = []
         self.tail: list[dict] = []
+        # Every tier-3 escalation this run, verdict or not (see EscalationSink).
+        self.escalations: list[dict] = []
 
     def sink_for(self, *, key: str, snippet: str) -> LearnSink:
         """A per-file hook bound to this file's hash + snippet."""
@@ -252,8 +287,21 @@ class Recorder:
                 self.tail.append({"vec": vec, "snippet": snippet, "category": category})
         return _sink
 
+    def escalation_sink_for(self, *, key: str) -> EscalationSink:
+        """A per-file hook that records each tier-3 escalation under this file's hash."""
+        def _sink(row: dict) -> None:
+            self.escalations.append({
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "hash": key,
+                **row,
+            })
+        return _sink
+
     def flush_learned(self, model: str) -> dict:
         return merge_learned(model, self.confident)
+
+    def flush_escalations(self, teacher_model: str) -> dict:
+        return append_escalations(teacher_model, self.escalations)
 
 
 # --- clustering discovery (pure-python spherical k-means) -------------------
