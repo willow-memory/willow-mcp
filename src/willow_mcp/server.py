@@ -1905,6 +1905,9 @@ def nest_scan(
     dry_run: bool = True,
     use_llm: bool = False,
     use_embed: bool = True,
+    learn: bool = False,
+    discover: int = 0,
+    promote: bool = False,
 ) -> dict:
     """Walk a drop folder, extract + classify its files, and write a canonical
     SQLite Nest DB. Returns structure only (counts by source status and fragment
@@ -1914,6 +1917,14 @@ def nest_scan(
     inspect what a dump would become before committing it. dry_run=False writes.
     use_embed uses an Ollama embedding model when present (falls back to regex
     offline); use_llm escalates the uncertain tail to a text/vision model.
+
+    Self-training loop (nest/selflearn.py), reachable from the desk rather than
+    only from a CLI flag: `learn` folds this run's confident classifications into
+    the learned centroids; `discover=k` clusters the uncertain tail into k
+    candidate categories (report-only); `promote` persists qualifying clusters
+    as new `auto:` categories. With use_llm on, every tier-3 escalation is
+    appended to the JSONL escalation log regardless — `counts.escalations`
+    reports it three-state: off / on with counts / unreachable.
 
     Inference stays on this machine by default. It is NOT unconditional: the
     seams post to $OLLAMA_HOST, and if that points off-box this tool requires the
@@ -1960,6 +1971,9 @@ def nest_scan(
                 verbose=False,
                 use_llm=use_llm,
                 use_embed=use_embed,
+                learn=learn,
+                discover=discover,
+                promote=promote,
             )
     except Exception as e:  # engine failure must not take the server down
         return {"error": f"nest scan failed: {type(e).__name__}: {e}"}

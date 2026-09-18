@@ -218,10 +218,15 @@ def classify(text: str, filename: str = "", path: "Path | None" = None,
              centroids: "dict[str, list[float]] | None" = None,
              text_model: str | None = None, vision_model: str | None = None,
              embed_model: str | None = None,
-             learn_sink: "Callable[[str, list, float, str], None] | None" = None) -> list[Fragment]:
+             learn_sink: "Callable[[str, list, float, str], None] | None" = None,
+             escalation_sink: "Callable[[dict], None] | None" = None) -> list[Fragment]:
     """Public entry. Scrubs credentials FIRST: any secret becomes a flagged,
     redacted `secret` fragment and is removed from the text before any other tier
-    embeds or stores it — the Nest never persists a raw credential."""
+    embeds or stores it — the Nest never persists a raw credential.
+
+    `escalation_sink`, when given, is called once per tier-3 LLM escalation with
+    the (excerpt, margin, candidates, verdict, teacher_model) row — the redacted
+    text only, since it runs after the scrub above."""
     secret_frags: list[Fragment] = []
     found = _secrets.find_secrets(text)
     if found:
@@ -233,7 +238,8 @@ def classify(text: str, filename: str = "", path: "Path | None" = None,
             for kind, val in found
         ]
     core = _classify_core(text, filename, path, use_llm, use_embed, centroids,
-                          text_model, vision_model, embed_model, learn_sink)
+                          text_model, vision_model, embed_model, learn_sink,
+                          escalation_sink)
     return secret_frags + core
 
 
@@ -242,7 +248,8 @@ def _classify_core(text: str, filename: str = "", path: "Path | None" = None,
                    centroids: "dict[str, list[float]] | None" = None,
                    text_model: str | None = None, vision_model: str | None = None,
                    embed_model: str | None = None,
-                   learn_sink: "Callable[[str, list, float, str], None] | None" = None) -> list[Fragment]:
+                   learn_sink: "Callable[[str, list, float, str], None] | None" = None,
+                   escalation_sink: "Callable[[dict], None] | None" = None) -> list[Fragment]:
     name_lower = filename.lower()
     is_image = any(name_lower.endswith(x) for x in _IMAGE_EXTS)
 
@@ -261,6 +268,7 @@ def _classify_core(text: str, filename: str = "", path: "Path | None" = None,
     primary = _classify_text_tiers(
         text, filename, is_image, use_llm, use_embed, centroids,
         text_model=text_model, embed_model=embed_model, learn_sink=learn_sink,
+        escalation_sink=escalation_sink,
     )
     if primary is None:
         # No tier produced a verdict (all models down) → pure regex.
@@ -274,7 +282,8 @@ def _classify_text_tiers(text: str, filename: str, is_image: bool,
                          centroids: "dict[str, list[float]] | None",
                          text_model: str | None,
                          embed_model: str | None,
-                         learn_sink: "Callable[[str, list, float, str], None] | None" = None) -> "Fragment | None":
+                         learn_sink: "Callable[[str, list, float, str], None] | None" = None,
+                         escalation_sink: "Callable[[dict], None] | None" = None) -> "Fragment | None":
     """Run the embedding → generative cascade for a text document.
 
     Returns the primary fragment, or None if no tier was available.
@@ -299,9 +308,23 @@ def _classify_text_tiers(text: str, filename: str, is_image: bool,
             # --- tier 3: escalate the uncertain tail to the LLM -------------
             if use_llm:
                 cands = [c for _, c in ranked[:3]]
-                verdict = _llm.classify_text(text, filename,
-                                             model=text_model or _llm.DEFAULT_TEXT_MODEL,
+                teacher = text_model or _llm.DEFAULT_TEXT_MODEL
+                verdict = _llm.classify_text(text, filename, model=teacher,
                                              candidates=cands)
+                # Escalation log: the (excerpt, margin, top-3, verdict) tuple is
+                # the distillation corpus for a tier-2.5 student. Logged even
+                # when the teacher returned nothing, so "asked, no answer" is
+                # distinguishable from "never asked".
+                if escalation_sink is not None:
+                    escalation_sink({
+                        "excerpt": excerpt,
+                        "margin": st["margin"],
+                        "embed_best": st["cat"],
+                        "candidates": cands,
+                        "verdict": verdict,
+                        "teacher_model": teacher,
+                        "embed_model": embed_model or _embed.DEFAULT_EMBED_MODEL,
+                    })
                 if verdict is not None:
                     return _frag_from_verdict(verdict, text, is_image)
 
