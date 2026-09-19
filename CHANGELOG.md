@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.56.0](https://github.com/willow-memory/willow-mcp/compare/v2.55.0...v2.56.0) (2026-09-19)
+
+
+### Added
+
+* **seal:** seal_drain — the seal watch as one tick of the steward ([a8fe66f](https://github.com/willow-memory/willow-mcp/commit/a8fe66f1b4103c0f08083c1064c0f882613cdec8))
+* **seal:** seal_drain — the seal watch as one tick of the steward ([306c6d8](https://github.com/willow-memory/willow-mcp/commit/306c6d8031f46178ebf9abec7a904c2ef3a45d79))
+
 ## [2.55.0](https://github.com/willow-memory/willow-mcp/compare/v2.54.1...v2.55.0) (2026-09-18)
 
 
