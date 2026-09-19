@@ -204,14 +204,73 @@ def test_handler_surprise_outcome_counts_as_error(paths):
 
 # ── shares the daemon's paths and predicate ─────────────────────────────────
 
-def test_defaults_are_the_daemons_defaults(monkeypatch, tmp_path):
+@pytest.fixture
+def clean_env(monkeypatch, tmp_path):
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
-    monkeypatch.delenv(seal_daemon.NESTOR_LEDGER_ENV, raising=False)
+    for var in (seal_daemon.NESTOR_LEDGER_ENV, "NESTOR_LEDGER", "NESTOR_DB"):
+        monkeypatch.delenv(var, raising=False)
+    return tmp_path
+
+
+def test_defaults_are_the_daemons_defaults(clean_env):
     out = seal_drain.drain(on_seal=_Recorder())
     assert out["ledger"] == str(seal_daemon.default_ledger_path())
     assert out["offset_path"] == str(seal_daemon.default_offset_path())
     assert out["state"] == "unreachable" and out["reason"] == "ledger_missing"
+
+
+# ── the watcher resolves the ledger the way the sealer does (gap 507a71433397) ──
+
+def test_legacy_ledger_is_the_last_resort(clean_env):
+    assert seal_daemon.default_ledger_path() == clean_env / "ledger.jsonl"
+    assert seal_daemon.default_offset_path().name == "seal_watch.offset"
+
+
+def test_per_db_chain_beside_nestor_db_wins_when_it_exists(clean_env, monkeypatch):
+    db = clean_env / "keep" / "nestor.db"
+    db.parent.mkdir()
+    monkeypatch.setenv("NESTOR_DB", str(db))
+    # Not there yet: fall through to legacy.
+    assert seal_daemon.default_ledger_path() == clean_env / "ledger.jsonl"
+    # Nestor creates <db>.ledger.jsonl on its first append; from then on the
+    # watcher must read that file, and keep a separate position for it.
+    (clean_env / "keep" / "nestor.db.ledger.jsonl").write_text("")
+    assert seal_daemon.default_ledger_path() == clean_env / "keep" / "nestor.db.ledger.jsonl"
+    assert seal_daemon.default_offset_path().name == "seal_watch.nestor.db.ledger.jsonl.offset"
+
+
+def test_per_db_chain_under_willow_home_wins_without_nestor_db(clean_env):
+    (clean_env / "nestor.db.ledger.jsonl").write_text("")
+    assert seal_daemon.default_ledger_path() == clean_env / "nestor.db.ledger.jsonl"
+
+
+def test_nestor_ledger_env_beats_the_per_db_spelling(clean_env, monkeypatch):
+    (clean_env / "nestor.db.ledger.jsonl").write_text("")
+    monkeypatch.setenv("NESTOR_LEDGER", str(clean_env / "pinned.jsonl"))
+    assert seal_daemon.default_ledger_path() == clean_env / "pinned.jsonl"
+    monkeypatch.setenv(seal_daemon.NESTOR_LEDGER_ENV, str(clean_env / "mine.jsonl"))
+    assert seal_daemon.default_ledger_path() == clean_env / "mine.jsonl"
+
+
+def test_a_new_chain_is_drained_from_the_start_the_legacy_one_from_eof(clean_env):
+    """The operator-box case: 20 seals in a five-day-old per-db chain that
+    no watcher ever read. Seeding at EOF would skip every one of them."""
+    legacy = clean_env / "ledger.jsonl"
+    _write_ledger(legacy, [_seal("old-1"), _seal("old-2")])
+    rec_legacy = _Recorder()
+    out_legacy = seal_drain.drain(ledger_path=legacy, on_seal=rec_legacy)
+    assert out_legacy["state"] == "empty" and rec_legacy.seen == []
+
+    per_db = clean_env / "nestor.db.ledger.jsonl"
+    _write_ledger(per_db, [_seal("new-1"), _seal("new-2")])
+    rec_new = _Recorder()
+    out_new = seal_drain.drain(ledger_path=per_db, on_seal=rec_new)
+    assert out_new["state"] == "populated"
+    assert [r["pair_id"] for r in rec_new.seen] == ["new-1", "new-2"]
+    # And the two chains keep two positions.
+    assert (clean_env / "store" / "seal_watch.offset").exists()
+    assert (clean_env / "store" / "seal_watch.nestor.db.ledger.jsonl.offset").exists()
 
 
 # ── end to end through the real handler and a real store ────────────────────

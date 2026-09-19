@@ -84,7 +84,8 @@ def drain(
     historical ones. Pass ``False`` to walk from the start (a backfill).
     """
     ledger = Path(ledger_path) if ledger_path is not None else seal_daemon.default_ledger_path()
-    offset_file = Path(offset_path) if offset_path is not None else seal_daemon.default_offset_path()
+    offset_file = (Path(offset_path) if offset_path is not None
+                   else seal_daemon.default_offset_path(ledger))
     receipt: dict = {"ledger": str(ledger), "offset_path": str(offset_file)}
 
     if seed_at_eof_if_absent:
