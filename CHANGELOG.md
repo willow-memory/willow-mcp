@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **nest:** escalation log durable per row; nest_scan walks a window ([598971b](https://github.com/willow-memory/willow-mcp/commit/598971bb8d9a00196b4d3e0013aa65ff135615ab))
 * **nest:** escalation log durable per row; nest_scan walks a window ([27798f3](https://github.com/willow-memory/willow-mcp/commit/27798f34a2caa7a4efe3eb5aec7294a78c97774d))
 
 ## [2.56.1](https://github.com/willow-memory/willow-mcp/compare/v2.56.0...v2.56.1) (2026-09-19)
