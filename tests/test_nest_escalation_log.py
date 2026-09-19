@@ -240,6 +240,94 @@ def test_ingest_reports_unreachable_when_log_cannot_be_written(
     assert esc["error"] == "OSError: denied"
 
 
+# ── durable per row, bounded per call (gap 0c062b3c83c3) ────────────────────
+
+def test_rows_are_on_disk_before_the_run_ends(nest_cache, drop_folder, stub_engine, monkeypatch):
+    """A run killed after the first escalation must have logged it. Simulate
+    the kill: the teacher answers once, then the second call raises out of
+    ingest.run entirely."""
+    calls = {"n": 0}
+
+    def _teacher(text, filename="", model=None, candidates=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt("client timeout / broker restart")
+        return dict(VERDICT)
+    monkeypatch.setattr(llm, "classify_text", _teacher)
+
+    with pytest.raises(KeyboardInterrupt):
+        ingest.run(drop_folder, nest_cache / "nest.db", owner="t",
+                   dry_run=True, use_llm=True, text_model="teacher:3b")
+
+    log = nest_cache / "escalations_teacher_3b.jsonl"
+    assert log.exists()
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["verdict"]["category"] == "legal"
+
+
+def test_recorder_with_a_model_appends_at_sink_time(nest_cache):
+    rec = selflearn.Recorder(escalation_model="teacher:3b")
+    sink = rec.escalation_sink_for(key="k1")
+    sink({"excerpt": "x", "margin": 0.0, "candidates": [], "verdict": None,
+          "teacher_model": "t", "embed_model": "e"})
+    log = nest_cache / "escalations_teacher_3b.jsonl"
+    assert len(log.read_text().splitlines()) == 1          # before any flush
+    assert rec.escalations_logged == 1
+    out = rec.flush_escalations("teacher:3b")
+    assert out == {"logged": 1, "path": str(log)}
+    assert len(log.read_text().splitlines()) == 1          # flush did not re-append
+
+
+def test_recorder_with_a_model_reports_a_write_error(nest_cache, monkeypatch):
+    (nest_cache / "blocker").write_text("")
+    monkeypatch.setattr(selflearn, "_escalation_path",
+                        lambda model: nest_cache / "blocker" / "escalations.jsonl")
+    rec = selflearn.Recorder(escalation_model="teacher:3b")
+    rec.escalation_sink_for(key="k")({"excerpt": "x", "margin": 0.0, "candidates": [],
+                                      "verdict": None, "teacher_model": "t",
+                                      "embed_model": "e"})
+    out = rec.flush_escalations("teacher:3b")
+    assert out["logged"] == 0 and out["errors"] == 1 and out["error"]
+
+
+def test_window_bounds_one_call_and_names_the_next(nest_cache, drop_folder, stub_engine, monkeypatch):
+    monkeypatch.setattr(llm, "classify_text",
+                        lambda text, filename="", model=None, candidates=None: dict(VERDICT))
+    for i in range(3):
+        (drop_folder / f"more-{i}.txt").write_text(f"more uncertain document {i}")
+    # 5 files total: one.txt, two.txt, more-0..2 (sorted: more-0, more-1, more-2, one, two)
+
+    first = ingest.run(drop_folder, nest_cache / "nest.db", owner="t", dry_run=True,
+                       use_llm=True, text_model="teacher:3b", max_files=2)
+    assert first["files"] == 2
+    assert first["window"] == {"total": 5, "skip": 0, "max_files": 2, "seen": 2, "next_skip": 2}
+    assert first["escalations"]["escalated"] == 2
+
+    second = ingest.run(drop_folder, nest_cache / "nest.db", owner="t", dry_run=True,
+                        use_llm=True, text_model="teacher:3b", max_files=2, skip=2)
+    assert second["window"]["next_skip"] == 4
+
+    last = ingest.run(drop_folder, nest_cache / "nest.db", owner="t", dry_run=True,
+                      use_llm=True, text_model="teacher:3b", max_files=2, skip=4)
+    assert last["files"] == 1
+    assert last["window"]["next_skip"] is None
+
+    # The three ticks together logged every escalation once.
+    log = nest_cache / "escalations_teacher_3b.jsonl"
+    assert len(log.read_text().splitlines()) == 5
+
+
+def test_no_window_walks_everything(nest_cache, drop_folder, stub_engine):
+    counts = ingest.run(drop_folder, nest_cache / "nest.db", owner="t", dry_run=True)
+    assert counts["window"] == {"total": 2, "skip": 0, "max_files": 0, "seen": 2, "next_skip": None}
+
+
+def test_skip_past_the_end_is_an_empty_window(nest_cache, drop_folder, stub_engine):
+    counts = ingest.run(drop_folder, nest_cache / "nest.db", owner="t", dry_run=True, skip=99)
+    assert counts["files"] == 0
+    assert counts["window"]["seen"] == 0 and counts["window"]["next_skip"] is None
+
+
 # ── nest_scan threads the loop flags to the engine ──────────────────────────
 
 @pytest.fixture
@@ -263,13 +351,15 @@ def _scan(**kw):
 
 def test_nest_scan_threads_learn_discover_promote(home, scan_seam):
     out = _scan(app_id="willow", folder=str(home / "drop"), dry_run=True,
-                use_llm=True, learn=True, discover=4, promote=True)
+                use_llm=True, learn=True, discover=4, promote=True,
+                max_files=50, skip=100)
 
     assert out["status"] == "ok"
     assert scan_seam["use_llm"] is True
     assert scan_seam["learn"] is True
     assert scan_seam["discover"] == 4
     assert scan_seam["promote"] is True
+    assert scan_seam["max_files"] == 50 and scan_seam["skip"] == 100
 
 
 def test_nest_scan_defaults_leave_the_loop_off(home, scan_seam):
