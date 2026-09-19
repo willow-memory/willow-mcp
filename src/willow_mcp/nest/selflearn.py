@@ -271,11 +271,21 @@ class Recorder:
     computed — no extra model calls.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, escalation_model: str | None = None) -> None:
         self.confident: list[dict] = []
         self.tail: list[dict] = []
         # Every tier-3 escalation this run, verdict or not (see EscalationSink).
         self.escalations: list[dict] = []
+        # When a teacher model is named, each escalation is appended to that
+        # model's JSONL log AT SINK TIME — durable per row, so a run killed
+        # mid-way (client timeout, broker restart, the laptop dying hard) keeps
+        # every row it paid the teacher for (gap 0c062b3c83c3). Without a
+        # model the rows only buffer and flush_escalations() writes them, the
+        # pre-#568 posture. The learned-centroid merge stays end-of-run: it is
+        # a fold, not a log.
+        self.escalation_model = escalation_model
+        self.escalations_logged = 0
+        self.escalation_errors: list[str] = []
 
     def sink_for(self, *, key: str, snippet: str) -> LearnSink:
         """A per-file hook bound to this file's hash + snippet."""
@@ -290,17 +300,36 @@ class Recorder:
     def escalation_sink_for(self, *, key: str) -> EscalationSink:
         """A per-file hook that records each tier-3 escalation under this file's hash."""
         def _sink(row: dict) -> None:
-            self.escalations.append({
+            full = {
                 "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "hash": key,
                 **row,
-            })
+            }
+            self.escalations.append(full)
+            if self.escalation_model:
+                out = append_escalations(self.escalation_model, [full])
+                self.escalations_logged += out.get("logged", 0)
+                if out.get("error"):
+                    self.escalation_errors.append(out["error"])
         return _sink
 
     def flush_learned(self, model: str) -> dict:
         return merge_learned(model, self.confident)
 
     def flush_escalations(self, teacher_model: str) -> dict:
+        """Report the escalation log for this run.
+
+        With an `escalation_model` the rows are already on disk; this only
+        totals them (and carries the first write error, if any). Without one,
+        this is the write.
+        """
+        if self.escalation_model:
+            out = {"logged": self.escalations_logged,
+                   "path": str(_escalation_path(self.escalation_model))}
+            if self.escalation_errors:
+                out["error"] = self.escalation_errors[0]
+                out["errors"] = len(self.escalation_errors)
+            return out
         return append_escalations(teacher_model, self.escalations)
 
 

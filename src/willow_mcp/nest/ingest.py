@@ -28,7 +28,13 @@ def run(folder: Path, db_path: Path, owner: str, dry_run: bool = False,
         verbose: bool = False, use_llm: bool = False, use_embed: bool = True,
         text_model: str | None = None, vision_model: str | None = None,
         embed_model: str | None = None, learn: bool = False,
-        discover: int = 0, promote: bool = False) -> dict:
+        discover: int = 0, promote: bool = False,
+        max_files: int = 0, skip: int = 0) -> dict:
+    """Walk `folder`, classify, write. `max_files` / `skip` bound one call
+    to a window of the sorted file list so a large drop folder can be
+    walked in ticks (the 1,061-source Nest with the LLM tier on runs far
+    past any MCP call window); `counts["window"]` says what was seen and
+    what to pass as `skip` next time, or None when the walk is complete."""
     conn = None if dry_run else _db.open_db(db_path)
     if conn:
         _db.init_meta(conn, owner=owner, description=f"Seeded from {folder}")
@@ -49,13 +55,26 @@ def run(folder: Path, db_path: Path, owner: str, dry_run: bool = False,
     # classifier already computes) for self-learning and clustering discovery,
     # and every tier-3 escalation when the LLM tier is on — the escalation log
     # accumulates from normal operation, not only from a --learn run.
-    recorder = _learn.Recorder() if (learn or discover or promote or use_llm) else None
+    # With the LLM tier on, the Recorder names the teacher so each escalation
+    # is appended at sink time (durable per row — gap 0c062b3c83c3).
+    teacher = text_model or _llm.DEFAULT_TEXT_MODEL
+    recorder = None
+    if learn or discover or promote or use_llm:
+        recorder = _learn.Recorder(escalation_model=teacher if use_llm else None)
 
     supported = _ocr.supported_suffixes()
-    files = [p for p in sorted(folder.rglob("*"))
-             if p.is_file() and p.suffix.lower() in supported]
+    all_files = [p for p in sorted(folder.rglob("*"))
+                 if p.is_file() and p.suffix.lower() in supported]
+    skip = max(0, int(skip or 0))
+    files = all_files[skip:]
+    if max_files and max_files > 0:
+        files = files[:int(max_files)]
+    seen_end = skip + len(files)
 
-    counts = {"files": 0, "extracted": 0, "failed": 0, "fragments": 0, "skipped": 0}
+    counts = {"files": 0, "extracted": 0, "failed": 0, "fragments": 0, "skipped": 0,
+              "window": {"total": len(all_files), "skip": skip,
+                         "max_files": int(max_files or 0), "seen": len(files),
+                         "next_skip": seen_end if seen_end < len(all_files) else None}}
 
     for path in files:
         counts["files"] += 1
@@ -121,14 +140,15 @@ def run(folder: Path, db_path: Path, owner: str, dry_run: bool = False,
 
     # Escalation log, three-state: off (LLM tier not requested), on with a count
     # (possibly zero — every doc resolved on the embedding tier), or on and the
-    # log itself could not be written. Written even on a dry run: the tuple was
-    # computed and the teacher was paid for either way.
+    # log could not be written. Rows were appended at sink time; this totals
+    # them. Logged even on a dry run: the tuple was computed and the teacher
+    # was paid for either way.
     if recorder is None or not use_llm:
         counts["escalations"] = {"state": "off", "escalated": 0, "logged": 0}
     else:
         escalated = len(recorder.escalations)
         unanswered = sum(1 for r in recorder.escalations if r.get("verdict") is None)
-        flushed = recorder.flush_escalations(text_model or _llm.DEFAULT_TEXT_MODEL)
+        flushed = recorder.flush_escalations(teacher)
         counts["escalations"] = {
             "state": "unreachable" if flushed.get("error") else "on",
             "escalated": escalated,

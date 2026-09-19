@@ -1940,10 +1940,18 @@ def nest_scan(
     learn: bool = False,
     discover: int = 0,
     promote: bool = False,
+    max_files: int = 0,
+    skip: int = 0,
 ) -> dict:
     """Walk a drop folder, extract + classify its files, and write a canonical
     SQLite Nest DB. Returns structure only (counts by source status and fragment
     type) — never file content.
+
+    `max_files` / `skip` bound one call to a window of the sorted file list, so
+    a large folder is walked in ticks: `counts.window.next_skip` is what to pass
+    as `skip` next time, or null when the walk is complete. With the LLM tier
+    on, the ~1,000-source Nest runs far past any MCP call window in one go;
+    tick it.
 
     dry_run=True (default): classify and report counts WITHOUT writing the DB —
     inspect what a dump would become before committing it. dry_run=False writes.
@@ -2006,6 +2014,8 @@ def nest_scan(
                 learn=learn,
                 discover=discover,
                 promote=promote,
+                max_files=max_files,
+                skip=skip,
             )
     except Exception as e:  # engine failure must not take the server down
         return {"error": f"nest scan failed: {type(e).__name__}: {e}"}
