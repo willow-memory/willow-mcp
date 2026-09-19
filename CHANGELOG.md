@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **seal:** the watcher resolves the ledger the way the sealer does ([870be2a](https://github.com/willow-memory/willow-mcp/commit/870be2a17d4bd03458b4f153acaaad0127dc0c77))
 * **seal:** the watcher resolves the ledger the way the sealer does ([20a5683](https://github.com/willow-memory/willow-mcp/commit/20a56834dc53fbcf6e098ed38e49f8526a4d4388))
 
 ## [2.56.0](https://github.com/willow-memory/willow-mcp/compare/v2.55.0...v2.56.0) (2026-09-19)
