@@ -190,7 +190,7 @@ gcal = [
 # jeles stays named in tests.yml rather than here: it is a runtime dependency
 # `pip install -e "."` already brings, and two test files importorskip on it —
 # see the comment on that step for why it is restated explicitly.
-# ruff is pinned here to match the lint job's `pip install ruff==0.15.0`
+# ruff is pinned here to match the lint job's `pip install ruff==0.16.7`
 # (.github/workflows/tests.yml): tests/test_stop_lint_gate.py exercises the
 # Stop-hook green-claim gate against a REAL ruff subprocess (F401 output,
 # timeout handling, etc). CI's test-matrix job only ever ran
@@ -208,7 +208,7 @@ test = [
     "coverage",
     "PyYAML>=6.0,<7.0",
     "jsonschema>=4.0,<5.0",
-    "ruff==0.15.0",
+    "ruff==0.16.7",
     # The fleet's convention set has one home — willow-reconciler publishes it
     # (`reconciler conventions --json`, `reconciler.conventions.conventions()`)
     # and tests/test_fleet_conventions.py READS it rather than restating it
