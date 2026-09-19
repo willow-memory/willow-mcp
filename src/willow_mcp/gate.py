@@ -226,6 +226,16 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     "governance_propose": frozenset({
         "decision_propose",
     }),
+    # Seal watch as a tick (sealed decision 72292afd; gap 7a114cfb8cc4) —
+    # drain the Nestor ledger from the stored offset and mirror each HUMAN
+    # decision seal onto its projects_willow_governance_decisions record.
+    # Its own group: it writes governance records, but only ever to reflect a
+    # seal a human already made — less authority than propose, none of seal.
+    # Meant for the steward's seat and the desk, the same callers that run
+    # fleet_health on the tick.
+    "governance_sync": frozenset({
+        "seal_drain",
+    }),
     # Cryptographic identity binding (willow-gate seam, Phase 2). The security is
     # the HMAC signature, not this ACL; the group just lets a manifest opt an app
     # into calling check-in. Registration stays operator/CLI-only.
@@ -395,6 +405,10 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         "fleet_status", "fleet_health",
         "frank_read", "frank_verify",
         "bot_status", "pr_checks_read",
+        # Seal watch tick — mirrors a human's seal, mints nothing (unlike
+        # decision_propose, which stays off this line): the steward and the
+        # desk tick it beside fleet_health without a manifest re-sign.
+        "seal_drain",
         # Grove — the fleet's shared messaging room (read + write; no egress
         # concern like web_net/integration_net/mcp_federation, so unlike those
         # this rides full_access, same reasoning as knowledge_read/write above)

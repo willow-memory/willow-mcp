@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 129 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 130 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -1667,6 +1667,38 @@ def decision_propose(app_id: str, record_id: str, question: str = "",
     return decision_bridge.propose(app_id, record_id, question=question,
                                     conclusion=conclusion, rationale=rationale,
                                     origin=origin)
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("seal_drain")
+def seal_drain(app_id: str, max_records: int = 0, backfill: bool = False) -> dict:
+    """One tick of the seal watch (sealed decision 72292afd; gap
+    7a114cfb8cc4): read the vault's Nestor ledger from the stored offset,
+    hand every governance-decision seal to seal_handler.on_seal, and return
+    a receipt the steward journal and bot_status can show. The willow-bot
+    steward calls this every tick beside fleet_health and
+    commitment_surface; the standalone willow-seal-watch unit retires once
+    the tick step is live — one watcher, not two.
+
+    This mirrors a HUMAN's seal into SOIL; it seals nothing itself. The
+    counter-verb (Nestor's own seal, a human's signing key) stays out of
+    reach, same as decision_propose.
+
+    Three-state, never collapsed: `unreachable` (ledger missing/unreadable,
+    or the offset could not be saved — `reason` names which; nothing is
+    consumed), `empty` (no new bytes past the offset), `populated`
+    (`drained`, per-outcome `results`, and the `upgraded` pair ids). At
+    least once: the offset advances only after the whole batch is handled,
+    and on_seal is idempotent, so a replay is a clean `already`.
+
+    `max_records` bounds one tick (default 500; the rest is next tick,
+    `truncated: true`). `backfill=True` walks a ledger with no offset file
+    from the start instead of seeding at EOF."""
+    from . import seal_drain as _drain
+    kwargs = {}
+    if max_records and max_records > 0:
+        kwargs["max_records"] = int(max_records)
+    return _drain.drain(seed_at_eof_if_absent=not backfill, **kwargs)
 
 
 # ── Identity binding (willow-gate seam — check-in / check-out) ───────────────────
