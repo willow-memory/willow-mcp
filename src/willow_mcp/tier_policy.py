@@ -96,6 +96,9 @@ TOOL_CLASS: dict[str, str] = {
     # record's nestor_pair_id — a write, but never a seal (docs/design/
     # nestor-propose-bridge.md).
     "decision_propose": WRITE,
+    # seal_drain mirrors a human's Nestor seal onto the SOIL governance record
+    # and advances a local offset file — a write, never a seal (decision 72292afd).
+    "seal_drain": WRITE,
     "context_save": WRITE, "context_expire": WRITE,
     "frank_append": WRITE,
     # nest_scan writes a local SQLite Nest DB; nest_promote writes structure-only
