@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.56.1](https://github.com/willow-memory/willow-mcp/compare/v2.56.0...v2.56.1) (2026-09-19)
+
+
+### Fixed
+
+* **seal:** the watcher resolves the ledger the way the sealer does ([20a5683](https://github.com/willow-memory/willow-mcp/commit/20a56834dc53fbcf6e098ed38e49f8526a4d4388))
+
 ## [2.56.0](https://github.com/willow-memory/willow-mcp/compare/v2.55.0...v2.56.0) (2026-09-19)
 
 
