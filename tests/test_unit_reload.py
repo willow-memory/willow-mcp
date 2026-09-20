@@ -52,11 +52,11 @@ class _FakeGovernanceCursor:
         if s.startswith("SELECT hash FROM"):
             self._result = [(self.pg.rows[-1]["hash"],)] if self.pg.rows else []
             return
-        if s.startswith("SELECT content, created_at FROM"):
+        if s.startswith("SELECT id, content, created_at FROM"):
             event_type = params[0]
             matches = [r for r in self.pg.rows if r["event_type"] == event_type]
             matches.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
-            self._result = [(r["content"], r.get("created_at")) for r in matches]
+            self._result = [(r["id"], r["content"], r.get("created_at")) for r in matches]
             return
         if s.startswith("INSERT INTO"):
             record_id, project, event_type, content, prev_hash, digest = params

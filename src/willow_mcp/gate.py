@@ -226,6 +226,16 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     "governance_propose": frozenset({
         "decision_propose",
     }),
+    # Seal watch as a tick (sealed decision 72292afd; gap 7a114cfb8cc4) —
+    # drain the Nestor ledger from the stored offset and mirror each HUMAN
+    # decision seal onto its projects_willow_governance_decisions record.
+    # Its own group: it writes governance records, but only ever to reflect a
+    # seal a human already made — less authority than propose, none of seal.
+    # Meant for the steward's seat and the desk, the same callers that run
+    # fleet_health on the tick.
+    "governance_sync": frozenset({
+        "seal_drain",
+    }),
     # Cryptographic identity binding (willow-gate seam, Phase 2). The security is
     # the HMAC signature, not this ACL; the group just lets a manifest opt an app
     # into calling check-in. Registration stays operator/CLI-only.
@@ -311,6 +321,10 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # host, skip records the decision. Filing is a filesystem mutation, so it
         # rides the write group (never nest_read).
         "nest_intake_scan", "nest_intake_file", "nest_intake_skip",
+        # human negative-correction path (GAP #2a): demotes a learned centroid
+        # entry (and logs a training_corpus row) — a mutation of the Nest's
+        # local learned store, same class as the router's file/skip above.
+        "nest_correct_classification",
     }),
     # The Commitment Membrane (willow_mcp.commitments) — the operator's kept record
     # of their own calendar commitments (Jarvis layer 2). Read is the dew-rule surface
@@ -395,6 +409,10 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         "fleet_status", "fleet_health",
         "frank_read", "frank_verify",
         "bot_status", "pr_checks_read",
+        # Seal watch tick — mirrors a human's seal, mints nothing (unlike
+        # decision_propose, which stays off this line): the steward and the
+        # desk tick it beside fleet_health without a manifest re-sign.
+        "seal_drain",
         # Grove — the fleet's shared messaging room (read + write; no egress
         # concern like web_net/integration_net/mcp_federation, so unlike those
         # this rides full_access, same reasoning as knowledge_read/write above)
@@ -424,7 +442,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # The Nest (content pipeline + live router; scan/promote/file/skip write)
         "nest_status", "nest_digest", "nest_scan", "nest_promote",
         "nest_intake_scan", "nest_intake_queue", "nest_intake_file",
-        "nest_intake_skip", "nest_intake_flags",
+        "nest_intake_skip", "nest_intake_flags", "nest_correct_classification",
         # The Commitment Membrane (read surface + ledger ingest/acknowledge; never
         # writes the calendar back — no new authority)
         "commitment_surface", "commitment_list",
@@ -788,9 +806,18 @@ _LOGICAL_COLLECTION_RE = re.compile(
 
 
 def collection_aliases(app_id: str) -> dict[str, str]:
-    """Return validated explicit logical→physical aliases from the manifest."""
+    """Return validated explicit logical→physical aliases from the manifest.
+
+    Aliases whose physical target sits outside this app's ``store_scope`` are
+    dropped (gap 982594e01ab3 / H4): registry-level ``projects_willow_*``
+    aliases are often merged into every specialist manifest, and serving them
+    made orientation report ``collection_denied`` by construction. An out-of-
+    scope alias is not an alias for that seat — callers see
+    ``alias_not_configured`` instead of a permission wall they cannot clear.
+    """
     try:
-        manifest = _load_manifest(_validate_app_id(app_id))
+        app_id = _validate_app_id(app_id)
+        manifest = _load_manifest(app_id)
     except ValueError:
         return {}
     raw = (manifest or {}).get("collection_aliases") or {}
@@ -822,7 +849,14 @@ def collection_aliases(app_id: str) -> dict[str, str]:
             )
             return {}
         aliases[logical] = physical
-    return aliases
+    # Drop targets the seat cannot read — same rule as collection_permitted,
+    # applied at alias surface so orientation never invents a denial for a
+    # collection the seat was never meant to name.
+    return {
+        logical: physical
+        for logical, physical in aliases.items()
+        if collection_permitted(app_id, physical)
+    }
 
 
 def resolve_collection_alias(

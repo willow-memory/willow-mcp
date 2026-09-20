@@ -6,7 +6,6 @@ tripped. See `session_friction_scan.py` for the fail-open contract."""
 from __future__ import annotations
 
 import json
-import os
 import sys
 
 from .session_friction_scan import scan_session_for_friction
@@ -14,14 +13,26 @@ from .stack_snapshot import write_stack_snapshot
 
 
 def handle(payload: dict) -> dict:
-    app_id = os.environ.get("WILLOW_APP_ID", "willow")
+    from .seat_identity import resolve_hook_app_id
+
+    # Same seat rule as SessionStart (gaps acceefc0ec77 / 3727efb30041): never
+    # default to willow, never trust an env that disagrees with .mcp.json.
+    app_id, app_err = resolve_hook_app_id()
     session_id = str(
         payload.get("session_id")
         or payload.get("conversation_id")
         or ""
     )
-    result = write_stack_snapshot(app_id, session_id)
-    out = {"stack_snapshot": result}
+    if app_err or not app_id:
+        out: dict = {
+            "stack_snapshot": {
+                "error": "seat_unresolved",
+                "detail": app_err or "WILLOW_APP_ID could not be resolved",
+            }
+        }
+    else:
+        result = write_stack_snapshot(app_id, session_id)
+        out = {"stack_snapshot": result}
 
     # Fail-open, belt and suspenders: scan_session_for_friction already never
     # raises, but SessionEnd must never fail to report a result over a signal

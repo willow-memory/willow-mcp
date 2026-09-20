@@ -70,19 +70,70 @@ def seal_predicate(record: dict) -> bool:
     )
 
 
+#: Nestor's own env for the ledger. Read here so the watcher resolves the
+#: chain the way the sealer does — gap 507a71433397: for five days the
+#: 8765 UI sealed into ``<NESTOR_DB>.ledger.jsonl`` (Nestor's
+#: ``home_paths.ledger_for`` spelling when NESTOR_LEDGER is unset) while this
+#: watcher tailed ``$WILLOW_HOME/ledger.jsonl`` and reported, truthfully of
+#: the file and falsely of the box, that nothing had been sealed.
+_NESTOR_LEDGER_ENV = "NESTOR_LEDGER"
+_NESTOR_DB_ENV = "NESTOR_DB"
+_LEGACY_LEDGER_NAME = "ledger.jsonl"
+
+
 def default_ledger_path() -> Path:
+    """The chain the sealer writes, resolved in the sealer's order.
+
+    1. ``WILLOW_NESTOR_LEDGER`` — this watcher's own explicit pin.
+    2. ``NESTOR_LEDGER`` — Nestor's explicit pin; every Nestor process on the
+       box that has it set seals here.
+    3. ``<NESTOR_DB>.ledger.jsonl`` beside the database, *if it exists* —
+       what a Nestor process with no NESTOR_LEDGER creates and appends to
+       (``home_paths.ledger_for``). Existence is the test: a box that never
+       grew the per-db spelling keeps its legacy chain.
+    4. ``$WILLOW_HOME/ledger.jsonl`` — the legacy default, and where the
+       historical seals up to 2026-09-13 live.
+    """
     override = os.environ.get(NESTOR_LEDGER_ENV, "").strip()
     if override:
         return Path(override).expanduser()
-    return paths.willow_home() / "ledger.jsonl"
+    nestor_env = os.environ.get(_NESTOR_LEDGER_ENV, "").strip()
+    if nestor_env:
+        return Path(nestor_env).expanduser()
+    db = os.environ.get(_NESTOR_DB_ENV, "").strip()
+    if db:
+        beside = Path(db).expanduser()
+        beside = beside.with_name(beside.name + ".ledger.jsonl")
+        if beside.exists():
+            return beside
+    home = paths.willow_home()
+    # A box with no NESTOR_DB in this process's env but a per-db chain on
+    # disk under WILLOW_HOME (the operator-box layout) still gets the sealer's
+    # file; the legacy name is the fallback, not the first guess.
+    beside_home = home / "nestor.db.ledger.jsonl"
+    if beside_home.exists():
+        return beside_home
+    return home / _LEGACY_LEDGER_NAME
 
 
-def default_offset_path() -> Path:
-    return paths.store_root() / _OFFSET_FILENAME
+def default_offset_path(ledger_path: Optional[Path] = None) -> Path:
+    """The watch position for ``ledger_path`` (default: the resolved ledger).
+
+    Keyed by ledger: the legacy chain keeps the unqualified
+    ``seal_watch.offset`` it has always had, so a box that never switched
+    resumes exactly where it was; any other chain gets
+    ``seal_watch.<ledger filename>.offset``. Two chains, two positions — an
+    offset measured against one file must never be applied to another.
+    """
+    ledger = Path(ledger_path) if ledger_path is not None else default_ledger_path()
+    if ledger.name == _LEGACY_LEDGER_NAME:
+        return paths.store_root() / _OFFSET_FILENAME
+    return paths.store_root() / f"seal_watch.{ledger.name}.offset"
 
 
 def _seed_offset_at_eof_if_absent(ledger_path: Path, offset_path: Path) -> None:
-    """First-run posture: watch only NEW seals.
+    """First-run posture for the LEGACY chain: watch only NEW seals. Any
+    other chain starts at 0 (see the branch below).
 
     ``JsonlTailWatcher`` defaults a missing offset file to 0 — read the
     ledger from the start — which is right for a watcher with no history
@@ -98,10 +149,18 @@ def _seed_offset_at_eof_if_absent(ledger_path: Path, offset_path: Path) -> None:
     if offset_path.exists():
         return
     offset_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        size = ledger_path.stat().st_size
-    except FileNotFoundError:
+    if ledger_path.name != _LEGACY_LEDGER_NAME:
+        # A chain other than the legacy one has never been watched from this
+        # box: every seal in it is unpropagated by definition, and it is
+        # short (the per-db chain was 42 rows at five days old). Start at 0
+        # so the first drain carries them all; on_seal is idempotent, so a
+        # record already sealed by some other path is a clean "already".
         size = 0
+    else:
+        try:
+            size = ledger_path.stat().st_size
+        except FileNotFoundError:
+            size = 0
     tmp = offset_path.with_name(offset_path.name + ".tmp")
     tmp.write_text(str(size), encoding="utf-8")
     tmp.replace(offset_path)
@@ -133,7 +192,7 @@ def build_seal_daemon(
         ) from _IMPORT_ERROR
 
     ledger = Path(ledger_path) if ledger_path is not None else default_ledger_path()
-    offset = Path(offset_path) if offset_path is not None else default_offset_path()
+    offset = Path(offset_path) if offset_path is not None else default_offset_path(ledger)
     _seed_offset_at_eof_if_absent(ledger, offset)
 
     return SeatDaemon(
@@ -186,7 +245,7 @@ def run_seal_watch_forever(
         ) from _IMPORT_ERROR
 
     ledger = Path(ledger_path) if ledger_path is not None else default_ledger_path()
-    offset = Path(offset_path) if offset_path is not None else default_offset_path()
+    offset = Path(offset_path) if offset_path is not None else default_offset_path(ledger)
     _seed_offset_at_eof_if_absent(ledger, offset)
 
     if stop is None:

@@ -84,7 +84,15 @@ def _refuse(errno: str, reason: str, **extra) -> dict:
 def _run(argv: list[str], *, runner: Optional[Callable] = None,
          timeout: float) -> subprocess.CompletedProcess:
     run = runner or subprocess.run
-    return run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    # `systemctl show` prints timestamps in the process's local zone and
+    # `_parse_systemd_timestamp` reads the result as UTC (strptime's %Z does
+    # not carry an offset). On a box west of Greenwich that read the unit
+    # as having started hours EARLIER than it did, which is invisible to a
+    # one-shot call but makes a polling caller (`reloader`) see "older than
+    # the receipt" on every tick after its own restart. Pin the zone so the
+    # printed text and the parse agree.
+    env = {**os.environ, "TZ": "UTC", "LC_ALL": "C"}
+    return run(argv, capture_output=True, text=True, timeout=timeout, check=False, env=env)
 
 
 def _git(checkout: Path, *args: str, runner: Optional[Callable] = None) -> subprocess.CompletedProcess:

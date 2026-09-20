@@ -1,0 +1,13 @@
+# Polls on a short cadence: a pull receipt is minutes old before anyone can
+# have sealed a decision naming it, and a tick that finds nothing due exits
+# quietly (EALREADY / ENOSEAL are the resting states, not failures).
+[Unit]
+Description=willow-mcp reloader — poll for a sealed pull receipt
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=@INTERVAL@
+Unit=@SERVICE_UNIT@
+
+[Install]
+WantedBy=timers.target

@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 129 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 131 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -579,14 +579,19 @@ def _transport_security():
 
 
 from .request_context import AdvertiseFilterMiddleware, RequestContextMiddleware
+from .tools_changed import ToolsChangedMiddleware
 
 _common_kwargs: dict[str, Any] = dict(
     # Outermost: publishes the per-request context on a ContextVar we own,
     # which is how _read_call_credential reaches `_meta` now that SDK 2.0
     # removed the ambient request contextvar. AdvertiseFilterMiddleware
     # runs inside that bind so tools/list can read seat identity and shrink
-    # discovery (desk_core) without changing call ACL.
-    middleware=[RequestContextMiddleware(), AdvertiseFilterMiddleware()],
+    # discovery (desk_core) without changing call ACL. ToolsChangedMiddleware
+    # sits between them: after each request it remembers the connection and
+    # fingerprints the seat's surface, sending notifications/tools/list_changed
+    # when it moved (decision ab9b55dd) — on the loop, where the SDK's async
+    # sends can be awaited.
+    middleware=[RequestContextMiddleware(), ToolsChangedMiddleware(), AdvertiseFilterMiddleware()],
     instructions=(
         "Willow sovereign agent platform (willow-mcp). "
         "FIRST CALL of every session: session_enter(app_id, session_id) — it returns your "
@@ -638,6 +643,15 @@ if _SERVE_MODE:
     _auth_provider.register_routes(mcp)
 else:
     mcp = MCPServer("willow-mcp", **_common_kwargs)
+
+# Decision ab9b55dd: the initialize result declares tools.listChanged (the SDK's
+# stdio path builds its InitializationOptions with no NotificationOptions, so
+# the flag was False on the wire), and this server's subscription bus is the
+# modern-era carrier for the notification. Raises at import if the SDK seam
+# moved — loud, never a quiet False.
+from .tools_changed import bind as _bind_tools_changed
+
+_bind_tools_changed(mcp)
 
 
 # ── MarkdownAI (mai) tools — vendored from legacy fleet monolith (sap/mai) ──────────────────
@@ -1669,6 +1683,38 @@ def decision_propose(app_id: str, record_id: str, question: str = "",
                                     origin=origin)
 
 
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("seal_drain")
+def seal_drain(app_id: str, max_records: int = 0, backfill: bool = False) -> dict:
+    """One tick of the seal watch (sealed decision 72292afd; gap
+    7a114cfb8cc4): read the vault's Nestor ledger from the stored offset,
+    hand every governance-decision seal to seal_handler.on_seal, and return
+    a receipt the steward journal and bot_status can show. The willow-bot
+    steward calls this every tick beside fleet_health and
+    commitment_surface; the standalone willow-seal-watch unit retires once
+    the tick step is live — one watcher, not two.
+
+    This mirrors a HUMAN's seal into SOIL; it seals nothing itself. The
+    counter-verb (Nestor's own seal, a human's signing key) stays out of
+    reach, same as decision_propose.
+
+    Three-state, never collapsed: `unreachable` (ledger missing/unreadable,
+    or the offset could not be saved — `reason` names which; nothing is
+    consumed), `empty` (no new bytes past the offset), `populated`
+    (`drained`, per-outcome `results`, and the `upgraded` pair ids). At
+    least once: the offset advances only after the whole batch is handled,
+    and on_seal is idempotent, so a replay is a clean `already`.
+
+    `max_records` bounds one tick (default 500; the rest is next tick,
+    `truncated: true`). `backfill=True` walks a ledger with no offset file
+    from the start instead of seeding at EOF."""
+    from . import seal_drain as _drain
+    kwargs = {}
+    if max_records and max_records > 0:
+        kwargs["max_records"] = int(max_records)
+    return _drain.drain(seed_at_eof_if_absent=not backfill, **kwargs)
+
+
 # ── Identity binding (willow-gate seam — check-in / check-out) ───────────────────
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -1905,15 +1951,34 @@ def nest_scan(
     dry_run: bool = True,
     use_llm: bool = False,
     use_embed: bool = True,
+    learn: bool = False,
+    discover: int = 0,
+    promote: bool = False,
+    max_files: int = 0,
+    skip: int = 0,
 ) -> dict:
     """Walk a drop folder, extract + classify its files, and write a canonical
     SQLite Nest DB. Returns structure only (counts by source status and fragment
     type) — never file content.
 
+    `max_files` / `skip` bound one call to a window of the sorted file list, so
+    a large folder is walked in ticks: `counts.window.next_skip` is what to pass
+    as `skip` next time, or null when the walk is complete. With the LLM tier
+    on, the ~1,000-source Nest runs far past any MCP call window in one go;
+    tick it.
+
     dry_run=True (default): classify and report counts WITHOUT writing the DB —
     inspect what a dump would become before committing it. dry_run=False writes.
     use_embed uses an Ollama embedding model when present (falls back to regex
     offline); use_llm escalates the uncertain tail to a text/vision model.
+
+    Self-training loop (nest/selflearn.py), reachable from the desk rather than
+    only from a CLI flag: `learn` folds this run's confident classifications into
+    the learned centroids; `discover=k` clusters the uncertain tail into k
+    candidate categories (report-only); `promote` persists qualifying clusters
+    as new `auto:` categories. With use_llm on, every tier-3 escalation is
+    appended to the JSONL escalation log regardless — `counts.escalations`
+    reports it three-state: off / on with counts / unreachable.
 
     Inference stays on this machine by default. It is NOT unconditional: the
     seams post to $OLLAMA_HOST, and if that points off-box this tool requires the
@@ -1960,6 +2025,11 @@ def nest_scan(
                 verbose=False,
                 use_llm=use_llm,
                 use_embed=use_embed,
+                learn=learn,
+                discover=discover,
+                promote=promote,
+                max_files=max_files,
+                skip=skip,
             )
     except Exception as e:  # engine failure must not take the server down
         return {"error": f"nest scan failed: {type(e).__name__}: {e}"}
@@ -2160,6 +2230,61 @@ def nest_intake_flags(app_id: str) -> dict:
     classifier never rewrites its own rules; a human ratifies the delta."""
     from .nest import intake as _intake
     return {"status": "ok", "flags": _intake.open_flags(_store)}
+
+
+# nest_correct_classification (GAP #2a) is the human negative-correction path
+# for the embedding/tier-3 text classifier: nest_scan's `learn` fold
+# (selflearn.merge_learned) is additive-only, with no way for a human to say
+# "that classification was wrong" and have it DEMOTE the wrong category. This
+# closes that loop — the classifier proposes, a human ratifies or corrects,
+# same shape as nest_intake's file/skip gate above but for the embedding
+# centroids rather than the intake track rules. See nest/selflearn.py's
+# "human correction" section and nest/correct.py for the mechanism and why
+# it is numerically stable (no negative weights ever enter the centroid mean).
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("nest_correct_classification")
+def nest_correct_classification(
+    app_id: str,
+    wrong_category: str,
+    text: str = "",
+    correct_category: str = "",
+    record_hash: str = "",
+    embed_model: str = "",
+) -> dict:
+    """Tell the Nest classifier a text/tier-3 classification was WRONG.
+
+    `wrong_category` is the category the classifier produced (must be a
+    known exemplar/learned/`auto:`-discovered category — an unknown name is
+    rejected, not silently accepted). `text` is the document that was
+    misclassified (embedded with the same model the classifier uses, unless
+    `record_hash` names the original learned entry exactly). `correct_category`
+    is optional: given, the vector is also folded into it as a confident
+    exemplar (human ground truth bypasses the usual confidence margin).
+
+    This DEMOTES `wrong_category`: the offending vector is retracted from its
+    learned store, so the next `build_adaptive_centroids` no longer folds it
+    in. It also logs a training_corpus example (label_kind=human, negative
+    weight) — best effort; a logging failure never blocks the correction
+    itself. Requires nest write access."""
+    from . import model_egress
+    from .nest import correct as _correct
+    from .nest import embed as _embed
+
+    if text:
+        denial = model_egress.denial("nest_correct_classification")
+        if denial:
+            return denial
+
+    return _correct.record_correction(
+        _store,
+        embed_model or _embed.DEFAULT_EMBED_MODEL,
+        wrong_category=wrong_category,
+        text=text or None,
+        correct_category=correct_category or None,
+        record_hash=record_hash or None,
+        embed_model=embed_model or None,
+        app_id=app_id,
+    )
 
 
 # ── Gap backlog tools ──────────────────────────────────────────────────────────
@@ -2379,11 +2504,16 @@ def knowledge_verify(
     """Verify source provenance of knowledge records. Checks each record
     for a non-empty source field. Returns {outcome, total, sourced, unsourced,
     unsourced_records, recommendation}. outcome is pass/warn/fail.
-    Requires knowledge_read."""
+    Requires knowledge_read.
+
+    Also persists the outcome to the durable verification_log and a matching
+    training_corpus example (GAP #3) — best-effort; a store failure never
+    turns a successful verification into a failed response."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
-    return kb_verify.verify_sources(pg, app_id, domain=domain or None, limit=min(limit, 500))
+    return kb_verify.verify_and_record(pg, _store, app_id, check_kind="verify_sources",
+                                       domain=domain or None, limit=min(limit, 500))
 
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -2395,11 +2525,16 @@ def knowledge_check(
 ) -> dict:
     """Health check on knowledge records (mem_check analog). Checks for
     unsourced records, missing domains, and duplicate content. Returns
-    {flags, recommendation, evidence}. Requires knowledge_read."""
+    {flags, recommendation, evidence}. Requires knowledge_read.
+
+    Also persists the outcome to the durable verification_log and a matching
+    training_corpus example (GAP #3) — best-effort; a store failure never
+    turns a successful check into a failed response."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
-    return kb_verify.check_health(pg, app_id, domain=domain or None, limit=min(limit, 500))
+    return kb_verify.verify_and_record(pg, _store, app_id, check_kind="check_health",
+                                       domain=domain or None, limit=min(limit, 500))
 
 
 # ── Task queue tools ───────────────────────────────────────────────────────────
@@ -3391,6 +3526,34 @@ def kb_startup_continuity(app_id: str, limit: int = 20) -> dict:
 
 
 # ── Agent dispatch tools ───────────────────────────────────────────────────────
+#
+# GAP #5 (routing-lane logging) + GAP #6 (dispatch outcome-quality): the
+# routing_decisions row already recorded WHAT was decided (target_agent) but
+# not WHICH of the routing ladder's 8 lanes the request actually traversed,
+# nor any outcome-quality signal beyond a coarse done/failed status. Both are
+# OPTIONAL additions carried inside the existing `decision` jsonb column
+# (docs/schema/routing_decisions.postgres.sql already owns that column as the
+# one structured-detail field on this table — a new lane/quality column would
+# need a migration this repo's schema-ownership convention doesn't ask for
+# when jsonb already has room). Omitting either parameter reproduces exactly
+# today's row shape and today's UPDATE payload, so every existing caller is
+# unaffected.
+#
+# ROUTING_LANES is the closed set of ladder steps a caller/orchestrator may
+# tag a routing decision with. This module does not choose the lane itself —
+# the caller already knows which step of its own ladder resolved the
+# request — it only validates and persists what it is told.
+ROUTING_LANES = (
+    "sealed_fact",
+    "deterministic",
+    "mcp_read",
+    "corpus",
+    "shell_kart",
+    "tool_oracle",
+    "local_draft",
+    "open_synthesis",
+)
+
 
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("agent_route")
@@ -3399,12 +3562,25 @@ def agent_route(
     task: str,
     target_agent: str,
     context: Optional[dict] = None,
+    lane: Optional[str] = None,
 ) -> dict:
     """Record a routing decision — "this task goes to that agent" — in the
     fleet's routing_decisions ledger and return a routing_id for correlating
     the eventual outcome. Does NOT start or notify the target agent: pair with
     dispatch_send to actually deliver the work, and report completion via
-    agent_dispatch_result."""
+    agent_dispatch_result.
+
+    `lane` (GAP #5, optional) tags which routing-ladder step chose this
+    target — one of ROUTING_LANES (sealed_fact, deterministic, mcp_read,
+    corpus, shell_kart, tool_oracle, local_draft, open_synthesis). Omitted,
+    the `decision` jsonb gets no `lane` key at all — the row is byte-
+    identical to before this change — existing callers are unaffected;
+    given, `lane` is added to `decision`. An unrecognized lane is rejected
+    rather than silently stored, so the ladder-step vocabulary stays closed.
+    See list_routing_decisions_by_lane (server.py, not an MCP tool) to read
+    lane-tagged rows back."""
+    if lane is not None and lane not in ROUTING_LANES:
+        return {"error": f"unknown_lane: {lane!r} is not one of {ROUTING_LANES}"}
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
@@ -3412,6 +3588,8 @@ def agent_route(
     routing_id = str(uuid.uuid4())[:8].upper()
     prompt_hash = hashlib.sha256(task.encode()).hexdigest()[:16]
     decision = {"task": task, "target": target_agent, "context": context or {}}
+    if lane is not None:
+        decision["lane"] = lane
     try:
         cur = pg.cursor()
         cur.execute(
@@ -3423,7 +3601,49 @@ def agent_route(
         cur.close()
     except Exception as e:
         return {"error": f"routing_unavailable: {e}"}
-    return {"routing_id": routing_id, "target": target_agent, "status": "routed"}
+    out = {"routing_id": routing_id, "target": target_agent, "status": "routed"}
+    if lane is not None:
+        out["lane"] = lane
+    return out
+
+
+def list_routing_decisions_by_lane(pg, lane: Optional[str] = None, limit: int = 100) -> dict:
+    """Read-only helper (GAP #5) — NOT an MCP tool, so it adds no tool count.
+
+    Lists routing_decisions rows that carry a lane tag in their `decision`
+    jsonb, newest first. With `lane` given, filters to that one lane;
+    omitted, returns every lane-tagged row (rows written before this change,
+    or by a caller that omitted `lane`, are untagged and never appear here —
+    that is the backward-compat contract, not a bug). `pg` is a caller-
+    supplied connection (get_pg()) so this composes with the same pipeline
+    every other reader in this module uses."""
+    if pg is None:
+        return _postgres_unavailable()
+    if lane is not None and lane not in ROUTING_LANES:
+        return {"error": f"unknown_lane: {lane!r} is not one of {ROUTING_LANES}"}
+    where = "decision->>'lane' IS NOT NULL"
+    params: list = []
+    if lane is not None:
+        where += " AND decision->>'lane' = %s"
+        params.append(lane)
+    params.append(limit)
+    try:
+        cur = pg.cursor()
+        cur.execute(
+            f"SELECT id, decision FROM routing_decisions WHERE {where} "  # nosec B608 - where is built from a fixed lane-column check, never request input; all values are bound params
+            "ORDER BY created_at DESC LIMIT %s",
+            params,
+        )
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        return {"error": f"routing_unavailable: {e}"}
+    decisions = []
+    for rid, decision in rows:
+        if isinstance(decision, str):
+            decision = json.loads(decision)
+        decisions.append({"routing_id": rid, **decision})
+    return {"decisions": decisions, "count": len(decisions)}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -3433,27 +3653,97 @@ def agent_dispatch_result(
     routing_id: str,
     result: str,
     status: str = "done",
+    quality_score: Optional[float] = None,
+    quality_note: str = "",
 ) -> dict:
     """Close the loop on an agent_route call: attach the outcome — `result`
     text plus `status` (e.g. 'done', 'failed') — to the routing_decisions row
     named by `routing_id`. Returns {routing_id, status}, or {error: not_found}
-    for an unknown routing_id."""
+    for an unknown routing_id.
+
+    `quality_score` (GAP #6, optional) is a bounded outcome-quality signal in
+    [0.0, 1.0] — a rubric score for how good the dispatch outcome was, beyond
+    the coarse done/failed `status`. `quality_note` is an optional free-text
+    rubric note. Both omitted, the persisted payload and the return shape are
+    byte-identical to before this change.
+
+    Also appends a best-effort training_corpus example (source=dispatch_route,
+    GAP #5+#6): a store or corpus-write failure is logged and never turns a
+    successful dispatch-result call into a failed one."""
+    if quality_score is not None and not (0.0 <= quality_score <= 1.0):
+        return {"error": f"invalid_quality_score: {quality_score!r} must be between 0.0 and 1.0"}
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
+    payload = {"result": result, "dispatch_status": status}
+    if quality_score is not None:
+        payload["quality_score"] = quality_score
+    if quality_note:
+        payload["quality_note"] = quality_note
     try:
         cur = pg.cursor()
         cur.execute(
             "UPDATE routing_decisions "
             "SET decision = decision || %s::jsonb "
             "WHERE id = %s",
-            (json.dumps({"result": result, "dispatch_status": status}), routing_id)
+            (json.dumps(payload), routing_id)
         )
         updated = cur.rowcount
         cur.close()
     except Exception as e:
         return {"error": f"routing_unavailable: {e}"}
-    return {"routing_id": routing_id, "status": status} if updated else {"error": "not_found"}
+    if not updated:
+        return {"error": "not_found"}
+
+    # Best-effort training_corpus emission (GAP #5 lane + GAP #6 quality feed
+    # one row): read the now-complete decision back so `input`/
+    # `small_model_output` reflect the routing lane/target that were actually
+    # recorded, not just what this call itself was given. Never allowed to
+    # turn a successful dispatch-result call into a failed one (mirrors
+    # kb_verify.verify_and_record's try/except+log pattern).
+    try:
+        from .training_corpus import SOURCE_DISPATCH_ROUTE, TrainingExample, append_training_example
+        cur2 = pg.cursor()
+        cur2.execute("SELECT decision FROM routing_decisions WHERE id = %s", (routing_id,))
+        row = cur2.fetchone()
+        cur2.close()
+        if row:
+            full_decision = row[0]
+            if isinstance(full_decision, str):
+                full_decision = json.loads(full_decision)
+            large_label = {"status": status}
+            if quality_score is not None:
+                large_label["quality_score"] = quality_score
+            if quality_note:
+                large_label["quality_note"] = quality_note
+            example = TrainingExample(
+                source=SOURCE_DISPATCH_ROUTE,
+                input={
+                    "routing_id": routing_id,
+                    "task": full_decision.get("task"),
+                    "lane": full_decision.get("lane"),
+                    "context": full_decision.get("context"),
+                },
+                small_model_output={
+                    "target": full_decision.get("target"),
+                    "lane": full_decision.get("lane"),
+                },
+                large_label=large_label,
+                label_kind="verification" if quality_score is not None else "none",
+                provenance={"app_id": app_id, "routing_id": routing_id},
+            )
+            append_training_example(_store, example)
+    except Exception:
+        import logging
+        logging.getLogger("willow_mcp.server").warning(
+            "agent_dispatch_result: failed to append training_corpus example "
+            "for routing_id=%r", routing_id, exc_info=True,
+        )
+
+    out = {"routing_id": routing_id, "status": status}
+    if quality_score is not None:
+        out["quality_score"] = quality_score
+    return out
 
 
 # ── Verb-level citation-before-act enforcement (#333) ──────────────────────────
@@ -9946,7 +10236,29 @@ def _main():
                 file=sys.stderr,
             )
     except Exception as exc:  # noqa: BLE001 — never block startup on this convenience sync
+        _sync_result = None
+        _sync_ledger = None
         print(f"willow-mcp: syscall table sync failed: {exc}", file=sys.stderr)
+
+    # Decision ab9b55dd: ink what changed the tool surface before any client
+    # could be told — rows the sync just added, and an advertise mode that
+    # differs from the last one receipted for this seat. No session exists
+    # yet, so these receipts say state=empty; the runtime half lives in
+    # ToolsChangedMiddleware. Fail-soft for the same reason as the sync.
+    try:
+        from . import tools_changed as _tools_changed
+        for _r in _tools_changed.startup_check(
+            (os.environ.get("WILLOW_APP_ID") or "").strip(),
+            sync_result=_sync_result, ledger=_sync_ledger,
+        ):
+            print(
+                f"willow-mcp: tools surface changed at startup ({_r.get('trigger')}: "
+                f"{_r.get('reason')}) — no client to notify yet; receipt "
+                f"{_r.get('receipt_id') or _r.get('receipt_error')}",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001 — never block startup on the receipt of a change
+        print(f"willow-mcp: tools surface startup check failed: {exc}", file=sys.stderr)
 
     # Serve mode is SINGLE-INSTANCE per WILLOW_HOME — agent sessions, rate-limit
     # buckets and in-flight OAuth state are process memory, so a second replica

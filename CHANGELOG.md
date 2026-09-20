@@ -31,6 +31,72 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.60.0](https://github.com/willow-memory/willow-mcp/compare/v2.59.0...v2.60.0) (2026-09-20)
+
+
+### Added
+
+* **mcp:** notifications/tools/list_changed — declared, sent, inked (ab9b55dd) ([af53b47](https://github.com/willow-memory/willow-mcp/commit/af53b4774887ea8f3f3e761cafbc923e25fe3d64))
+
+
+### Fixed
+
+* **mcp:** tools/list_changed counts only what could arrive (Loki rework of af53b47) ([8fa3409](https://github.com/willow-memory/willow-mcp/commit/8fa34091448ee659baf236b5944edbb90d807b65))
+
+## [2.59.0](https://github.com/willow-memory/willow-mcp/compare/v2.58.0...v2.59.0) (2026-09-20)
+
+
+### Added
+
+* **mcp:** willow-mcp-reloader unit — restart the broker onto a sealed pull receipt (e961aff8) ([e148202](https://github.com/willow-memory/willow-mcp/commit/e148202b7e8c48d6028b432e0e66b09c20fba743))
+
+## [2.58.0](https://github.com/willow-memory/willow-mcp/compare/v2.57.0...v2.58.0) (2026-09-20)
+
+
+### Added
+
+* **dispatch:** log routing lane and dispatch outcome-quality ([e13e123](https://github.com/willow-memory/willow-mcp/commit/e13e123ab77d975a23b30acf6695312ed61c83c6))
+* **nest:** human negative-correction path for the embedding classifier ([cdea200](https://github.com/willow-memory/willow-mcp/commit/cdea2001bfbd2311a686fb77b4883f568de631a4))
+* **kb:** persist verification outcomes to a durable log ([0f293df](https://github.com/willow-memory/willow-mcp/commit/0f293dfcca93c22d7a634b2755ca280a5797dab4))
+* **nest:** add unified training-example schema ([a48f226](https://github.com/willow-memory/willow-mcp/commit/a48f226ac5e6581382c0d1fbb9423358144f446d))
+
+## [2.57.0](https://github.com/willow-memory/willow-mcp/compare/v2.56.1...v2.57.0) (2026-09-19)
+
+
+### Added
+
+* **nest:** escalation log durable per row; nest_scan walks a window ([27798f3](https://github.com/willow-memory/willow-mcp/commit/27798f34a2caa7a4efe3eb5aec7294a78c97774d))
+
+## [2.56.1](https://github.com/willow-memory/willow-mcp/compare/v2.56.0...v2.56.1) (2026-09-19)
+
+
+### Fixed
+
+* **seal:** the watcher resolves the ledger the way the sealer does ([20a5683](https://github.com/willow-memory/willow-mcp/commit/20a56834dc53fbcf6e098ed38e49f8526a4d4388))
+
+## [2.56.0](https://github.com/willow-memory/willow-mcp/compare/v2.55.0...v2.56.0) (2026-09-19)
+
+
+### Added
+
+* **seal:** seal_drain — the seal watch as one tick of the steward ([306c6d8](https://github.com/willow-memory/willow-mcp/commit/306c6d8031f46178ebf9abec7a904c2ef3a45d79))
+
+## [2.55.0](https://github.com/willow-memory/willow-mcp/compare/v2.54.1...v2.55.0) (2026-09-18)
+
+
+### Added
+
+* **nest:** log every tier-3 escalation; self-training loop reachable from nest_scan ([0a71c83](https://github.com/willow-memory/willow-mcp/commit/0a71c834ea2ed7685663f381daa8516060cf5475))
+
+## [2.54.1](https://github.com/willow-memory/willow-mcp/compare/v2.54.0...v2.54.1) (2026-09-17)
+
+
+### Fixed
+
+* **hooks:** resolve seat from .mcp.json; refuse env mismatch ([0e642e9](https://github.com/willow-memory/willow-mcp/commit/0e642e9594163778a7bcd460f24353505e69b095))
+* **hooks:** drop collection aliases outside store_scope ([9e72916](https://github.com/willow-memory/willow-mcp/commit/9e729162852d96611ea9f867978f8c67518c166e))
+* **hooks:** block python3 - << in bash routing ([4589c69](https://github.com/willow-memory/willow-mcp/commit/4589c69980ecf55799a730c676bd3f1d29803122))
+
 ## [2.54.0](https://github.com/willow-memory/willow-mcp/compare/v2.53.0...v2.54.0) (2026-09-17)
 
 
