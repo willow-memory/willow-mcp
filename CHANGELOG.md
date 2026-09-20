@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **mcp:** willow-mcp-reloader unit — restart the broker onto a sealed pull receipt (e961aff8) ([007717f](https://github.com/willow-memory/willow-mcp/commit/007717f5aff73b3d05e3047d831fae7d8cea3f31))
 * **mcp:** willow-mcp-reloader unit — restart the broker onto a sealed pull receipt (e961aff8) ([e148202](https://github.com/willow-memory/willow-mcp/commit/e148202b7e8c48d6028b432e0e66b09c20fba743))
 
 ## [2.58.0](https://github.com/willow-memory/willow-mcp/compare/v2.57.0...v2.58.0) (2026-09-20)
