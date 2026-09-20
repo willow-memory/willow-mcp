@@ -261,6 +261,141 @@ def build_adaptive_centroids(model: str = _embed.DEFAULT_EMBED_MODEL,
     return out
 
 
+# --- human correction (GAP #2a): negative feedback into the learned store --
+#
+# merge_learned/build_adaptive_centroids above are additive-only: there is no
+# path for a human to say "that classification was wrong" and have it demote
+# the wrong category. This section adds one.
+#
+# Mechanism, chosen for numerical stability over raw negative weighting:
+# RETRACT the offending vector from the wrong category's learned store (so
+# build_adaptive_centroids's exact mean over exemplars+learned no longer
+# includes it — the denominator only ever shrinks toward n_exemplars, never
+# toward or past zero, and the centroid arithmetic never sees a negative
+# weight at all), and, optionally, PROMOTE the same vector into the correct
+# category via the ordinary (positive) merge_learned() path. A human
+# correction is ground truth, so the promotion bypasses LEARN_MIN_MARGIN
+# entirely rather than being subject to the same confidence gate a machine
+# observation is.
+
+# A vector already in the learned store this close (cosine) to the corrected
+# one is treated as "the same observation" for retraction when no exact hash
+# is given — near-1.0 so an unrelated-but-similar document is never retracted
+# by mistake.
+CORRECTION_MATCH_COSINE = 0.999
+
+
+class CorrectionError(ValueError):
+    """A malformed or unresolvable human correction — rejected, not applied."""
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _validate_correction_vec(vec) -> list[float]:
+    """Reject a malformed vector before it can reach any centroid arithmetic."""
+    if not isinstance(vec, (list, tuple)) or not vec:
+        raise CorrectionError("vec must be a non-empty list of numbers")
+    try:
+        out = [float(x) for x in vec]
+    except (TypeError, ValueError):
+        raise CorrectionError("vec must contain only numbers") from None
+    if any(math.isnan(x) or math.isinf(x) for x in out):
+        raise CorrectionError("vec must not contain NaN/inf")
+    if all(x == 0.0 for x in out):
+        raise CorrectionError("vec must not be the all-zero vector")
+    return out
+
+
+def known_categories(model: str) -> set[str]:
+    """Every category name the classifier could plausibly have produced:
+    curated exemplar categories, learned members, and promoted `auto:`
+    discoveries. A correction naming anything outside this set is rejected
+    (fail-safe) rather than silently creating a new, unvetted category."""
+    return set(_tax.EXEMPLARS) | set(load_learned(model)) | set(load_discovered(model))
+
+
+def apply_correction(model: str, *, wrong_category: str, vec: list,
+                     correct_category: str | None = None,
+                     record_hash: str | None = None,
+                     max_per_cat: int | None = None) -> dict:
+    """Demote `wrong_category` for `vec` and, optionally, promote `correct_category`.
+
+    Raises CorrectionError (nothing written) for: an unknown wrong/correct
+    category, `correct_category == wrong_category`, or a malformed `vec`
+    (empty, non-numeric, NaN/inf, or the zero vector).
+
+    Returns {status, wrong_category, retracted, correct_category, promoted}.
+    `retracted` is the number of learned entries removed from
+    `wrong_category` (0 or 1 in the normal case; a hash match is exact, a
+    vector match is by near-identity cosine — see CORRECTION_MATCH_COSINE).
+    `promoted` is 1 iff a `correct_category` was given and the vector was
+    added to it (0 if it was already present, deduped by hash as usual).
+    """
+    if max_per_cat is None:
+        max_per_cat = LEARN_MAX_PER_CAT
+    vec = _validate_correction_vec(vec)
+
+    if not wrong_category or not isinstance(wrong_category, str):
+        raise CorrectionError("wrong_category must be a non-empty str")
+    known = known_categories(model)
+    if wrong_category not in known:
+        raise CorrectionError(f"unknown category {wrong_category!r}")
+    if correct_category is not None:
+        if not isinstance(correct_category, str) or not correct_category:
+            raise CorrectionError("correct_category must be a non-empty str or None")
+        if correct_category == wrong_category:
+            raise CorrectionError("correct_category must differ from wrong_category")
+        if correct_category not in known:
+            raise CorrectionError(f"unknown category {correct_category!r}")
+
+    # --- retract from the wrong category ------------------------------------
+    store = load_learned(model)
+    bucket = store.get(wrong_category, [])
+    before = len(bucket)
+    if record_hash:
+        kept = [e for e in bucket if e.get("hash") != record_hash]
+    else:
+        kept = [e for e in bucket
+                if not e.get("vec") or _cosine(e["vec"], vec) < CORRECTION_MATCH_COSINE]
+    retracted = before - len(kept)
+    if retracted:
+        if kept:
+            store[wrong_category] = kept
+        else:
+            del store[wrong_category]
+        save_learned(model, store)
+
+    # --- promote the correct category (human ground truth, no margin gate) --
+    promoted = 0
+    if correct_category is not None:
+        h = record_hash or ("correction:" + hashlib.sha256(
+            json.dumps(vec, sort_keys=True).encode()).hexdigest()[:16])
+        summary = merge_learned(
+            model,
+            [{"category": correct_category, "vec": vec, "margin": 1.0, "hash": h}],
+            min_margin=0.0,
+            max_per_cat=max_per_cat,
+        )
+        promoted = summary["added"]
+
+    return {
+        "status": "ok",
+        "wrong_category": wrong_category,
+        "retracted": retracted,
+        "correct_category": correct_category,
+        "promoted": promoted,
+    }
+
+
 # --- per-run observation collector ------------------------------------------
 
 class Recorder:

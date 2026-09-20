@@ -1,17 +1,37 @@
 """willow_mcp/kb_verify.py — Knowledge-base source verification and health checks.
 
 Ports the verification patterns from 2.0's source_trail_verify and 1.9's
-mem_check into willow-mcp's schema-profile-aware KB surface.  Both functions
-are read-only and return a structured verdict dict with an outcome key plus
-evidence — the same shape frank_verify and the canonical verify tools use.
+mem_check into willow-mcp's schema-profile-aware KB surface.  `verify_sources`
+and `check_health` are read-only and return a structured verdict dict with an
+outcome key plus evidence — the same shape frank_verify and the canonical
+verify tools use.
+
+`verify_and_record` (below) is the ONLY function in this module that writes.
+It wraps the two read-only checks with a persistence layer: a durable,
+timestamped `verification_log` SOIL trail (GAP #3) plus a training_corpus
+example per run. The pure functions above remain side-effect-free when called
+directly — persistence is opt-in, not implicit in the verdict computation.
 """
 from __future__ import annotations
 
+import logging
+import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from . import kb_curate as kbc
 from . import schema_profile as sp
 from ._kb_sql import KNOWLEDGE_FIELDS, build_select, row_to_dict
+from .training_corpus import (
+    SOURCE_KB_VERIFY,
+    TrainingExample,
+    append_training_example,
+)
+
+logger = logging.getLogger(__name__)
+
+# SOIL collection for the durable verification trail (GAP #3).
+VERIFICATION_LOG_COLLECTION = "verification_log"
 
 
 def _query_records(pg, app_id: str, *, domain: Optional[str] = None,
@@ -190,3 +210,147 @@ def check_health(pg, app_id: str, *, domain: Optional[str] = None,
     if unmapped:
         result_dict["_unmapped"] = unmapped
     return result_dict
+
+
+# ── Persistence layer (GAP #3) ──────────────────────────────────────────────
+#
+# Everything above this line is the original, read-only surface: pure
+# functions that compute a verdict and return it. Nothing above ever touches
+# a store. What follows is additive — a thin wrapper that calls those pure
+# functions and then records the outcome, so real verify/health runs leave a
+# durable, timestamped trail instead of evaporating once the caller reads the
+# response.
+
+CHECK_KINDS = ("verify_sources", "check_health")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def record_verification(store, *, record_id: str, outcome: str, check_kind: str,
+                        evidence: Optional[dict] = None, ts: Optional[str] = None
+                        ) -> str:
+    """Persist one timestamped verification outcome to the durable log.
+
+    Keyed by `record_id + ts` (plus a short random suffix to rule out a
+    same-instant collision) rather than by `record_id` alone: the whole point
+    of this log is a history, not a snapshot. `store.put` upserts by id, so a
+    key that dropped the timestamp would make a second verification of the
+    same target silently replace the first instead of accumulating a trail
+    a human (or a later curator) can read the arc of over time.
+
+    Returns the stored row's `record_id`.
+    """
+    if not record_id or not isinstance(record_id, str):
+        raise ValueError("record_id must be a non-empty str")
+    if outcome not in ("pass", "warn", "fail"):
+        raise ValueError(f"outcome must be one of pass/warn/fail, got {outcome!r}")
+    if not check_kind or not isinstance(check_kind, str):
+        raise ValueError("check_kind must be a non-empty str")
+
+    ts = ts or _now_iso()
+    row = {
+        "record_id": record_id,
+        "outcome": outcome,
+        "check_kind": check_kind,
+        "evidence": evidence if evidence is not None else {},
+        "ts": ts,
+    }
+    log_id = f"{record_id}::{ts}::{uuid.uuid4().hex[:8]}"
+    store.put(VERIFICATION_LOG_COLLECTION, row, record_id=log_id)
+    return log_id
+
+
+def iter_verification_log(store, record_id: Optional[str] = None) -> list[dict]:
+    """Read back the verification trail, optionally filtered by `record_id`.
+
+    Mirrors the populated/empty/unreachable contract the other SOIL readers
+    follow: an empty or unreachable collection reads back as an empty list,
+    never an exception. Rows come back in `store.all()`'s created_at order
+    (oldest first) — the natural order for reading a history.
+    """
+    rows = store.all(VERIFICATION_LOG_COLLECTION)
+    if record_id is not None:
+        rows = [r for r in rows if r.get("record_id") == record_id]
+    return rows
+
+
+def _health_outcome(health_result: dict) -> str:
+    """Map check_health's {flags, ...} shape onto pass/warn/fail.
+
+    check_health has no outcome field of its own (it predates this
+    persistence layer and its own docstring commits it to staying read-only
+    and shape-stable); this derives one only for the log/training-example
+    side, using the same "how many distinct things are wrong" signal
+    verify_sources already uses via its 20% threshold.
+    """
+    flags = health_result.get("flags") or []
+    if not flags:
+        return "pass"
+    if len(flags) >= 2:
+        return "fail"
+    return "warn"
+
+
+def verify_and_record(pg, store, app_id: str, *, check_kind: str = "verify_sources",
+                      domain: Optional[str] = None, limit: int = 200,
+                      record_id: Optional[str] = None) -> dict:
+    """Run a read-only verification, then persist the outcome — best effort.
+
+    Calls `verify_sources` or `check_health` (chosen by `check_kind`), then
+    records the result to the durable `verification_log` and appends a
+    matching `training_corpus` example (source=kb_verify,
+    label_kind=verification) — the reward signal a later curation stage
+    consumes.
+
+    Persistence is best-effort relative to the verdict: a store write
+    failure is logged (not swallowed silently) but never raised, so a broken
+    log or corpus store cannot turn a successful verification into a failed
+    MCP tool call. The verdict dict returned is always exactly what the
+    underlying read-only function computed, plus `_verification_logged`
+    (bool) noting whether persistence succeeded.
+    """
+    if check_kind not in CHECK_KINDS:
+        raise ValueError(f"check_kind must be one of {CHECK_KINDS}, got {check_kind!r}")
+
+    if check_kind == "verify_sources":
+        verdict = verify_sources(pg, app_id, domain=domain, limit=limit)
+    else:
+        verdict = check_health(pg, app_id, domain=domain, limit=limit)
+
+    result = dict(verdict)
+    result["_verification_logged"] = False
+
+    if "error" in verdict:
+        # The read-only check itself couldn't run (e.g. unusable schema) —
+        # nothing was verified, so there is no outcome worth logging.
+        return result
+
+    outcome = verdict.get("outcome") if check_kind == "verify_sources" else _health_outcome(verdict)
+    rid = record_id or f"{app_id}:{domain or '_all'}"
+    ts = _now_iso()
+
+    try:
+        record_verification(store, record_id=rid, outcome=outcome,
+                            check_kind=check_kind, evidence=verdict, ts=ts)
+        result["_verification_logged"] = True
+    except Exception:
+        logger.exception("verify_and_record: failed to persist verification_log "
+                         "row for record_id=%r check_kind=%r", rid, check_kind)
+
+    try:
+        example = TrainingExample(
+            source=SOURCE_KB_VERIFY,
+            input={"record_id": rid, "check_kind": check_kind,
+                  "domain": domain, "app_id": app_id},
+            large_label={"outcome": outcome},
+            label_kind="verification",
+            provenance={"ts": ts, "check_kind": check_kind},
+        )
+        append_training_example(store, example)
+    except Exception:
+        logger.exception("verify_and_record: failed to append training_corpus "
+                         "example for record_id=%r check_kind=%r", rid, check_kind)
+
+    return result

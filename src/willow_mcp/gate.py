@@ -321,6 +321,10 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # host, skip records the decision. Filing is a filesystem mutation, so it
         # rides the write group (never nest_read).
         "nest_intake_scan", "nest_intake_file", "nest_intake_skip",
+        # human negative-correction path (GAP #2a): demotes a learned centroid
+        # entry (and logs a training_corpus row) — a mutation of the Nest's
+        # local learned store, same class as the router's file/skip above.
+        "nest_correct_classification",
     }),
     # The Commitment Membrane (willow_mcp.commitments) — the operator's kept record
     # of their own calendar commitments (Jarvis layer 2). Read is the dew-rule surface
@@ -438,7 +442,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # The Nest (content pipeline + live router; scan/promote/file/skip write)
         "nest_status", "nest_digest", "nest_scan", "nest_promote",
         "nest_intake_scan", "nest_intake_queue", "nest_intake_file",
-        "nest_intake_skip", "nest_intake_flags",
+        "nest_intake_skip", "nest_intake_flags", "nest_correct_classification",
         # The Commitment Membrane (read surface + ledger ingest/acknowledge; never
         # writes the calendar back — no new authority)
         "commitment_surface", "commitment_list",
