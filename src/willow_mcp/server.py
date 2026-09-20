@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 130 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 131 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -2216,6 +2216,61 @@ def nest_intake_flags(app_id: str) -> dict:
     classifier never rewrites its own rules; a human ratifies the delta."""
     from .nest import intake as _intake
     return {"status": "ok", "flags": _intake.open_flags(_store)}
+
+
+# nest_correct_classification (GAP #2a) is the human negative-correction path
+# for the embedding/tier-3 text classifier: nest_scan's `learn` fold
+# (selflearn.merge_learned) is additive-only, with no way for a human to say
+# "that classification was wrong" and have it DEMOTE the wrong category. This
+# closes that loop — the classifier proposes, a human ratifies or corrects,
+# same shape as nest_intake's file/skip gate above but for the embedding
+# centroids rather than the intake track rules. See nest/selflearn.py's
+# "human correction" section and nest/correct.py for the mechanism and why
+# it is numerically stable (no negative weights ever enter the centroid mean).
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("nest_correct_classification")
+def nest_correct_classification(
+    app_id: str,
+    wrong_category: str,
+    text: str = "",
+    correct_category: str = "",
+    record_hash: str = "",
+    embed_model: str = "",
+) -> dict:
+    """Tell the Nest classifier a text/tier-3 classification was WRONG.
+
+    `wrong_category` is the category the classifier produced (must be a
+    known exemplar/learned/`auto:`-discovered category — an unknown name is
+    rejected, not silently accepted). `text` is the document that was
+    misclassified (embedded with the same model the classifier uses, unless
+    `record_hash` names the original learned entry exactly). `correct_category`
+    is optional: given, the vector is also folded into it as a confident
+    exemplar (human ground truth bypasses the usual confidence margin).
+
+    This DEMOTES `wrong_category`: the offending vector is retracted from its
+    learned store, so the next `build_adaptive_centroids` no longer folds it
+    in. It also logs a training_corpus example (label_kind=human, negative
+    weight) — best effort; a logging failure never blocks the correction
+    itself. Requires nest write access."""
+    from . import model_egress
+    from .nest import correct as _correct
+    from .nest import embed as _embed
+
+    if text:
+        denial = model_egress.denial("nest_correct_classification")
+        if denial:
+            return denial
+
+    return _correct.record_correction(
+        _store,
+        embed_model or _embed.DEFAULT_EMBED_MODEL,
+        wrong_category=wrong_category,
+        text=text or None,
+        correct_category=correct_category or None,
+        record_hash=record_hash or None,
+        embed_model=embed_model or None,
+        app_id=app_id,
+    )
 
 
 # ── Gap backlog tools ──────────────────────────────────────────────────────────

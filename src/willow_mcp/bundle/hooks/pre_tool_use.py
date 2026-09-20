@@ -911,6 +911,7 @@ _SEAT_WRITE_TOOLS = frozenset({
     "knowledge_flag", "knowledge_ingest", "knowledge_retract",
     "lineage_link", "lineage_record",
     "mai_execute_directive", "mai_get_env", "mai_invalidate_cache", "mai_write_file",
+    "nest_correct_classification",
     "nest_intake_file", "nest_intake_scan", "nest_intake_skip", "nest_promote", "nest_scan",
     "nestor_tool_route", "nestor_tool_seal",
     "schema_confirm_mapping", "seal_drain",
