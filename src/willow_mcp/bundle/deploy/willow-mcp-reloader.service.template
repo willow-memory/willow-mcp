@@ -1,0 +1,21 @@
+# systemd --user template for the willow-mcp reloader (decision e961aff8).
+# One act: `systemctl --user restart @UNIT@`, and only when a FRANK git_pull
+# receipt for @CHECKOUT@ is named by a sealed Nestor decision. Type=oneshot
+# because it checks, restarts at most once, and exits — the .timer beside it
+# owns the cadence. A separate principal from the broker on purpose: the
+# broker's own unit_reload_execute refuses its own unit (EPERM), and this
+# unit is the hand that refusal points at.
+[Unit]
+Description=willow-mcp reloader — restart @UNIT@ onto a sealed pull receipt
+
+[Service]
+Type=oneshot
+WorkingDirectory=@CHECKOUT@
+Environment="WILLOW_HOME=@WILLOW_HOME@"
+Environment="WILLOW_STORE_ROOT=@WILLOW_STORE_ROOT@"
+Environment="WILLOW_PG_DB=@PG_DB@"
+Environment="WILLOW_NESTOR_DB=@NESTOR_DB@"
+Environment="WILLOW_RELOADER_UNIT=@UNIT@"
+Environment="WILLOW_RELOADER_CHECKOUT=@CHECKOUT@"
+Environment="WILLOW_RELOADER_REPO=@REPO@"
+ExecStart=@PYTHON@ -m willow_mcp.reloader tick
