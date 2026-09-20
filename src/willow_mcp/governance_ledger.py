@@ -383,21 +383,27 @@ class GovernanceLedger:
         same way via `->>'` on individual keys. Rows are walked newest
         first and the first match wins, so "latest" means what it says
         even though the table has no per-event-type index to lean on.
+
+        The row's ``id`` rides along: a `git_pull` receipt's content does
+        not carry its own id, and the ``reloader`` needs it — the sealed
+        decision that confirms a broker restart names the receipt by id
+        (decision ``e961aff8``), so the row id is the join key between
+        this ledger and Nestor's.
         """
         cur = self.pg.cursor()
         try:
             cur.execute(
-                f"SELECT content, created_at FROM {TABLE} "  # nosec B608 - TABLE is the module-level constant "frank_ledger"; event_type is a bound param
+                f"SELECT id, content, created_at FROM {TABLE} "  # nosec B608 - TABLE is the module-level constant "frank_ledger"; event_type is a bound param
                 "WHERE event_type = %s ORDER BY created_at DESC",
                 (event_type,),
             )
-            for content, created_at in cur.fetchall():
+            for record_id, content, created_at in cur.fetchall():
                 if isinstance(content, str):
                     content = json.loads(content)
                 if isinstance(content, dict) and all(
                     content.get(k) == v for k, v in match.items()
                 ):
-                    return {"content": content, "created_at": created_at}
+                    return {"id": record_id, "content": content, "created_at": created_at}
             return None
         finally:
             cur.close()
