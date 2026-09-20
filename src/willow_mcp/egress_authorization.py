@@ -107,6 +107,21 @@ def claimed_task_id(envelope: str) -> str:
     return value if isinstance(value, str) and _TASK_ID_RE.fullmatch(value) else ""
 
 
+def seal_pair_id_of(envelope: str) -> str:
+    """The ``seal_pair_id`` an envelope CLAIMS was its confirm, or ``""``.
+
+    A claim, not a fact — the field is inside the signed payload, so it is
+    only meaningful once ``verify_envelope`` has passed on the same string.
+    Callers use it to decide whether to look for a standing lease; they never
+    grant on it alone.
+    """
+    try:
+        value = json.loads(envelope).get("payload", {}).get("seal_pair_id", "")
+    except (AttributeError, TypeError, json.JSONDecodeError):
+        return ""
+    return value if isinstance(value, str) else ""
+
+
 def _parse_deadline(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -141,17 +156,32 @@ def sign_envelope(
     submitted_by: str,
     task_id: str,
     agent: str,
-    task: str,
+    task: str | None = None,
     ttl_seconds: int,
     nonce: str,
     scope: str = NETWORK_SCOPE,
     now: datetime | None = None,
+    task_hash: str | None = None,
+    seal_pair_id: str = "",
 ) -> str:
-    """Create a signed envelope. This function is never registered as an MCP tool."""
+    """Create a signed envelope. This function is never registered as an MCP tool.
+
+    ``task`` is hashed here (the operator's terminal path, ``sign-net-task``).
+    ``task_hash`` is the seal-driven path (decision ``c8572a92``): the signer
+    that holds the key never receives the task text — only the hash the
+    operator sealed — so it binds the hash it was handed. Exactly one of the
+    two must be given. ``seal_pair_id`` names the sealing Nestor pair and
+    rides INSIDE the signed payload, so an executor can tell a seal-minted
+    envelope from a terminal-minted one without trusting anything unsigned.
+    """
     if os.environ.get("WILLOW_IN_KART", "").strip():
         raise PermissionError("network authorization cannot be signed inside Kart")
     if not submitted_by.strip():
         raise ValueError("submitted_by is required")
+    if (task is None) == (task_hash is None):
+        raise ValueError("exactly one of task or task_hash is required")
+    if task_hash is not None and not re.fullmatch(r"[0-9a-f]{64}", task_hash):
+        raise ValueError("task_hash must be a 64-hex sha256")
     if not _TASK_ID_RE.fullmatch(task_id or ""):
         raise ValueError("task_id must be exactly 8 uppercase letters or digits")
     if not _AGENT_RE.fullmatch(agent or ""):
@@ -175,12 +205,14 @@ def sign_envelope(
         "submitted_by": submitted_by,
         "task_id": task_id,
         "agent": agent,
-        "task_hash": normalized_task_hash(task),
+        "task_hash": task_hash if task_hash is not None else normalized_task_hash(task or ""),
         "scope": scope,
         "issued_at": issued.isoformat(),
         "expires_at": (issued + timedelta(seconds=ttl_seconds)).isoformat(),
         "nonce": nonce,
     }
+    if seal_pair_id:
+        payload["seal_pair_id"] = seal_pair_id
     signature = _load_private_key(private_key_path).sign(
         _canonical_payload(payload)
     )
@@ -389,7 +421,12 @@ class ExecutorNetworkAuthorizer:
             return self._deny("task_net capability denied")
         if not consent.internet_permitted():
             return self._deny("internet consent denied")
-        if not lease.active(submitted_by):
+        # Decision c8572a92: a sealed per-task pair satisfies the lease FOR
+        # THAT TASK. The claim rides inside the signed payload
+        # (``seal_pair_id``), so it is only honoured after the signature
+        # verifies below — an unsigned claim of a seal is worth nothing. A
+        # standing lease still satisfies exactly as before.
+        if not lease.active(submitted_by) and not seal_pair_id_of(envelope):
             return self._deny("egress lease denied")
         if not lease.strict_trust_root():
             return self._deny("strict trust root is required")
