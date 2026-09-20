@@ -10,26 +10,32 @@ three the reloader (``e961aff8``) uses:
   task hash, inserts the row as :data:`HELD_STATUS` (a status the worker's
   ``claim_pending`` never selects — ``task_queue.py`` claims ``'pending'``
   only), and proposes ONE Nestor decision pair through the ordinary
-  ``decision_bridge`` path. The pair's conclusion binds exactly what
-  ``willow-net-auth-v2`` signs — ``task_id, agent, submitted_by, task_hash,
-  scope, ttl, nonce`` — and its rationale carries the task text so the human
-  reads what they seal. The hash is what the seal signs; the text is what
-  the human sees; the two are bound by the hash.
+  ``decision_bridge`` path. The pair's conclusion — the SEALED text — is the
+  bound line (``task_id, agent, submitted_by, scope, ttl, nonce``), a rule,
+  and the task text itself. No hash anywhere: a hash is the one field a
+  human cannot check by eye, and a line whose hash named a text other than
+  the one shown beside it was the phishable shape Loki found (7153DC79;
+  amending pair 6b305258). What the human reads is inside what they sign.
 * **confirm** — the operator's seal, in the Nestor UI, with the browser
   verifier key whose private half never leaves the browser.
 * **act** — :mod:`net_signer`, a separate process running as the egress
   key's owner. :func:`drain` (one tick, beside ``seal_drain.drain``) finds
-  each held row, reads its pair from ``nestor.db``, and hands the signer
-  ONLY the sealed bytes (``source_norm``, ``target_text``, ``verifier``,
-  ``seal_sig``) plus the bound fields as this side read them off the row.
-  The signer re-verifies the seal against the ring's public halves, parses
-  the bound fields out of the sealed text, refuses if this side's view
-  differs, and signs. The task text never crosses the socket — the protocol
-  asserts it.
+  each held row, reads its pair from ``nestor.db``, and hands the signer the
+  sealed bytes (``source_norm``, ``target_text``, ``verifier``, ``seal_sig``,
+  ``created_at``) plus this side's view of the identity fields. The signer
+  re-verifies the seal against the ring's public halves, splits the sealed
+  text, DERIVES the task hash from the body it verified, refuses if the
+  identity fields differ, and signs from that hash. No hash, no task text
+  and no pair id travel outside the seal — the client refuses to send them
+  and the signer refuses to read them — so every binding in the envelope is
+  something the operator sealed, never something a caller asserted.
 
-What this does NOT let any uid-1000 process do: sign. Without a seal the
-signer refuses (unsealed / bad signature / bound-field mismatch, each named);
-with a seal it signs exactly what the operator sealed and nothing else.
+What this does NOT let any uid-1000 process do: sign, or steer what is
+signed. Without a seal the signer refuses (unsealed / bad signature /
+identity mismatch, each named); with a seal it signs exactly the text the
+operator sealed and nothing else. This side then checks the envelope
+against the ROW's text (``verify_envelope(task=row.task)``) before release,
+so a row whose text differs from the sealed text is refused here.
 
 Three states on every step, never collapsed (INVARIANTS §1): a held row is
 ``waiting`` (no seal yet), ``minted`` (envelope attached, row released to
@@ -69,6 +75,22 @@ HELD_STATUS = "held_net_authorization"
 #: The status a held row is released to once its envelope is attached.
 RELEASED_STATUS = "pending"
 
+#: The status a held row is moved to when nobody sealed it in time. Terminal
+#: for the worker (never claimed), and `_row_blocks_net_authorization`
+#: treats a non-pending, non-running row as not runnable either way.
+EXPIRED_STATUS = "failed"
+
+#: How long a held row waits for a seal before it is refused as stale
+#: (Loki 7153DC79: a held row that never expires is a standing offer). One
+#: day: long enough for an operator away from the seal desk, short enough
+#: that a request from a session nobody remembers does not sit for a week.
+HELD_MAX_AGE_S = 24 * 60 * 60
+
+#: A seal older than this is not honoured for a NEW mint: the operator sealed
+#: it for a row that has since been refused as stale, or the seal predates a
+#: key rotation the ring cannot express. Same bound as the held row.
+SEAL_MAX_AGE_S = HELD_MAX_AGE_S
+
 #: Version tag on the sealed conclusion line. Bump it if the bound field set
 #: ever changes — a signer must refuse a line it does not know how to parse.
 BOUND_FORMAT = "willow-net-auth-v2"
@@ -83,8 +105,19 @@ EVENT_LEASE_MINTED = "net_lease_minted"
 #: The sealed-text field order. FROZEN alongside :data:`BOUND_FORMAT`: the
 #: signer parses this line independently of this module's parser and the two
 #: must agree byte for byte.
-BOUND_FIELDS = ("task_id", "agent", "submitted_by", "task_hash", "scope", "ttl", "nonce")
-LEASE_BOUND_FIELDS = ("app_id", "ttl", "reason_sha", "scope")
+#: No ``task_hash`` here (Loki 7153DC79, amending pair 6b305258): a hash in
+#: the line is the one field a human cannot check by eye, and a sealed line
+#: whose hash named a different text than the one shown beside it was the
+#: phishable shape. The text itself is IN the sealed bytes below the rule;
+#: the signer derives the hash from what was sealed and never accepts one.
+BOUND_FIELDS = ("task_id", "agent", "submitted_by", "scope", "ttl", "nonce")
+LEASE_BOUND_FIELDS = ("app_id", "ttl", "scope")
+
+#: Separates the bound line from the body in the sealed ``target_text``.
+#: A line of its own so neither a bound value nor a task line can be
+#: mistaken for it: task text is canonicalised (directive lines stripped)
+#: and a task containing this exact line is refused at hold time.
+SEALED_RULE = "---"
 
 _TASK_ID_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ0123456789"
 _BOUND_LINE_RE = re.compile(
@@ -150,8 +183,6 @@ def parse_bound_line(text: str) -> Optional[dict]:
         return None
     if not ea._TASK_ID_RE.fullmatch(out["task_id"]):
         return None
-    if not re.fullmatch(r"[0-9a-f]{64}", out["task_hash"]):
-        return None
     if out["scope"] not in ea._VALID_SCOPES:
         return None
     if not out["ttl"].isdigit():
@@ -159,6 +190,36 @@ def parse_bound_line(text: str) -> Optional[dict]:
     if not ea._NONCE_RE.fullmatch(out["nonce"]):
         return None
     return out
+
+
+def sealed_text(bound: dict, body: str) -> str:
+    """What the operator seals: the bound line, a rule, the body — the task
+    text for a task, the reason for a lease. The body is what the human
+    reads; being inside the sealed bytes is what makes reading it count."""
+    if SEALED_RULE in (body or "").splitlines():
+        raise ValueError(f"body contains the sealed rule line {SEALED_RULE!r}")
+    return bound_line(bound) + "\n" + SEALED_RULE + "\n" + (body or "")
+
+
+def split_sealed_text(text: str) -> Optional[tuple[dict, str]]:
+    """Inverse of :func:`sealed_text`: ``(bound, body)`` or ``None``. The
+    FIRST rule line splits; a body may not contain one, and a text with no
+    rule is not a sealed text. Used by the signer on the bytes it verified,
+    so the body it hashes is the body the human sealed."""
+    lines = (text or "").split("\n")
+    try:
+        rule_at = lines.index(SEALED_RULE)
+    except ValueError:
+        return None
+    if rule_at != 1:
+        return None
+    bound = parse_bound_line(lines[0])
+    if bound is None:
+        return None
+    body = "\n".join(lines[2:])
+    if SEALED_RULE in body.split("\n"):
+        return None
+    return bound, body
 
 
 def lease_bound_line(bound: dict) -> str:
@@ -186,9 +247,30 @@ def parse_lease_bound_line(text: str) -> Optional[dict]:
         return None
     if not out["ttl"].isdigit() or out["scope"] != "lease":
         return None
-    if not re.fullmatch(r"[0-9a-f]{16}", out["reason_sha"]):
-        return None
     return out
+
+
+def sealed_lease_text(bound: dict, reason: str) -> str:
+    if SEALED_RULE in (reason or "").splitlines():
+        raise ValueError(f"reason contains the sealed rule line {SEALED_RULE!r}")
+    return lease_bound_line(bound) + "\n" + SEALED_RULE + "\n" + (reason or "")
+
+
+def split_sealed_lease_text(text: str) -> Optional[tuple[dict, str]]:
+    lines = (text or "").split("\n")
+    try:
+        rule_at = lines.index(SEALED_RULE)
+    except ValueError:
+        return None
+    if rule_at != 1:
+        return None
+    bound = parse_lease_bound_line(lines[0])
+    if bound is None:
+        return None
+    reason = "\n".join(lines[2:])
+    if SEALED_RULE in reason.split("\n"):
+        return None
+    return bound, reason
 
 
 def question_for_task(bound: dict) -> str:
@@ -198,9 +280,9 @@ def question_for_task(bound: dict) -> str:
             f"({bound['agent']}, submitted by {bound['submitted_by']}, scope {bound['scope']})?")
 
 
-def question_for_lease(bound: dict) -> str:
-    return (f"Grant {bound['app_id']} a standing egress lease for {bound['ttl']}s "
-            f"(reason sha {bound['reason_sha']})?")
+def question_for_lease(bound: dict, nonce: str) -> str:
+    return (f"Grant {bound['app_id']} a standing egress lease for {bound['ttl']}s? "
+            f"[{nonce[:8]}]")
 
 
 # ── request: hold the row, propose the pair ───────────────────────────────────
@@ -237,24 +319,29 @@ def hold_and_propose(
     nonce = mint_nonce()
     bound = {
         "task_id": task_id, "agent": agent, "submitted_by": app_id,
-        "task_hash": ea.normalized_task_hash(task), "scope": scope,
-        "ttl": str(int(ttl_seconds)), "nonce": nonce,
+        "scope": scope, "ttl": str(int(ttl_seconds)), "nonce": nonce,
     }
     try:
-        line = bound_line(bound)
+        # The task text IS the sealed body. No hash anywhere the human
+        # cannot check; the signer derives it from the sealed bytes.
+        to_seal = sealed_text(bound, task)
     except ValueError as exc:
         return {"error": f"net_hold_denied: {exc}"}
 
     st = store if store is not None else Store()
     record_id = record_id_for_task(task_id)
+    held_at = _now().isoformat()
     st.put(seal_handler.GOVERNANCE_COLLECTION, {
         "title": question_for_task(bound),
-        "ruling": line,
-        "rationale": task,
+        "ruling": to_seal,
+        "rationale": (f"Seal only if the task text under the rule is what you mean to "
+                      f"authorize for {agent} on behalf of {app_id}. Decision c8572a92 as "
+                      f"amended by 6b305258: the text is inside the sealed bytes; the signer "
+                      f"hashes what you sealed, never what a caller says you sealed."),
         "kind": "net-authorization-request",
         "task_id": task_id, "scope": scope, "submitted_by": app_id, "agent": agent,
-        "task_hash": bound["task_hash"], "nonce": nonce, "ttl": bound["ttl"],
-        "status": "proposed", "proposed_by": app_id, "date": _now().date().isoformat(),
+        "nonce": nonce, "ttl": bound["ttl"], "held_at": held_at,
+        "status": "proposed", "proposed_by": app_id, "date": held_at[:10],
         "under": "c8572a92",
     }, record_id=record_id)
 
@@ -283,7 +370,7 @@ def hold_and_propose(
     cur.execute(f"INSERT INTO tasks ({cols}) VALUES ({placeholders})", params)  # nosec B608 - cols come from the confirmed schema_profile mapping; values are bound params
     cur.close()
     return {"task_id": task_id, "status": HELD_STATUS, "pair_id": pair_id,
-            "record_id": record_id, "seal_this": line,
+            "record_id": record_id, "seal_this": to_seal,
             "next": "the operator seals the pair in the Nestor UI; the next net_authority "
                     "tick mints the envelope and releases the row to pending"}
 
@@ -297,32 +384,29 @@ def propose_lease(
     db_path: Optional[Path] = None,
     propose: Callable = None,
 ) -> dict:
-    """The request half for a standing lease: one pair binding
-    ``(app_id, ttl, reason_sha, scope=lease)``; the reason text rides in the
-    rationale for the human."""
-    import hashlib
-
+    """The request half for a standing lease: one pair whose sealed text is
+    the bound line ``(app_id, ttl, scope=lease)``, the rule, and the reason
+    — the reason inside the sealed bytes, same as a task's text."""
     from .db import Store
     from . import lease as lease_mod
 
     if not isinstance(ttl_seconds, int) or ttl_seconds <= 0 or ttl_seconds > lease_mod.MAX_TTL_SECONDS:
         return {"error": f"lease_hold_denied: ttl_seconds must be within 1..{lease_mod.MAX_TTL_SECONDS}"}
     nonce = mint_nonce()
-    bound = {"app_id": app_id, "ttl": str(ttl_seconds),
-             "reason_sha": hashlib.sha256((reason or "").encode("utf-8")).hexdigest()[:16],
-             "scope": "lease"}
+    bound = {"app_id": app_id, "ttl": str(ttl_seconds), "scope": "lease"}
     try:
-        line = lease_bound_line(bound)
+        to_seal = sealed_lease_text(bound, reason or "")
     except ValueError as exc:
         return {"error": f"lease_hold_denied: {exc}"}
     st = store if store is not None else Store()
     record_id = record_id_for_lease(app_id, nonce)
     st.put(seal_handler.GOVERNANCE_COLLECTION, {
-        "title": question_for_lease(bound) + f" [{nonce[:8]}]",
-        "ruling": line,
-        "rationale": reason or "",
+        "title": question_for_lease(bound, nonce),
+        "ruling": to_seal,
+        "rationale": "Seal only if the reason under the rule is one you accept for a "
+                     "standing lease; the reason is inside the sealed bytes.",
         "kind": "net-lease-request",
-        "app_id": app_id, "ttl": bound["ttl"], "reason_sha": bound["reason_sha"],
+        "app_id": app_id, "ttl": bound["ttl"], "nonce": nonce,
         "status": "proposed", "proposed_by": app_id, "date": _now().date().isoformat(),
         "under": "c8572a92",
     }, record_id=record_id)
@@ -334,7 +418,7 @@ def propose_lease(
     if proposed.get("error"):
         return {"error": f"lease_hold_denied: {proposed['error']}", "record_id": record_id}
     return {"status": "proposed", "pair_id": proposed["pair_id"], "record_id": record_id,
-            "seal_this": line}
+            "seal_this": to_seal}
 
 
 # ── the seal, read from nestor.db ─────────────────────────────────────────────
@@ -355,15 +439,15 @@ def read_sealed_pair(pair_id: str, db_path: Path) -> dict:
         return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
     try:
         row = conn.execute(
-            "SELECT source_norm, target_text, verifier, seal_sig, status, superseded_by "
-            "FROM tm_pairs WHERE id = ?", (pair_id,)).fetchone()
+            "SELECT source_norm, target_text, verifier, seal_sig, status, superseded_by, "
+            "created_at FROM tm_pairs WHERE id = ?", (pair_id,)).fetchone()
     except sqlite3.Error as exc:
         return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
     finally:
         conn.close()
     if row is None:
         return {"state": "empty", "why": "pair_absent"}
-    source_norm, target_text, verifier, seal_sig, status, superseded_by = row
+    source_norm, target_text, verifier, seal_sig, status, superseded_by, created_at = row
     if superseded_by:
         return {"state": "empty", "why": "superseded"}
     if status != "sealed":
@@ -371,7 +455,7 @@ def read_sealed_pair(pair_id: str, db_path: Path) -> dict:
     if not seal_sig:
         return {"state": "empty", "why": "unsigned"}
     return {"state": "populated", "source_norm": source_norm, "target_text": target_text,
-            "verifier": verifier, "seal_sig": seal_sig}
+            "verifier": verifier, "seal_sig": seal_sig, "created_at": created_at}
 
 
 # ── the signer, over a socket ─────────────────────────────────────────────────
@@ -384,11 +468,16 @@ def signer_call(request: dict, *, path: Optional[Path] = None, timeout: float = 
     """One request, one reply, newline-delimited JSON over AF_UNIX. Never
     raises: an unreachable signer is ``{"state": "unreachable", ...}``.
 
-    The protocol assertion the ruling asks for lives here, on the client:
-    a request carrying ``task`` (the text) is refused before it is sent.
+    Protocol assertion, client side: the ONLY body the signer may hash is
+    the one inside the sealed bytes. A request that carries a task text, a
+    hash, or a pair id OUTSIDE the seal is refused before it is sent — those
+    would be caller-supplied facts, and the whole point (Loki 7153DC79) is
+    that the signer derives every binding from what the operator sealed.
     """
-    if "task" in request or "task_text" in request:
-        return {"state": "refused", "reason": "protocol: the task text never crosses the socket"}
+    for forbidden in ("task", "task_text", "task_hash", "pair_id"):
+        if forbidden in request or forbidden in (request.get("bound") or {}):
+            return {"state": "refused", "field": forbidden,
+                    "reason": f"protocol: {forbidden} outside the sealed bytes is not a fact"}
     sock_path = Path(path) if path is not None else socket_path()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -429,6 +518,31 @@ def _held_rows(pg, cols: dict) -> list[dict]:
     return rows
 
 
+def _parse_iso(value) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return None
+    return dt.astimezone(timezone.utc)
+
+
+def _expire(pg, cols: dict, task_id: str) -> bool:
+    cur = pg.cursor()
+    cur.execute(
+        f'UPDATE tasks SET "{cols["status"]}" = %s '  # nosec B608 - cols come from the confirmed schema_profile mapping; values are bound params
+        f'WHERE "{cols["task_id"]}" = %s AND "{cols["status"]}" = %s',
+        (EXPIRED_STATUS, task_id, HELD_STATUS),
+    )
+    expired = cur.rowcount == 1
+    cur.close()
+    pg.commit()
+    return expired
+
+
 def _release(pg, cols: dict, task_id: str, envelope: str) -> bool:
     cur = pg.cursor()
     cur.execute(
@@ -452,6 +566,7 @@ def drain(
     call: Callable[[dict], dict] = signer_call,
     max_rows: int = 200,
     now: Optional[datetime] = None,
+    held_max_age_s: int = HELD_MAX_AGE_S,
 ) -> dict:
     """One tick: for every held row, find its pair, ask the signer, release
     the row. Receipt shape mirrors ``seal_drain.drain``:
@@ -488,6 +603,7 @@ def drain(
     rows_out: list[dict] = []
     counts = {"waiting": 0, "minted": 0, "refused": 0, "unreachable": 0}
     truncated = len(held) > max_rows
+    current = now or _now()
     for row in held[:max_rows]:
         task_id = row["task_id"]
         out = {"task_id": task_id}
@@ -499,6 +615,21 @@ def drain(
             continue
         pair_id = gov["nestor_pair_id"]
         out["pair_id"] = pair_id
+
+        # A held row does not wait forever (Loki 7153DC79): past the cap it
+        # is refused with the field named and inked, so a request nobody
+        # sealed is a record, not a standing offer.
+        held_at = _parse_iso(gov.get("held_at"))
+        if held_at is not None and (current - held_at).total_seconds() > held_max_age_s:
+            out.update(state="refused", field="age",
+                       reason=f"held since {gov.get('held_at')} exceeds {held_max_age_s}s")
+            counts["refused"] += 1
+            _ink(ledger, out, EVENT_REFUSED, {"task_id": task_id, "pair_id": pair_id,
+                                              "reason": out["reason"], "field": "age"})
+            _expire(pg, cols, task_id)
+            rows_out.append(out)
+            continue
+
         sealed = read_sealed_pair(pair_id, nestor_db)
         if sealed["state"] == "unreachable":
             out.update(state="unreachable", cause=sealed.get("cause"))
@@ -511,22 +642,24 @@ def drain(
             rows_out.append(out)
             continue
 
-        # This side's view of what the row is — the signer compares it to
-        # what the operator sealed and refuses on any difference.
+        # This side's view of the row's identity fields. NO hash and NO
+        # pair id travel: the signer derives the hash from the sealed body
+        # and names the seal by the digest of the bytes it verified. The
+        # row's text is compared to the envelope on THIS side, below, by
+        # verify_envelope(task=row.task) against the hash the signer bound.
         bound_view = {
             "task_id": task_id,
             "agent": row.get("agent") or gov.get("agent"),
             "submitted_by": row.get("submitted_by") or gov.get("submitted_by"),
-            "task_hash": ea.normalized_task_hash(row.get("task") or ""),
             "scope": gov.get("scope"),
             "ttl": str(gov.get("ttl")),
             "nonce": gov.get("nonce"),
         }
         reply = call({
             "op": "sign_task",
-            "seal": {k: sealed[k] for k in ("source_norm", "target_text", "verifier", "seal_sig")},
+            "seal": {k: sealed[k] for k in ("source_norm", "target_text", "verifier", "seal_sig",
+                                            "created_at")},
             "bound": bound_view,
-            "pair_id": pair_id,
         })
         state = reply.get("state")
         if state == "unreachable":
@@ -563,12 +696,13 @@ def drain(
                 counts["refused"] += 1
             else:
                 out.update(state="minted", expires_at=payload.get("expires_at"),
-                           verifier=sealed["verifier"], released_to=RELEASED_STATUS)
+                           verifier=sealed["verifier"], released_to=RELEASED_STATUS,
+                           seal_digest=payload.get("seal_pair_id"))
                 counts["minted"] += 1
                 _ink(ledger, out, EVENT_MINTED, {
                     "task_id": task_id, "pair_id": pair_id, "verifier": sealed["verifier"],
                     "scope": bound_view["scope"], "expires_at": payload.get("expires_at"),
-                    "decision": "c8572a92",
+                    "seal_digest": payload.get("seal_pair_id"), "decision": "c8572a92",
                 })
         else:
             out.update(state="unreachable", cause=f"signer reply not understood: {state!r}")
@@ -630,13 +764,13 @@ def drain_leases(
                        why=sealed.get("why") or sealed.get("cause"))
             rows_out.append(out)
             continue
+        # The reason is INSIDE the sealed bytes; nothing else about the lease
+        # travels except this side's view of the identity fields.
         reply = call({
             "op": "sign_lease",
-            "seal": {k: sealed[k] for k in ("source_norm", "target_text", "verifier", "seal_sig")},
-            "bound": {"app_id": gov.get("app_id"), "ttl": str(gov.get("ttl")),
-                      "reason_sha": gov.get("reason_sha"), "scope": "lease"},
-            "reason": gov.get("rationale") or "",
-            "pair_id": pair_id,
+            "seal": {k: sealed[k] for k in ("source_norm", "target_text", "verifier", "seal_sig",
+                                            "created_at")},
+            "bound": {"app_id": gov.get("app_id"), "ttl": str(gov.get("ttl")), "scope": "lease"},
         })
         state = reply.get("state")
         if state == "minted":

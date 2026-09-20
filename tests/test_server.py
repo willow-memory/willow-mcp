@@ -1170,9 +1170,11 @@ def test_task_submit_allow_net_without_envelope_is_held_and_proposed(tmp_path, m
 
     assert result["status"] == net_authority.HELD_STATUS, result
     assert result["pair_id"] == "pair-held"
-    bound = net_authority.parse_bound_line(result["seal_this"])
+    bound, body = net_authority.split_sealed_text(result["seal_this"])
     assert bound["task_id"] == result["task_id"] and bound["scope"] == "network"
     assert bound["submitted_by"] == app
+    assert body == "curl https://example.com\n# allow_net"   # the human seals the text itself
+    assert "task_hash" not in result["seal_this"]
     insert_sql, params = fake.executed[-1]
     assert insert_sql.startswith("INSERT INTO tasks")
     assert params[1] == "curl https://example.com\n# allow_net"
