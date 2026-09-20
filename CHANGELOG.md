@@ -31,6 +31,19 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.61.0](https://github.com/willow-memory/willow-mcp/compare/v2.60.0...v2.61.0) (2026-09-20)
+
+
+### Added
+
+* **mcp:** egress authority is seal-driven — held rows, one sealable line, a signer as the key owner (c8572a92) ([ecf04c7](https://github.com/willow-memory/willow-mcp/commit/ecf04c79d3dd007962b3b3151f8052912ce85ba8))
+* **mcp:** egress authority is seal-driven — held rows, sealed task text, a signer as the key owner (c8572a92, 6b305258) ([af6799a](https://github.com/willow-memory/willow-mcp/commit/af6799a08b3d9a2b07b866693907a1882aceed0e))
+
+
+### Fixed
+
+* **mcp:** the seal carries the task text; the signer derives the hash (6b305258) ([b3e419c](https://github.com/willow-memory/willow-mcp/commit/b3e419c3f2da64d6ce1866be6c2b8621377db1cc))
+
 ## [2.60.0](https://github.com/willow-memory/willow-mcp/compare/v2.59.0...v2.60.0) (2026-09-20)
 
 
