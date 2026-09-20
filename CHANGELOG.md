@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **mcp:** notifications/tools/list_changed — capability, emission, receipts (ab9b55dd) ([4492aa0](https://github.com/willow-memory/willow-mcp/commit/4492aa0ebfa560e0d21fbd5ce7327da3424effb3))
 * **mcp:** notifications/tools/list_changed — declared, sent, inked (ab9b55dd) ([af53b47](https://github.com/willow-memory/willow-mcp/commit/af53b4774887ea8f3f3e761cafbc923e25fe3d64))
 
 
