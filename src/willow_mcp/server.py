@@ -2435,11 +2435,16 @@ def knowledge_verify(
     """Verify source provenance of knowledge records. Checks each record
     for a non-empty source field. Returns {outcome, total, sourced, unsourced,
     unsourced_records, recommendation}. outcome is pass/warn/fail.
-    Requires knowledge_read."""
+    Requires knowledge_read.
+
+    Also persists the outcome to the durable verification_log and a matching
+    training_corpus example (GAP #3) — best-effort; a store failure never
+    turns a successful verification into a failed response."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
-    return kb_verify.verify_sources(pg, app_id, domain=domain or None, limit=min(limit, 500))
+    return kb_verify.verify_and_record(pg, _store, app_id, check_kind="verify_sources",
+                                       domain=domain or None, limit=min(limit, 500))
 
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -2451,11 +2456,16 @@ def knowledge_check(
 ) -> dict:
     """Health check on knowledge records (mem_check analog). Checks for
     unsourced records, missing domains, and duplicate content. Returns
-    {flags, recommendation, evidence}. Requires knowledge_read."""
+    {flags, recommendation, evidence}. Requires knowledge_read.
+
+    Also persists the outcome to the durable verification_log and a matching
+    training_corpus example (GAP #3) — best-effort; a store failure never
+    turns a successful check into a failed response."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
-    return kb_verify.check_health(pg, app_id, domain=domain or None, limit=min(limit, 500))
+    return kb_verify.verify_and_record(pg, _store, app_id, check_kind="check_health",
+                                       domain=domain or None, limit=min(limit, 500))
 
 
 # ── Task queue tools ───────────────────────────────────────────────────────────
