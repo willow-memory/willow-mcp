@@ -579,14 +579,19 @@ def _transport_security():
 
 
 from .request_context import AdvertiseFilterMiddleware, RequestContextMiddleware
+from .tools_changed import ToolsChangedMiddleware
 
 _common_kwargs: dict[str, Any] = dict(
     # Outermost: publishes the per-request context on a ContextVar we own,
     # which is how _read_call_credential reaches `_meta` now that SDK 2.0
     # removed the ambient request contextvar. AdvertiseFilterMiddleware
     # runs inside that bind so tools/list can read seat identity and shrink
-    # discovery (desk_core) without changing call ACL.
-    middleware=[RequestContextMiddleware(), AdvertiseFilterMiddleware()],
+    # discovery (desk_core) without changing call ACL. ToolsChangedMiddleware
+    # sits between them: after each request it remembers the connection and
+    # fingerprints the seat's surface, sending notifications/tools/list_changed
+    # when it moved (decision ab9b55dd) — on the loop, where the SDK's async
+    # sends can be awaited.
+    middleware=[RequestContextMiddleware(), ToolsChangedMiddleware(), AdvertiseFilterMiddleware()],
     instructions=(
         "Willow sovereign agent platform (willow-mcp). "
         "FIRST CALL of every session: session_enter(app_id, session_id) — it returns your "
@@ -638,6 +643,15 @@ if _SERVE_MODE:
     _auth_provider.register_routes(mcp)
 else:
     mcp = MCPServer("willow-mcp", **_common_kwargs)
+
+# Decision ab9b55dd: the initialize result declares tools.listChanged (the SDK's
+# stdio path builds its InitializationOptions with no NotificationOptions, so
+# the flag was False on the wire), and this server's subscription bus is the
+# modern-era carrier for the notification. Raises at import if the SDK seam
+# moved — loud, never a quiet False.
+from .tools_changed import bind as _bind_tools_changed
+
+_bind_tools_changed(mcp)
 
 
 # ── MarkdownAI (mai) tools — vendored from legacy fleet monolith (sap/mai) ──────────────────
@@ -10222,7 +10236,29 @@ def _main():
                 file=sys.stderr,
             )
     except Exception as exc:  # noqa: BLE001 — never block startup on this convenience sync
+        _sync_result = None
+        _sync_ledger = None
         print(f"willow-mcp: syscall table sync failed: {exc}", file=sys.stderr)
+
+    # Decision ab9b55dd: ink what changed the tool surface before any client
+    # could be told — rows the sync just added, and an advertise mode that
+    # differs from the last one receipted for this seat. No session exists
+    # yet, so these receipts say state=empty; the runtime half lives in
+    # ToolsChangedMiddleware. Fail-soft for the same reason as the sync.
+    try:
+        from . import tools_changed as _tools_changed
+        for _r in _tools_changed.startup_check(
+            (os.environ.get("WILLOW_APP_ID") or "").strip(),
+            sync_result=_sync_result, ledger=_sync_ledger,
+        ):
+            print(
+                f"willow-mcp: tools surface changed at startup ({_r.get('trigger')}: "
+                f"{_r.get('reason')}) — no client to notify yet; receipt "
+                f"{_r.get('receipt_id') or _r.get('receipt_error')}",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001 — never block startup on the receipt of a change
+        print(f"willow-mcp: tools surface startup check failed: {exc}", file=sys.stderr)
 
     # Serve mode is SINGLE-INSTANCE per WILLOW_HOME — agent sessions, rate-limit
     # buckets and in-flight OAuth state are process memory, so a second replica
