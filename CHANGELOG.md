@@ -37,7 +37,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 ### Added
 
 * **mcp:** egress authority is seal-driven — held rows, one sealable line, a signer as the key owner (c8572a92) ([ecf04c7](https://github.com/willow-memory/willow-mcp/commit/ecf04c79d3dd007962b3b3151f8052912ce85ba8))
-* **mcp:** egress authority is seal-driven — held rows, sealed task text, a signer as the key owner (c8572a92, 6b305258) ([af6799a](https://github.com/willow-memory/willow-mcp/commit/af6799a08b3d9a2b07b866693907a1882aceed0e))
 
 
 ### Fixed
