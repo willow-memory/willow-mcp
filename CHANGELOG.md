@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.60.0](https://github.com/willow-memory/willow-mcp/compare/v2.59.0...v2.60.0) (2026-09-20)
+
+
+### Added
+
+* **mcp:** notifications/tools/list_changed — declared, sent, inked (ab9b55dd) ([af53b47](https://github.com/willow-memory/willow-mcp/commit/af53b4774887ea8f3f3e761cafbc923e25fe3d64))
+
+
+### Fixed
+
+* **mcp:** tools/list_changed counts only what could arrive (Loki rework of af53b47) ([8fa3409](https://github.com/willow-memory/willow-mcp/commit/8fa34091448ee659baf236b5944edbb90d807b65))
+
 ## [2.59.0](https://github.com/willow-memory/willow-mcp/compare/v2.58.0...v2.59.0) (2026-09-20)
 
 
