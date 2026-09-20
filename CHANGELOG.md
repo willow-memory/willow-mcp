@@ -31,6 +31,16 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.58.0](https://github.com/willow-memory/willow-mcp/compare/v2.57.0...v2.58.0) (2026-09-20)
+
+
+### Added
+
+* **dispatch:** log routing lane and dispatch outcome-quality ([e13e123](https://github.com/willow-memory/willow-mcp/commit/e13e123ab77d975a23b30acf6695312ed61c83c6))
+* **nest:** human negative-correction path for the embedding classifier ([cdea200](https://github.com/willow-memory/willow-mcp/commit/cdea2001bfbd2311a686fb77b4883f568de631a4))
+* **kb:** persist verification outcomes to a durable log ([0f293df](https://github.com/willow-memory/willow-mcp/commit/0f293dfcca93c22d7a634b2755ca280a5797dab4))
+* **nest:** add unified training-example schema ([a48f226](https://github.com/willow-memory/willow-mcp/commit/a48f226ac5e6581382c0d1fbb9423358144f446d))
+
 ## [2.57.0](https://github.com/willow-memory/willow-mcp/compare/v2.56.1...v2.57.0) (2026-09-19)
 
 
