@@ -17,47 +17,57 @@ showed a merged verb. The protocol defines the notification; the server never
 sent it, and never said it would.
 
 What the installed SDK (``mcp`` 2.0.0) actually offers, read from its source
-rather than remembered:
+rather than remembered (file:line under ``site-packages/mcp/``):
 
-* **Capability.** ``Server.get_capabilities`` (``mcp/server/lowlevel/server.py``
-  lines 584-606) has two eras. Handshake era: ``tools.listChanged`` comes from
+* **Capability.** ``Server.get_capabilities`` (``server/lowlevel/server.py``
+  :584-606) has two eras. Handshake era: ``tools.listChanged`` comes from
   ``NotificationOptions.tools_changed`` — and ``MCPServer.run_stdio_async``
-  (``mcp/server/mcpserver/server.py`` line 1024) calls
-  ``create_initialization_options()`` with none, so the flag is ``False``
-  today. Modern 2026-07-28 era: the flag derives from whether
-  ``subscriptions/listen`` is served, which ``MCPServer`` always registers.
-  :func:`declare_capability` closes the handshake-era half.
-* **Delivery.** Handshake era: ``Connection.send_tool_list_changed()``
-  (``mcp/server/connection.py`` line 441) on each live connection's
-  standalone channel. Modern era: that same call is DROPPED by
-  ``NotifyOnlyOutbound`` (line 174-181) — change notifications reach a
-  client only through a ``subscriptions/listen`` stream it opened, fed by
-  ``MCPServer._subscriptions.publish(ToolsListChanged())``. Both are done,
-  every time; each era's dead path is a no-op by the SDK's own design.
-* **Sessions.** The SDK keeps no registry of live connections. Every inbound
-  request carries ``ctx.connection`` through the middleware chain, so
-  :class:`ToolsChangedMiddleware` remembers each one it sees and prunes a
-  connection the moment a send to it raises.
+  (``server/mcpserver/server.py``:1024) calls
+  ``create_initialization_options()`` with none, so the flag was ``False``.
+  Modern 2026-07-28 era: the flag derives from ``subscriptions/listen`` being
+  served, which ``MCPServer`` always registers. :func:`declare_capability`
+  closes the handshake-era half.
+* **What middleware sees.** A ``ServerRequestContext`` (``server/context.py``
+  :30-49): ``session`` (a per-request ``ServerSession``), ``protocol_version``,
+  ``method`` … and no ``connection``. The durable per-client object is the
+  ``Connection`` the session proxies (``server/session.py``:47-55); the SDK
+  keeps no registry of them, so :class:`ToolsChangedMiddleware` remembers
+  each one it sees, weakly, and lets the SDK's own lifetime prune it.
+* **Delivery, and what "delivered" can honestly mean.** ``Connection.notify``
+  (``server/connection.py``:401-410) never raises: with no standalone channel
+  (``_NoChannelOutbound``, :149-150) or on a modern-era connection
+  (``NotifyOnlyOutbound``, :174-181 — list_changed is dropped by design) the
+  notification is debug-logged and discarded, and a closed stream is
+  swallowed the same way. So a send that returned is NOT a send that
+  arrived. This module decides deliverability BEFORE sending — handshake era
+  AND ``has_standalone_channel`` (:321-331) — and reports every other
+  connection under its own count (``modern``, ``no_channel``) rather than as
+  ``sent``. Modern-era delivery is the subscription bus:
+  ``MCPServer._subscriptions.publish(ToolsListChanged())`` reaches only the
+  ``subscriptions/listen`` streams a client opened; the in-memory bus's
+  listener count (``server/subscriptions.py``:100) is read so a publish with
+  nobody listening is ``bus_listeners=0``, never ``sent``.
 
 The three triggers the seal names, and what each honestly is on this server:
 
 1. **Constitutional sync** runs at process start (``server.main``), before a
    client can have connected. There is no session to notify at that moment —
-   the receipt is written with ``state=empty`` and ``sessions_notified=0``,
-   which is the truth, and the client that connects afterwards gets the new
-   table on its first ``tools/list`` anyway. The middleware ALSO watches the
-   live table's mtime, so a sync performed by another process while this one
-   serves is caught on the next request.
+   the receipt is written with ``state=empty``, which is the truth, and the
+   client that connects afterwards gets the new table on its first
+   ``tools/list``. The middleware ALSO watches the live table's CONTENT, so a
+   sync performed by another process while this one serves is caught on the
+   next request.
 2. **Manifest re-sign.** ``gate._read_manifest`` re-reads and re-verifies the
-   manifest on every call — there is no cache to invalidate, so a re-sign is
-   observable on the very next request. The middleware fingerprints the
-   manifest and its ``.sig`` by mtime and notifies when either moved.
+   manifest on every call — there is no cache to invalidate. The middleware
+   fingerprints the manifest and its ``.sig`` by content hash (a ``stat`` of
+   mtime+size gates the read, so an unchanged file costs three stats per
+   request and no I/O; a ``touch``, a checkout, or a byte-identical re-sign
+   re-hashes once and stays quiet).
 3. **Advertise-mode change.** ``WILLOW_MCP_ADVERTISE`` is process
    environment and cannot change under a running server; the manifest
-   ``advertise`` key can (case 2 covers the file moving). For the env, the
-   honest trigger is at startup: :func:`startup_check` compares the resolved
-   mode against the last one receipted for this seat under the store and
-   inks the difference (again ``state=empty`` — no client yet).
+   ``advertise`` key can (case 2 covers the file). For the env, the honest
+   trigger is at startup: :func:`startup_check` compares the resolved mode
+   against the last one receipted for this seat under the store.
 
 Only sends and startup differences leave FRANK ink (event
 ``tools_list_changed``, beside ``constitutional_sync``); a request that found
@@ -65,10 +75,12 @@ nothing changed writes nothing.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import threading
+import weakref
 from pathlib import Path
 from typing import Any, Optional
 
@@ -85,11 +97,25 @@ ACTOR = "willow-mcp"
 #: home root, matching ``seal_daemon``'s offset files.
 _STATE_FILENAME = "tools_surface.json"
 
+#: Upper bound on remembered connections; a serve process that has seen more
+#: distinct clients than this since boot keeps the newest.
+_MAX_CONNECTIONS = 256
+
 _lock = threading.Lock()
-#: Live connections seen by the middleware, keyed by ``id(connection)``.
-_connections: dict[int, Any] = {}
+#: Live connections seen by the middleware. Weak values: when the SDK's
+#: serve loop drops a connection (clean close or crash) the entry vanishes
+#: with it, and a reused ``id()`` can never resolve to a dead peer.
+_connections: "weakref.WeakValueDictionary[int, Any]" = weakref.WeakValueDictionary()
+#: Connections that cannot be weakly referenced (a double with ``__slots__``),
+#: held strongly under the same bound.
+_strong: dict[int, Any] = {}
+#: Insertion order for the bound above (WeakValueDictionary keeps none).
+_order: list[int] = []
 #: Last fingerprint observed per app_id, in-process.
 _fingerprints: dict[str, dict] = {}
+#: Stat gate: ``{path: (mtime_ns, size, sha256)}`` so an unchanged file is
+#: never re-read.
+_hash_cache: dict[str, tuple[Optional[int], Optional[int], Optional[str]]] = {}
 #: Reasons queued by sync code (``mark_changed``) for the next flush.
 _pending: list[tuple[str, str]] = []
 #: The ``MCPServer`` this module notifies for (its subscription bus); bound
@@ -146,27 +172,51 @@ def bind(server: Any) -> None:
 
 # ── fingerprint ───────────────────────────────────────────────────────────────
 
-def _mtime_ns(path: Path) -> Optional[int]:
+def _content_hash(path: Path) -> Optional[str]:
+    """sha256 of ``path``, or ``None`` when absent/unreadable. A ``stat``
+    (mtime_ns, size) gates the read: unchanged stat → cached hash, no I/O."""
+    key = str(path)
     try:
-        return path.stat().st_mtime_ns
+        st = path.stat()
+        gate = (st.st_mtime_ns, st.st_size)
     except OSError:
+        _hash_cache[key] = (None, None, None)
         return None
+    cached = _hash_cache.get(key)
+    if cached is not None and cached[0] == gate[0] and cached[1] == gate[1]:
+        return cached[2]
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        digest = None
+    _hash_cache[key] = (gate[0], gate[1], digest)
+    return digest
+
+
+def _resolve_mode(app_id: str) -> str:
+    """``advertise.resolve_advertise_mode`` is the one source of truth; it is
+    called from here only."""
+    from . import advertise as _advertise
+
+    return _advertise.resolve_advertise_mode(app_id)
 
 
 def fingerprint(app_id: str) -> dict:
-    """What the advertised surface for ``app_id`` depends on, as cheap facts:
-    the resolved advertise mode, the manifest and its ``.sig`` (mtime), and
-    the live syscall table (mtime). A change in any is a change in what
-    ``tools/list`` would return or what the gate would permit."""
-    from . import advertise as _advertise
+    """What the advertised surface for ``app_id`` depends on: the manifest
+    and its ``.sig`` (content), the live syscall table (content), and the
+    resolved advertise mode. Content, not mtime: a ``touch`` or a checkout
+    that rewrote identical bytes is not a change and must not wake the
+    client. Cost on an unchanged request: three ``stat`` calls and one
+    advertise-mode resolution (the gate already reads the manifest on every
+    call; this adds no second verify beyond that read)."""
     from . import gate as _gate
 
     manifest = _gate._apps_root() / app_id / "manifest.json"
     return {
-        "advertise_mode": _advertise.resolve_advertise_mode(app_id),
-        "manifest_mtime_ns": _mtime_ns(manifest),
-        "manifest_sig_mtime_ns": _mtime_ns(manifest.with_name(manifest.name + ".sig")),
-        "syscall_table_mtime_ns": _mtime_ns(paths.syscall_table_path()),
+        "manifest_sha256": _content_hash(manifest),
+        "manifest_sig_sha256": _content_hash(manifest.with_name(manifest.name + ".sig")),
+        "syscall_table_sha256": _content_hash(paths.syscall_table_path()),
+        "advertise_mode": _resolve_mode(app_id),
     }
 
 
@@ -178,7 +228,7 @@ def _diff(before: Optional[dict], after: dict) -> list[str]:
 
 def _reason_for(changed: list[str]) -> tuple[str, str]:
     """``(trigger, reason)`` naming which of the seal's three cases moved."""
-    if "syscall_table_mtime_ns" in changed:
+    if "syscall_table_sha256" in changed:
         return "constitutional_sync", "live syscall table changed"
     if "advertise_mode" in changed:
         return "advertise_mode", "advertise mode changed"
@@ -233,6 +283,8 @@ def _ink(content: dict, ledger=None) -> dict:
 
 
 def _tool_count(app_id: str) -> Optional[int]:
+    """Only computed on a notification (rare), never per request — it walks
+    the registered tool catalogue."""
     try:
         from . import advertise as _advertise
         from . import server as _server_mod
@@ -246,21 +298,66 @@ def _tool_count(app_id: str) -> Optional[int]:
 
 # ── connections ───────────────────────────────────────────────────────────────
 
+def connection_of(ctx: Any) -> Optional[Any]:
+    """The durable ``Connection`` behind a middleware ``ctx``.
+
+    ``ServerRequestContext.session`` is a per-request ``ServerSession`` whose
+    ``_connection`` is the per-client ``Connection`` (session.py:47-55); the
+    SDK exposes no public accessor for it from the context. The private name
+    is read deliberately; if the SDK renames it this returns ``None`` and a
+    live desk's receipt shows ``sessions_seen=0`` — loud, not a silently
+    wrong count."""
+    session = getattr(ctx, "session", None)
+    conn = getattr(session, "_connection", None)
+    if conn is None or not callable(getattr(conn, "send_tool_list_changed", None)):
+        return None
+    return conn
+
+
 def remember_connection(connection: Any) -> None:
     if connection is None:
         return
+    key = id(connection)
     with _lock:
-        _connections[id(connection)] = connection
+        if _connections.get(key) is connection or _strong.get(key) is connection:
+            return
+        try:
+            _connections[key] = connection
+        except TypeError:
+            _strong[key] = connection
+        _order.append(key)
+        while len(_order) > _MAX_CONNECTIONS:
+            old = _order.pop(0)
+            _connections.pop(old, None)
+            _strong.pop(old, None)
 
 
 def forget_connection(connection: Any) -> None:
+    key = id(connection)
     with _lock:
-        _connections.pop(id(connection), None)
+        _connections.pop(key, None)
+        _strong.pop(key, None)
+        if key in _order:
+            _order.remove(key)
 
 
 def live_connections() -> list[Any]:
     with _lock:
-        return list(_connections.values())
+        return list(_connections.values()) + list(_strong.values())
+
+
+def _era(connection: Any) -> str:
+    """``handshake`` or ``modern`` by the connection's own protocol version."""
+    from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+
+    return "modern" if getattr(connection, "protocol_version", "") in MODERN_PROTOCOL_VERSIONS else "handshake"
+
+
+def _bus_listeners(bus: Any) -> Optional[int]:
+    """Listener count for the in-memory bus (``_listeners``, subscriptions.py
+    :100); ``None`` for a custom bus that does not expose one."""
+    listeners = getattr(bus, "_listeners", None)
+    return len(listeners) if isinstance(listeners, dict) else None
 
 
 # ── the act ───────────────────────────────────────────────────────────────────
@@ -268,42 +365,64 @@ def live_connections() -> list[Any]:
 async def notify(reason: str, *, trigger: str, app_id: str = "", ledger=None,
                  server: Any = None) -> dict:
     """Send ``notifications/tools/list_changed`` every way the SDK can carry
-    it, then ink one receipt.
+    it, counting only what could have arrived, then ink one receipt.
 
-    ``state`` is ``sent`` (at least one connection or listen stream took it),
-    ``empty`` (nothing live to notify — a CLI, a test, or startup before the
-    first client), or ``unreachable`` (every attempt raised). Per-connection
-    failures prune that connection and are counted, never swallowed.
+    Per remembered connection: handshake era with a standalone channel →
+    ``send_tool_list_changed()``, counted in ``sessions_notified``; modern
+    era → ``sessions_modern`` (the SDK drops the channel copy by design;
+    those clients are reached by the bus, if they listen); no standalone
+    channel → ``sessions_no_channel``. A send that raises is
+    ``sessions_unreachable`` and pruned. The bus publish is judged by its
+    listeners: ``bus_listeners`` is the number of open listen streams, or
+    ``None`` for a bus that cannot say.
+
+    ``state``: ``sent`` when at least one handshake send went out or the bus
+    had a listener (or an unknowable bus had modern peers); ``empty`` when
+    nothing could be reached; ``unreachable`` when every attempt raised.
     """
     srv = server if server is not None else _server
-    sent = 0
+    sent = modern = no_channel = 0
     unreachable: list[str] = []
     for conn in live_connections():
-        send = getattr(conn, "send_tool_list_changed", None)
-        if not callable(send):
-            forget_connection(conn)
+        if not getattr(conn, "has_standalone_channel", True):
+            no_channel += 1
+            continue
+        if _era(conn) == "modern":
+            modern += 1
             continue
         try:
-            await send()
+            await conn.send_tool_list_changed()
             sent += 1
         except Exception as exc:  # noqa: BLE001 — one dead pipe must not stop the others, and is reported by name
             forget_connection(conn)
             unreachable.append(f"{type(exc).__name__}: {exc}")
 
     bus_published = False
+    bus_listeners: Optional[int] = None
+    bus_error = False
     bus = getattr(srv, "_subscriptions", None) if srv is not None else None
     if bus is not None:
+        bus_listeners = _bus_listeners(bus)
         try:
             from mcp.shared.subscriptions import ToolsListChanged
 
             await bus.publish(ToolsListChanged())
             bus_published = True
         except Exception as exc:  # noqa: BLE001 — same clause: named, counted, not hidden
+            bus_error = True
             unreachable.append(f"bus: {type(exc).__name__}: {exc}")
 
-    if sent or bus_published:
+    conn_failures = len(unreachable) - (1 if bus_error else 0)
+    if bus_listeners is None:
+        # A custom bus that cannot count: the modern peers we saw are the
+        # best evidence anyone was on the other end.
+        reached_by_bus = bus_published and modern > 0
+    else:
+        reached_by_bus = bus_published and bus_listeners > 0
+    attempts = sent + conn_failures + (1 if bus is not None else 0)
+    if sent or reached_by_bus:
         state = "sent"
-    elif unreachable:
+    elif attempts and len(unreachable) == attempts:
         state = "unreachable"
     else:
         state = "empty"
@@ -312,11 +431,14 @@ async def notify(reason: str, *, trigger: str, app_id: str = "", ledger=None,
 
     content = {
         "actor": ACTOR, "method": METHOD, "reason": reason, "trigger": trigger,
-        "app_id": app_id, "state": state, "sessions_notified": sent,
-        "sessions_unreachable": len(unreachable), "bus_published": bus_published,
+        "app_id": app_id, "state": state,
+        "sessions_seen": sent + modern + no_channel + conn_failures,
+        "sessions_notified": sent, "sessions_modern": modern, "sessions_no_channel": no_channel,
+        "sessions_unreachable": conn_failures,
+        "bus_published": bus_published, "bus_listeners": bus_listeners,
     }
     if app_id:
-        content["advertise_mode"] = fingerprint(app_id).get("advertise_mode")
+        content["advertise_mode"] = _resolve_mode(app_id)
         content["tool_count"] = _tool_count(app_id)
     out = {"ok": True, **content, "unreachable": unreachable}
     out.update(_ink(content, ledger=ledger))
@@ -338,12 +460,12 @@ async def flush(app_id: str = "", ledger=None) -> list[dict]:
 
 # ── observe ───────────────────────────────────────────────────────────────────
 
-async def observe(app_id: str, connection: Any = None, *, ledger=None) -> Optional[dict]:
-    """One request's worth of watching: remember the connection, fingerprint
-    the seat's surface, and notify if it moved since the last request. The
-    first observation for a seat seeds the fingerprint silently — that is
-    what :func:`startup_check` inks against the persisted one."""
-    remember_connection(connection)
+async def observe(app_id: str, ctx: Any = None, *, ledger=None) -> Optional[dict]:
+    """One request's worth of watching: remember the request's connection,
+    fingerprint the seat's surface, and notify if it moved since the last
+    request. The first observation for a seat seeds the fingerprint silently
+    — that is what :func:`startup_check` inks against the persisted one."""
+    remember_connection(connection_of(ctx))
     if not app_id:
         return None
     now = fingerprint(app_id)
@@ -361,6 +483,13 @@ async def observe(app_id: str, connection: Any = None, *, ledger=None) -> Option
     return result
 
 
+_EMPTY_COUNTS = {
+    "sessions_seen": 0, "sessions_notified": 0, "sessions_modern": 0,
+    "sessions_no_channel": 0, "sessions_unreachable": 0,
+    "bus_published": False, "bus_listeners": 0,
+}
+
+
 def startup_check(app_id: str, *, sync_result: Optional[dict] = None, ledger=None) -> list[dict]:
     """Run once from ``server.main`` after the constitutional sync and before
     the transport is up. No client exists yet, so nothing is sent; what is
@@ -373,8 +502,7 @@ def startup_check(app_id: str, *, sync_result: Optional[dict] = None, ledger=Non
         content = {
             "actor": ACTOR, "method": METHOD, "trigger": "constitutional_sync",
             "reason": f"syscall table gained verb id(s) {sync_result['added']} at startup",
-            "app_id": app_id, "state": "empty", "sessions_notified": 0,
-            "sessions_unreachable": 0, "bus_published": False,
+            "app_id": app_id, "state": "empty", **_EMPTY_COUNTS,
             "sync_receipt_id": sync_result.get("receipt_id"),
         }
         receipts.append({**content, **_ink(content, ledger=ledger)})
@@ -389,8 +517,7 @@ def startup_check(app_id: str, *, sync_result: Optional[dict] = None, ledger=Non
         content = {
             "actor": ACTOR, "method": METHOD, "trigger": "advertise_mode",
             "reason": f"advertise mode {last.get('advertise_mode')!r} -> {now['advertise_mode']!r} at startup",
-            "app_id": app_id, "state": "empty", "sessions_notified": 0,
-            "sessions_unreachable": 0, "bus_published": False,
+            "app_id": app_id, "state": "empty", **_EMPTY_COUNTS,
             "advertise_mode": now["advertise_mode"], "tool_count": _tool_count(app_id),
         }
         receipts.append({**content, **_ink(content, ledger=ledger)})
@@ -415,7 +542,7 @@ class ToolsChangedMiddleware:
             from .request_context import _list_identity_app_id
 
             app_id = _list_identity_app_id() or ""
-            await observe(app_id, getattr(ctx, "connection", None))
+            await observe(app_id, ctx)
             if _pending:
                 await flush(app_id)
         except Exception:  # noqa: BLE001 — the request succeeded; the watch failing must not turn it into an error
@@ -427,7 +554,10 @@ def _reset_for_tests() -> None:
     global _server, _ledger_factory
     with _lock:
         _connections.clear()
+        _strong.clear()
+        _order.clear()
         _fingerprints.clear()
+        _hash_cache.clear()
         _pending.clear()
     _server = None
     _ledger_factory = None
