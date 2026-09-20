@@ -3512,6 +3512,34 @@ def kb_startup_continuity(app_id: str, limit: int = 20) -> dict:
 
 
 # ── Agent dispatch tools ───────────────────────────────────────────────────────
+#
+# GAP #5 (routing-lane logging) + GAP #6 (dispatch outcome-quality): the
+# routing_decisions row already recorded WHAT was decided (target_agent) but
+# not WHICH of the routing ladder's 8 lanes the request actually traversed,
+# nor any outcome-quality signal beyond a coarse done/failed status. Both are
+# OPTIONAL additions carried inside the existing `decision` jsonb column
+# (docs/schema/routing_decisions.postgres.sql already owns that column as the
+# one structured-detail field on this table — a new lane/quality column would
+# need a migration this repo's schema-ownership convention doesn't ask for
+# when jsonb already has room). Omitting either parameter reproduces exactly
+# today's row shape and today's UPDATE payload, so every existing caller is
+# unaffected.
+#
+# ROUTING_LANES is the closed set of ladder steps a caller/orchestrator may
+# tag a routing decision with. This module does not choose the lane itself —
+# the caller already knows which step of its own ladder resolved the
+# request — it only validates and persists what it is told.
+ROUTING_LANES = (
+    "sealed_fact",
+    "deterministic",
+    "mcp_read",
+    "corpus",
+    "shell_kart",
+    "tool_oracle",
+    "local_draft",
+    "open_synthesis",
+)
+
 
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("agent_route")
@@ -3520,12 +3548,25 @@ def agent_route(
     task: str,
     target_agent: str,
     context: Optional[dict] = None,
+    lane: Optional[str] = None,
 ) -> dict:
     """Record a routing decision — "this task goes to that agent" — in the
     fleet's routing_decisions ledger and return a routing_id for correlating
     the eventual outcome. Does NOT start or notify the target agent: pair with
     dispatch_send to actually deliver the work, and report completion via
-    agent_dispatch_result."""
+    agent_dispatch_result.
+
+    `lane` (GAP #5, optional) tags which routing-ladder step chose this
+    target — one of ROUTING_LANES (sealed_fact, deterministic, mcp_read,
+    corpus, shell_kart, tool_oracle, local_draft, open_synthesis). Omitted,
+    the `decision` jsonb gets no `lane` key at all — the row is byte-
+    identical to before this change — existing callers are unaffected;
+    given, `lane` is added to `decision`. An unrecognized lane is rejected
+    rather than silently stored, so the ladder-step vocabulary stays closed.
+    See list_routing_decisions_by_lane (server.py, not an MCP tool) to read
+    lane-tagged rows back."""
+    if lane is not None and lane not in ROUTING_LANES:
+        return {"error": f"unknown_lane: {lane!r} is not one of {ROUTING_LANES}"}
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
@@ -3533,6 +3574,8 @@ def agent_route(
     routing_id = str(uuid.uuid4())[:8].upper()
     prompt_hash = hashlib.sha256(task.encode()).hexdigest()[:16]
     decision = {"task": task, "target": target_agent, "context": context or {}}
+    if lane is not None:
+        decision["lane"] = lane
     try:
         cur = pg.cursor()
         cur.execute(
@@ -3544,7 +3587,49 @@ def agent_route(
         cur.close()
     except Exception as e:
         return {"error": f"routing_unavailable: {e}"}
-    return {"routing_id": routing_id, "target": target_agent, "status": "routed"}
+    out = {"routing_id": routing_id, "target": target_agent, "status": "routed"}
+    if lane is not None:
+        out["lane"] = lane
+    return out
+
+
+def list_routing_decisions_by_lane(pg, lane: Optional[str] = None, limit: int = 100) -> dict:
+    """Read-only helper (GAP #5) — NOT an MCP tool, so it adds no tool count.
+
+    Lists routing_decisions rows that carry a lane tag in their `decision`
+    jsonb, newest first. With `lane` given, filters to that one lane;
+    omitted, returns every lane-tagged row (rows written before this change,
+    or by a caller that omitted `lane`, are untagged and never appear here —
+    that is the backward-compat contract, not a bug). `pg` is a caller-
+    supplied connection (get_pg()) so this composes with the same pipeline
+    every other reader in this module uses."""
+    if pg is None:
+        return _postgres_unavailable()
+    if lane is not None and lane not in ROUTING_LANES:
+        return {"error": f"unknown_lane: {lane!r} is not one of {ROUTING_LANES}"}
+    where = "decision->>'lane' IS NOT NULL"
+    params: list = []
+    if lane is not None:
+        where += " AND decision->>'lane' = %s"
+        params.append(lane)
+    params.append(limit)
+    try:
+        cur = pg.cursor()
+        cur.execute(
+            f"SELECT id, decision FROM routing_decisions WHERE {where} "  # nosec B608 - where is built from a fixed lane-column check, never request input; all values are bound params
+            "ORDER BY created_at DESC LIMIT %s",
+            params,
+        )
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        return {"error": f"routing_unavailable: {e}"}
+    decisions = []
+    for rid, decision in rows:
+        if isinstance(decision, str):
+            decision = json.loads(decision)
+        decisions.append({"routing_id": rid, **decision})
+    return {"decisions": decisions, "count": len(decisions)}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -3554,27 +3639,97 @@ def agent_dispatch_result(
     routing_id: str,
     result: str,
     status: str = "done",
+    quality_score: Optional[float] = None,
+    quality_note: str = "",
 ) -> dict:
     """Close the loop on an agent_route call: attach the outcome — `result`
     text plus `status` (e.g. 'done', 'failed') — to the routing_decisions row
     named by `routing_id`. Returns {routing_id, status}, or {error: not_found}
-    for an unknown routing_id."""
+    for an unknown routing_id.
+
+    `quality_score` (GAP #6, optional) is a bounded outcome-quality signal in
+    [0.0, 1.0] — a rubric score for how good the dispatch outcome was, beyond
+    the coarse done/failed `status`. `quality_note` is an optional free-text
+    rubric note. Both omitted, the persisted payload and the return shape are
+    byte-identical to before this change.
+
+    Also appends a best-effort training_corpus example (source=dispatch_route,
+    GAP #5+#6): a store or corpus-write failure is logged and never turns a
+    successful dispatch-result call into a failed one."""
+    if quality_score is not None and not (0.0 <= quality_score <= 1.0):
+        return {"error": f"invalid_quality_score: {quality_score!r} must be between 0.0 and 1.0"}
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
+    payload = {"result": result, "dispatch_status": status}
+    if quality_score is not None:
+        payload["quality_score"] = quality_score
+    if quality_note:
+        payload["quality_note"] = quality_note
     try:
         cur = pg.cursor()
         cur.execute(
             "UPDATE routing_decisions "
             "SET decision = decision || %s::jsonb "
             "WHERE id = %s",
-            (json.dumps({"result": result, "dispatch_status": status}), routing_id)
+            (json.dumps(payload), routing_id)
         )
         updated = cur.rowcount
         cur.close()
     except Exception as e:
         return {"error": f"routing_unavailable: {e}"}
-    return {"routing_id": routing_id, "status": status} if updated else {"error": "not_found"}
+    if not updated:
+        return {"error": "not_found"}
+
+    # Best-effort training_corpus emission (GAP #5 lane + GAP #6 quality feed
+    # one row): read the now-complete decision back so `input`/
+    # `small_model_output` reflect the routing lane/target that were actually
+    # recorded, not just what this call itself was given. Never allowed to
+    # turn a successful dispatch-result call into a failed one (mirrors
+    # kb_verify.verify_and_record's try/except+log pattern).
+    try:
+        from .training_corpus import SOURCE_DISPATCH_ROUTE, TrainingExample, append_training_example
+        cur2 = pg.cursor()
+        cur2.execute("SELECT decision FROM routing_decisions WHERE id = %s", (routing_id,))
+        row = cur2.fetchone()
+        cur2.close()
+        if row:
+            full_decision = row[0]
+            if isinstance(full_decision, str):
+                full_decision = json.loads(full_decision)
+            large_label = {"status": status}
+            if quality_score is not None:
+                large_label["quality_score"] = quality_score
+            if quality_note:
+                large_label["quality_note"] = quality_note
+            example = TrainingExample(
+                source=SOURCE_DISPATCH_ROUTE,
+                input={
+                    "routing_id": routing_id,
+                    "task": full_decision.get("task"),
+                    "lane": full_decision.get("lane"),
+                    "context": full_decision.get("context"),
+                },
+                small_model_output={
+                    "target": full_decision.get("target"),
+                    "lane": full_decision.get("lane"),
+                },
+                large_label=large_label,
+                label_kind="verification" if quality_score is not None else "none",
+                provenance={"app_id": app_id, "routing_id": routing_id},
+            )
+            append_training_example(_store, example)
+    except Exception:
+        import logging
+        logging.getLogger("willow_mcp.server").warning(
+            "agent_dispatch_result: failed to append training_corpus example "
+            "for routing_id=%r", routing_id, exc_info=True,
+        )
+
+    out = {"routing_id": routing_id, "status": status}
+    if quality_score is not None:
+        out["quality_score"] = quality_score
+    return out
 
 
 # ── Verb-level citation-before-act enforcement (#333) ──────────────────────────
