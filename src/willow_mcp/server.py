@@ -1237,6 +1237,17 @@ def _guarded(tool_name: str, *, list_error: bool = False, paginated: bool = Fals
                 detail = json.dumps({"meter": meter_row}, separators=(",", ":")) if meter_row else None
                 _receipt_log.record(effective_app_id, tool_name, "ok", detail)
 
+            # A second, additive receipt when the Muzzle neutralised a
+            # tool_output boundary in fetched/federated content — a
+            # "something tried to close the boundary" signal that would
+            # otherwise be invisible (the fetch itself succeeded). Distinct
+            # from the outcome above so an operator, and friction_scan/gap,
+            # can find boundary-forge attempts on their own.
+            if isinstance(probe, dict) and probe.get("guard_escape"):
+                _receipt_log.record(
+                    effective_app_id, tool_name, "guard.tool_output_escape",
+                    f"neutralised tool_output boundary in {tool_name} output")
+
             # Egress secret redaction (defense-in-depth for the README
             # guarantee "No tool ever returns a credential"). Enforced at this
             # single funnel so a credential smuggled through the DATA path — a

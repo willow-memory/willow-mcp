@@ -101,7 +101,12 @@ def _guard_tool_listing(tools: list[Any]) -> list[dict]:
             "guard_hits": hits,
         }
         if verdict == "BLOCKED":
-            entry["description"] = external_guard.SANDWICH_TEMPLATE.format(content=description)
+            framed, escaped = external_guard.frame(description, tool=name or "federated_tool")
+            entry["description"] = framed
+            if escaped:
+                entry["guard_escape"] = True
+                logger.warning("federated tool %r description carried a tool_output "
+                            "boundary; neutralised", name)
         guarded.append(entry)
     return guarded
 
@@ -370,14 +375,21 @@ class _ServerConnection:
         )
         verdict, hits = _scan_text(text)
         content_text = text
+        escaped = False
         if verdict == "BLOCKED":
-            content_text = external_guard.SANDWICH_TEMPLATE.format(content=text)
-        return {
+            content_text, escaped = external_guard.frame(text, tool=tool or "federated_tool")
+            if escaped:
+                logger.warning("federated tool %r result carried a tool_output "
+                            "boundary; neutralised", tool)
+        out = {
             "is_error": bool(getattr(result, "isError", False)),
             "content_text": content_text,
             "guard_verdict": verdict,
             "guard_hits": hits,
         }
+        if escaped:
+            out["guard_escape"] = True
+        return out
 
     def disconnect(self) -> None:
         if self._thread is None:

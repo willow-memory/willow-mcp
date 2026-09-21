@@ -112,6 +112,19 @@ outbound call and **before** the socket connects, in the `web_net` and
 
 ## P2 (priority: high) - Muzzle tool-output framing
 
+> **Status (landed):** `external_guard.frame` replaces the static
+> `SANDWICH_TEMPLATE` boundary — which injected text could reproduce
+> (`---EXTERNAL DATA END---`) to escape the fence — with a per-result
+> `<tool_output_{nonce}>` boundary (`secrets.token_hex(8)`, fresh each call, so
+> the payload cannot contain the closing token). Any `tool_output` boundary the
+> content *does* carry is neutralised and reported (`escape_fired`). The scan
+> still runs first; the frame runs after. Wired into `web_fetch.fetch_url` (the
+> `willow_web_fetch` tool) and both `mcp_federation_client` framing sites; the
+> legacy `---EXTERNAL DATA START/END---` markers are kept inside the fence as
+> human-readable guidance, not as the boundary. A neutralised boundary surfaces
+> as `guard_escape` on the result and the guarded pipeline records an additive
+> `guard.tool_output_escape` receipt.
+
 ### Design
 
 Frame tool/fetch results with a per-iteration random nonce so injected content
