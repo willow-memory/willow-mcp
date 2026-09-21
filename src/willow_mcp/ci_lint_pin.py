@@ -176,7 +176,7 @@ _CLAUSE_SPLIT_RE = re.compile(r"(?:;|\||—|–|\n|\.\s+|\.$)")
 # The linter word. `ruff` followed by `-`/`_`/`.` is a name (ruff-action,
 # ruff_cache, ruff.toml), not the tool being run.
 _LINTER_WORD_RE = re.compile(
-    r"\bruff\b(?![-_.]\w)|\blint(?:er|ing)?\b|\bformat(?:ter|ting)?\b(?=[^\n]{0,30}\b(?:check|clean|ok|pass))",
+    r"\bruff\b(?![-_.]\w|['’]s\b)|\blint(?:er|ing)?\b|\bformat(?:ter|ting)?\b(?=[^\n]{0,30}\b(?:check|clean|ok|pass))",
     re.IGNORECASE,
 )
 # The clean word is a LINT-OUTCOME phrase: ruff's own output ("All checks
@@ -185,7 +185,8 @@ _LINTER_WORD_RE = re.compile(
 # "format --check clean"). Never a bare colour or mood word — `green`/`ok`
 # turned "the green-claim gate reads the ruff pin" into a refused claim
 # (Loki 7AA9F436). A bare "N passed" is a test count and is not here.
-_LINTER_TOKEN = r"(?:ruff\b(?![-_.]\w)|lint(?:er|ing)?\b|format(?:ter|ting)?\b)"
+# `ruff's` (possessive) is a reference to the tool, not the tool being run.
+_LINTER_TOKEN = r"(?:ruff\b(?![-_.]\w|['’]s\b)|lint(?:er|ing)?\b|format(?:ter|ting)?\b)"
 _CLEAN_WORD_RE = re.compile(
     r"\ball checks? passed\b|\bchecks? passed\b"
     r"|\b(?:no|0|zero)\s+(?:errors?|violations?|findings?|issues?|warnings?)\b"
@@ -198,7 +199,9 @@ _CLEAN_WORD_RE = re.compile(
 # measured. Never judged.
 _DISCLAIMER_RE = re.compile(
     r"\b(?:not|never|no)\s+(?:installed|run|ran|executed|measured|available|found)\b"
-    r"|\bno ruff (?:run|binary|executable)\b|\bunmeasured\b|\bnot re-?run\b|\bskipped\b|\bcould not\b|\bcannot\b",
+    r"|\bno ruff (?:run|binary|executable)\b|\bunmeasured\b|\bnot re-?run\b"
+    r"|\b(?:ruff|lint\w*|format\w*)\s+(?:was\s+)?skipped\b|\bskipped\s+(?:ruff|lint\w*)\b"
+    r"|\bcould not\b|\bcannot\b",
     re.IGNORECASE,
 )
 # `ruff 0.16.7`, `ruff==0.16.7`, `ruff (0.16.7)`, `ruff v0.16.7`, `ruff/0.16.7`
@@ -232,24 +235,40 @@ def lint_claims(text: str) -> list[dict[str, Any]]:
     (Loki 7AA9F436, C63A2C48)."""
     out: list[dict[str, Any]] = []
     clauses = _clauses(text)
+
+    def _inherit(i: int) -> tuple[str, list[str]] | None:
+        """The nearest earlier clause (≤ _LOOKBACK_CLAUSES) that names the
+        linter with a version, or None. Stops at a disclaimer, and past
+        the first step at any clause that carries its own outcome."""
+        for back in range(1, _LOOKBACK_CLAUSES + 1):
+            j = i - back
+            if j < 0:
+                return None
+            prev = clauses[j]
+            if _DISCLAIMER_RE.search(prev) or (back > 1 and _CLEAN_WORD_RE.search(prev)):
+                return None
+            if _LINTER_WORD_RE.search(prev):
+                return prev, [m.group(1) for m in _NAMED_VERSION_RE.finditer(prev)]
+        return None
+
     for i, clause in enumerate(clauses):
         if not _CLEAN_WORD_RE.search(clause) or _DISCLAIMER_RE.search(clause):
             continue
         if _LINTER_WORD_RE.search(clause):
             versions = [m.group(1) for m in _NAMED_VERSION_RE.finditer(clause)]
+            if not versions:
+                # "ruff 0.16.7 check: All checks passed; format --check: 232
+                # files already formatted" — one run, two clauses: the
+                # unnamed half inherits the version the same line named.
+                found = _inherit(i)
+                if found and found[1]:
+                    out.append({"clause": f"{found[0]} / {clause}", "versions": found[1]})
+                    continue
             out.append({"clause": clause, "versions": versions})
             continue
-        for back in range(1, _LOOKBACK_CLAUSES + 1):
-            j = i - back
-            if j < 0:
-                break
-            prev = clauses[j]
-            if _DISCLAIMER_RE.search(prev) or (back > 1 and _CLEAN_WORD_RE.search(prev)):
-                break
-            if _LINTER_WORD_RE.search(prev):
-                versions = [m.group(1) for m in _NAMED_VERSION_RE.finditer(prev)]
-                out.append({"clause": f"{prev} / {clause}", "versions": versions})
-                break
+        found = _inherit(i)
+        if found:
+            out.append({"clause": f"{found[0]} / {clause}", "versions": found[1]})
     return out
 
 

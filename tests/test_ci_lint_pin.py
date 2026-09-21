@@ -159,7 +159,14 @@ def test_every_claim_must_name_the_pin():
     assert v["named"] == "0.15.0" and "0.16.7" in v["reason"] and "src" in v["reason"]
     v = clp.judge_lint_claim("ruff 0.16.7 clean on src; ruff 0.16.7 format --check clean", _pin)
     assert v["verdict"] == "accept"
-    v = clp.judge_lint_claim("ruff 0.16.7 check clean; format clean", _pin)
+    # One run reported as two clauses: the unnamed half inherits the
+    # version the same line named (the ordinary "check; format --check" shape).
+    v = clp.judge_lint_claim("ruff 0.16.7 check: All checks passed; format --check: 232 files already formatted", _pin)
+    assert v["verdict"] == "accept"
+    v = clp.judge_lint_claim("ruff 0.15.0 check clean; format --check clean", _pin)
+    assert v["verdict"] == "refuse" and v["named"] == "0.15.0"
+    # An unnamed claim with nothing to inherit from still refuses.
+    v = clp.judge_lint_claim("pytest: 81 passed; format --check clean", _pin)
     assert v["verdict"] == "refuse" and "names no linter version" in v["reason"]
 
 
