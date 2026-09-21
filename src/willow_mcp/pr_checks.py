@@ -235,6 +235,7 @@ def read_pr_checks(
     project: str = "",
     api: Optional[Callable] = None,
     log_fetch: Optional[Callable] = None,
+    store=None,
 ) -> dict:
     """Read check-runs (and, for a failing run, a bounded log tail) on a
     commit — named by ``pr`` (a PR number, resolved to its head sha) or
@@ -291,8 +292,11 @@ def read_pr_checks(
         head = {"sha": sha}
 
     if not checks_perm_present(permissions):
-        return {"state": "unreachable", "reason": "permission_absent", "permission": "checks",
-                "head": head}
+        out = {"state": "unreachable", "reason": "permission_absent", "permission": "checks",
+               "head": head}
+        _file_ask(out, store=store, app_id=app_id, repo=repo, permission="checks",
+                  current=(permissions or {}).get("checks"))
+        return out
 
     runs, failed = _fetch_check_runs(call, repo=repo, sha=sha, bearer=bearer)
     if failed is not None:
@@ -306,6 +310,7 @@ def read_pr_checks(
     actions_ok = actions_perm_present(permissions)
     out_runs: list[dict] = []
     red: list[dict] = []
+    actions_ask: Optional[dict] = None
     for run in runs:
         summary = _run_summary(run)
         conclusion = summary.get("conclusion")
@@ -321,6 +326,11 @@ def read_pr_checks(
                     "permission": "actions",
                 }
                 first_error = "(log unreachable: permission_absent: actions)"
+                if actions_ask is None:  # one ask per call, not per failing run
+                    actions_ask = {}
+                    _file_ask(actions_ask, store=store, app_id=app_id, repo=repo,
+                              permission="actions",
+                              current=(permissions or {}).get("actions"))
             else:
                 job_id = _job_id_from_url(summary.get("details_url") or "") or \
                     _job_id_from_url(summary.get("html_url") or "")
@@ -354,10 +364,30 @@ def read_pr_checks(
             })
         out_runs.append(summary)
 
-    return {
+    result = {
         "state": "populated",
         "repo": repo,
         "head": head,
         "check_runs": out_runs,
         "red": red,
     }
+    if actions_ask:
+        result.update(actions_ask)
+    return result
+
+
+def _file_ask(out: dict, *, store, app_id: str, repo: str, permission: str,
+              current: Optional[str]) -> None:
+    """Gap 4464a63db1a9: a missing App permission is told to the operator
+    ONCE, as a named human_required item, beside the verb's own
+    ``permission_absent`` — which is unchanged. Mutates ``out`` with
+    ``human_required_id`` (and ``human_required_state``); never raises."""
+    from . import github_app_permissions as gap_
+
+    filed = gap_.file_permission_ask(
+        store, app_id=app_id, verb="pr_checks_read", repo=repo,
+        permission=permission, level="read", current=current,
+    )
+    out["human_required_state"] = filed.get("state")
+    if filed.get("human_required_id"):
+        out["human_required_id"] = filed["human_required_id"]

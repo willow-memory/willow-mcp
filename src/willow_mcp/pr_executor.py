@@ -205,7 +205,7 @@ def execute_pr_open(
         )
     if not pulls_perm_allows_open(auth.get("permissions")):
         level = (auth.get("permissions") or {}).get("pull_requests")
-        return _refuse(
+        out = _refuse(
             "EPERM",
             f"willows-bot is installed on {repo} but Pull requests is {level!r} "
             f"(need write). In GitHub App settings → Permissions → Repository → "
@@ -213,6 +213,17 @@ def execute_pr_open(
             f"permission request on each org.",
             envelope_id=matches[0],
         )
+        # Gap 4464a63db1a9: the operator is told once, as a named queue item.
+        from . import github_app_permissions as gap_
+
+        filed = gap_.file_permission_ask(
+            store, app_id=app_id, verb="pr_open_execute", repo=repo,
+            permission="pull_requests", level="write", current=level,
+        )
+        out["human_required_state"] = filed.get("state")
+        if filed.get("human_required_id"):
+            out["human_required_id"] = filed["human_required_id"]
+        return out
 
     # Remote-base ancestry preflight (gap bc9945dd47da). PR #530 was opened
     # from stale local `master` and the operator was told by GitHub to click
