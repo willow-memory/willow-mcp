@@ -52,7 +52,7 @@ good and the rest are load-bearing morale.
 
 ## 🌳 The Grove (lessons / rings)
 
-11. **🌱 Growth rings as literal changelog** — one ring per session; ring width = how much was learned. — ✅ **shipped**: willow-mcp `src/willow_mcp/the_grove.py` (a lessons-ring store). *(Note: the `willow-grove` repo is docs-only — the code lives here.)*
+11. **🌱 Growth rings as literal changelog** — one ring per session; ring width = how much was learned. — ✅ **shipped**: willow-mcp `src/willow_mcp/the_grove.py` (a lessons-ring store). *(Note: four grove-ish names coexist — `the_grove.py` here is the lessons-ring store; `willow-grove` (archived) is docs-only fleet-seam notes; `willows-grove` is the public operator-seat rebuild; `safe-app-willow-grove` (private) is the Grove running today. Verified 2026-09-21.)*
 12. **🌱 "Lesson regression" tests** — assert the agent still remembers a hard-won lesson; fail CI if a ring is forgotten.
 13. Render the Grove as an actual ASCII tree that gains rings.
 14. Drought years: sessions where nothing was learned show as thin rings.
