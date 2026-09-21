@@ -98,21 +98,65 @@ def test_workflows_path_that_is_a_file_is_unreachable(tmp_path):
 def test_lint_claim_detection_is_a_claim_not_a_mention():
     assert clp.is_lint_claim("ruff check src tests: All checks passed!")
     assert clp.is_lint_claim("lint clean")
-    assert clp.is_lint_claim("format --check: 63 files already formatted; formatter ok")
+    assert clp.is_lint_claim("ruff format --check: 63 files already formatted")
     assert not clp.is_lint_claim("tests/test_lint_pin.py: 7 passed")
     assert not clp.is_lint_claim("360 passed, 2 skipped in 10.1s")
+
+
+def test_honest_non_claims_are_not_judged():
+    """Loki 15D211C7: the first cut refused this branch's own handoff on
+    these. A mention, a disclaimer, a drift disclosure and a test count are
+    not claims of lint-clean."""
+    _pin = {"state": "populated", "version": "0.15.0", "source": "tests.yml"}
+    for text in [
+        "tests/test_ci_lint_pin.py: 21 passed — pip pin, ruff-action, required-version",
+        "ruff: not installed in any venv on the box and not a dev dep — no ruff run",
+        "ruff 0.16.7 check on the six changed files: 29 errors (UP045, PLW1510) — 20 pre-existing; not fixed: CI measures 0.15.0",
+        "ci_lint_pin(willow-mcp) → version 0.15.0, conflicts [{0.16.7, pyproject.toml: ruff==0.16.7}]",
+        "ruff 0.15.0 check: 3 errors, 2 fixable",
+    ]:
+        assert not clp.is_lint_claim(text), text
+        assert clp.judge_lint_claim(text, _pin)["verdict"] == "none", text
+
+
+def test_version_is_the_one_adjacent_to_the_clean_claim():
+    """'CI pins ruff==0.16.7; measured with ruff 0.15.0: All checks passed'
+    is a 0.15.0 measurement — order in the string must not decide."""
+    _pin = {"state": "populated", "version": "0.15.0", "source": "tests.yml"}
+    text = "CI pins ruff==0.16.7 in tests.yml; measured with ruff 0.15.0: All checks passed"
+    assert clp.named_ruff_version(text) == "0.15.0"
+    assert clp.judge_lint_claim(text, _pin)["verdict"] == "accept"
+    text2 = "measured with ruff 0.15.0: All checks passed; CI pins ruff==0.16.7 in tests.yml"
+    assert clp.judge_lint_claim(text2, _pin)["verdict"] == "accept"
+    bad = "CI pins ruff==0.15.0; measured with ruff 0.16.7: All checks passed"
+    v = clp.judge_lint_claim(bad, _pin)
+    assert v["verdict"] == "refuse" and "0.16.7" in v["reason"] and "0.15.0" in v["reason"]
 
 
 def test_named_version_shapes():
     for text, want in [
         ("ruff 0.16.7 check clean", "0.16.7"),
         ("ruff==0.15.0: All checks passed", "0.15.0"),
-        ("ruff-0.16.7 format --check clean", "0.16.7"),
         ("ruff (0.16.7) clean", "0.16.7"),
         ("ruff v0.16.7 clean", "0.16.7"),
         ("ruff clean", None),
     ]:
         assert clp.named_ruff_version(text) == want, text
+
+
+def test_pyproject_comment_is_not_a_pin(tmp_path):
+    """willow-mcp pyproject.toml:193 quotes `pip install ruff==0.16.7` in a
+    comment; the parsed document, not the text, is what pins."""
+    root = _repo(
+        tmp_path,
+        workflow="  - run: pip install ruff==0.15.0\n",
+        pyproject='# ruff is pinned here to match the lint job\'s `pip install ruff==0.16.7`\n'
+        '[project.optional-dependencies]\ntest = ["ruff==0.16.7"]\n',
+    )
+    pin = clp.ci_lint_pin(root)
+    assert pin["version"] == "0.15.0"
+    assert [c["version"] for c in pin["conflicts"]] == ["0.16.7"]
+    assert "optional-dependencies" in pin["conflicts"][0]["source"]
 
 
 # ── judgement ──────────────────────────────────────────────────────────────

@@ -87,8 +87,26 @@ def _pyproject_pins(repo_root: Path) -> list[dict[str, str]]:
             m = re.search(_VERSION, req)
             if m:
                 pins.append({"version": m.group(1), "source": f"pyproject.toml: [tool.ruff] required-version = {req!r}"})
-    for m in _PIP_PIN_RE.finditer(text):
-        pins.append({"version": m.group(1), "source": f"pyproject.toml: ruff=={m.group(1)}"})
+    # Dependency specs, from the PARSED document — a comment that quotes
+    # `pip install ruff==X` is prose, not a pin (Loki 15D211C7).
+    project = data.get("project") if isinstance(data, dict) else None
+    groups: list[tuple[str, Any]] = []
+    if isinstance(project, dict):
+        groups.append(("[project] dependencies", project.get("dependencies")))
+        extras = project.get("optional-dependencies")
+        if isinstance(extras, dict):
+            groups.extend((f"[project.optional-dependencies] {k}", v) for k, v in extras.items())
+    dep_groups = data.get("dependency-groups") if isinstance(data, dict) else None
+    if isinstance(dep_groups, dict):
+        groups.extend((f"[dependency-groups] {k}", v) for k, v in dep_groups.items())
+    for where, specs in groups:
+        if not isinstance(specs, list):
+            continue
+        for spec in specs:
+            if isinstance(spec, str):
+                m = _PIP_PIN_RE.search(spec)
+                if m:
+                    pins.append({"version": m.group(1), "source": f"pyproject.toml: {where}: {spec}"})
     return pins
 
 
@@ -142,44 +160,101 @@ def ci_lint_pin(repo_root: str | Path) -> dict[str, Any]:
 
 # ── judging a lint claim ───────────────────────────────────────────────────
 
-# A lint CLAIM, not a lint MENTION: `ruff` anywhere, or lint/format beside a
-# green word. "test_lint_pin passed" mentions lint and claims a test count —
-# that is the test gate's business, not this one's.
-_LINT_CLAIM_RE = re.compile(
-    r"\bruff\b"
-    r"|\b(?:lint(?:er|ing)?|format(?:ter|ting)?)\b[^.\n]{0,60}?"
-    r"\b(?:clean|green|pass(?:ed|es|ing)?|ok|no (?:errors|violations|findings)|checks passed)\b"
-    r"|\b(?:clean|green)\b[^.\n]{0,20}?\b(?:lint|format)\b",
+# What this gate judges is a CLAIM OF LINT-CLEAN — a linter word and a clean
+# word in the same clause. It must never fire on a mention of the tool
+# (`ruff-action`, a file named test_ci_lint_pin.py), a disclaimer ("ruff:
+# not installed … no ruff run"), a disclosure of drift ("ruff 0.16.7: 29
+# errors … CI measures 0.15.0"), or a test count ("21 passed"). Loki
+# 15D211C7 ran the first cut over this branch's own handoff and it refused
+# three honest lines; the shape below is built from those four strings.
+#
+# Evidence is judged clause by clause (split on ; . — | and newlines), and
+# the version a claim names is the `ruff <ver>` INSIDE that clause — so
+# "CI pins ruff==0.16.7; measured with ruff 0.15.0: All checks passed" is
+# a 0.15.0 measurement, whichever version is written first.
+_CLAUSE_SPLIT_RE = re.compile(r"(?:;|\||—|–|\n|\.\s+|\.$)")
+# The linter word. `ruff` followed by `-`/`_`/`.` is a name (ruff-action,
+# ruff_cache, ruff.toml), not the tool being run.
+_LINTER_WORD_RE = re.compile(
+    r"\bruff\b(?![-_.]\w)|\blint(?:er|ing)?\b|\bformat(?:ter|ting)?\b(?=[^\n]{0,30}\b(?:check|clean|ok|pass))",
     re.IGNORECASE,
 )
-# `ruff 0.16.7`, `ruff==0.16.7`, `ruff-0.16.7`, `ruff (0.16.7)`, `ruff v0.16.7`, `ruff/0.16.7`
-_NAMED_VERSION_RE = re.compile(r"\bruff\b[\s=(/\-]*v?" + _VERSION, re.IGNORECASE)
+# The clean word, tied to a check rather than a test count: "clean", "All
+# checks passed", "no/0 errors|violations|findings", "green", "ok", "already
+# formatted", "checks passed". A bare "N passed" is a test count and is NOT
+# here on purpose.
+_CLEAN_WORD_RE = re.compile(
+    r"\bclean\b|\ball checks? passed\b|\bchecks? passed\b|\bgreen\b|\bok\b"
+    r"|\b(?:no|0|zero)\s+(?:errors?|violations?|findings?|issues?|warnings?)\b"
+    r"|\balready formatted\b|\bno (?:changes|files) would be reformatted\b|\bpasses\b",
+    re.IGNORECASE,
+)
+# Honest non-claims: the tool was not run, or the line reports what was NOT
+# measured. Never judged.
+_DISCLAIMER_RE = re.compile(
+    r"\b(?:not|never|no)\s+(?:installed|run|ran|executed|measured|available|found)\b"
+    r"|\bno ruff (?:run|binary|executable)\b|\bunmeasured\b|\bnot re-?run\b|\bskipped\b|\bcould not\b|\bcannot\b",
+    re.IGNORECASE,
+)
+# `ruff 0.16.7`, `ruff==0.16.7`, `ruff (0.16.7)`, `ruff v0.16.7`, `ruff/0.16.7`
+_NAMED_VERSION_RE = re.compile(r"\bruff\b[\s=(/]*v?" + _VERSION, re.IGNORECASE)
+
+
+def _clauses(text: str) -> list[str]:
+    return [c.strip() for c in _CLAUSE_SPLIT_RE.split(text or "") if c and c.strip()]
+
+
+def lint_claims(text: str) -> list[dict[str, Any]]:
+    """Every clause of ``text`` that claims lint-clean, with the ruff
+    versions that clause names. A clause is a claim when it carries a linter
+    word AND a clean word AND no disclaimer."""
+    out: list[dict[str, Any]] = []
+    for clause in _clauses(text):
+        if not _LINTER_WORD_RE.search(clause) or not _CLEAN_WORD_RE.search(clause):
+            continue
+        if _DISCLAIMER_RE.search(clause):
+            continue
+        versions = [m.group(1) for m in _NAMED_VERSION_RE.finditer(clause)]
+        out.append({"clause": clause, "versions": versions})
+    return out
 
 
 def is_lint_claim(text: str) -> bool:
-    """Does this evidence string claim something about lint / format?"""
-    return bool(text) and bool(_LINT_CLAIM_RE.search(text))
+    """Does this evidence string claim lint-clean anywhere?"""
+    return bool(lint_claims(text))
 
 
 def named_ruff_version(text: str) -> str | None:
+    """The version the FIRST lint-clean claim in ``text`` names (or, with no
+    claim, the first `ruff <ver>` anywhere — for callers that only want a
+    version out of a line)."""
+    claims = lint_claims(text)
+    if claims:
+        vs = claims[0]["versions"]
+        return vs[0] if vs else None
     m = _NAMED_VERSION_RE.search(text or "")
     return m.group(1) if m else None
 
 
 def judge_lint_claim(evidence: str, pin: dict[str, Any]) -> dict[str, Any]:
-    """Judge ONE evidence string that claims lint against the resolved pin.
+    """Judge ONE evidence string against the resolved pin.
 
-    Returns ``{"verdict": "accept"|"refuse"|"advisory", "reason": str,
-    "named": str|None, "pinned": str|None}``.
+    Returns ``{"verdict": "accept"|"refuse"|"advisory"|"none", "reason",
+    "named", "pinned"}``. ``none`` means the string makes no lint-clean
+    claim and is not judged.
 
     * pin ``unreachable`` → ``advisory`` (never refuse on what could not be read).
-    * no version named → ``refuse`` (with the pin in the message when known).
+    * a claim naming no version → ``refuse`` (with the pin in the message).
     * pin ``empty`` → ``accept`` any named version.
-    * named == pinned → ``accept``; else ``refuse`` naming both.
+    * any claim's named version == pinned → ``accept``; else ``refuse`` naming both.
     """
-    named = named_ruff_version(evidence)
+    claims = lint_claims(evidence)
     pinned = pin.get("version")
     state = pin.get("state")
+    if not claims:
+        return {"verdict": "none", "reason": "no lint-clean claim", "named": None, "pinned": pinned}
+    named_all = [v for c in claims for v in c["versions"]]
+    named = named_all[0] if named_all else None
     if state == "unreachable":
         return {
             "verdict": "advisory",
@@ -192,7 +267,7 @@ def judge_lint_claim(evidence: str, pin: dict[str, Any]) -> dict[str, Any]:
         return {
             "verdict": "refuse",
             "reason": (
-                f"lint claim names no linter version: {evidence!r}{where}. "
+                f"lint claim names no linter version: {claims[0]['clause']!r}{where}. "
                 "A green that does not say which binary measured it is an assertion, not a measurement."
             ),
             "named": None,
@@ -200,8 +275,8 @@ def judge_lint_claim(evidence: str, pin: dict[str, Any]) -> dict[str, Any]:
         }
     if state == "empty" or not pinned:
         return {"verdict": "accept", "reason": "repo pins no linter version; named version accepted", "named": named, "pinned": None}
-    if named == pinned:
-        return {"verdict": "accept", "reason": f"ruff {named} matches the CI pin ({pin.get('source')})", "named": named, "pinned": pinned}
+    if pinned in named_all:
+        return {"verdict": "accept", "reason": f"ruff {pinned} matches the CI pin ({pin.get('source')})", "named": pinned, "pinned": pinned}
     return {
         "verdict": "refuse",
         "reason": (
@@ -223,9 +298,10 @@ def judge_findings(findings: list, pin: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(f, dict):
             continue
         for ev in _finding_evidence(f):
-            if is_lint_claim(ev):
-                v = judge_lint_claim(ev, pin)
-                v["finding_index"] = i
-                v["evidence"] = ev
-                verdicts.append(v)
+            v = judge_lint_claim(ev, pin)
+            if v["verdict"] == "none":
+                continue
+            v["finding_index"] = i
+            v["evidence"] = ev
+            verdicts.append(v)
     return verdicts
