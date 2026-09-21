@@ -200,7 +200,24 @@ def _fresh_rate_buckets():
 
 @pytest.fixture
 def desk(home_registry, monkeypatch):
-    """willow desk with an attributed orchestrator session."""
+    """willow desk with an attributed orchestrator session.
+
+    ``server._DEFAULT_APP_ID`` is read from ``WILLOW_APP_ID`` once, at
+    ``server`` module import time (see ``server.py``: ``_DEFAULT_APP_ID =
+    os.environ.get("WILLOW_APP_ID", "")``) -- long before this fixture's
+    ``monkeypatch.setenv`` calls run. ``envelope_pending_read`` /
+    ``envelope_ratify`` / ``envelope_reject`` take no ``app_id`` parameter
+    at all, so ``_guarded`` falls back to that frozen module global to
+    resolve the gate's caller. A desk-broker shell that already has
+    ``WILLOW_APP_ID=willow`` set before the test process starts hides this
+    completely; CI has no such ambient env, so ``_DEFAULT_APP_ID`` stays
+    ``""``, ``gate.valid_app_id("")`` is False, and every one of these
+    calls was refused ``invalid app_id`` before ever reaching the registry
+    logic under test -- surfacing three calls later as a bare ``KeyError``
+    on ``count``/``registry``/``ok``. Patch the module global directly so
+    the fixture is correct with or without ``WILLOW_APP_ID`` in the
+    environment.
+    """
     home, _ = home_registry
     monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(home / "mcp_apps"))
     monkeypatch.setenv("WILLOW_STORE_ROOT", str(home / "store"))
@@ -210,12 +227,30 @@ def desk(home_registry, monkeypatch):
         {"app_id": "willow",
          "permissions": ["orchestrator", "envelope_read", "envelope_write"]}))
     monkeypatch.setenv("WILLOW_HUMAN_ORCHESTRATOR", "1")
+    monkeypatch.setattr(server, "_DEFAULT_APP_ID", "willow")
     monkeypatch.setattr(server, "get_pg", lambda: None)
     (home / "sessions").mkdir(exist_ok=True)
     (home / "sessions" / "willow-s-orch.json").write_text(json.dumps(
         {"app_id": "willow", "session_id": "s-orch", "status": "idle",
          "dispatch_id": "", "verifier": "rita"}))
     monkeypatch.setattr(server, "_current_orchestrator_session", lambda: "s-orch")
+
+    # Name a future gate refusal at the source instead of a bare KeyError
+    # three lines later when a test indexes into the success shape.
+    # EREGISTRY is a real, expected outcome several tests below assert on
+    # explicitly (steered_away) -- only an unanticipated refusal fails here.
+    def _refusing(fn, fn_name):
+        def wrapper(*a, **kw):
+            result = fn(*a, **kw)
+            err = isinstance(result, dict) and result.get("error")
+            if err and err != "EREGISTRY":
+                pytest.fail(f"{fn_name} refused unexpectedly: {result}")
+            return result
+        return wrapper
+
+    for _name in ("envelope_pending_read", "envelope_ratify", "envelope_reject"):
+        monkeypatch.setattr(server, _name, _refusing(getattr(server, _name), _name))
+
     return home
 
 
