@@ -21,8 +21,9 @@ This module does not resolve anything. Per feedback_eliminate-split-brains
 could *actually* land on given the current environment, notes which of them
 exist, and flags divergence — two or more of those actually-reachable
 candidates existing and disagreeing. It is read-only: every operation here is
-``Path.exists()`` / ``Path.stat()`` on candidate paths. Nothing is created,
-written, moved, or deleted.
+``Path.exists()`` / ``Path.stat()`` on candidate paths, plus one
+``json.loads`` of each envelope-registry copy to compare their newest entries
+(gap 4c7512c57a7e). Nothing is created, written, moved, or deleted.
 
 Candidate enumeration is written to mirror each real resolver's own
 precedence exactly (``paths.willow_home``, ``paths.charter_repo``,
@@ -105,7 +106,96 @@ def envelope_registry_candidates() -> list[Candidate]:
                               charter / "envelopes" / "pre-approved.json"))
     else:
         out.append(Candidate("home_default", paths.willow_home() / "constitutional" / "pre-approved.json"))
+    # Gap 4c7512c57a7e: the implicit ~/.willow registry is unreachable from
+    # THIS process once WILLOW_HOME is set — but a shell the operator opens
+    # without WILLOW_HOME (a plain terminal, a CLI ratify) resolves it, and
+    # "ratified" from there never reaches the registry this process reads.
+    # Listed so scan() can compare its contents; reachable=False keeps it out
+    # of the plain "divergent" count, and _shadow_registry_problem() names it
+    # only when it holds something newer than the resolved registry.
+    shadow = Path.home() / ".willow" / "constitutional" / "pre-approved.json"
+    if _env_path("WILLOW_HOME") is not None and all(
+        c.path is None or not _same(c.path, shadow) for c in out
+    ):
+        out.append(Candidate("implicit_home_shadow", shadow, reachable=False))
     return out
+
+
+def _same(a: Path, b: Path) -> bool:
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return False
+
+
+def _registry_newest(path: Path) -> tuple[str, set[str]] | None:
+    """``(newest_timestamp, proposal_ids)`` across a registry's ``proposals``
+    and ``active`` rows, or ``None`` when the file is absent or unreadable.
+    Timestamps are the ISO strings the authoring module writes, which sort
+    lexically. Read-only — one ``json.loads``, no resolver consulted."""
+    import json
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    stamps: list[str] = []
+    ids: set[str] = set()
+    for row in (doc.get("proposals") or []):
+        if isinstance(row, dict):
+            ids.add(str(row.get("id") or ""))
+            stamps.append(str(row.get("proposed_at") or ""))
+    for row in (doc.get("active") or []):
+        if isinstance(row, dict):
+            stamps.append(str(row.get("issued_at") or row.get("proposed_at") or ""))
+    ids.discard("")
+    return (max(stamps) if stamps else ""), ids
+
+
+def _shadow_registry_problem(report: dict) -> dict | None:
+    """Gap 4c7512c57a7e: the ``implicit_home_shadow`` candidate is a named
+    problem — not a leftover — when it holds a proposal newer than anything
+    in the resolved registry, or a proposal id the resolved registry has
+    never seen. That is the signature of an operator act (a CLI ratify, a
+    propose from a plain shell) that landed in ``~/.willow`` while this
+    process reads elsewhere. Read-only."""
+    resolved = report.get("resolved")
+    shadow = next(
+        (c for c in report.get("candidates") or []
+         if c.get("source") == "implicit_home_shadow" and c.get("exists")),
+        None,
+    )
+    if shadow is None or not resolved:
+        return None
+    shadow_state = _registry_newest(Path(shadow["path"]))
+    if shadow_state is None:
+        return None
+    resolved_state = _registry_newest(Path(resolved)) or ("", set())
+    shadow_newest, shadow_ids = shadow_state
+    resolved_newest, resolved_ids = resolved_state
+    newer = bool(shadow_newest) and shadow_newest > resolved_newest
+    unseen = sorted(shadow_ids - resolved_ids)
+    if not newer and not unseen:
+        return None
+    return {
+        "shadow": shadow["path"],
+        "resolved": resolved,
+        "shadow_newest": shadow_newest or None,
+        "resolved_newest": resolved_newest or None,
+        "unseen_proposals": unseen,
+        "detail": (
+            f"envelope_registry: the implicit ~/.willow registry ({shadow['path']}) "
+            + (f"holds an entry from {shadow_newest}, newer than anything in the "
+               f"resolved registry ({resolved_newest or 'empty'})"
+               if newer else "holds proposals the resolved registry has never seen")
+            + (f"; proposal ids not in the resolved registry: {', '.join(unseen)}"
+               if unseen and newer else "")
+            + f". This process reads {resolved}; a shell without WILLOW_HOME "
+            "writes the shadow, so an operator's 'ratified' can land there and "
+            "never be seen here. Not repaired automatically — consolidate by hand."
+        ),
+    }
 
 
 def keyring_candidates() -> list[Candidate]:
@@ -197,9 +287,17 @@ def scan() -> dict:
     ``status`` is ``warn`` iff any artifact has two or more genuinely
     reachable, existing, disagreeing copies. Never mutates, creates,
     resolves, or picks between candidates — report only."""
+    registry = _artifact_report(
+        "envelope_registry", envelope_registry_candidates(), _resolved_envelope_registry())
+    shadow_problem = _shadow_registry_problem(registry)
+    if shadow_problem is not None:
+        registry["shadow_problem"] = shadow_problem
+        registry["status"] = "warn"
+        registry["detail"] = (
+            (registry["detail"] + " ") if registry.get("detail") else ""
+        ) + shadow_problem["detail"]
     artifacts = {
-        "envelope_registry": _artifact_report(
-            "envelope_registry", envelope_registry_candidates(), _resolved_envelope_registry()),
+        "envelope_registry": registry,
         "keyring": _artifact_report(
             "keyring", keyring_candidates(), _env_path("WILLOW_KEYRING")),
         "charter_repo": _artifact_report(

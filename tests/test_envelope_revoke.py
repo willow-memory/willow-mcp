@@ -38,7 +38,11 @@ def _registry(extra=None):
 
 @pytest.fixture
 def register(tmp_path, monkeypatch):
-    p = tmp_path / "pre-approved.json"
+    # The register sits where $WILLOW_HOME names it: revoke refuses EREGISTRY
+    # on any other resolve (gap 4c7512c57a7e).
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    (tmp_path / "constitutional").mkdir()
+    p = tmp_path / "constitutional" / "pre-approved.json"
     p.write_text(json.dumps(_registry()))
     monkeypatch.setattr(envelopes, "registry_path", lambda: p)
     monkeypatch.setattr(ea, "_load_registry", lambda: json.loads(p.read_text()))

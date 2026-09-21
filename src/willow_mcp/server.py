@@ -5668,9 +5668,11 @@ def envelope_ratify(proposal_id: str) -> dict:
         ledger = GovernanceLedger(pg)
     try:
         row = _ea.ratify(proposal_id, verifier=verifier, ledger=ledger)
+    except _ea.RegistryMismatchError as exc:
+        return {**exc.detail, "message": str(exc)}
     except _ea.EnvelopeAuthoringError as exc:
         return {"error": type(exc).__name__, "message": str(exc)}
-    return {"ok": True, "envelope": row}
+    return {"ok": True, "envelope": row, "registry": _ea.registry_identity()}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -5696,9 +5698,11 @@ def envelope_reject(
             proposal_id, reason=reason, verifier=verifier,
             reopen_when=reopen_when, ledger=ledger,
         )
+    except _ea.RegistryMismatchError as exc:
+        return {**exc.detail, "message": str(exc)}
     except _ea.EnvelopeAuthoringError as exc:
         return {"error": type(exc).__name__, "message": str(exc)}
-    return {"ok": True, "rejection": row}
+    return {"ok": True, "rejection": row, "registry": _ea.registry_identity()}
 
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -5744,13 +5748,24 @@ def envelope_pending_read(
     override") rather than a two-hop dance through ``envelope_list``.
     Precedent IDs that no longer resolve to an active envelope are
     silently dropped from the expansion (revoked / hand-edited registry);
-    ``precedent_ids`` itself stays intact as tamper evidence."""
+    ``precedent_ids`` itself stays intact as tamper evidence.
+
+    ``registry`` names the file this queue was read from — ``path`` and a
+    content ``fingerprint`` — so when an operator says "ratified" and the
+    queue has not moved, the desk can say which registry their act would
+    have to be in (gap 4c7512c57a7e). ``registry_mismatch`` is present when
+    that file is not the one ``$WILLOW_HOME`` names: every ratify from
+    this process would refuse ``EREGISTRY``."""
     from . import envelope_authoring as _ea
     rows = _ea.list_pending(
         oldest_first=oldest_first, limit=limit,
         include_precedents=include_precedents,
     )
-    return {"pending": rows, "count": len(rows)}
+    out = {"pending": rows, "count": len(rows), "registry": _ea.registry_identity()}
+    mismatch = _ea.registry_mismatch()
+    if mismatch is not None:
+        out["registry_mismatch"] = mismatch
+    return out
 
 
 @mcp.tool(annotations=_ANNO_READ)

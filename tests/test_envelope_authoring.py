@@ -49,8 +49,16 @@ def ring_with_rita(tmp_path, monkeypatch):
 @pytest.fixture
 def fresh_registry(tmp_path, monkeypatch):
     """Point the envelope registry + syscall table at throwaway tmp files with
-    a known verb ('demo_verb') available for proposals."""
-    registry_path = tmp_path / "pre-approved.json"
+    a known verb ('demo_verb') available for proposals.
+
+    The registry sits where ``$WILLOW_HOME`` names it: since gap
+    4c7512c57a7e every ratify / reject / revoke refuses ``EREGISTRY`` when
+    the resolved registry is any other file, so ``WILLOW_HOME`` is pointed
+    at ``tmp_path`` too (tests/test_envelope_registry_mismatch.py covers the
+    steered-away case on purpose)."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    (tmp_path / "constitutional").mkdir(exist_ok=True)
+    registry_path = tmp_path / "constitutional" / "pre-approved.json"
     syscall_path = tmp_path / "syscall-table.json"
     registry_path.write_text(
         json.dumps({
