@@ -39,6 +39,9 @@ ORCHESTRATOR_WRITE_TOOLS = frozenset({
     "handoff_write_v4",
     "verify_handoff",
     "agent_clear",
+    # gap afa515539c0a: retiring a packet is the orchestrator's act, same
+    # shape as clearing one.
+    "dispatch_withdraw",
     "frank_append",
     "envelope_apply",
     # PR5 (envelope-accrual): the operator's authoring writes gate under

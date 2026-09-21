@@ -110,10 +110,24 @@ def get_pg() -> Optional[psycopg2.extensions.connection]:
     into a dead one at 100+ call sites."""
     global _pg_conn, _pg_last_error
 
+    def _resolve_user() -> str:
+        # WILLOW_PG_USER is this project's own override and wins when set.
+        # Otherwise defer to the standard libpq PGUSER — every CI runner and
+        # every real Postgres deployment sets this, and overriding it with
+        # the OS account ($USER) instead connects as whatever user happens to
+        # be running the process (e.g. GitHub Actions' "runner"), which the
+        # target cluster never created a role for. Only fall back to $USER
+        # when neither is set, matching libpq's own last-resort default.
+        return (
+            os.environ.get("WILLOW_PG_USER")
+            or os.environ.get("PGUSER")
+            or os.environ.get("USER", "")
+        )
+
     def _connect():
         conn = psycopg2.connect(
             dbname=paths.pg_db(),
-            user=os.environ.get("WILLOW_PG_USER", os.environ.get("USER", "")),
+            user=_resolve_user(),
         )
         conn.autocommit = True
         return conn
@@ -128,7 +142,7 @@ def get_pg() -> Optional[psycopg2.extensions.connection]:
         return (
             f"{type(exc).__name__}: {detail} "
             f"(dbname={paths.pg_db()!r}, "
-            f"user={os.environ.get('WILLOW_PG_USER', os.environ.get('USER', ''))!r})"
+            f"user={_resolve_user()!r})"
         )
 
     with _pg_lock:

@@ -52,8 +52,11 @@ def registry_with_paths_verb(tmp_path, monkeypatch):
     """Registry + syscall table with a 'demo_paths' verb whose bounds are
     {path_pattern, max_bytes} — same shape earlier fixtures use, hoisted
     here so the tests below don't conflict on same-app-id session records
-    from other test files."""
-    registry_path = tmp_path / "pre-approved.json"
+    from other test files. The registry sits where $WILLOW_HOME names it:
+    ratify/reject refuse EREGISTRY on any other resolve (gap 4c7512c57a7e)."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    (tmp_path / "constitutional").mkdir(exist_ok=True)
+    registry_path = tmp_path / "constitutional" / "pre-approved.json"
     syscall_path = tmp_path / "syscall-table.json"
     registry_path.write_text(
         json.dumps({
