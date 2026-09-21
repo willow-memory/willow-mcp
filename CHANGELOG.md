@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.69.1](https://github.com/willow-memory/willow-mcp/compare/v2.69.0...v2.69.1) (2026-09-21)
+
+
+### Fixed
+
+* **deploy:** manifest-grant unit reads its keyring and fingerprint from the env file, not baked placeholders ([a19fe3c](https://github.com/willow-memory/willow-mcp/commit/a19fe3ca0ac3412675ab4178bc8e486c1855dd75))
+
 ## [2.69.0](https://github.com/willow-memory/willow-mcp/compare/v2.68.0...v2.69.0) (2026-09-21)
 
 
