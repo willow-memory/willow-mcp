@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **envelope:** retirement sweep — spent and branch-gone envelopes leave active[] ([98306e6](https://github.com/willow-memory/willow-mcp/commit/98306e6208b9bfc99bb27082aa1c4301180751ac))
 * **envelope:** retirement sweep for spent/merged envelopes ([5fbf959](https://github.com/willow-memory/willow-mcp/commit/5fbf95907ab4e15eff859243f90a40315b1b4d77))
 
 
