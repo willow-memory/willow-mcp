@@ -31,6 +31,20 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.74.0](https://github.com/willow-memory/willow-mcp/compare/v2.73.0...v2.74.0) (2026-09-21)
+
+
+### Added
+
+* **envelope:** retirement sweep for spent/merged envelopes ([5fbf959](https://github.com/willow-memory/willow-mcp/commit/5fbf95907ab4e15eff859243f90a40315b1b4d77))
+
+
+### Fixed
+
+* **envelope:** a zero clipped timeout ends the call, not the row (Loki D44CA29B) ([eacb12d](https://github.com/willow-memory/willow-mcp/commit/eacb12d1b9d31ff0ea17fa3a90a4d81eb753fe32))
+* **envelope:** add sweep cursor and per-row deadline (Loki re-audit D81165E5) ([4c4b928](https://github.com/willow-memory/willow-mcp/commit/4c4b9285bc9d2f6fd7286c616ece1c041dd7a18a))
+* **envelope:** rework retirement sweep per Loki's findings (9494D3AF) ([6a8b719](https://github.com/willow-memory/willow-mcp/commit/6a8b71913937b7b2185abdd83c86f632728e4327))
+
 ## [2.73.0](https://github.com/willow-memory/willow-mcp/compare/v2.72.0...v2.73.0) (2026-09-21)
 
 
