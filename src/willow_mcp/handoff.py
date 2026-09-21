@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -334,6 +335,14 @@ def verify_handoff(dispatch_id: str) -> dict:
             "passed', '0 violations') and no finding carries an `evidence` "
             "field — a bare assertion is not evidence"
         )
+    lint_verdicts = _judge_lint_claims(handoff, findings)
+    lint_refusals = [v for v in lint_verdicts if v["verdict"] == "refuse"]
+    lint_advisories = [v for v in lint_verdicts if v["verdict"] == "advisory"]
+    if checklist and lint_refusals:
+        reasons.append(
+            f"{len(lint_refusals)} lint claim(s) not measured against the CI pin: "
+            + "; ".join(f"finding {v['finding_index']}: {v['reason']}" for v in lint_refusals)
+        )
     verified = not reasons
 
     if verified:
@@ -354,4 +363,53 @@ def verify_handoff(dispatch_id: str) -> dict:
         out["reason"] = "; ".join(reasons)
         if invalid:
             out["invalid_findings"] = invalid
+    if lint_verdicts:
+        out["lint_claims"] = lint_verdicts
+    if lint_advisories:
+        # Unreachable pin: said, never a refusal (three-state, not collapsed).
+        out["advisory"] = "; ".join(v["reason"] for v in lint_advisories)
     return out
+
+
+# Sealed pair 11ccb0f7 part (4): a green claim names its linter. A finding
+# whose evidence claims lint/format clean must name the ruff version it was
+# measured with, and that version must be the one the repo's CI pins —
+# ratatosk #48 (2026-09-21) went red because 0.15.0 was clean where the
+# pinned 0.16.7 was not. The repo root, per finding: the finding's own
+# `repo_root` / `workspace` when it names one (a builder working two repos
+# names the one each claim is about), else the handoff's, else the broker's
+# WILLOW_PROJECT_ROOT. No root at all → the pin is `unreachable` and the
+# verdict is advisory — never a refusal on a repo the verifier could not read.
+_NO_ROOT_PIN = {
+    "state": "unreachable",
+    "reason": "no repo root: neither the finding nor the handoff names repo_root/workspace and WILLOW_PROJECT_ROOT is unset",
+    "version": None,
+    "source": None,
+}
+
+
+def _lint_pin_root(finding: dict, handoff: dict) -> str:
+    for scope in (finding, handoff):
+        for key in ("repo_root", "workspace"):
+            val = scope.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return os.environ.get("WILLOW_PROJECT_ROOT", "").strip()
+
+
+def _judge_lint_claims(handoff: dict, findings: list) -> list[dict]:
+    from . import ci_lint_pin
+
+    pins: dict[str, dict] = {}
+    verdicts: list[dict] = []
+    for i, f in enumerate(findings):
+        if not isinstance(f, dict):
+            continue
+        root = _lint_pin_root(f, handoff)
+        if root not in pins:
+            pins[root] = ci_lint_pin.ci_lint_pin(root) if root else dict(_NO_ROOT_PIN)
+        for v in ci_lint_pin.judge_findings([f], pins[root]):
+            v["finding_index"] = i
+            v["repo_root"] = root or None
+            verdicts.append(v)
+    return verdicts
