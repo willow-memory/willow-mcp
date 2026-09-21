@@ -552,6 +552,8 @@ def main(argv: Optional[list] = None) -> int:
     i.add_argument("--stage-dir", default=None,
                    help="where to stage the unit and ring (default: $WILLOW_HOME/deploy/net-signer)")
     i.add_argument("--group", default=None, help="the operator's group (socket access)")
+    i.add_argument("--keyboard", action="store_true",
+                   help="I am at a keyboard on a box with no broker; stage the unit by hand")
     args = parser.parse_args(argv)
 
     if args.command == "export-ring":
@@ -563,6 +565,13 @@ def main(argv: Optional[list] = None) -> int:
         return 0
 
     if args.command == "install":
+        # Verb 17 (unit.install, sealed 197aafa5): the unit file is a broker
+        # act under an envelope. The signer is a SYSTEM unit whose root line
+        # stays the operator's, so this path is kept — behind the shared
+        # --keyboard guard, so typing it is a stated choice, not the default.
+        from .unit_install_executor import keyboard_install_refused
+        if keyboard_install_refused(args):
+            return 2
         out = stage_install(stage_dir=Path(args.stage_dir) if args.stage_dir else None,
                             group=args.group)
         print(json.dumps(out, indent=2))

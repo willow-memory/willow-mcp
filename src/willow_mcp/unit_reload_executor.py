@@ -57,11 +57,14 @@ PULL_EVENT = "git_pull"
 _SYSTEMCTL_TIMEOUT_S = 10
 _GIT_TIMEOUT_S = 30
 
-#: The broker's own unit(s) — never a grantable reload target regardless of
-#: what bounds an envelope carries (syscall-table.json row 15's own note).
-#: Matched by suffix so a per-instance unit (``willow-mcp@prod.service``)
-#: is still caught by name, not just the bare unit.
-_BROKER_UNIT_SUFFIXES = ("willow-mcp.service", "willow-mcp-serve.service")
+#: The broker's own unit(s) — never a grantable reload (row 15) or install
+#: (row 17) target regardless of what bounds an envelope carries. Matched
+#: on the unit STEM, so a per-instance unit (``willow-mcp-serve@1.service``)
+#: and a non-service unit of the same name (``willow-mcp-serve.socket``) are
+#: both caught — Loki FECF6FED: the old suffix match let both through while
+#: its docstring claimed otherwise, and row 17 can *install* such a unit.
+_BROKER_UNIT_STEMS = ("willow-mcp", "willow-mcp-serve")
+_BROKER_UNIT_SUFFIXES = tuple(f"{s}.service" for s in _BROKER_UNIT_STEMS)  # kept for readers
 
 #: Errnos for which an ask is worth filing: the verb is real and the actor
 #: is the right one; what is missing is a grant the operator could issue.
@@ -114,10 +117,18 @@ def _parse_show(stdout: str) -> dict:
 
 
 def is_broker_unit(unit: str) -> bool:
-    """True if ``unit`` names (or is a per-instance variant of) the broker's
-    own unit — never a grantable reload target, per row 15's bounds note."""
-    u = (unit or "").strip()
-    return any(u == suf or u.endswith("/" + suf) for suf in _BROKER_UNIT_SUFFIXES)
+    """True if ``unit`` names the broker's own unit in any systemd spelling —
+    ``willow-mcp-serve.service``, a per-instance ``willow-mcp-serve@1.service``,
+    or any other unit type on that stem (``.socket``, ``.timer``, ...) — never
+    a grantable reload or install target, per rows 15 and 17. Compared on the
+    stem (name before ``@`` and before the last ``.``), case-insensitively, so
+    a template's ``Alias=``/``Also=`` value is judged the same way as an
+    argument."""
+    u = (unit or "").strip().lower()
+    if not u or "/" in u or "." not in u:
+        return False
+    stem = u.rsplit(".", 1)[0].split("@", 1)[0]
+    return stem in _BROKER_UNIT_STEMS
 
 
 def is_willow_bot_unit(unit: str) -> bool:

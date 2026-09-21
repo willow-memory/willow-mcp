@@ -84,6 +84,7 @@ _ENV_REPO = "WILLOW_RELOADER_REPO"
 _SYSTEMCTL_TIMEOUT_S = 15
 
 
+
 # ── configuration ─────────────────────────────────────────────────────────────
 
 def default_checkout() -> Optional[Path]:
@@ -417,9 +418,12 @@ def main(argv: Optional[list] = None) -> int:
         p.add_argument("--unit", default=None)
         p.add_argument("--checkout", default=None)
         p.add_argument("--repo", default=None)
-    inst = sub.add_parser("install", help="write the .service and .timer (never enables or starts them)")
+    inst = sub.add_parser("install", help="write the .service and .timer (never enables or starts them) — "
+                                          "the keyboard path; the broker path is unit_install_execute")
     inst.add_argument("--interval", default=DEFAULT_INTERVAL, help="OnUnitActiveSec= for the timer")
     inst.add_argument("--no-reload", action="store_true")
+    inst.add_argument("--keyboard", action="store_true",
+                      help="I am at a keyboard on a box with no broker; write the units by hand")
     sub.add_parser("status")
     un = sub.add_parser("uninstall")
     un.add_argument("--no-reload", action="store_true")
@@ -443,6 +447,10 @@ def main(argv: Optional[list] = None) -> int:
         # Due-and-failed is the only exit that should wake anyone.
         return 1 if (out.get("act") and not out.get("reloaded")) else 0
     if args.command == "install":
+        # Verb 17 (unit.install, sealed 197aafa5): one shared keyboard guard.
+        from .unit_install_executor import keyboard_install_refused
+        if keyboard_install_refused(args):
+            return 2
         print(json.dumps(install_services(config, reload=not args.no_reload, interval=args.interval), indent=2))
         return 0
     if args.command == "status":
