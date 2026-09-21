@@ -14,6 +14,97 @@ from willow_mcp import ci_lint_pin as clp
 from willow_mcp.handoff import verify_handoff
 
 
+# ── the adversarial set: every string from the five audit passes ────────────
+#
+# One labelled list so an edit that reopens any pass is caught by name.
+# Strings are verbatim from Loki's handoffs (15D211C7, 7AA9F436, C63A2C48,
+# AC8CBA02, AB9564DB) where the handoff quoted them; the ones Loki only
+# described (I4, I8, I9, C8, C9, X5, X6) are Hanuman's reconstructions of
+# the described shape and are marked `~`. Verdict is (verdict, named) at
+# pin 0.16.7 unless the row names another pin.
+_P167 = {"state": "populated", "version": "0.16.7", "source": "tests.yml"}
+_P150 = {"state": "populated", "version": "0.15.0", "source": "tests.yml"}
+_PEMPTY = {"state": "empty", "version": None, "source": None}
+
+ADVERSARIAL_SET = [
+    # pass 1 — 15D211C7
+    ("N1", "tests/test_ci_lint_pin.py: 21 passed — pip pin, ruff-action, required-version", "none", None, _P167),
+    ("N2", "ruff: not installed in any venv on the box and not a dev dep — no ruff run", "none", None, _P167),
+    ("N3", "ruff 0.16.7 check on the six changed files: 29 errors (UP045, PLW1510) — 20 pre-existing; not fixed: CI measures 0.15.0", "none", None, _P167),
+    ("R2@150", "CI pins ruff==0.16.7 in tests.yml; measured with ruff 0.15.0: All checks passed", "accept", "0.15.0", _P150),
+    ("R2", "CI pins ruff==0.16.7 in tests.yml; measured with ruff 0.15.0: All checks passed", "refuse", "0.15.0", _P167),
+    # pass 2 — 7AA9F436
+    ("E2", "the green claim gate reads the ruff pin", "none", None, _P167),
+    ("E3", "the lint job went green on CI (ruff 0.16.7)", "none", None, _P167),
+    ("E4", "passes; ruff 0.15.0 not run", "none", None, _P167),
+    ("E5", "81 passed; ruff 0.15.0 check clean", "refuse", "0.15.0", _P167),
+    ("E8", "bandit 1.7: no issues found; lint clean", "refuse", None, _P167),
+    ("R1", "ruff 0.15.0 check src tests: All checks passed", "refuse", "0.15.0", _P167),
+    ("R3", "lint clean, format clean", "refuse", None, _P167),
+    ("S1", "ruff 0.15.0 was used. All checks passed.", "refuse", "0.15.0", _P167),
+    ("S1n", "ruff 0.15.0\nAll checks passed", "refuse", "0.15.0", _P167),
+    ("S1d", "Ruff v0.15.0 — All checks passed!", "refuse", "0.15.0", _P167),
+    ("V1", "0.16.7 clean", "none", None, _P167),
+    ("V2", "0.15.0: All checks passed", "none", None, _P167),
+    ("C1", "37 conformance checks passed", "none", None, _P167),
+    ("C2", "ruff-action@v3 pinned; checks passed on CI", "none", None, _P167),
+    ("C4", "232 files already formatted (ruff 0.16.7)", "accept", "0.16.7", _P167),
+    ("C5", "no findings from bandit; ruff not run", "none", None, _P167),
+    ("C6", "lint: no errors (ruff 0.16.7)", "accept", "0.16.7", _P167),
+    # pass 3 — C63A2C48
+    ("C7", "ruff 0.15.0 clean on src; ruff 0.16.7 clean on tests", "refuse", "0.15.0", _P167),
+    ("~C8", "ruff 0.16.7 clean on src; ruff 0.16.7 clean on tests; ruff 0.15.0 clean on scripts", "refuse", "0.15.0", _P167),
+    ("~C9", "ruff 0.16.7 check src: All checks passed; ruff format --check: clean; 232 files already formatted", "accept", "0.16.7", _P167),
+    ("Q1", "src/ci_lint_pin.py: the clean word is ruff's own outcome phrase (\"All checks passed\") or `clean` adjacent to the linter word", "none", None, _P167),
+    ("Q2", "judge: a clean word is `clean` adjacent to the linter word — described, not claimed", "none", None, _P167),
+    ("L1", "ruff 0.15.0. All checks passed.", "refuse", "0.15.0", _P167),
+    ("L2", "ruff 0.15.0. Tests: 81 passed. All checks passed.", "refuse", "0.15.0", _P167),
+    # pass 4 — AC8CBA02
+    ("I1", "ruff 0.16.7 check: All checks passed; format --check: 232 files already formatted", "accept", "0.16.7", _P167),
+    ("I2", "ruff 0.16.7 check: All checks passed; ruff format --check: 0.15.0 was used, clean", "refuse", "0.15.0", _P167),
+    ("I3", "ruff 0.16.7 --version; ruff check: clean", "accept", "0.16.7", _P167),
+    ("~I4", "pytest: 81 passed; format --check clean", "refuse", None, _P167),
+    ("I5", "ruff 0.16.7 check: All checks passed; ruff format --check 0.15.0: clean", "refuse", "0.15.0", _P167),
+    ("I6", "CI pins ruff 0.16.7; ruff check: clean", "refuse", None, _P167),
+    ("I7", "the pin is ruff==0.16.7; lint clean", "refuse", None, _P167),
+    ("~I8", "ruff 0.16.7 check: All checks passed. ruff not run on tests. format --check: clean", "refuse", None, _P167),
+    ("~I9", "ruff 0.15.0: 29 errors. ruff 0.16.7 check: All checks passed", "accept", "0.16.7", _P167),
+    ("I10", "ruff 0.16.7\nAll checks passed", "accept", "0.16.7", _P167),
+    ("I11", "ruff 0.16.7 check: All checks passed; bandit: no findings", "accept", "0.16.7", _P167),
+    ("I11m", "ruff 0.15.0 check: 3 errors. mypy: no errors", "none", None, _P167),
+    ("L2p", "ruff 0.16.7. Tests: 81 passed. 2 skipped. All checks passed.", "accept", "0.16.7", _P167),
+    ("L4", "ruff 0.15.0. a. b. c. All checks passed.", "none", None, _P167),
+    ("SK", "Tests: 81 passed. 2 skipped.", "none", None, _P167),
+    ("Q3@150", "adversarial: '81 passed; ruff 0.16.7 check clean' accept 0.16.7", "none", None, _P150),
+    ("Q4", "ruff 0.16.7 check: All checks passed; it's clean", "accept", "0.16.7", _P167),
+    ("Q5", "over the transcript 'ruff 0.15.0 check: All checks passed' the gate said refuse", "none", None, _P167),
+    ("PA", "ruff 0.16.7 (tests.yml pin) check: All checks passed; format --check: 232 files already formatted; 41 passed", "accept", "0.16.7", _P167),
+    # pass 5 — AB9564DB
+    ("X1", "ruff check: All checks passed (CI pins 0.16.7)", "refuse", None, _P167),
+    ("X1b", "ruff check (tests.yml pins ruff==0.16.7): All checks passed", "refuse", None, _P167),
+    ("X2", "All checks passed; ruff 0.15.0 was the binary", "refuse", "0.15.0", _P167),
+    ("X2b", "All checks passed\nruff 0.15.0", "refuse", "0.15.0", _P167),
+    ("X3", "ruff 0.16.7 check: All checks passed; format --check under python 3.12: 232 files already formatted", "accept", "0.16.7", _P167),
+    ("X3b", "ruff 0.16.7 check on Python 3.14.4: All checks passed", "accept", "0.16.7", _P167),
+    ("X3c", "ruff check: All checks passed on python 3.12", "refuse", None, _P167),
+    ("X4", "ruff-check 0.15.0 clean", "none", None, _P167),
+    ("~X5@empty", "ruff 0.15.0 check: All checks passed", "accept", "0.15.0", _PEMPTY),
+    ("~X6@empty", "lint clean", "refuse", None, _PEMPTY),
+]
+
+
+def test_adversarial_set():
+    """Every string from the five audit passes, by name. A failure here names
+    the pass it reopened."""
+    failures = []
+    for label, text, want_verdict, want_named, pin in ADVERSARIAL_SET:
+        v = clp.judge_lint_claim(text, pin)
+        got = (v["verdict"], v["named"] if v["verdict"] != "none" else None)
+        if got != (want_verdict, want_named):
+            failures.append(f"{label}: want {(want_verdict, want_named)}, got {got} — {text!r}")
+    assert not failures, "\n".join(failures)
+
+
 # ── resolver ───────────────────────────────────────────────────────────────
 
 

@@ -26,6 +26,17 @@ mcp itself: tests.yml ``pip install ruff==0.15.0`` beside a pyproject test
 extra ``ruff==0.16.7``). When they disagree, ``version`` is the workflow's
 and ``conflicts`` names the other so the drift is legible rather than
 silently resolved.
+
+Scope of the prose judge (Loki AB9564DB, five audit passes): it judges the
+ordinary report shapes; it refuses the ones it can see. It has converged on
+its shapes and will never converge on prose — each pass found a new edge
+by construction, and that is what a regex over prose is. A structured lint
+field on a finding — ``{tool, version, outcome, source}`` — that
+verify_handoff reads directly is the durable answer; this judge is the
+fallback for findings that carry no such field. Gap:
+handoff/lint-claim-is-a-field-not-prose. ``tests/test_ci_lint_pin.py::
+test_adversarial_set`` holds every string from the five passes with its
+verdict, so an edit that reopens any pass is caught by name.
 """
 
 from __future__ import annotations
@@ -208,8 +219,14 @@ _DISCLAIMER_RE = re.compile(
 _NAMED_VERSION_RE = re.compile(r"\bruff\b[\s=(/]*v?" + _VERSION, re.IGNORECASE)
 # Any version token at all. A claim clause that carries one — anywhere —
 # names it; it never inherits (Loki AC8CBA02 I2/I5: `ruff format --check
-# 0.15.0: clean` is a 0.15.0 measurement, not an unnamed half).
+# 0.15.0: clean` is a 0.15.0 measurement, not an unnamed half). An
+# interpreter/runtime version is never a ruff version: "format --check
+# under python 3.12" names 3.12 as Python's, not ruff's (Loki AB9564DB X3).
 _ANY_VERSION_RE = re.compile(r"(?<![\w.])v?(\d+\.\d+(?:\.\d+){0,2})(?![\w.])")
+_RUNTIME_BEFORE_RE = re.compile(
+    r"\b(?:python|py|cpython|pypy|node|nodejs|java|jdk|gradle|go|rust|ubuntu|macos|windows)\s*[-=:v]?\s*$",
+    re.IGNORECASE,
+)
 # A statement of the pin is not a run: `CI pins ruff 0.16.7; ruff check:
 # clean` says which binary CI uses, not which one measured (I6/I7).
 _PIN_WORDING_RE = re.compile(
@@ -260,14 +277,49 @@ def lint_claims(text: str) -> list[dict[str, Any]]:
     clauses = _clauses(text)
 
     def _versions_in(clause: str) -> list[str]:
-        """Versions a clause names: `ruff <ver>` first, then any version
-        token in a clause that carries the linter word."""
-        named = [m.group(1) for m in _NAMED_VERSION_RE.finditer(clause)]
+        """Versions a clause names AS THE BINARY: `ruff <ver>` first, then
+        any version token in a clause that carries the linter word — except
+        a runtime version ("python 3.12") and, in a clause with pin wording,
+        any version that follows the pin words: "ruff check: All checks
+        passed (CI pins 0.16.7)" names the pin, not the binary (Loki
+        AB9564DB X1/X1b); "ruff 0.16.7 (tests.yml pin) check" names the
+        binary before the annotation and stays named."""
+        pin_at = None
+        pm = _PIN_WORDING_RE.search(clause)
+        if pm:
+            pin_at = pm.start()
+
+        def _before_pin(m: re.Match) -> bool:
+            return pin_at is None or m.start() < pin_at
+
+        named = [m.group(1) for m in _NAMED_VERSION_RE.finditer(clause) if _before_pin(m)]
         if named:
             return named
         if _LINTER_WORD_RE.search(clause):
-            return [m.group(1) for m in _ANY_VERSION_RE.finditer(clause)]
+            out: list[str] = []
+            for m in _ANY_VERSION_RE.finditer(clause):
+                if not _before_pin(m):
+                    continue
+                if _RUNTIME_BEFORE_RE.search(clause[max(0, m.start() - 12) : m.start()]):
+                    continue
+                out.append(m.group(1))
+            return out
         return []
+
+    def _lookahead(i: int) -> tuple[str, list[str]] | None:
+        """Outcome written before the tool: "All checks passed; ruff 0.15.0
+        was the binary" — one forward step to a same-tool line that names a
+        version and is not itself an outcome, a disclaimer or a pin
+        statement (Loki AB9564DB X2)."""
+        if i + 1 >= len(clauses):
+            return None
+        nxt = clauses[i + 1]
+        if _DISCLAIMER_RE.search(nxt) or _CLEAN_WORD_RE.search(nxt) or _OTHER_TOOL_RE.search(nxt):
+            return None
+        if not _LINTER_WORD_RE.search(nxt) or (_PIN_WORDING_RE.search(nxt) and not _CLEAN_WORD_RE.search(nxt)):
+            return None
+        vs = _versions_in(nxt)
+        return (nxt, vs) if vs else None
 
     def _inherit(i: int) -> tuple[str, list[str]] | None:
         """The nearest earlier clause (≤ _LOOKBACK_CLAUSES) that is a RUN of
@@ -323,7 +375,7 @@ def lint_claims(text: str) -> list[dict[str, Any]]:
             # Another tool's outcome, or an outcome with its own version and
             # no linter word — neither is a ruff claim (I11 and its mirror).
             continue
-        found = _inherit(i)
+        found = _inherit(i) or _lookahead(i)
         if found:
             out.append({"clause": f"{found[0]} / {clause}", "versions": found[1]})
     return out
@@ -384,7 +436,7 @@ def judge_lint_claim(evidence: str, pin: dict[str, Any]) -> dict[str, Any]:
                 "A green that does not say which binary measured it is an assertion, not a measurement "
                 f"(if this line is a quoted transcript, {_QUOTE_RULE})."
             ),
-            "named": named,
+            "named": None,
             "pinned": pinned,
         }
     if state == "empty" or not pinned:
