@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 134 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 135 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -5245,6 +5245,54 @@ def unit_install_execute(
 
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("envelope_apply")
+def manifest_grant_execute(
+    app_id: str,
+    envelope_id: str,
+    pair_id: str,
+) -> dict:
+    """Add the permission group(s) a human-sealed Nestor pair names to one or
+    more seats' `manifest.json`, performed by THIS process under the
+    `manifest.grant` envelope that governs `app_id` (verb 18, sealed
+    `d5504878`) — orchestrator-only. `pair_id` names a sealed decision
+    (`projects_willow_governance_decisions`, correlated via `nestor_pair_id`)
+    whose record carries `seats: [app_id]` and `groups: [group]`; those are
+    the call args the envelope's `apps`/`groups` bounds judge, not free
+    arguments to this tool. Refuses before any citation: caller is not the
+    orchestrator seat (`EPERM`), running inside Kart where gpg-agent is
+    unreachable (`EUNREACH`), no governance record for `pair_id` (`ENOENT`),
+    the pair is not `status=sealed` or its verifier is unknown/compromised in
+    the keyring (`EACCES`), the record's `seats`/`groups` are malformed
+    (`EINVAL`), or any named group is on the escalation list (`store_write`,
+    `envelope_apply`, `orchestrator`, `full_access`, `task_net`, ... — the
+    same list the PreToolUse manifest guard refuses self-grant of) (`EPERM`).
+    Then, per seat: append the groups to `permissions` (dedupe, keep order),
+    write atomically, detach-sign under PGP enforcement, and verify with
+    `gate.authorized` — a sign or verify failure restores the manifest's
+    previous bytes and `.sig`. Returns `{ok, granted, refused, receipt_ids}`
+    with a FRANK `manifest_granted` citation per seat. Gated as
+    envelope_apply, beside unit.install and unit.reload."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import manifest_grant_executor
+        from .governance_ledger import GovernanceLedger
+
+        return manifest_grant_executor.execute_manifest_grant(
+            app_id,
+            envelope_id=envelope_id,
+            pair_id=pair_id,
+            project="willow-mcp",
+            session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "granted": [], "refused": [],
+                "error": f"manifest_grant_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
 def pr_update_execute(
     app_id: str,
     repo: str,
@@ -8507,6 +8555,30 @@ def _cmd_sign_manifest(args) -> None:
     )
 
 
+def _cmd_manifest_grant(args) -> None:
+    """`willow-mcp manifest-grant <pair_id> --envelope <id>` — the CLI wrapper
+    around `manifest_grant_execute` (verb 18, `manifest.grant`), same code
+    path as the MCP tool. Runs as the orchestrator seat (`app_id="willow"`);
+    the executor itself refuses inside Kart and outside PGP-signed manifests
+    exactly as the MCP tool does — this wrapper adds no separate authority,
+    it is a keyboard door onto the same broker call."""
+    from . import manifest_grant_executor
+    from .governance_ledger import GovernanceLedger
+
+    pg = get_pg()
+    ledger = GovernanceLedger(pg) if pg else None
+    result = manifest_grant_executor.execute_manifest_grant(
+        "willow",
+        envelope_id=args.envelope or "",
+        pair_id=args.pair_id,
+        project="willow-mcp",
+        ledger=ledger,
+    )
+    print(json.dumps(result, indent=2, default=str))
+    if not result.get("ok"):
+        raise SystemExit(1)
+
+
 def _cmd_attest_session(args) -> None:
     """`willow-mcp attest-session <session_id>` — detach-sign the human
     orchestrator's stable session identity (#186 P2 / #313,
@@ -9687,6 +9759,7 @@ _COMMANDS: dict[str, str] = {
     "sign-net-task": "_cmd_sign_net_task",
     "sign-db-task": "_cmd_sign_db_task",
     "sign-manifest": "_cmd_sign_manifest",
+    "manifest-grant": "_cmd_manifest_grant",
     "attest-session": "_cmd_attest_session",
     "keys": "_cmd_keys",
     "sign-session": "_cmd_sign_session",
@@ -9989,6 +10062,18 @@ def _build_parser():
              "interactive operator terminal only; never an MCP tool)",
     )
     sign_manifest_p.add_argument("app_id", help="whose manifest to sign")
+
+    manifest_grant_p = subparsers.add_parser(
+        "manifest-grant",
+        help="Execute a sealed manifest.grant decision: add the sealed pair's "
+             "groups to its named seats' manifests, signed (verb 18; broker "
+             "process only, never Kart)",
+    )
+    manifest_grant_p.add_argument("pair_id", help="sealed Nestor pair id to execute")
+    manifest_grant_p.add_argument(
+        "--envelope", dest="envelope", default="",
+        help="which active manifest.grant envelope to cite (required if more than one governs 'willow')",
+    )
 
     attest_session_p = subparsers.add_parser(
         "attest-session",

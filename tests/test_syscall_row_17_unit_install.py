@@ -46,9 +46,12 @@ def test_row_17_note_names_the_seal_for_the_live_table_sync():
     assert "row 15" in row["note"]
 
 
-def test_row_ids_are_dense_and_17_is_the_last():
+def test_row_ids_are_dense_and_17_is_not_the_last_anymore():
+    """Row 18 (manifest.grant, tests/test_manifest_grant.py) landed after this
+    row — dense ids still hold, 17 is just no longer the tail."""
     ids = sorted(_rows())
-    assert ids == list(range(1, 18))
+    assert ids == list(range(1, 19))
+    assert 17 in ids
 
 
 def test_bounds_signature_accepts_units_and_sources():
