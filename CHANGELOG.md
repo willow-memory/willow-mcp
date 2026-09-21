@@ -36,7 +36,8 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **deploy:** manifest-grant unit reads its keyring and fingerprint from the env file, not baked placeholders ([a19fe3c](https://github.com/willow-memory/willow-mcp/commit/a19fe3ca0ac3412675ab4178bc8e486c1855dd75))
+* **deploy:** manifest-grant unit strips the Nestor-product keys it never reads, adds process hardening ([1d4b28a](https://github.com/willow-memory/willow-mcp/commit/1d4b28ac0e5e8a7d7d6407a7b04cb765fab35339))
+* **deploy:** manifest-grant unit reads the keyring and fingerprint from the env file, not baked placeholders ([1eec700](https://github.com/willow-memory/willow-mcp/commit/1eec70094759fa8fb51b001ea74ed45fb2ce6e84))
 
 ## [2.69.0](https://github.com/willow-memory/willow-mcp/compare/v2.68.0...v2.69.0) (2026-09-21)
 
