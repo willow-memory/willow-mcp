@@ -20,19 +20,32 @@ envelope, no citation, no write. It:
    for any run whose conclusion isn't quiet (``success``/``skipped``/
    ``neutral``).
 4. For a run that actually failed (``failure``, ``timed_out``,
-   ``cancelled``, ``action_required``, ``startup_failure``), tails the
-   Actions job log: the install token authenticates
+   ``cancelled``, ``action_required``, ``startup_failure``), fetches the
+   FULL Actions job log (capped at 5 MB): the install token authenticates
    ``GET .../actions/jobs/{id}/logs``, and GitHub answers with a 302 to a
    pre-signed, unauthenticated blob URL — the bearer must not ride along
    to that second host, which is why the log fetch is its own helper
    rather than a reuse of ``github_app_credentials._api``.
+5. Extracts a ``failure`` block from that full log (gap ``d5345e7e737f``:
+   willow-mcp CI jobs end with ~200 lines of Postgres service teardown, so
+   the pytest summary is never inside a 200-line tail window). Preference
+   order: pytest's ``=== FAILURES ===``/``short test summary info`` section
+   through the trailing count line; else a ruff/lint block (lines matching
+   ``path.py:LINE:COL: CODE`` plus the ``Found N errors`` summary); else a
+   generic fallback anchored on GitHub's own ``##[error]`` annotations
+   (Postgres teardown lines are dropped from this fallback ONLY — the
+   pytest/ruff blocks are bounded by their own markers and taken verbatim).
 
 Three-state top level (INVARIANTS §1): ``populated`` (at least one
 check-run), ``empty`` (the head resolved but zero check-runs are
 reported yet), ``unreachable`` (``reason`` names the cause: ``token``,
 ``permission_absent``, ``not_found``, ``timeout``, ``http_<status>``).
 A per-run ``log_tail`` that could not be read carries its OWN state the
-same way — never an empty string standing in for "no output".
+same way — never an empty string standing in for "no output". ``log_tail``
+stays a raw-line tail for callers that want it; each ``red[]`` entry gains
+``failure`` (``{kind, text, tests_failed, count_line}``, ``None`` when no
+log was fetched) and ``first_error_line`` becomes the first ``FAILED``
+line when ``failure.kind == "pytest"``.
 """
 from __future__ import annotations
 
@@ -52,7 +65,8 @@ _MAX_OUTPUT_TEXT = 4096          # bytes; per run's output.text
 _MAX_ANNOTATIONS = 50            # per run
 _MAX_LOG_LINES = 200             # hard cap regardless of the caller's log_tail
 _LOG_FETCH_TIMEOUT_S = 10
-_LOG_FETCH_MAX_BYTES = 2 * 1024 * 1024
+_LOG_FETCH_MAX_BYTES = 5 * 1024 * 1024   # the full job log, capped (gap d5345e7e737f)
+_GENERIC_CONTEXT_LINES = 40       # lines of context kept before the first ##[error]
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _GROUP_MARKER_RE = re.compile(r"^##\[(?:group|endgroup)\]")
@@ -60,6 +74,33 @@ _GROUP_MARKER_RE = re.compile(r"^##\[(?:group|endgroup)\]")
 _TS_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s?")
 _JOB_ID_RE = re.compile(r"/actions/runs/\d+/job/(\d+)")
 _ERROR_LINE_RE = re.compile(r"(?i)(error|failed|traceback|assert)")
+
+# ── failure-block extraction (gap d5345e7e737f) ─────────────────────────────
+# A pytest run's failure section: "=== FAILURES ===" (or the first
+# "___ test_name ___" header if the former is missing — e.g. a single
+# collection error), through "short test summary info" and the trailing
+# count line.
+_PYTEST_FAILURES_HEADER_RE = re.compile(r"^=+\s*FAILURES\s*=+\s*$")
+_PYTEST_TEST_HEADER_RE = re.compile(r"^_{3,}\s*.+?\s*_{3,}$")
+_PYTEST_SUMMARY_HEADER_RE = re.compile(r"^=+\s*short test summary info\s*=+\s*$", re.IGNORECASE)
+_PYTEST_COUNT_LINE_RE = re.compile(
+    r"^=+.*\b\d+\s+(?:failed|passed|error|errors|skipped|xfailed|xpassed|warnings?)\b.*=+\s*$",
+    re.IGNORECASE,
+)
+_PYTEST_FAILED_LINE_RE = re.compile(r"^FAILED\s+(\S+)")
+
+# ruff: "path/to/file.py:12:5: E501 line too long"
+_RUFF_LINE_RE = re.compile(r"^\S+\.py:\d+:\d+:\s+[A-Z]+\d+")
+_RUFF_SUMMARY_RE = re.compile(r"^Found\s+\d+\s+error", re.IGNORECASE)
+
+# Generic fallback: GitHub Actions' own error annotations.
+_ACTIONS_ERROR_RE = re.compile(r"##\[error\]")
+
+# Postgres service-container teardown noise — dropped from the GENERIC
+# fallback only; pytest/ruff blocks are bounded and taken verbatim.
+_PG_LOG_LINE_RE = re.compile(
+    r"^\s*\d{4}-\d{2}-\d{2}\s+.*\b(FATAL|LOG|DETAIL|HINT):",
+)
 
 
 def checks_perm_present(permissions: dict | None) -> bool:
@@ -166,6 +207,115 @@ def _first_error_line(tail_lines: list[str]) -> str:
         if _ERROR_LINE_RE.search(line):
             return line
     return tail_lines[-1] if tail_lines else ""
+
+
+def _clean_lines(text: str) -> list[str]:
+    """The full log, ANSI-stripped, GitHub's per-line ISO timestamp prefix
+    trimmed, ``##[group]``/``##[endgroup]`` markers dropped — the same
+    cleaning ``_log_tail_lines`` does, but over the WHOLE log rather than
+    the tail window, so failure-block extraction can see sections
+    ``log_tail``'s cap would otherwise cut off (gap d5345e7e737f: a CI job's
+    ~200-line Postgres teardown pushed the pytest summary out of the old
+    tail-only window)."""
+    cleaned = (_clean_log_line(raw) for raw in text.splitlines())
+    return [line for line in cleaned if not _GROUP_MARKER_RE.match(line.strip())]
+
+
+def _extract_pytest_failure(lines: list[str]) -> Optional[dict[str, Any]]:
+    start = None
+    for i, line in enumerate(lines):
+        if _PYTEST_FAILURES_HEADER_RE.match(line.strip()):
+            start = i
+            break
+    if start is None:
+        for i, line in enumerate(lines):
+            if _PYTEST_TEST_HEADER_RE.match(line.strip()):
+                start = i
+                break
+    if start is None:
+        return None
+
+    end = len(lines)
+    count_line = ""
+    # If a "short test summary info" header is present, the count line that
+    # ends the block is the one AFTER it — a per-test warnings banner earlier
+    # in the FAILURES section (some plugins print one per test) must not be
+    # mistaken for it.
+    summary_idx = None
+    for i in range(start, len(lines)):
+        if _PYTEST_SUMMARY_HEADER_RE.match(lines[i].strip()):
+            summary_idx = i
+            break
+    for i in range(summary_idx if summary_idx is not None else start, len(lines)):
+        if _PYTEST_COUNT_LINE_RE.match(lines[i].strip()):
+            count_line = lines[i].strip()
+            end = i + 1
+            break
+
+    block = lines[start:end]
+    tests_failed = []
+    for line in block:
+        m = _PYTEST_FAILED_LINE_RE.match(line.strip())
+        if m:
+            tests_failed.append(m.group(1))
+    return {
+        "kind": "pytest",
+        "text": "\n".join(block),
+        "tests_failed": tests_failed,
+        "count_line": count_line,
+    }
+
+
+def _extract_ruff_failure(lines: list[str]) -> Optional[dict[str, Any]]:
+    matches = [line.strip() for line in lines if _RUFF_LINE_RE.match(line.strip())]
+    if not matches:
+        return None
+    summary = ""
+    for line in lines:
+        if _RUFF_SUMMARY_RE.match(line.strip()):
+            summary = line.strip()
+            break
+    block = matches + ([summary] if summary else [])
+    return {
+        "kind": "ruff",
+        "text": "\n".join(block),
+        "tests_failed": [],
+        "count_line": summary,
+    }
+
+
+def _extract_generic_failure(lines: list[str]) -> dict[str, Any]:
+    """The last resort: GitHub's own ``##[error]`` annotations, plus
+    ``_GENERIC_CONTEXT_LINES`` of context before the first one. Postgres
+    service-container teardown noise is dropped HERE ONLY — pytest/ruff
+    blocks above are bounded by their own markers and taken verbatim."""
+    filtered = [line for line in lines if not _PG_LOG_LINE_RE.match(line)]
+    error_idxs = [i for i, line in enumerate(filtered) if _ACTIONS_ERROR_RE.search(line)]
+    if not error_idxs:
+        block = filtered[-_GENERIC_CONTEXT_LINES:]
+    else:
+        start = max(0, error_idxs[0] - _GENERIC_CONTEXT_LINES)
+        end = error_idxs[-1] + 1
+        block = filtered[start:end]
+    return {
+        "kind": "generic",
+        "text": "\n".join(block),
+        "tests_failed": [],
+        "count_line": "",
+    }
+
+
+def _extract_failure_block(text: str) -> dict[str, Any]:
+    """Extract the diagnostic block from a full job log: pytest's
+    FAILURES/summary section, else a ruff lint block, else a generic
+    ``##[error]``-anchored fallback. Never raises on a text with no
+    recognizable failure shape — the generic path always returns something."""
+    lines = _clean_lines(text)
+    return (
+        _extract_pytest_failure(lines)
+        or _extract_ruff_failure(lines)
+        or _extract_generic_failure(lines)
+    )
 
 
 def _fetch_check_runs(api: Callable, *, repo: str, sha: str, bearer: str) -> tuple[Optional[list[dict]], Optional[dict]]:
@@ -319,6 +469,7 @@ def read_pr_checks(
                 call, repo=repo, run_id=summary["id"], bearer=bearer,
             )
         first_error = ""
+        failure: Optional[dict[str, Any]] = None
         if conclusion in _FAILING_CONCLUSIONS:
             if not actions_ok:
                 summary["log_tail"] = {
@@ -348,19 +499,34 @@ def read_pr_checks(
                         summary["log_tail"] = {"state": "unreachable", "reason": cause, "detail": reason}
                         first_error = f"(log unreachable: {cause})"
                     else:
-                        tail_lines, total_lines = _log_tail_lines(log_resp.get("text") or "", cap)
+                        full_text = log_resp.get("text") or ""
+                        tail_lines, total_lines = _log_tail_lines(full_text, cap)
                         summary["log_tail"] = {
                             "state": "populated" if tail_lines else "empty",
                             "lines": tail_lines,
                             "log_lines_total": total_lines,
                             "truncated": total_lines > len(tail_lines),
                         }
-                        first_error = _first_error_line(tail_lines)
+                        # The failure block is extracted from the FULL log, not
+                        # the tail window: a job's Postgres-teardown noise (gap
+                        # d5345e7e737f) can push the pytest summary past
+                        # log_tail's 200-line cap entirely.
+                        failure = _extract_failure_block(full_text)
+                        if failure["kind"] == "pytest":
+                            pytest_failed_lines = [
+                                line for line in failure["text"].splitlines()
+                                if line.strip().startswith("FAILED ")
+                            ]
+                            first_error = pytest_failed_lines[0].strip() if pytest_failed_lines \
+                                else _first_error_line(tail_lines)
+                        else:
+                            first_error = _first_error_line(tail_lines)
             red.append({
                 "name": summary.get("name"),
                 "conclusion": conclusion,
                 "job_url": summary.get("html_url") or summary.get("details_url"),
                 "first_error_line": first_error,
+                "failure": failure,
             })
         out_runs.append(summary)
 

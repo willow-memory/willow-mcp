@@ -244,6 +244,12 @@ def test_populated_with_one_red_tail_annotations_and_first_error_line(home, monk
         "name": "pytest", "conclusion": "failure",
         "job_url": "https://github.com/forge-play/Forge/actions/runs/9/job/99",
         "first_error_line": "FAILED tests/test_x.py::test_x - AssertionError: nope",
+        "failure": {
+            "kind": "generic",
+            "text": "collecting…\nFAILED tests/test_x.py::test_x - AssertionError: nope",
+            "tests_failed": [],
+            "count_line": "",
+        },
     }]
     # The bearer rides the first (api.github.com) hop; the log fetch is a
     # separate call the fake here answers directly (redirect-following is
@@ -279,6 +285,176 @@ def test_log_fetch_failure_is_unreachable_but_run_still_returned(home, monkeypat
     run = out["check_runs"][0]
     assert run["log_tail"] == {"state": "unreachable", "reason": "not_found", "detail": "gone"}
     assert out["red"][0]["first_error_line"] == "(log unreachable: not_found)"
+    assert out["red"][0]["failure"] is None
+
+
+# ── failure-block extraction: the full log, not the tail window ──────────────
+# Fixture shaped like tonight's #594 job 106227660755: ~880 lines, the pytest
+# FAILURES/summary section around lines 650-700, Postgres service teardown
+# noise after it — the exact shape that pushed the pytest summary out of the
+# old 200-line tail window (gap d5345e7e737f).
+
+def _ci_log_fixture_pytest():
+    setup = [f"setting up step {i}" for i in range(1, 649)]           # ~648 lines
+    failures = [
+        "=================================== FAILURES ===================================",
+        "_______________________________ test_alpha ___________________________________",
+        "    def test_alpha():",
+        ">       assert False",
+        "E       AssertionError",
+        "",
+        "tests/test_a.py:10: AssertionError",
+        "_______________________________ test_beta ____________________________________",
+        "    def test_beta():",
+        ">       raise KeyError('x')",
+        "E       KeyError: 'x'",
+        "",
+        "tests/test_b.py:20: KeyError",
+        "_______________________________ test_gamma ___________________________________",
+        "    def test_gamma():",
+        ">       raise ValueError('nope')",
+        "E       ValueError: nope",
+        "",
+        "tests/test_c.py:30: ValueError",
+        "=========================== short test summary info ============================",
+        "FAILED tests/test_a.py::test_alpha - AssertionError",
+        "FAILED tests/test_b.py::test_beta - KeyError: 'x'",
+        "FAILED tests/test_c.py::test_gamma - ValueError: nope",
+        "======================= 3 failed, 4351 passed, 26 skipped in 122.30s =======================",
+    ]                                                                   # 24 lines: ~649-672
+    teardown = []
+    for i in range(1, 151):                                            # ~150 lines after
+        if i % 3 == 0:
+            teardown.append("2026-09-20 23:00:00.000 UTC [1] LOG:  received fast shutdown request")
+        else:
+            teardown.append(
+                "2026-09-20 23:00:00.000 UTC [1] FATAL:  terminating connection due to "
+                "administrator command"
+            )
+    lines = setup + failures + teardown
+    # GitHub's per-line ISO timestamp prefix, on every line, per gap d5345e7e737f.
+    return "\n".join(
+        f"2026-09-21T00:{(i % 60):02d}:00.0000000Z {line}" for i, line in enumerate(lines)
+    )
+
+
+def test_pytest_failure_block_survives_postgres_teardown_after_it(home, monkeypatch):
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+    text = _ci_log_fixture_pytest()
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": text}
+
+    out = _read(api, log_fetch=log_fetch)
+    failure = out["red"][0]["failure"]
+    assert failure["kind"] == "pytest"
+    assert failure["tests_failed"] == [
+        "tests/test_a.py::test_alpha",
+        "tests/test_b.py::test_beta",
+        "tests/test_c.py::test_gamma",
+    ]
+    assert failure["count_line"] == (
+        "======================= 3 failed, 4351 passed, 26 skipped in 122.30s ======================="
+    )
+    # The Postgres teardown lines that follow the count line never make it in.
+    assert "FATAL" not in failure["text"]
+    assert "LOG:" not in failure["text"]
+    # Timestamps are stripped from every retained line.
+    assert "2026-09-21T00:" not in failure["text"]
+    assert out["red"][0]["first_error_line"] == "FAILED tests/test_a.py::test_alpha - AssertionError"
+
+
+def test_ruff_failure_block(home, monkeypatch):
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+    text = "\n".join([
+        "Run ruff check src tests hooks",
+        "src/willow_mcp/foo.py:12:5: E501 line too long (100 > 88 characters)",
+        "src/willow_mcp/bar.py:30:1: F401 'os' imported but unused",
+        "Found 2 errors.",
+    ])
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": text}
+
+    out = _read(api, log_fetch=log_fetch)
+    failure = out["red"][0]["failure"]
+    assert failure["kind"] == "ruff"
+    assert failure["count_line"] == "Found 2 errors."
+    assert "src/willow_mcp/foo.py:12:5: E501" in failure["text"]
+    assert "src/willow_mcp/bar.py:30:1: F401" in failure["text"]
+
+
+def test_generic_fallback_when_no_pytest_section_drops_postgres_noise(home, monkeypatch):
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+    context = [f"context line {i}" for i in range(60)]
+    pg = [
+        "2026-09-20 23:00:00.000 UTC [1] LOG:  received fast shutdown request",
+        "2026-09-20 23:00:01.000 UTC [1] FATAL:  terminating connection due to administrator command",
+    ]
+    tail = ["##[error]Process completed with exit code 1."]
+    text = "\n".join(context + pg + tail)
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": text}
+
+    out = _read(api, log_fetch=log_fetch)
+    failure = out["red"][0]["failure"]
+    assert failure["kind"] == "generic"
+    assert "##[error]Process completed with exit code 1." in failure["text"]
+    assert "FATAL" not in failure["text"]
+    assert "LOG:" not in failure["text"]
+    assert "context line 20" in failure["text"]   # 40 lines of context, kept
+    assert "context line 19" not in failure["text"]  # older than the 40-line window
+
+
+def test_default_log_fetch_caps_download_at_5mb(monkeypatch):
+    import urllib.request
+
+    huge = b"x" * (6 * 1024 * 1024)
+
+    class _FakeResponse:
+        status = 200
+
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def read(self, n=-1):
+            return self._data[:n] if n and n > 0 else self._data
+
+        def close(self):
+            pass
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            return _FakeResponse(huge)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _FakeOpener())
+
+    out = pr_checks._default_log_fetch(
+        "https://api.github.com/repos/x/y/actions/jobs/1/logs", bearer="ghs_secret",
+    )
+    assert out["truncated"] is True
+    assert len(out["text"].encode("utf-8")) == 5 * 1024 * 1024
+
+
+def test_missing_actions_permission_refusal_names_actions_read(home, monkeypatch):
+    _app_token(monkeypatch, checks="read", actions="")
+    calls = []
+
+    def fake_file_ask(store, *, app_id, verb, repo, permission, level="read", current=None):
+        calls.append({"permission": permission, "level": level})
+        return {"state": "filed", "human_required_id": "abc"}
+
+    monkeypatch.setattr(
+        "willow_mcp.github_app_permissions.file_permission_ask", fake_file_ask,
+    )
+    api = _FakeApi(runs=[_red_run()])
+    _read(api)
+    assert calls, "a missing actions permission must file exactly one ask"
+    assert f"{calls[0]['permission']}:{calls[0]['level']}" == "actions:read"
 
 
 # ── the redirect-following default log fetch, no network ─────────────────────
