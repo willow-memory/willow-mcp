@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **mcp:** net_authority_drain — the verb that runs the seal-driven drain; net_signer install honesty (c8572a92) ([8ad8cce](https://github.com/willow-memory/willow-mcp/commit/8ad8cce8a9d291675136aa3ee14c597819fa1be4))
 * **mcp:** net_authority_drain — the verb that runs the seal-driven tick; net_signer install says what is missing (6031199ac4e1) ([4cace3c](https://github.com/willow-memory/willow-mcp/commit/4cace3caffe322b855158508ae8c303bbf0e492f))
 
 ## [2.61.0](https://github.com/willow-memory/willow-mcp/compare/v2.60.0...v2.61.0) (2026-09-20)
