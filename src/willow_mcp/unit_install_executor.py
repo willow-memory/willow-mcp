@@ -127,19 +127,37 @@ def _fresh_backup_path(target: Path, stamp: str) -> Path:
     return keep
 
 
-def _prune_backups(target: Path, keep_n: int = BACKUPS_KEPT) -> list[str]:
-    """Delete all but the newest ``keep_n`` backups of ``target`` (lexical
-    order on the stamp is chronological); return what was removed."""
+#: The only backup names this verb writes: `<stamp>` is `%Y%m%dT%H%M%S.%fZ`,
+#: optionally `-N`. Anything else beside a unit is not ours to prune (Loki
+#: 0B774ED3: a `…pre-install-junk` file sorted as "newest" and a real backup
+#: was deleted in its place).
+_BACKUP_STAMP_RE = re.compile(r"^\d{8}T\d{6}\.\d{6}Z(-\d+)?$")
+
+
+def _prune_backups(target: Path, keep_n: int = BACKUPS_KEPT) -> tuple[list[str], list[str]]:
+    """Delete all but the newest ``keep_n`` STAMP-SHAPED backups of ``target``
+    (lexical order on the stamp is chronological). Returns ``(pruned,
+    unrecognised)`` — a file under the backup prefix whose suffix is not a
+    stamp is left alone and named, never counted as newest."""
     prefix = f"{target.name}{_BACKUP_TAG}"
-    found = sorted(p for p in target.parent.iterdir() if p.name.startswith(prefix) and p.is_file())
+    stamped: list[Path] = []
+    unrecognised: list[str] = []
+    for p in target.parent.iterdir():
+        if not p.name.startswith(prefix) or not p.is_file():
+            continue
+        if _BACKUP_STAMP_RE.match(p.name[len(prefix):]):
+            stamped.append(p)
+        else:
+            unrecognised.append(str(p))
+    stamped.sort()
     pruned: list[str] = []
-    for old in found[:-keep_n] if keep_n > 0 else found:
+    for old in stamped[:-keep_n] if keep_n > 0 else stamped:
         try:
             old.unlink()
             pruned.append(str(old))
         except OSError as exc:
             pruned.append(f"{old}: prune failed: {exc}")
-    return pruned
+    return pruned, sorted(unrecognised)
 
 
 def _digest(text: str) -> str:
@@ -399,16 +417,43 @@ def broker_units_named(rendered: str) -> list[str]:
     return hits
 
 
+#: Per unit type, the section+key naming what `enable --now <unit>` starts.
+_ACTIVATION_KEY = {"timer": ("Timer", "Unit"), "socket": ("Socket", "Service"), "path": ("Path", "Unit")}
+
+
+def enable_effects(rendered: str, unit_name: str) -> dict:
+    """Every unit name ``systemctl enable --now <unit_name>`` will CREATE or
+    START from this rendered text, so the envelope's bounds can judge all of
+    it (Loki 0B774ED3 — the last door in the class):
+
+    * ``creates``: ``[Install] Alias=`` names (symlinks created) and
+      ``Also=`` units (enabled alongside);
+    * ``activates``: for a ``.timer``/``.socket``/``.path`` the unit its
+      activation key names, last assignment wins as in systemd, or absent
+      the ``.service`` on the same stem; ``""`` for any other type.
+
+    The service+timer sibling rule of 02195799 is the special case of this.
+    """
+    install = unit_keys(rendered, "Install")
+    creates: list[str] = []
+    for key in ("Alias", "Also"):
+        for value in install.get(key, ()):
+            creates.extend(n for n in value.split() if n)
+    activates = ""
+    suffix = unit_name.rsplit(".", 1)[-1] if "." in unit_name else ""
+    if suffix in _ACTIVATION_KEY:
+        section, key = _ACTIVATION_KEY[suffix]
+        values = unit_keys(rendered, section).get(key, [])
+        if values and values[-1].strip():
+            activates = values[-1].strip()
+        else:
+            activates = unit_name[: -len(suffix) - 1] + ".service"
+    return {"creates": creates, "activates": activates}
+
+
 def timer_activates(timer_rendered: str, timer_name: str) -> str:
-    """What ``enable --now <timer>`` will start: ``[Timer] Unit=`` (the last
-    assignment wins, as in systemd) or, absent, the service on the same stem.
-    Loki 02195799: a tracked, clean timer whose ``Unit=`` names another
-    service would start THAT service on schedule, outside the cited bounds."""
-    values = unit_keys(timer_rendered, "Timer").get("Unit", [])
-    if values:
-        return values[-1].strip()
-    stem = timer_name[: -len(".timer")] if timer_name.endswith(".timer") else timer_name
-    return f"{stem}.service"
+    """Kept for readers of 02195799's fix; :func:`enable_effects` is the rule."""
+    return enable_effects(timer_rendered, timer_name)["activates"]
 
 
 def execute_unit_install(
@@ -518,20 +563,38 @@ def execute_unit_install(
             named=named,
         )
 
-    # What the timer ACTIVATES must be the unit being installed: `enable
-    # --now <timer>` starts whatever [Timer] Unit= names, and a tracked, clean
-    # timer naming another service would start it outside the cited bounds
-    # (Loki 02195799). ENAME, naming both.
-    activates = ""
+    # Everything `enable --now` will CREATE or START, for the installed unit
+    # and its sibling, is judged: an activation target that is not the
+    # installed service (or the sibling pair's own service) is ENAME naming
+    # both, and every created/enabled name rides in the cited bounds below
+    # (Loki 02195799 for the service->timer pair; 0B774ED3 generalised it to
+    # direct .timer/.socket/.path installs and [Install] Alias=/Also=).
+    effects = enable_effects(rendered, unit)
+    activates = effects["activates"]
+    if activates and activates != unit:
+        # A direct .timer/.socket/.path install: its target must be the
+        # same-stem service it ships for — the only unit the bounds could
+        # have meant by naming this one.
+        stem_service = unit.rsplit(".", 1)[0] + ".service"
+        if activates != stem_service:
+            return _refuse(
+                "ENAME",
+                f"{unit!r} activates {activates!r}, not {stem_service!r} — a "
+                f"{unit.rsplit('.', 1)[-1]} installs only for the service it ships with",
+                declared=activates, activates=activates,
+            )
+    creates = list(effects["creates"])
     if timer_src is not None:
-        activates = timer_activates(timer_rendered, timer_name)
+        timer_effects = enable_effects(timer_rendered, timer_name)
+        activates = timer_effects["activates"]
         if activates != unit:
             return _refuse(
                 "ENAME",
                 f"timer {timer_name!r} activates {activates!r}, not {unit!r} — a timer "
                 f"installs only beside the service it schedules",
-                declared=activates, timer=timer_name,
+                declared=activates, timer=timer_name, activates=activates,
             )
+        creates.extend(timer_effects["creates"])
 
     if ledger is None:
         return _refuse(
@@ -539,10 +602,16 @@ def execute_unit_install(
             "no governance ledger: an install that cannot be cited is not performed",
         )
 
-    # The cited call names everything that will be written AND what gets
-    # enabled: the timer rides in `units` so the bounds check judges it, and
-    # the receipt says what it activates.
-    call_args = {"units": [unit] + ([timer_name] if timer_name else []), "sources": [source]}
+    # The cited call names everything the enable will write, create, enable
+    # or start — the unit, its sibling, every Alias=/Also= name, and the
+    # activation target — so the envelope's bounds judge all of it. An
+    # activation target equal to the installed unit adds nothing; a
+    # direct timer/socket/path's same-stem service does ride along.
+    judged: list[str] = [unit]
+    for name in ([timer_name] if timer_name else []) + creates + ([activates] if activates else []):
+        if name and name not in judged:
+            judged.append(name)
+    call_args = {"units": judged, "sources": [source]}
     try:
         matches = governing_envelope_ids(VERB, app_id)
     except (OSError, ValueError) as exc:
@@ -653,8 +722,11 @@ def execute_unit_install(
 
     state_after = show_unit(unit, runner=runner)
     pruned: list[str] = []
+    unrecognised: list[str] = []
     for target, _ in targets:
-        pruned.extend(_prune_backups(target))
+        p, u = _prune_backups(target)
+        pruned.extend(p)
+        unrecognised.extend(u)
 
     receipt_out = {
         "ok": True, "installed": True, "unit": unit, "source": source,
@@ -663,7 +735,9 @@ def execute_unit_install(
         "timer_template_digest": _digest(timer_src["text"]) if timer_src else "",
         "replaced": replaced, "previous_digest": previous_digest,
         "previous_kept": [str(k) for _, k in backups], "pruned": pruned,
-        "timer": timer_name, "activates": activates, "enabled": enable_target,
+        "unrecognised_backups": unrecognised,
+        "timer": timer_name, "activates": activates, "creates": creates,
+        "judged_units": judged, "enabled": enable_target,
         "written": written,
         "envelope_id": matches[0], "citation_id": result.get("citation_id"),
         "state_before": state_before, "state_after": state_after,
@@ -676,7 +750,9 @@ def execute_unit_install(
             "timer_template_digest": receipt_out["timer_template_digest"],
             "replaced": replaced, "previous_digest": previous_digest,
             "previous_kept": receipt_out["previous_kept"], "pruned": pruned,
-            "timer": timer_name, "activates": activates, "enabled": enable_target,
+            "unrecognised_backups": unrecognised,
+            "timer": timer_name, "activates": activates, "creates": creates,
+            "judged_units": judged, "enabled": enable_target,
             "active_state_after": state_after.get("ActiveState"),
             "active_enter_after": state_after.get("ActiveEnterTimestamp"),
             "session": session, "citation_id": result.get("citation_id"),

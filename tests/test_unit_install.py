@@ -673,7 +673,8 @@ def test_backups_are_bounded_and_pruned_ones_are_named(home, tmp_path, monkeypat
     assert len(remaining) == uix.BACKUPS_KEPT
     assert Path(out["previous_kept"][0]).name in remaining  # the newest survives
     assert len(out["pruned"]) == 6 + 1 - uix.BACKUPS_KEPT
-    assert all(".pre-install-2026092" in p for p in out["pruned"])
+    assert all(".pre-install-20260921T" in p for p in out["pruned"])
+    assert out["unrecognised_backups"] == []
 
 
 class _FrozenDatetime:
@@ -683,6 +684,122 @@ class _FrozenDatetime:
     @classmethod
     def now(cls, tz=None):
         return cls._fixed
+
+
+# ── Loki 0B774ED3: every name the enable creates or starts is judged ──────────
+
+def test_junk_backup_name_is_left_alone_and_never_counts_as_newest(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    for i in range(4):
+        (dest / f"{UNIT}.pre-install-20260921T00000{i}.000000Z").write_text(f"old{i}")
+    (dest / f"{UNIT}.pre-install-junk").write_text("not ours")
+    (dest / UNIT).write_text("[Unit]\nDescription=live\n")
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["ok"]
+    assert (dest / f"{UNIT}.pre-install-junk").read_text() == "not ours"
+    assert out["unrecognised_backups"] == [str(dest / f"{UNIT}.pre-install-junk")]
+    stamped = sorted(p.name for p in dest.iterdir() if ".pre-install-2026" in p.name)
+    assert len(stamped) == uix.BACKUPS_KEPT and Path(out["previous_kept"][0]).name in stamped
+    # the three OLDEST stamped were pruned, junk was not counted among them
+    assert sorted(Path(p).name for p in out["pruned"]) == [
+        f"{UNIT}.pre-install-20260921T000000.000000Z",
+        f"{UNIT}.pre-install-20260921T000001.000000Z",
+    ]
+
+
+def test_also_outside_bounds_is_refused(home, tmp_path, monkeypatch, github_root, dest):
+    """`enable` enables every Also= unit; the bounds must name it."""
+    _charter(tmp_path, monkeypatch)
+    _tmpl_path(github_root).write_text(TEMPLATE + "[Install]\nAlso=other.service\n")
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["ok"] is False and out.get("fields"), out
+    assert _citations(pg)[0]["content"]["call_args"]["units"] == [UNIT, "other.service"]
+    assert not (dest / UNIT).exists()
+
+
+def test_alias_outside_bounds_is_refused(home, tmp_path, monkeypatch, github_root, dest):
+    """`enable` creates every Alias= name; the bounds must name it."""
+    _charter(tmp_path, monkeypatch)
+    _tmpl_path(github_root).write_text(TEMPLATE + "[Install]\nAlias=elsewhere.service\n")
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["ok"] is False and out.get("fields")
+
+
+def test_also_and_alias_inside_bounds_are_fine_and_recorded(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch, units=(UNIT, "other.service", "elsewhere.service"))
+    _tmpl_path(github_root).write_text(TEMPLATE + "[Install]\nAlias=elsewhere.service\nAlso=other.service\n")
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["ok"] and out["creates"] == ["elsewhere.service", "other.service"]
+    assert out["judged_units"] == [UNIT, "elsewhere.service", "other.service"]
+    assert _receipts(pg)[0]["content"]["creates"] == ["elsewhere.service", "other.service"]
+
+
+DIRECT_TIMER = "# unit: foo.timer\n[Timer]\nOnUnitActiveSec=60s\nUnit=@ACT@\n[Install]\nWantedBy=timers.target\n"
+DIRECT_SOCKET = "# unit: foo.socket\n[Socket]\nListenStream=/run/foo.sock\nService=@ACT@\n[Install]\nWantedBy=sockets.target\n"
+DIRECT_PATH = "# unit: foo.path\n[Path]\nPathExists=/tmp/x\nUnit=@ACT@\n[Install]\nWantedBy=paths.target\n"
+
+
+def _direct(github_root, name, body):
+    p = github_root / "willow-memory" / "willow-mcp" / "deploy" / f"{name}.template"
+    p.write_text(body)
+    return f"{REPO}@deploy/{name}.template"
+
+
+@pytest.mark.parametrize("unit_name,body", [
+    ("foo.timer", DIRECT_TIMER), ("foo.socket", DIRECT_SOCKET), ("foo.path", DIRECT_PATH),
+])
+def test_direct_timer_socket_path_activating_another_unit_is_ENAME(
+        home, tmp_path, monkeypatch, github_root, dest, unit_name, body):
+    """A DIRECT .timer/.socket/.path install (no service sibling) still has
+    its activation target judged — the 02195799 rule reached by the other
+    door."""
+    src = _direct(github_root, unit_name, body.replace("@ACT@", "bar.service"))
+    _charter(tmp_path, monkeypatch, units=(unit_name, "foo.service"), sources=(src,))
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest, unit=unit_name, source=src,
+                   values={**VALUES, "UNIT": unit_name})
+    assert out["error"] == "ENAME" and out["activates"] == "bar.service", out
+    assert _citations(pg) == [] and not (dest / unit_name).exists()
+
+
+@pytest.mark.parametrize("unit_name,body", [
+    ("foo.timer", DIRECT_TIMER), ("foo.socket", DIRECT_SOCKET), ("foo.path", DIRECT_PATH),
+])
+def test_direct_timer_socket_path_for_its_own_service_is_judged_and_installs(
+        home, tmp_path, monkeypatch, github_root, dest, unit_name, body):
+    src = _direct(github_root, unit_name, body.replace("@ACT@", "foo.service"))
+    _charter(tmp_path, monkeypatch, units=(unit_name, "foo.service"), sources=(src,))
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest, unit=unit_name, source=src,
+                   values={**VALUES, "UNIT": unit_name})
+    assert out["ok"] and out["activates"] == "foo.service" and out["enabled"] == unit_name, out
+    assert _citations(pg)[0]["content"]["call_args"]["units"] == [unit_name, "foo.service"]
+
+
+def test_direct_timer_whose_service_is_not_in_bounds_is_refused(home, tmp_path, monkeypatch, github_root, dest):
+    src = _direct(github_root, "foo.timer", DIRECT_TIMER.replace("@ACT@", "foo.service"))
+    _charter(tmp_path, monkeypatch, units=("foo.timer",), sources=(src,))
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest, unit="foo.timer", source=src,
+                   values={**VALUES, "UNIT": "foo.timer"})
+    assert out["ok"] is False and out.get("fields")
+
+
+def test_direct_timer_without_unit_key_defaults_to_same_stem(home, tmp_path, monkeypatch, github_root, dest):
+    src = _direct(github_root, "foo.timer", "# unit: foo.timer\n[Timer]\nOnCalendar=daily\n")
+    _charter(tmp_path, monkeypatch, units=("foo.timer", "foo.service"), sources=(src,))
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest, unit="foo.timer", source=src,
+                   values={**VALUES, "UNIT": "foo.timer"})
+    assert out["ok"] and out["activates"] == "foo.service", out
+
+
+def test_enable_effects_shape():
+    fx = uix.enable_effects("[Install]\nAlias=a.service b.service\nAlso=c.service\n", "x.service")
+    assert fx == {"creates": ["a.service", "b.service", "c.service"], "activates": ""}
+    assert uix.enable_effects("[Socket]\nService=s.service\n", "x.socket")["activates"] == "s.service"
+    assert uix.enable_effects("[Path]\n", "x.path")["activates"] == "x.service"
+    assert uix.enable_effects("[Timer]\nUnit=a.service\nUnit=b.service\n", "x.timer")["activates"] == "b.service"
 
 
 def test_replace_then_fail_restores_the_previous_unit_and_inks_a_failure_row(
