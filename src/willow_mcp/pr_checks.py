@@ -29,12 +29,21 @@ envelope, no citation, no write. It:
 5. Extracts a ``failure`` block from that full log (gap ``d5345e7e737f``:
    willow-mcp CI jobs end with ~200 lines of Postgres service teardown, so
    the pytest summary is never inside a 200-line tail window). Preference
-   order: pytest's ``=== FAILURES ===``/``short test summary info`` section
-   through the trailing count line; else a ruff/lint block (lines matching
+   order: pytest's ``=== FAILURES ===``/``=== ERRORS ===``/``short test
+   summary info`` section through the trailing count line (whichever of
+   FAILURES/ERRORS appears first, when both are present; when the log holds
+   more than one pytest invocation, the LAST complete one — the one CI
+   actually judged); else a ruff/lint block (lines matching
    ``path.py:LINE:COL: CODE`` plus the ``Found N errors`` summary); else a
    generic fallback anchored on GitHub's own ``##[error]`` annotations
    (Postgres teardown lines are dropped from this fallback ONLY — the
-   pytest/ruff blocks are bounded by their own markers and taken verbatim).
+   pytest/ruff blocks are bounded by their own markers and taken verbatim,
+   UNLESS no count line closes the pytest block, in which case Postgres
+   teardown noise is filtered from it too). A pytest block with no closing
+   count line (a timed-out job) ends at the earliest of: the next
+   ``##[group]``/job-step marker, 200 lines past the last FAILED/ERROR
+   summary line, or end of log — and ``failure.text`` is capped at 300
+   lines with ``trimmed: true`` when cut.
 
 Three-state top level (INVARIANTS §1): ``populated`` (at least one
 check-run), ``empty`` (the head resolved but zero check-runs are
@@ -43,9 +52,11 @@ reported yet), ``unreachable`` (``reason`` names the cause: ``token``,
 A per-run ``log_tail`` that could not be read carries its OWN state the
 same way — never an empty string standing in for "no output". ``log_tail``
 stays a raw-line tail for callers that want it; each ``red[]`` entry gains
-``failure`` (``{kind, text, tests_failed, count_line}``, ``None`` when no
-log was fetched) and ``first_error_line`` becomes the first ``FAILED``
-line when ``failure.kind == "pytest"``.
+``failure`` (``{kind, text, tests_failed, count_line, trimmed}``, ``None``
+when no log was fetched), ``first_error_line`` becomes the first ``FAILED``
+line when ``failure.kind == "pytest"``, and ``truncated``/``bytes_dropped``
+report whether the 5 MB log-fetch cap dropped bytes off the HEAD of the
+log to keep the tail (the pytest summary lives at the tail).
 """
 from __future__ import annotations
 
@@ -81,13 +92,24 @@ _ERROR_LINE_RE = re.compile(r"(?i)(error|failed|traceback|assert)")
 # collection error), through "short test summary info" and the trailing
 # count line.
 _PYTEST_FAILURES_HEADER_RE = re.compile(r"^=+\s*FAILURES\s*=+\s*$")
-_PYTEST_TEST_HEADER_RE = re.compile(r"^_{3,}\s*.+?\s*_{3,}$")
+_PYTEST_ERRORS_HEADER_RE = re.compile(r"^=+\s*ERRORS\s*=+\s*$")
+# The middle group must hold at least one non-underscore character, else a
+# bare "______" banner (e.g. from a make log) would satisfy this pattern —
+# `.` matches an underscore too, so "at least one char" alone is not enough.
+_PYTEST_TEST_HEADER_RE = re.compile(r"^_{3,}\s*(?P<title>.+?)\s*_{3,}$")
 _PYTEST_SUMMARY_HEADER_RE = re.compile(r"^=+\s*short test summary info\s*=+\s*$", re.IGNORECASE)
 _PYTEST_COUNT_LINE_RE = re.compile(
     r"^=+.*\b\d+\s+(?:failed|passed|error|errors|skipped|xfailed|xpassed|warnings?)\b.*=+\s*$",
     re.IGNORECASE,
 )
-_PYTEST_FAILED_LINE_RE = re.compile(r"^FAILED\s+(\S+)")
+# Capture up to " - " (pytest's separator before the failure message) or end
+# of line, so a parametrize id containing a space (`test_a[a b]`) survives
+# instead of being cut at its first space.
+_PYTEST_FAILED_LINE_RE = re.compile(r"^FAILED\s+(.+?)(?: - .*)?$")
+_PYTEST_ERROR_SUMMARY_LINE_RE = re.compile(r"^ERROR\s+(.+?)(?: - .*)?$")
+_JOB_STEP_MARKER_RE = _GROUP_MARKER_RE  # alias: a "##[group]" line IS a job-step marker
+_MAX_FAILURE_TEXT_LINES = 300            # cap on failure.text when no count line closes the block
+_MAX_UNCLOSED_LINES_PAST_LAST_FAILURE = 200
 
 # ruff: "path/to/file.py:12:5: E501 line too long"
 _RUFF_LINE_RE = re.compile(r"^\S+\.py:\d+:\d+:\s+[A-Z]+\d+")
@@ -156,12 +178,28 @@ def _default_log_fetch(url: str, *, bearer: str, timeout: float = _LOG_FETCH_TIM
             return {"ok": False, "status": exc.code, "reason": detail or str(exc.reason)}
         except Exception as exc:  # noqa: BLE001 — surface as a structured miss
             return {"ok": False, "status": 0, "reason": f"{type(exc).__name__}: {exc}"}
-        raw = resp.read(max_bytes + 1)
+        # Ring-buffer the stream in chunks, keeping only the LAST max_bytes
+        # bytes: the pytest FAILURES/summary section lives at the TAIL of a
+        # CI log, so a cap that keeps the head (a plain `read(max_bytes)`)
+        # silently drops exactly the block this feature exists to find.
+        buf = bytearray()
+        total_read = 0
+        chunk_size = 65536
+        while True:
+            chunk = resp.read(chunk_size)
+            if not chunk:
+                break
+            total_read += len(chunk)
+            buf.extend(chunk)
+            if len(buf) > max_bytes:
+                del buf[: len(buf) - max_bytes]
         resp.close()
+        truncated = total_read > max_bytes
         return {
             "ok": True, "status": getattr(resp, "status", 200),
-            "text": raw[:max_bytes].decode("utf-8", errors="replace"),
-            "redirected": redirected, "truncated": len(raw) > max_bytes,
+            "text": bytes(buf).decode("utf-8", errors="replace"),
+            "redirected": redirected, "truncated": truncated,
+            "bytes_dropped": max(0, total_read - max_bytes),
         }
     return {"ok": False, "status": 0, "reason": "too many redirects"}
 
@@ -211,58 +249,116 @@ def _first_error_line(tail_lines: list[str]) -> str:
 
 def _clean_lines(text: str) -> list[str]:
     """The full log, ANSI-stripped, GitHub's per-line ISO timestamp prefix
-    trimmed, ``##[group]``/``##[endgroup]`` markers dropped — the same
-    cleaning ``_log_tail_lines`` does, but over the WHOLE log rather than
-    the tail window, so failure-block extraction can see sections
-    ``log_tail``'s cap would otherwise cut off (gap d5345e7e737f: a CI job's
-    ~200-line Postgres teardown pushed the pytest summary out of the old
-    tail-only window)."""
+    trimmed — the same cleaning ``_log_tail_lines`` does, but over the WHOLE
+    log rather than the tail window, so failure-block extraction can see
+    sections ``log_tail``'s cap would otherwise cut off (gap d5345e7e737f:
+    a CI job's ~200-line Postgres teardown pushed the pytest summary out of
+    the old tail-only window).
+
+    Unlike ``_log_tail_lines``, ``##[group]``/``##[endgroup]`` marker lines
+    are KEPT here (not dropped) — an unclosed pytest block (no count line)
+    uses the next job-step marker as an end boundary, so extraction needs
+    to see them. Each extractor strips marker lines from its own returned
+    ``text``."""
     cleaned = (_clean_log_line(raw) for raw in text.splitlines())
-    return [line for line in cleaned if not _GROUP_MARKER_RE.match(line.strip())]
+    return list(cleaned)
+
+
+def _find_pytest_block_start(lines: list[str], lo: int, hi: int) -> Optional[int]:
+    """Earliest of a FAILURES/ERRORS header in ``[lo, hi)``; when both are
+    present the earlier one wins so the ERRORS section is never dropped
+    (item 6). Else the earliest ``___ title ___`` header whose title holds a
+    non-underscore character. Else the earliest "short test summary info"
+    header (the ``-q --tb=no`` shape: no FAILURES/ERRORS section at all)."""
+    headers = [
+        i for i in range(lo, hi)
+        if _PYTEST_FAILURES_HEADER_RE.match(lines[i].strip())
+        or _PYTEST_ERRORS_HEADER_RE.match(lines[i].strip())
+    ]
+    if headers:
+        return min(headers)
+    for i in range(lo, hi):
+        m = _PYTEST_TEST_HEADER_RE.match(lines[i].strip())
+        if m and any(c != "_" for c in m.group("title")):
+            return i
+    for i in range(lo, hi):
+        if _PYTEST_SUMMARY_HEADER_RE.match(lines[i].strip()):
+            return i
+    return None
 
 
 def _extract_pytest_failure(lines: list[str]) -> Optional[dict[str, Any]]:
-    start = None
-    for i, line in enumerate(lines):
-        if _PYTEST_FAILURES_HEADER_RE.match(line.strip()):
-            start = i
-            break
-    if start is None:
-        for i, line in enumerate(lines):
-            if _PYTEST_TEST_HEADER_RE.match(line.strip()):
-                start = i
+    n = len(lines)
+    count_idxs = [i for i in range(n) if _PYTEST_COUNT_LINE_RE.match(lines[i].strip())]
+
+    if count_idxs:
+        # Multiple pytest invocations in one log: take the LAST complete
+        # block — the re-run is what CI judged (item 6) — searching for its
+        # start only after the previous invocation's own count line.
+        lo = count_idxs[-2] + 1 if len(count_idxs) > 1 else 0
+        last_count_idx = count_idxs[-1]
+        start = _find_pytest_block_start(lines, lo, last_count_idx + 1)
+        if start is None:
+            start = _find_pytest_block_start(lines, 0, last_count_idx + 1)
+        if start is None:
+            return None
+        end = last_count_idx + 1
+        count_line = lines[last_count_idx].strip()
+        closed = True
+    else:
+        start = _find_pytest_block_start(lines, 0, n)
+        if start is None:
+            return None
+        count_line = ""
+        closed = False
+        # No count line closes the block (a timed-out job): end at the
+        # earliest of the next job-step marker, 200 lines past the last
+        # FAILED/ERROR summary line, or end of log.
+        last_failure_idx = None
+        for i in range(start, n):
+            s = lines[i].strip()
+            if _PYTEST_FAILED_LINE_RE.match(s) or _PYTEST_ERROR_SUMMARY_LINE_RE.match(s):
+                last_failure_idx = i
+        next_marker_idx = None
+        for i in range(start + 1, n):
+            if _JOB_STEP_MARKER_RE.match(lines[i].strip()):
+                next_marker_idx = i
                 break
-    if start is None:
-        return None
+        candidates = [n]
+        if next_marker_idx is not None:
+            candidates.append(next_marker_idx)
+        if last_failure_idx is not None:
+            candidates.append(min(n, last_failure_idx + 1 + _MAX_UNCLOSED_LINES_PAST_LAST_FAILURE))
+        end = min(candidates)
 
-    end = len(lines)
-    count_line = ""
-    # If a "short test summary info" header is present, the count line that
-    # ends the block is the one AFTER it — a per-test warnings banner earlier
-    # in the FAILURES section (some plugins print one per test) must not be
-    # mistaken for it.
-    summary_idx = None
-    for i in range(start, len(lines)):
-        if _PYTEST_SUMMARY_HEADER_RE.match(lines[i].strip()):
-            summary_idx = i
-            break
-    for i in range(summary_idx if summary_idx is not None else start, len(lines)):
-        if _PYTEST_COUNT_LINE_RE.match(lines[i].strip()):
-            count_line = lines[i].strip()
-            end = i + 1
-            break
+    block = [line for line in lines[start:end] if not _JOB_STEP_MARKER_RE.match(line.strip())]
+    if not closed:
+        # Postgres FATAL/LOG teardown noise is applied to the pytest block
+        # ONLY when no count line closed it (item 3) — a closed block is
+        # bounded by its own markers and taken verbatim.
+        block = [line for line in block if not _PG_LOG_LINE_RE.match(line)]
 
-    block = lines[start:end]
     tests_failed = []
     for line in block:
-        m = _PYTEST_FAILED_LINE_RE.match(line.strip())
+        s = line.strip()
+        m = _PYTEST_FAILED_LINE_RE.match(s)
         if m:
             tests_failed.append(m.group(1))
+            continue
+        m2 = _PYTEST_ERROR_SUMMARY_LINE_RE.match(s)
+        if m2:
+            tests_failed.append(m2.group(1))
+
+    trimmed = len(block) > _MAX_FAILURE_TEXT_LINES
+    if trimmed:
+        block = block[:_MAX_FAILURE_TEXT_LINES]
+
     return {
         "kind": "pytest",
         "text": "\n".join(block),
         "tests_failed": tests_failed,
         "count_line": count_line,
+        "trimmed": trimmed,
     }
 
 
@@ -281,6 +377,7 @@ def _extract_ruff_failure(lines: list[str]) -> Optional[dict[str, Any]]:
         "text": "\n".join(block),
         "tests_failed": [],
         "count_line": summary,
+        "trimmed": False,
     }
 
 
@@ -289,7 +386,10 @@ def _extract_generic_failure(lines: list[str]) -> dict[str, Any]:
     ``_GENERIC_CONTEXT_LINES`` of context before the first one. Postgres
     service-container teardown noise is dropped HERE ONLY — pytest/ruff
     blocks above are bounded by their own markers and taken verbatim."""
-    filtered = [line for line in lines if not _PG_LOG_LINE_RE.match(line)]
+    filtered = [
+        line for line in lines
+        if not _PG_LOG_LINE_RE.match(line) and not _JOB_STEP_MARKER_RE.match(line.strip())
+    ]
     error_idxs = [i for i, line in enumerate(filtered) if _ACTIONS_ERROR_RE.search(line)]
     if not error_idxs:
         block = filtered[-_GENERIC_CONTEXT_LINES:]
@@ -302,6 +402,7 @@ def _extract_generic_failure(lines: list[str]) -> dict[str, Any]:
         "text": "\n".join(block),
         "tests_failed": [],
         "count_line": "",
+        "trimmed": False,
     }
 
 
@@ -470,6 +571,8 @@ def read_pr_checks(
             )
         first_error = ""
         failure: Optional[dict[str, Any]] = None
+        log_truncated = False
+        log_bytes_dropped = 0
         if conclusion in _FAILING_CONCLUSIONS:
             if not actions_ok:
                 summary["log_tail"] = {
@@ -500,6 +603,8 @@ def read_pr_checks(
                         first_error = f"(log unreachable: {cause})"
                     else:
                         full_text = log_resp.get("text") or ""
+                        log_truncated = bool(log_resp.get("truncated"))
+                        log_bytes_dropped = int(log_resp.get("bytes_dropped") or 0)
                         tail_lines, total_lines = _log_tail_lines(full_text, cap)
                         summary["log_tail"] = {
                             "state": "populated" if tail_lines else "empty",
@@ -527,6 +632,8 @@ def read_pr_checks(
                 "job_url": summary.get("html_url") or summary.get("details_url"),
                 "first_error_line": first_error,
                 "failure": failure,
+                "truncated": log_truncated,
+                "bytes_dropped": log_bytes_dropped,
             })
         out_runs.append(summary)
 

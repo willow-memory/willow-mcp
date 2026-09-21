@@ -249,7 +249,10 @@ def test_populated_with_one_red_tail_annotations_and_first_error_line(home, monk
             "text": "collecting…\nFAILED tests/test_x.py::test_x - AssertionError: nope",
             "tests_failed": [],
             "count_line": "",
+            "trimmed": False,
         },
+        "truncated": False,
+        "bytes_dropped": 0,
     }]
     # The bearer rides the first (api.github.com) hop; the log fetch is a
     # separate call the fake here answers directly (redirect-following is
@@ -286,6 +289,32 @@ def test_log_fetch_failure_is_unreachable_but_run_still_returned(home, monkeypat
     assert run["log_tail"] == {"state": "unreachable", "reason": "not_found", "detail": "gone"}
     assert out["red"][0]["first_error_line"] == "(log unreachable: not_found)"
     assert out["red"][0]["failure"] is None
+
+
+def test_truncated_log_fetch_surfaces_truncated_and_bytes_dropped_on_the_job_entry(home, monkeypatch):
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": "some log text",
+                "truncated": True, "bytes_dropped": 1234}
+
+    out = _read(api, log_fetch=log_fetch)
+    assert out["red"][0]["truncated"] is True
+    assert out["red"][0]["bytes_dropped"] == 1234
+
+
+def test_untruncated_log_fetch_reports_no_truncation_on_the_job_entry(home, monkeypatch):
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": "some log text",
+                "truncated": False, "bytes_dropped": 0}
+
+    out = _read(api, log_fetch=log_fetch)
+    assert out["red"][0]["truncated"] is False
+    assert out["red"][0]["bytes_dropped"] == 0
 
 
 # ── failure-block extraction: the full log, not the tail window ──────────────
@@ -410,26 +439,218 @@ def test_generic_fallback_when_no_pytest_section_drops_postgres_noise(home, monk
     assert "context line 19" not in failure["text"]  # older than the 40-line window
 
 
+def test_tb_no_short_summary_only_is_still_classified_pytest(home, monkeypatch):
+    """`-q --tb=no`: no FAILURES section, no `___ title ___` header — only
+    the short-test-summary-info block and the final count line. Must still
+    be classified pytest, with tests_failed populated from the summary."""
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+    text = "\n".join([
+        "collecting…",
+        "..F..F.",
+        "=========================== short test summary info ============================",
+        "FAILED tests/test_a.py::test_alpha - AssertionError",
+        "FAILED tests/test_b.py::test_beta - KeyError: 'x'",
+        "======================= 2 failed, 10 passed in 1.23s =======================",
+    ])
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": text}
+
+    out = _read(api, log_fetch=log_fetch)
+    failure = out["red"][0]["failure"]
+    assert failure["kind"] == "pytest"
+    assert failure["tests_failed"] == [
+        "tests/test_a.py::test_alpha", "tests/test_b.py::test_beta",
+    ]
+    assert failure["count_line"] == "======================= 2 failed, 10 passed in 1.23s ======================="
+
+
+def test_timed_out_job_no_count_line_ends_at_job_step_marker_and_caps_length(home, monkeypatch):
+    """A timed-out job: FAILURES section present, no closing count line. The
+    block must end at the next job-step marker (not run to EOF), be capped
+    at 300 lines with trimmed=True, and drop Postgres teardown noise since
+    no count line closed it."""
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+    failures = [
+        "=================================== FAILURES ===================================",
+        "_______________________________ test_alpha ___________________________________",
+        "    def test_alpha():",
+        ">       assert False",
+        "E       AssertionError",
+    ]
+    postgres_noise = [f"2026-09-20 23:00:{i:02d}.000 UTC [1] FATAL:  terminating" for i in range(50)]
+    marker = ["2026-09-20T23:01:00.0000000Z ##[group]Post job cleanup"]
+    after_marker = ["this must never appear in the failure text"]
+    text = "\n".join(failures + postgres_noise + marker + after_marker)
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": text}
+
+    out = _read(api, log_fetch=log_fetch)
+    failure = out["red"][0]["failure"]
+    assert failure["kind"] == "pytest"
+    assert failure["count_line"] == ""
+    assert "FATAL" not in failure["text"], "Postgres noise dropped when no count line closes the block"
+    assert "this must never appear" not in failure["text"], "block must end at the job-step marker"
+
+
+def test_timed_out_job_59kb_case_caps_failure_text_at_300_lines(home, monkeypatch):
+    """No count line, no job-step marker, no summary header — a big FAILURES
+    section (Loki's 59 KB probe) must be capped at 300 lines with
+    trimmed=True, ending 200 lines past the last FAILED line."""
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+    header = ["=================================== FAILURES ==================================="]
+    body = []
+    for i in range(400):
+        body.append(f"_______________________________ test_{i} ___________________________________")
+        body.append(f"    raise AssertionError('boom {i}')")
+    body.append("FAILED tests/test_big.py::test_last - AssertionError")
+    trailer = [f"trailer line {i}" for i in range(400)]  # more than 200 lines past the last FAILED
+    text = "\n".join(header + body + trailer)
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": text}
+
+    out = _read(api, log_fetch=log_fetch)
+    failure = out["red"][0]["failure"]
+    assert failure["kind"] == "pytest"
+    assert failure["trimmed"] is True
+    assert len(failure["text"].splitlines()) == 300
+
+
+def test_failed_regex_captures_parametrize_id_with_spaces(home, monkeypatch):
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+    text = "\n".join([
+        "=================================== FAILURES ===================================",
+        "_____________________ test_a[a b] _____________________",
+        "    raise AssertionError",
+        "=========================== short test summary info ============================",
+        "FAILED tests/t.py::test_a[a b] - AssertionError: nope",
+        "======================= 1 failed in 1.00s =======================",
+    ])
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": text}
+
+    out = _read(api, log_fetch=log_fetch)
+    failure = out["red"][0]["failure"]
+    assert failure["tests_failed"] == ["tests/t.py::test_a[a b]"]
+
+
+def test_bare_underscore_banner_in_a_make_log_is_not_classified_pytest(home, monkeypatch):
+    """A `______` banner with no title text (e.g. from a `make` failure) must
+    not trip the pytest test-header anchor — the FAILURES banner requires a
+    non-underscore title and the word FAILURES on the `===` line."""
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+    text = "\n".join([
+        "make: *** [target] Error 1",
+        "______________________________________________________",
+        "##[error]Process completed with exit code 2.",
+    ])
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": text}
+
+    out = _read(api, log_fetch=log_fetch)
+    failure = out["red"][0]["failure"]
+    assert failure["kind"] != "pytest"
+
+
+def test_errors_section_before_failures_is_kept_and_error_lines_land_in_tests_failed(home, monkeypatch):
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+    text = "\n".join([
+        "=================================== ERRORS ===================================",
+        "____________________ ERROR at setup of test_fixture __________________________",
+        "    raise RuntimeError('fixture boom')",
+        "=================================== FAILURES ===================================",
+        "_______________________________ test_alpha ___________________________________",
+        "    raise AssertionError",
+        "=========================== short test summary info ============================",
+        "ERROR tests/test_x.py::test_fixture - RuntimeError: fixture boom",
+        "FAILED tests/test_a.py::test_alpha - AssertionError",
+        "======================= 1 failed, 1 error in 1.00s =======================",
+    ])
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": text}
+
+    out = _read(api, log_fetch=log_fetch)
+    failure = out["red"][0]["failure"]
+    assert failure["kind"] == "pytest"
+    assert "ERROR at setup of test_fixture" in failure["text"], "the ERRORS section is not dropped"
+    assert failure["tests_failed"] == [
+        "tests/test_x.py::test_fixture", "tests/test_a.py::test_alpha",
+    ]
+
+
+def test_two_pytest_invocations_takes_the_last_complete_block(home, monkeypatch):
+    """A retried job runs pytest twice; only the LAST complete invocation —
+    the one CI actually judged — should be extracted."""
+    _app_token(monkeypatch)
+    api = _FakeApi(runs=[_red_run()])
+    first_run = [
+        "=================================== FAILURES ===================================",
+        "_______________________________ test_flaky ___________________________________",
+        "    raise AssertionError",
+        "=========================== short test summary info ============================",
+        "FAILED tests/test_x.py::test_flaky - AssertionError",
+        "======================= 1 failed, 10 passed in 1.00s =======================",
+    ]
+    second_run = [
+        "Retrying pytest run…",
+        "=================================== FAILURES ===================================",
+        "_______________________________ test_real ___________________________________",
+        "    raise KeyError('x')",
+        "=========================== short test summary info ============================",
+        "FAILED tests/test_y.py::test_real - KeyError: 'x'",
+        "======================= 1 failed, 10 passed in 1.00s =======================",
+    ]
+    text = "\n".join(first_run + second_run)
+
+    def log_fetch(url, *, bearer, timeout=10, max_bytes=5_000_000):
+        return {"ok": True, "status": 200, "text": text}
+
+    out = _read(api, log_fetch=log_fetch)
+    failure = out["red"][0]["failure"]
+    assert failure["tests_failed"] == ["tests/test_y.py::test_real"]
+    assert "test_flaky" not in failure["text"]
+
+
+class _StreamingFakeResponse:
+    """A minimal file-like stream that actually consumes bytes on ``read``,
+    like a real ``http.client.HTTPResponse`` — a fake that always returns
+    the full buffer regardless of ``n`` would spin ``_default_log_fetch``'s
+    chunked read loop forever."""
+    status = 200
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            data, self._data = self._data, b""
+            return data
+        data, self._data = self._data[:n], self._data[n:]
+        return data
+
+    def close(self):
+        pass
+
+
 def test_default_log_fetch_caps_download_at_5mb(monkeypatch):
     import urllib.request
 
     huge = b"x" * (6 * 1024 * 1024)
 
-    class _FakeResponse:
-        status = 200
-
-        def __init__(self, data: bytes):
-            self._data = data
-
-        def read(self, n=-1):
-            return self._data[:n] if n and n > 0 else self._data
-
-        def close(self):
-            pass
-
     class _FakeOpener:
         def open(self, req, timeout=None):
-            return _FakeResponse(huge)
+            return _StreamingFakeResponse(huge)
 
     monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _FakeOpener())
 
@@ -438,6 +659,50 @@ def test_default_log_fetch_caps_download_at_5mb(monkeypatch):
     )
     assert out["truncated"] is True
     assert len(out["text"].encode("utf-8")) == 5 * 1024 * 1024
+    assert out["bytes_dropped"] == 1 * 1024 * 1024
+
+
+def test_default_log_fetch_keeps_the_tail_not_the_head(monkeypatch):
+    """A 6 MB log with the pytest failure block in the last 100 KB must
+    still have that block survive the 5 MB cap — the cap must keep the
+    TAIL of the stream, not the head."""
+    import urllib.request
+
+    head_sentinel = "HEAD_ONLY_SENTINEL_1234567890"
+    marker = "FAILED tests/test_tail.py::test_marker - AssertionError: tail lives here"
+    tail_block = "\n".join([
+        "=================================== FAILURES ===================================",
+        "_______________________________ test_marker __________________________________",
+        "    raise AssertionError('tail lives here')",
+        "=========================== short test summary info ============================",
+        marker,
+        "======================= 1 failed in 1.00s =======================",
+    ])
+    # 6 MB total: a sentinel tag sits at the very START of the log, far
+    # outside the last 5 MB, so it — and only it — must be dropped, while
+    # the pytest block living in the last 100 KB survives.
+    filler_len = 6 * 1024 * 1024 - 100 * 1024 - len(head_sentinel)
+    head_junk = head_sentinel + ("x" * filler_len)
+    tail_padding = "y" * (100 * 1024 - len(tail_block.encode("utf-8")) - 1)
+    huge = (head_junk + "\n" + tail_padding + "\n" + tail_block).encode("utf-8")
+
+    class _FakeOpener:
+        def open(self, req, timeout=None):
+            return _StreamingFakeResponse(huge)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _FakeOpener())
+
+    out = pr_checks._default_log_fetch(
+        "https://api.github.com/repos/x/y/actions/jobs/1/logs", bearer="ghs_secret",
+    )
+    assert out["truncated"] is True
+    assert marker in out["text"]
+    assert head_sentinel not in out["text"], "the head must have been dropped, not the tail"
+    assert out["bytes_dropped"] == len(huge) - 5 * 1024 * 1024
+
+    failure = pr_checks._extract_failure_block(out["text"])
+    assert failure["kind"] == "pytest"
+    assert failure["tests_failed"] == ["tests/test_tail.py::test_marker"]
 
 
 def test_missing_actions_permission_refusal_names_actions_read(home, monkeypatch):
@@ -464,18 +729,6 @@ def test_default_log_fetch_follows_one_redirect_without_the_bearer(monkeypatch):
 
     calls = []
 
-    class _FakeResponse:
-        status = 200
-
-        def __init__(self, data: bytes):
-            self._data = data
-
-        def read(self, n=-1):
-            return self._data[:n] if n and n > 0 else self._data
-
-        def close(self):
-            pass
-
     class _FakeOpener:
         def open(self, req, timeout=None):
             calls.append({"url": req.full_url, "auth": req.headers.get("Authorization")})
@@ -486,7 +739,7 @@ def test_default_log_fetch_follows_one_redirect_without_the_bearer(monkeypatch):
                     {"Location": "https://blob.example/signed"}, None,
                 )
                 raise exc
-            return _FakeResponse(b"the log text")
+            return _StreamingFakeResponse(b"the log text")
 
     monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _FakeOpener())
 
@@ -494,10 +747,86 @@ def test_default_log_fetch_follows_one_redirect_without_the_bearer(monkeypatch):
         "https://api.github.com/repos/x/y/actions/jobs/1/logs", bearer="ghs_secret",
     )
     assert out == {"ok": True, "status": 200, "text": "the log text",
-                    "redirected": True, "truncated": False}
+                    "redirected": True, "truncated": False, "bytes_dropped": 0}
     assert calls[0]["auth"] == "Bearer ghs_secret"
     assert calls[1]["url"] == "https://blob.example/signed"
     assert calls[1]["auth"] is None, "the bearer must not follow to the second host"
+
+
+def test_default_log_fetch_real_opener_chain_strips_bearer_cross_host(monkeypatch):
+    """Drives the REAL urllib chain — the code's own ``build_opener`` and its
+    ``_NoAutoRedirect`` handler, PLUS urllib's real ``HTTPErrorProcessor`` /
+    ``HTTPRedirectHandler`` / ``HTTPDefaultErrorHandler`` machinery that turns
+    a 302 response into the ``HTTPError`` our code catches. Only the
+    socket-level transport (``http.client.HTTPSConnection``) is faked —
+    genuine ``http.client.HTTPResponse`` objects are built from raw HTTP
+    bytes over a fake socket — so the real redirect-refusal /
+    re-request-without-bearer logic executes exactly as it would against
+    GitHub (Loki's probe shape), unlike a test that fakes ``build_opener``
+    (or raises ``HTTPError`` by hand) and never runs that machinery at all.
+    """
+    import http.client
+    import io
+
+    calls = []
+
+    _RESPONSES = {
+        "api.github.com": (
+            b"HTTP/1.1 302 Found\r\n"
+            b"Location: https://productionresultssa1.blob.core.windows.net/signed\r\n"
+            b"Content-Length: 0\r\n\r\n"
+        ),
+        "productionresultssa1.blob.core.windows.net": (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nthe log text"
+        ),
+    }
+
+    class _FakeSocket:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def makefile(self, mode, *a, **k):
+            return io.BytesIO(self._data)
+
+    class _FakeHTTPSConnection(http.client.HTTPConnection):
+        """Subclassing the plain (non-TLS) HTTPConnection gets us the class
+        attributes ``HTTPSHandler.__init__``/``do_open`` reach for
+        (``_http_vsn``, ``debuglevel``, ``default_port``, …) for free; only
+        the actual I/O methods are overridden so no socket is ever opened."""
+
+        def __init__(self, host, timeout=None, **kwargs):
+            self.host = host
+            self.sock = None
+
+        def set_debuglevel(self, level):
+            pass
+
+        def request(self, method, url, body=None, headers=None, **kw):
+            calls.append({
+                "url": f"https://{self.host}{url}",
+                "auth": (headers or {}).get("Authorization"),
+            })
+
+        def getresponse(self):
+            resp = http.client.HTTPResponse(_FakeSocket(_RESPONSES[self.host]))
+            resp.begin()
+            return resp
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", _FakeHTTPSConnection)
+
+    out = pr_checks._default_log_fetch(
+        "https://api.github.com/repos/x/y/actions/jobs/1/logs", bearer="ghs_SECRET",
+    )
+    assert out["ok"] is True, out
+    assert out["text"] == "the log text"
+    assert len(calls) == 2
+    assert calls[0]["url"] == "https://api.github.com/repos/x/y/actions/jobs/1/logs"
+    assert calls[0]["auth"] == "Bearer ghs_SECRET"
+    assert calls[1]["url"] == "https://productionresultssa1.blob.core.windows.net/signed"
+    assert calls[1]["auth"] is None, "the bearer must not follow to the cross-host hop"
 
 
 # ── gate visibility ────────────────────────────────────────────────────────────
