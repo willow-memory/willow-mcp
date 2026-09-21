@@ -103,6 +103,10 @@ TOOL_CLASS: dict[str, str] = {
     # net_authority_drain attaches a signer-minted envelope to a held task row
     # and flips it to pending — a write, never a seal (decision c8572a92).
     "net_authority_drain": WRITE,
+    # envelope_retire_sweep revokes a spent/branch-gone envelope in the
+    # register and appends a FRANK envelope_revoked row — a write, mints no
+    # new authority (decision 83faa340).
+    "envelope_retire_sweep": WRITE,
     "context_save": WRITE, "context_expire": WRITE,
     "frank_append": WRITE,
     # nest_scan writes a local SQLite Nest DB; nest_promote writes structure-only

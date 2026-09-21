@@ -936,6 +936,7 @@ _SEAT_WRITE_TOOLS = frozenset({
     "decision_propose",
     "dispatch_accept", "dispatch_send", "dispatch_withdraw",
     "envelope_apply", "envelope_propose", "envelope_ratify", "envelope_reject",
+    "envelope_retire_sweep",
     "federation_call",
     "fork_create", "fork_delete", "fork_join", "fork_log", "fork_merge",
     "frank_append",

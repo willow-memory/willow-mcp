@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 138 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 139 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -1787,6 +1787,47 @@ def net_authority_drain(app_id: str, max_rows: int = 0) -> dict:
     if max_rows and max_rows > 0:
         kwargs["max_rows"] = int(max_rows)
     return _na.tick(app_id=app_id, pg=get_pg(), **kwargs)
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_retire_sweep")
+def envelope_retire_sweep(app_id: str, dry_run: bool = True) -> dict:
+    """One pass over the active envelope register (sealed decision 83faa340;
+    gap 4c7512c57a7e): an envelope whose bounds name a branch is retired
+    when that branch is merged and deleted on the remote; an envelope with
+    `max_count` is retired when FRANK shows the count consumed. Retirement
+    is a revoke with `revoked_reason=branch_gone` or `=spent` and a FRANK
+    `envelope_revoked` row per envelope — the grant and its uses stay
+    auditable, it is just no longer listed as in force. Standing envelopes
+    (no branch bound, no `max_count` — the planting, the per-class dispatch
+    envelopes, `envelope.apply`) are untouched.
+
+    Orchestrator-scoped like `net_authority_drain` / `seal_drain`: this
+    mints no new authority and changes nothing the gate enforces (a
+    retired row was already unusable — branch gone or count spent — this
+    fixes what the register SAYS). The willow-bot steward calls this every
+    tick beside those two; the desk calls it by hand to prove a sweep end
+    to end.
+
+    Verification is always a remote lookup (the willows-bot GitHub App
+    install token, the same credential `pr_open_execute` mints) or a FRANK
+    count — never the envelope's own notes. A branch absent on the remote
+    with no merged PR found is left alone and reported, not retired on a
+    guess; a remote that cannot be reached reports that row `unreachable`,
+    never `gone`.
+
+    `dry_run` defaults True: every read still runs (remote lookups, FRANK
+    counts) and the receipt says what WOULD be retired; nothing is written
+    to the registry and no FRANK row is appended. Three-state receipt
+    (INVARIANTS §1): `{state: populated|empty|unreachable, examined,
+    retired: [{id, verb, reason}], kept_standing, kept_in_force: [{id,
+    verb, why}], unreachable: [{id, why}], dry_run}`."""
+    from . import envelope_retire_sweep as _sweep
+    from .governance_ledger import GovernanceLedger
+
+    pg = get_pg()
+    ledger = GovernanceLedger(pg) if pg is not None else None
+    return _sweep.sweep(actor=app_id or "willow-mcp-sweep", dry_run=dry_run, ledger=ledger)
 
 
 # ── Identity binding (willow-gate seam — check-in / check-out) ───────────────────
