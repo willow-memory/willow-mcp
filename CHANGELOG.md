@@ -31,6 +31,20 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.65.0](https://github.com/willow-memory/willow-mcp/compare/v2.64.0...v2.65.0) (2026-09-21)
+
+
+### Added
+
+* **keyboard-acts:** a confirmed schema mapping extends to a new seat; a missing App permission files one named ask; gap_retopic ([93814de](https://github.com/willow-memory/willow-mcp/commit/93814de83fa2a4da3543db72335f29b4ca4741a2))
+* **pr:** pr_open_execute records the opening seat and writes a watch row the steward reads ([d11de98](https://github.com/willow-memory/willow-mcp/commit/d11de98380012fb97bbf5a2904ab00341d623867))
+
+
+### Fixed
+
+* **docs:** tool counts in prose follow [#588](https://github.com/willow-memory/willow-mcp/issues/588) and [#590](https://github.com/willow-memory/willow-mcp/issues/590) ([e47bd53](https://github.com/willow-memory/willow-mcp/commit/e47bd5329a21cee3978cf92c040ec44982b7080c))
+* **docs:** tool counts in prose follow [#588](https://github.com/willow-memory/willow-mcp/issues/588) and [#590](https://github.com/willow-memory/willow-mcp/issues/590) ([962e7d3](https://github.com/willow-memory/willow-mcp/commit/962e7d3b25e79760921b78764254a8795b8a5fb6))
+
 ## [2.64.0](https://github.com/willow-memory/willow-mcp/compare/v2.63.0...v2.64.0) (2026-09-21)
 
 
