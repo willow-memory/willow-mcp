@@ -161,12 +161,24 @@ def test_session_enter_dispatch_by_id(home):
     assert out.get("display_name") == "Loki"
 
 
-def test_session_enter_picks_pending_packet(home):
+def test_session_enter_bare_lists_pending_and_does_not_bind(home):
+    """Gap 22c8c1aab079: a bare session_enter names the seat's pending packets
+    instead of silently claiming the oldest one; binding is explicit."""
     sent = ds.dispatch_send("willow", "ada", "# Monitor\n", summary="watch")
     did = sent["dispatch_id"]
     out = ds.session_enter("ada", "sess-auto")
-    assert out["entry_mode"] == "dispatch"
-    assert out["dispatch_id"] == did
+    assert out["entry_mode"] == "human"
+    assert out["dispatch_id"] is None
+    assert out["pending_dispatches"] == [did]
+    assert did in out["message"]
+    # nothing moved: the packet is still pending, the session is not bound
+    assert ds.dispatch_read(did)["status"]["status"] == "pending"
+    assert ds.session_read("ada", "sess-auto").get("dispatch_id") in (None, "")
+    # the explicit path still binds and flips the packet to working
+    bound = ds.session_enter("ada", "sess-explicit", dispatch_id=did)
+    assert bound["entry_mode"] == "dispatch"
+    assert bound["dispatch_id"] == did
+    assert ds.dispatch_read(did)["status"]["status"] == "working"
 
 
 def test_session_handoff_write_human_closeout(home):

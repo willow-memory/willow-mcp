@@ -4503,6 +4503,39 @@ def agent_clear(
     return dispatch_stack.agent_clear(target_app, dispatch_id, session_id)
 
 
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("dispatch_withdraw")
+def dispatch_withdraw(app_id: str, dispatch_id: str, reason: str) -> dict:
+    """Retire a dispatch packet the orchestrator no longer wants worked:
+    pending → withdrawn (gap afa515539c0a). Orchestrator-only, same group as
+    verify_handoff / agent_clear. A `working` packet is withdrawn only when
+    no session of the assignee is still bound to it as working — otherwise
+    `EBUSY` naming the session, because liveness beyond the session record
+    cannot be known here. `withdrawn` is terminal: dispatch_accept,
+    session_enter(dispatch_id=...) and handoff_write_v4 refuse
+    invalid_transition, and the packet never appears as pending again.
+    Writes a `dispatch_withdraw` event to the FRANK ledger when one is
+    reachable. Returns {id, previous, status}."""
+    out = dispatch_stack.dispatch_withdraw(dispatch_id, reason, by_app=app_id)
+    if out.get("error"):
+        return out
+    pg = get_pg()
+    if pg is not None:
+        try:
+            from .governance_ledger import GovernanceLedger
+            out["frank_id"] = GovernanceLedger(pg).append(
+                "willow", "dispatch_withdraw",
+                {"dispatch_id": out["dispatch_id"], "previous": out["previous"],
+                 "to_app": out.get("to_app"), "reason": out.get("reason"),
+                 "actor": app_id, "session": _current_orchestrator_session() or ""},
+            )
+        except Exception as exc:  # the withdrawal is on disk; the ledger fault is reported, not hidden
+            out["frank_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        out["frank_error"] = "postgres_unavailable"
+    return out
+
+
 @mcp.tool(annotations=_ANNO_READ)
 @_guarded("session_read")
 def session_read(app_id: str, session_id: str) -> dict:

@@ -887,22 +887,34 @@ def session_enter(
             did = str(existing["dispatch_id"]).upper()
 
     if not did:
-        pending = _pending_for_app(app_id)
-        if pending:
-            did = pending["dispatch_id"]
-
-    if not did:
+        # Gap 22c8c1aab079: a bare entry used to be handed the oldest pending
+        # packet for this app_id, whatever the seat had come to do — an
+        # unrelated packet was auto-claimed by whoever entered next. A
+        # packet is bound only when the caller names it (dispatch_id); a
+        # bare entry is told what is pending and enters unassigned.
+        pending_ids = [
+            row["dispatch_id"]
+            for row in (dispatch_list(to_app=app_id, status="pending", limit=20)
+                        .get("dispatches") or [])
+        ]
         session_bind(app_id, session_id, "", "idle")
         return {
             "entry_mode": "human",
             "app_id": app_id,
             "session_id": session_id,
             "dispatch_id": None,
+            "pending_dispatches": pending_ids,
             "agent_doc": _AGENT_DOC,
             "agent_doc_section": "specialist",
             "closeout_tools": ["context_save", "session_handoff_write"],
             "project": project_info,
-            "message": "Human entry — no dispatch_id. Use human-facing agent and output.",
+            "message": (
+                "Human entry — no dispatch_id. Use human-facing agent and output."
+                + (f" {len(pending_ids)} packet(s) pending for {app_id}: "
+                   f"{', '.join(pending_ids)} — none is bound; re-enter with "
+                   "dispatch_id=<id> to work one."
+                   if pending_ids else "")
+            ),
             **persona_context(app_id),
             **seed_context(app_id),
         }
@@ -920,6 +932,15 @@ def session_enter(
         }
 
     cur = pkt.get("status", {}).get("status", "pending")
+    if cur == "withdrawn":
+        return {
+            "entry_mode": "dispatch",
+            "error": "invalid_transition",
+            "from": cur,
+            "to": "working",
+            "dispatch_id": did,
+            "message": "packet was withdrawn by the orchestrator; it cannot be entered",
+        }
     if cur == "pending":
         pkt = dispatch_accept(did, app_id, session_id)
     elif session_id:
@@ -1056,3 +1077,81 @@ def agent_clear(target_app: str, dispatch_id: str, session_id: str = "") -> dict
     if session_id:
         session_bind(target_app, session_id, "", "idle")
     return {"dispatch_id": dispatch_id, "target_app": target_app, "status": "cleared"}
+
+
+def _sessions_bound_to(app_id: str, dispatch_id: str) -> list[dict]:
+    """Session records of ``app_id`` whose ``dispatch_id`` is this packet and
+    whose status is still ``working`` — the only liveness signal the session
+    layer holds. A record is a file the seat wrote at bind time; nothing
+    here can tell a live seat from one that died without closing, which is
+    exactly why a working packet with such a record is refused rather than
+    withdrawn from under it."""
+    root = sessions_dir()
+    if not root.is_dir():
+        return []
+    want = (dispatch_id or "").upper()
+    prefix = f"{app_id}-"
+    out: list[dict] = []
+    for path in sorted(root.glob(f"{prefix}*.json")):
+        if path.is_symlink() or path.name.endswith(".attest.json"):
+            continue
+        rec = _read_json(path)
+        if not rec:
+            continue
+        if str(rec.get("dispatch_id") or "").upper() != want:
+            continue
+        if rec.get("status") == "working":
+            out.append(rec)
+    return out
+
+
+def dispatch_withdraw(dispatch_id: str, reason: str, *, by_app: str) -> dict:
+    """Orchestrator retires a packet: pending → withdrawn (gap afa515539c0a).
+
+    ``working`` → ``withdrawn`` only when no session record of the assignee
+    is still bound to the packet as ``working``; when one is, the packet is
+    refused ``EBUSY`` naming the session — liveness beyond the session
+    record cannot be known here, and withdrawing a packet a seat is working
+    would strand its handoff. ``withdrawn`` is terminal: ``dispatch_accept``,
+    ``session_enter(dispatch_id=...)`` and ``handoff_write_v4`` all refuse
+    ``invalid_transition``; ``_pending_for_app`` and ``dispatch_list(
+    status="pending")`` never return it. The reason is recorded on
+    status.json; the FRANK ``dispatch_withdraw`` event is the server
+    wrapper's (it holds the ledger).
+    """
+    if not (reason or "").strip():
+        return {"error": "reason_required", "dispatch_id": dispatch_id}
+    pkt = dispatch_read(dispatch_id)
+    if pkt.get("error"):
+        return pkt
+    did = pkt["meta"].get("dispatch_id") or dispatch_id.upper()
+    cur = pkt.get("status", {}).get("status", "pending")
+    if cur == "withdrawn":
+        return {"error": "already", "dispatch_id": did, "status": cur}
+    if cur == "working":
+        bound = _sessions_bound_to(pkt["meta"].get("to_app", ""), did)
+        if bound:
+            return {
+                "error": "EBUSY",
+                "dispatch_id": did,
+                "status": cur,
+                "sessions": [r.get("session_id") for r in bound],
+                "message": (
+                    f"{pkt['meta'].get('to_app')} session(s) "
+                    f"{', '.join(str(r.get('session_id')) for r in bound)} still "
+                    "bound to this packet as working; liveness beyond the session "
+                    "record cannot be known here — wait for the handoff or clear "
+                    "the session first"
+                ),
+            }
+    elif cur != "pending":
+        return {"error": "invalid_transition", "from": cur, "to": "withdrawn",
+                "dispatch_id": did}
+    dispatch_set_status(
+        did, "withdrawn",
+        withdrawn_at=_utc_now(),
+        withdrawn_by=by_app,
+        withdraw_reason=reason.strip(),
+    )
+    return {"dispatch_id": did, "previous": cur, "status": "withdrawn",
+            "to_app": pkt["meta"].get("to_app"), "reason": reason.strip()}
