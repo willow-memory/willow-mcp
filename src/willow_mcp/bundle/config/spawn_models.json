@@ -1,0 +1,5 @@
+{
+  "_note": "Role -> required Agent-spawn session model. Sealed pair c9ca1a09 (pair 72f528ab, record b4a8cbe7, gap 20e6d23971dc): a specialist spawned under the wrong model is a silent capability substitution, not a preference. Read by src/willow_mcp/bundle/hooks/pre_tool_use.py's check_agent_spawn (mirrored at hooks/pre_tool_use.py); a role absent here is unconstrained by that guard. Ratified by the human trust root, same as specialists.json's model_hint_session — the fleet does not self-assign models.",
+  "builder": "sonnet",
+  "auditor": "opus"
+}

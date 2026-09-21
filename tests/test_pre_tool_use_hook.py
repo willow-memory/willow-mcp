@@ -1772,3 +1772,138 @@ def test_seat_write_tools_cover_every_exclusive_write_tool():
     assert not (actual - expected), (
         "_SEAT_WRITE_TOOLS has extras not exclusive-write: %s" % sorted(actual - expected)
     )
+
+
+# ── check_agent_spawn: the spawn-model guard (sealed rule c9ca1a09) ───────
+
+def _spawn_input(prompt, subagent_type="general-purpose", model=""):
+    return {
+        "prompt": prompt,
+        "subagent_type": subagent_type,
+        "model": model,
+        "description": "test spawn",
+    }
+
+
+def test_agent_spawn_builder_pinned_sonnet_allowed():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", session_id="x")', model="sonnet"))
+    assert result is None
+
+
+def test_agent_spawn_builder_unpinned_refused():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", session_id="x")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+
+def test_agent_spawn_builder_pinned_opus_refused():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", session_id="x")', model="opus"))
+    assert result is not None
+    assert result[0] == "block"
+
+
+def test_agent_spawn_auditor_pinned_opus_allowed():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="loki", session_id="x")', model="opus"))
+    assert result is None
+
+
+def test_agent_spawn_auditor_as_fork_refused():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="loki", session_id="x")',
+        subagent_type="fork", model="opus"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+
+
+def test_agent_spawn_explore_no_seat_prompt_allowed():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Find every usage of foo() across the repo.", subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_willow_seat_refused():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="willow", session_id="x")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+    assert "human-orchestrator" in reason
+
+
+def test_agent_spawn_detects_you_are_display_name_framing():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Loki, the audit seat for this dispatch.", subagent_type="fork"))
+    assert result is not None
+    assert "fork" in result[1]
+
+
+def test_agent_spawn_registry_unreadable_fallback_still_refuses_fork(monkeypatch):
+    monkeypatch.setattr(
+        pre_tool_use, "_bundle_config_candidates",
+        lambda filename: ["/nonexistent/does/not/exist/%s" % filename],
+    )
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="loki", session_id="x")',
+        subagent_type="fork", model="opus"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+    assert "fallback" in reason
+
+
+def test_agent_spawn_table_pins_config_not_code(tmp_path, monkeypatch):
+    """The role->model table is read from JSON at call time, not hardcoded —
+    editing the shipped file changes the guard's decision with no code
+    edit."""
+    custom = tmp_path / "spawn_models.json"
+    custom.write_text(json.dumps({"builder": "haiku"}))
+    real_candidates = pre_tool_use._bundle_config_candidates
+
+    def _patched(filename):
+        if filename == "spawn_models.json":
+            return [str(custom)]
+        return real_candidates(filename)
+
+    monkeypatch.setattr(pre_tool_use, "_bundle_config_candidates", _patched)
+
+    refused = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", session_id="x")', model="sonnet"))
+    assert refused is not None, "sonnet must now be refused — the table says haiku"
+
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", session_id="x")', model="haiku"))
+    assert allowed is None, "haiku must now be allowed — it came from the edited file"
+
+
+def test_fallback_specialists_track_the_registry():
+    """Drift guard: the hook's literal _FALLBACK_SPECIALISTS must stay in
+    step with the shipped config/specialists.json, or an unreadable-registry
+    fallback silently protects fewer (or differently-roled) seats than the
+    real one does."""
+    registry_path = (
+        Path(__file__).resolve().parent.parent
+        / "src" / "willow_mcp" / "bundle" / "config" / "specialists.json"
+    )
+    data = json.loads(registry_path.read_text())
+    real_roles = {row["agent_id"]: row.get("role") for row in data.get("specialists", [])}
+    orch = data["orchestrator_seat"]
+    real_roles[orch["agent_id"]] = orch.get("role")
+    real_human_only = {row["agent_id"]: bool(row.get("human_only")) for row in data.get("specialists", [])}
+    real_human_only[orch["agent_id"]] = bool(orch.get("human_only"))
+
+    fallback_roles = {row["agent_id"]: row.get("role") for row in pre_tool_use._FALLBACK_SPECIALISTS}
+    fallback_human_only = {
+        row["agent_id"]: bool(row.get("human_only")) for row in pre_tool_use._FALLBACK_SPECIALISTS
+    }
+    assert real_roles == fallback_roles
+    assert real_human_only == fallback_human_only

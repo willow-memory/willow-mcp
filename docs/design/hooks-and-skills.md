@@ -152,6 +152,31 @@ actually needs them:
   doesn't regress to a bare-substring match), plus an end-to-end `main()`
   case in each direction.
 
+**Addendum (2026-09-20):** sealed rule `c9ca1a09` (pair `72f528ab`, record
+`b4a8cbe7`, gap `20e6d23971dc`) closed the "the fleet does not self-assign
+models" guarantee in `specialists.json`'s `model_hint_session` field: nothing
+enforced it at the point a specialist is actually spawned via the harness
+`Agent` tool, so a caller could open `hanuman` under a heavier or lighter
+model than its role is pinned to and nothing would say so. Added
+`check_agent_spawn()`, wired to a new `Agent` `PreToolUse` matcher across all
+three wiring configs (`plugin.json`, `deploy/claude-settings.json`,
+`.claude/settings.json` — kept in step by `test_hook_wiring_sync.py`'s
+existing matcher-parity pin). Detection is prompt-text only — a spawn prompt
+naming a seat via `session_enter(app_id="<seat>"`, a bare `app_id=<seat>`, or
+"You are `<Display name>`" — matched against `config/specialists.json`
+(new bundle config `config/spawn_models.json` maps role → required session
+model, currently `{"builder": "sonnet", "auditor": "opus"}`; a role absent
+from the table is unconstrained by this guard). Three refusals, always a
+block: the orchestrator seat (`willow`) as a spawn target at all;
+`subagent_type="fork"` naming any specialist seat, because a fork inherits
+the caller's model and cannot carry a pin; and a pinned-role seat spawned
+with no `model` or the wrong one. Both loaders (`_load_specialist_rows`,
+`_load_spawn_models`) are stdlib-only `open()`/`json.load()` reads at call
+time, same fail-safe shape as `_load_remote_posture` above — no new imports,
+and a missing/malformed config degrades to a literal fallback set rather
+than silently disabling the guard for every seat (the reason text says so
+when that happens).
+
 @phase 5-schema-confirm-md-skill
 ## 5. `schema-confirm.md` skill
 

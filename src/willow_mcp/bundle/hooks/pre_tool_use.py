@@ -1,6 +1,6 @@
 """willow-mcp Claude Code hook — PreToolUse.
 
-Nine guards:
+Ten guards:
 - The willow seat does not use Shell (2026-09-14, gap 715d89fe3c90): for the
   human-orchestrator seat every Bash command is blocked, and the refusal
   names the fleet tool that replaces it — Read / search_code / detect_changes
@@ -50,6 +50,17 @@ Nine guards:
   a manifest to add an egress capability (`task_net` / `integration_net` /
   `web_net` / `mcp_federation`), the Grove relay capability (`grove_relay`), or
   any write-capable permission group (blocks).
+- Spawn guard (sealed rule c9ca1a09, pair 72f528ab / record b4a8cbe7, gap
+  20e6d23971dc): the harness `Agent` tool, when the spawn prompt names a
+  fleet seat (`session_enter(app_id="<seat>"`, a bare `app_id=<seat>`, or
+  "You are <Display name>"). The orchestrator seat (`willow`) is never a
+  spawn target at all. Any other named seat whose role appears in
+  `config/spawn_models.json` must be spawned with `model=` set to that
+  role's pinned value — missing or mismatched blocks. `subagent_type="fork"`
+  is refused for ANY named seat regardless of the table, since a fork
+  inherits the caller's model and cannot carry a pin. A prompt naming no
+  known seat (Explore, Plan, a plain general-purpose spawn) is untouched
+  (blocks; see check_agent_spawn).
 
 That third guard is the sudo invariant (FRANK `90e52ab7`) enforced where the
 agent actually acts: *a model may REQUEST egress, never CONFIRM it.* It is a
@@ -1275,6 +1286,175 @@ def check_trust_root_write(tool_input: dict) -> Optional[str]:
     return None
 
 
+_SPAWN_GUARD_RULE = "c9ca1a09"
+
+# Fallback specialist rows, used only when config/specialists.json can't be
+# read (deleted, malformed, or this hook copy has no config/ sibling — see
+# _bundle_config_candidates). A missing registry must not silently disable
+# the spawn guard for every seat; it degrades to this literal set instead.
+# Kept in step with the shipped registry by
+# tests/test_pre_tool_use_hook.py::test_fallback_specialists_track_the_registry.
+_FALLBACK_SPECIALISTS = [
+    {"agent_id": "hanuman", "display_name": "Hanuman", "role": "builder", "human_only": False},
+    {"agent_id": "loki", "display_name": "Loki", "role": "auditor", "human_only": False},
+    {"agent_id": "jeles", "display_name": "Jeles", "role": "librarian", "human_only": False},
+    {"agent_id": "ada", "display_name": "Ada", "role": "operator", "human_only": False},
+    {"agent_id": "skirnir", "display_name": "Skirnir", "role": "witness", "human_only": False},
+    {"agent_id": "vishwakarma", "display_name": "Vishwakarma", "role": "architect", "human_only": False},
+    {"agent_id": "heimdallr", "display_name": "Heimdallr", "role": "gatekeeper", "human_only": False},
+    {"agent_id": "binder", "display_name": "The Binder", "role": "records", "human_only": False},
+    {"agent_id": "willow", "display_name": "Willow", "role": "orchestrator", "human_only": True},
+]
+
+# Role -> required Agent-spawn session model, sealed pair c9ca1a09. Mirrors
+# config/spawn_models.json; used only if that file can't be read.
+_FALLBACK_SPAWN_MODELS = {"builder": "sonnet", "auditor": "opus"}
+
+
+def _bundle_config_candidates(filename: str) -> list[str]:
+    """Where a bundle config JSON might live relative to THIS file. Two
+    candidates because this module ships at two paths that must stay
+    byte-identical (src/willow_mcp/bundle/hooks/pre_tool_use.py and the
+    top-level hooks/pre_tool_use.py mirror tested against it): from the
+    bundle copy, config/ is a sibling of hooks/ (candidate 1). The top-level
+    mirror has no sibling config/ at all — it's a test-only copy, not an
+    install shape — so it reaches the bundle's own config by walking up to
+    the repo root instead (candidate 2). Tests may monkeypatch this to point
+    at a fixture directory instead of either real path."""
+    hook_dir = os.path.dirname(os.path.abspath(__file__))
+    return [
+        os.path.join(hook_dir, "..", "config", filename),
+        os.path.join(hook_dir, "..", "src", "willow_mcp", "bundle", "config", filename),
+    ]
+
+
+def _load_json_config(filename: str) -> Optional[dict]:
+    """Best-effort stdlib-only JSON load, same fail-safe shape as
+    _load_remote_posture above: a missing/malformed file at any candidate
+    path is silently skipped, never raised."""
+    for path in _bundle_config_candidates(filename):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _load_specialist_rows() -> "tuple[list[dict], bool]":
+    """Load specialist + orchestrator rows from config/specialists.json.
+    Returns (rows, used_fallback)."""
+    data = _load_json_config("specialists.json")
+    rows: list = []
+    if isinstance(data, dict):
+        for row in data.get("specialists") or []:
+            if isinstance(row, dict) and row.get("agent_id"):
+                rows.append(row)
+        orch = data.get("orchestrator_seat")
+        if isinstance(orch, dict) and orch.get("agent_id"):
+            rows.append(orch)
+    if rows:
+        return rows, False
+    return _FALLBACK_SPECIALISTS, True
+
+
+def _load_spawn_models() -> dict:
+    """Load the role->model pin table from config/spawn_models.json, falling
+    back to _FALLBACK_SPAWN_MODELS. Config, not code (sealed pair c9ca1a09):
+    editing the shipped JSON changes the guard's behaviour with no code
+    edit — see test_pre_tool_use_hook.py's table-is-config test."""
+    data = _load_json_config("spawn_models.json")
+    if isinstance(data, dict):
+        table = {
+            k: v for k, v in data.items()
+            if isinstance(k, str) and isinstance(v, str) and not k.startswith("_")
+        }
+        if table:
+            return table
+    return dict(_FALLBACK_SPAWN_MODELS)
+
+
+# Matches session_enter(app_id="<seat>" / a bare app_id=<seat> (quoted or
+# not) — the shape a specialist's own boot call, or a dispatching caller's
+# prompt, names the seat in. Anchored on the keyword so this can't match an
+# unrelated word that merely contains "app_id".
+_APP_ID_RE = re.compile(r'app_id\s*=\s*["\']?([A-Za-z][A-Za-z0-9_-]*)')
+
+
+def _detect_specialist_seat(prompt: str, rows: list) -> Optional[dict]:
+    """Find the fleet seat a spawn prompt names, by app_id= reference or by
+    "You are <Display name>" framing. None when the prompt names no known
+    seat — an ordinary Explore/Plan/general-purpose spawn with no seat
+    framing is not this guard's business."""
+    if not prompt:
+        return None
+    by_id = {row["agent_id"]: row for row in rows if row.get("agent_id")}
+    for match in _APP_ID_RE.finditer(prompt):
+        seat = by_id.get(match.group(1))
+        if seat is not None:
+            return seat
+    for row in rows:
+        name = row.get("display_name")
+        if name and re.search(r"\bYou are %s\b" % re.escape(name), prompt):
+            return row
+    return None
+
+
+def check_agent_spawn(tool_input: dict) -> Optional["tuple[str, str]"]:
+    """Sealed rule c9ca1a09 (pair 72f528ab, record b4a8cbe7, gap
+    20e6d23971dc): a specialist Agent spawn must carry the model its role is
+    pinned to, and a fork can never carry one at all — a spawn is a one-shot
+    decision with no cheap do-over once the wrong model is loaded, so this
+    always blocks rather than warns. Refuses:
+
+    - the orchestrator seat (willow) as a spawn target at all (human_only);
+    - subagent_type="fork" naming any other specialist seat — a fork
+      inherits the parent's model and cannot be pinned;
+    - a pinned-role seat (role present in spawn_models.json) spawned with no
+      model, or a model that isn't the table's value for that role.
+
+    Detection is prompt-text only — see _detect_specialist_seat. A prompt
+    naming no known seat (Explore, Plan, an unpinned general-purpose spawn)
+    passes through untouched."""
+    tool_input = tool_input or {}
+    prompt = str(tool_input.get("prompt", "") or "")
+    subagent_type = str(tool_input.get("subagent_type", "") or "")
+    model = str(tool_input.get("model", "") or "")
+    rows, used_fallback = _load_specialist_rows()
+    seat = _detect_specialist_seat(prompt, rows)
+    if seat is None:
+        return None
+    agent_id = seat.get("agent_id", "")
+    note = (
+        " (specialists.json unreadable — literal fallback registry used)"
+        if used_fallback else ""
+    )
+    if seat.get("human_only"):
+        return "block", (
+            f"willow-mcp: sealed rule {_SPAWN_GUARD_RULE} — the '{agent_id}' "
+            "seat is the human-orchestrator seat and is never an Agent spawn "
+            f"target{note}. Dispatch it a packet instead."
+        )
+    role = seat.get("role", "")
+    required = _load_spawn_models().get(role)
+    if subagent_type == "fork":
+        hint = f', model="{required}"' if required else ""
+        return "block", (
+            f"willow-mcp: sealed rule {_SPAWN_GUARD_RULE} — this prompt names "
+            f"the '{agent_id}' seat with subagent_type=\"fork\"{note}, and a "
+            "fork cannot carry a model pin. Retry with "
+            f'subagent_type="general-purpose"{hint}.'
+        )
+    if required and model != required:
+        return "block", (
+            f"willow-mcp: sealed rule {_SPAWN_GUARD_RULE} — the '{agent_id}' "
+            f"seat (role '{role}') is pinned to model=\"{required}\"{note}, "
+            f"got model={model!r}. Retry with "
+            f'subagent_type="general-purpose", model="{required}".'
+        )
+    return None
+
+
 def _is_file_write(tool_name: str) -> bool:
     return tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit")
 
@@ -1420,6 +1600,18 @@ def main() -> None:
                 from willow_mcp.cursor_hook_io import emit_claude_warn
 
                 emit_claude_warn(reason)
+    elif tool_name == "Agent" or tool_base == "Agent":
+        spawned = check_agent_spawn(tool_input)
+        if spawned:
+            _decision, reason = spawned
+            if cursor_dialect:
+                from willow_mcp.cursor_hook_io import cursor_permission_for_guard
+
+                cursor_permission_for_guard(_decision, reason)
+                sys.exit(0)
+            from willow_mcp.cursor_hook_io import emit_claude_block
+
+            emit_claude_block(reason)
     if cursor_dialect:
         from willow_mcp.cursor_hook_io import emit_cursor_permission
 
