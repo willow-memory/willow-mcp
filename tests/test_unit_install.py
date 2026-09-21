@@ -97,10 +97,11 @@ def _receipts(pg):
 
 REPO = "willow-memory/willow-mcp"
 UNIT = "nestor-ui.service"
+TIMER_UNIT = "nestor-ui.timer"
 SRC = f"{REPO}@deploy/nestor-ui.service.template"
 
 
-def _charter(tmp_path, monkeypatch, *, grantee="willow", units=(UNIT,),
+def _charter(tmp_path, monkeypatch, *, grantee="willow", units=(UNIT, TIMER_UNIT),
              sources=(SRC,), extra=None, expires="2027-01-01", max_count=None):
     active = [{
         "id": "env-unit.install-test",
@@ -534,7 +535,7 @@ def test_local_only_head_is_ENOSRC(home, tmp_path, monkeypatch, github_root, des
     _charter(tmp_path, monkeypatch)
     pg = _FakeGovernancePg()
     out = _install(pg, _Fake(on_remote=""), github_root, dest)
-    assert out["error"] == "ENOSRC" and "not on any remote" in out["reason"]
+    assert out["error"] == "ENOSRC" and "not on origin" in out["reason"]
     assert _citations(pg) == []
 
 
@@ -542,6 +543,146 @@ def test_remote_refs_are_in_the_receipt(home, tmp_path, monkeypatch, github_root
     _charter(tmp_path, monkeypatch)
     out = _install(_FakeGovernancePg(), _Fake(on_remote="  origin/master\n  origin/feat/x\n"), github_root, dest)
     assert out["ok"] and out["remote_refs"] == ["origin/master", "origin/feat/x"]
+
+
+# ── Loki 02195799 ─────────────────────────────────────────────────────────────
+
+def test_fork_only_head_is_ENOSRC(home, tmp_path, monkeypatch, github_root, dest):
+    """A `fork` remote the builder controls does not make a commit
+    reviewable in a PR on the named repo — only origin/* counts."""
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(on_remote="  fork/master\n"), github_root, dest)
+    assert out["error"] == "ENOSRC" and "not on origin" in out["reason"]
+    assert _citations(pg) == []
+
+
+def test_origin_HEAD_pointer_alone_does_not_count(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    out = _install(_FakeGovernancePg(), _Fake(on_remote="  origin/HEAD -> origin/master\n  fork/x\n"), github_root, dest)
+    assert out["error"] == "ENOSRC"
+
+
+def test_origin_beside_a_fork_is_fine_and_only_origin_is_recorded(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    out = _install(_FakeGovernancePg(), _Fake(on_remote="  fork/master\n  origin/master\n"), github_root, dest)
+    assert out["ok"] and out["remote_refs"] == ["origin/master"]
+
+
+def test_timer_activating_another_service_is_ENAME(home, tmp_path, monkeypatch, github_root, dest):
+    """A tracked, clean timer whose Unit= names another service would start
+    THAT service on `enable --now` — outside the cited bounds."""
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(
+        "[Timer]\nOnUnitActiveSec=60s\nUnit=other.service\n")
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["error"] == "ENAME" and out["declared"] == "other.service" and out["timer"] == TIMER_UNIT
+    assert _citations(pg) == [] and not (dest / UNIT).exists()
+
+
+def test_timer_without_unit_key_defaults_to_the_same_stem(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(
+        "[Timer]\nOnUnitActiveSec=60s\n")
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["ok"] and out["activates"] == UNIT and out["enabled"] == TIMER_UNIT
+
+
+def test_timer_last_unit_assignment_wins(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(
+        "[Timer]\nUnit=@UNIT@\nOnUnitActiveSec=60s\nUnit=other.service\n")
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["error"] == "ENAME"
+
+
+def test_timer_rides_in_the_cited_call_args_and_bounds(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(TIMER)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["ok"] and out["activates"] == UNIT
+    assert _citations(pg)[0]["content"]["call_args"] == {"units": [UNIT, TIMER_UNIT], "sources": [SRC]}
+    assert _receipts(pg)[0]["content"]["activates"] == UNIT
+    assert _receipts(pg)[0]["content"]["enabled"] == TIMER_UNIT
+
+
+def test_timer_not_in_bounds_is_refused_even_when_the_service_is(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch, units=(UNIT,))
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(TIMER)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["ok"] is False and out.get("fields")
+    assert not (dest / UNIT).exists() and not (dest / TIMER_UNIT).exists()
+
+
+@pytest.mark.parametrize("tail", [
+    "[Install]\nWantedBy=default.target \\\nwillow-mcp-serve.service\n",
+    "[Install]\nAlias=a.service \\\n  b.service \\\n  willow-mcp-serve.socket\n",
+    "[Unit]\nAfter=network.target \\\nwillow-mcp.service\n",
+])
+def test_backslash_continued_line_naming_the_broker_is_EPERM(home, tmp_path, monkeypatch, github_root, dest, tail):
+    _charter(tmp_path, monkeypatch)
+    _tmpl_path(github_root).write_text(TEMPLATE + tail)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["error"] == "EPERM", out
+    assert _citations(pg) == []
+
+
+def test_timer_continuation_naming_the_broker_is_EPERM(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(
+        "[Timer]\nOnUnitActiveSec=60s\nUnit=\\\nwillow-mcp-serve.service\n")
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["error"] == "EPERM"
+
+
+def test_lowercase_section_or_key_is_not_a_naming_key():
+    """systemd section/key names are case-sensitive; `[install] alias=` is
+    ignored by systemd, so it is not an escape and not a hit."""
+    assert uix.broker_units_named("[install]\nalias=willow-mcp-serve.service\n") == []
+    assert uix._logical_lines("a=b \\\nc\nd=e") == ["a=b c", "d=e"]
+    assert uix.timer_activates("[Timer]\nUnit=x.service\n", "n.timer") == "x.service"
+    assert uix.timer_activates("[Timer]\nOnCalendar=daily\n", "n.timer") == "n.service"
+
+
+def test_same_instant_installs_do_not_overwrite_the_backup(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    (dest / UNIT).write_text("[Unit]\nDescription=first\n")
+    monkeypatch.setattr(uix, "datetime", _FrozenDatetime)
+    out1 = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    (dest / UNIT).write_text("[Unit]\nDescription=second\n")
+    out2 = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out1["ok"] and out2["ok"]
+    k1, k2 = Path(out1["previous_kept"][0]), Path(out2["previous_kept"][0])
+    assert k1 != k2 and k1.is_file() and k2.is_file()
+    assert k1.read_text() == "[Unit]\nDescription=first\n"
+    assert k2.read_text() == "[Unit]\nDescription=second\n"
+
+
+def test_backups_are_bounded_and_pruned_ones_are_named(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    for i in range(6):
+        (dest / f"{UNIT}.pre-install-20260921T00000{i}.000000Z").write_text(f"old{i}")
+    (dest / UNIT).write_text("[Unit]\nDescription=live\n")
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["ok"]
+    remaining = sorted(p.name for p in dest.iterdir() if ".pre-install-" in p.name)
+    assert len(remaining) == uix.BACKUPS_KEPT
+    assert Path(out["previous_kept"][0]).name in remaining  # the newest survives
+    assert len(out["pruned"]) == 6 + 1 - uix.BACKUPS_KEPT
+    assert all(".pre-install-2026092" in p for p in out["pruned"])
+
+
+class _FrozenDatetime:
+    """Freezes `datetime.now()` so two installs share one stamp."""
+    _fixed = datetime(2026, 9, 21, 3, 36, 2, 123456, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed
 
 
 def test_replace_then_fail_restores_the_previous_unit_and_inks_a_failure_row(

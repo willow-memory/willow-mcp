@@ -108,6 +108,40 @@ def unit_dir() -> Path:
     return base.expanduser() / "systemd" / "user"
 
 
+#: Backups kept per unit after a successful replace; older ones are pruned
+#: and named in the receipt. Bounded so `previous_kept` cannot grow forever
+#: (Loki 02195799).
+BACKUPS_KEPT = 3
+_BACKUP_TAG = ".pre-install-"
+
+
+def _fresh_backup_path(target: Path, stamp: str) -> Path:
+    """``<unit>.pre-install-<µs stamp>``, with a counter suffix when that
+    name already exists — a second install in the same instant never
+    overwrites the first's backup."""
+    keep = target.with_name(f"{target.name}{_BACKUP_TAG}{stamp}")
+    n = 1
+    while keep.exists():
+        keep = target.with_name(f"{target.name}{_BACKUP_TAG}{stamp}-{n}")
+        n += 1
+    return keep
+
+
+def _prune_backups(target: Path, keep_n: int = BACKUPS_KEPT) -> list[str]:
+    """Delete all but the newest ``keep_n`` backups of ``target`` (lexical
+    order on the stamp is chronological); return what was removed."""
+    prefix = f"{target.name}{_BACKUP_TAG}"
+    found = sorted(p for p in target.parent.iterdir() if p.name.startswith(prefix) and p.is_file())
+    pruned: list[str] = []
+    for old in found[:-keep_n] if keep_n > 0 else found:
+        try:
+            old.unlink()
+            pruned.append(str(old))
+        except OSError as exc:
+            pruned.append(f"{old}: prune failed: {exc}")
+    return pruned
+
+
 def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -226,13 +260,23 @@ def _resolve_clone(repo: str, *, root: Optional[Path], runner) -> dict:
     if head.returncode != 0 or not (head.stdout or "").strip():
         return _refuse("ENOSRC", f"could not read HEAD of {clone}")
     sha = (head.stdout or "").strip()
+    # Only the NAMED repo's remote counts: resolve_clone_status verified that
+    # `origin` is org/name, so a ref under origin/* is a commit reviewable in
+    # a PR on that repo. A `fork` remote the builder controls is not (Loki
+    # 02195799): filter before judging.
     on_remote = _git(clone, "branch", "-r", "--contains", "HEAD", runner=runner)
-    if on_remote.returncode != 0 or not (on_remote.stdout or "").strip():
-        return _refuse("ENOSRC", f"HEAD {sha[:12]} of {repo!r} is not on any remote — "
-                                 f"a unit installs from a commit that was reviewable in a PR, "
-                                 f"never from a local-only commit")
-    return {"ok": True, "clone": clone, "head": sha,
-            "remote_refs": [r.strip() for r in on_remote.stdout.splitlines() if r.strip()]}
+    if on_remote.returncode != 0:
+        return _refuse("ENOSRC", f"could not read remote refs of {clone}")
+    origin_refs = [
+        r.strip().split(" ", 1)[0] for r in (on_remote.stdout or "").splitlines()
+        if r.strip().split(" ", 1)[0].startswith("origin/")
+        and r.strip().split(" ", 1)[0] != "origin/HEAD"
+    ]
+    if not origin_refs:
+        return _refuse("ENOSRC", f"HEAD {sha[:12]} of {repo!r} is not on origin — "
+                                 f"a unit installs from a commit that was reviewable in a PR "
+                                 f"on the named repo, never from a local-only or fork-only commit")
+    return {"ok": True, "clone": clone, "head": sha, "remote_refs": origin_refs}
 
 
 def _read_tracked(clone: Path, repo: str, rel: str, *, runner) -> dict:
@@ -302,26 +346,69 @@ _UNIT_NAMING_KEYS = {
 }
 
 
+def _logical_lines(text: str) -> list[str]:
+    """The unit file as systemd reads it: a line ending in a backslash is
+    concatenated with the following line (systemd.syntax). Parsing physical
+    lines let `WantedBy=default.target \\` + `willow-mcp-serve.service` hide
+    the broker's name on a line with no `=` (Loki 02195799). Section and key
+    names stay case-sensitive, as systemd's are — `[install] alias=` is not
+    an escape because systemd ignores it too."""
+    out: list[str] = []
+    buf = ""
+    for raw in text.splitlines():
+        if raw.rstrip().endswith("\\"):
+            buf += raw.rstrip()[:-1].rstrip() + " "
+            continue
+        out.append((buf + raw.lstrip()) if buf else raw)
+        buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
+def unit_keys(rendered: str, section: str) -> dict[str, list[str]]:
+    """``{key: [values...]}`` for one section of the rendered text, over
+    logical lines, last-assignment-wins per systemd but every value kept so a
+    repeated key is judged in full."""
+    found: dict[str, list[str]] = {}
+    current = ""
+    for raw in _logical_lines(rendered):
+        line = raw.strip()
+        m = _SECTION_RE.match(line)
+        if m:
+            current = m.group("name").strip()
+            continue
+        if current != section or not line or line.startswith(("#", ";")) or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        found.setdefault(key.strip(), []).append(value.strip())
+    return found
+
+
 def broker_units_named(rendered: str) -> list[str]:
     """Every unit name in the rendered text's naming keys that is the
     broker's — an EPERM before citation when non-empty."""
     hits: list[str] = []
-    section = ""
-    for raw in rendered.splitlines():
-        line = raw.strip()
-        m = _SECTION_RE.match(line)
-        if m:
-            section = m.group("name").strip()
-            continue
-        if not line or line.startswith(("#", ";")) or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        if key.strip() not in _UNIT_NAMING_KEYS.get(section, ()):
-            continue
-        for name in value.split():
-            if is_broker_unit(name):
-                hits.append(f"[{section}] {key.strip()}={name}")
+    for section, keys in _UNIT_NAMING_KEYS.items():
+        found = unit_keys(rendered, section)
+        for key in keys:
+            for value in found.get(key, ()):
+                for name in value.split():
+                    if is_broker_unit(name):
+                        hits.append(f"[{section}] {key}={name}")
     return hits
+
+
+def timer_activates(timer_rendered: str, timer_name: str) -> str:
+    """What ``enable --now <timer>`` will start: ``[Timer] Unit=`` (the last
+    assignment wins, as in systemd) or, absent, the service on the same stem.
+    Loki 02195799: a tracked, clean timer whose ``Unit=`` names another
+    service would start THAT service on schedule, outside the cited bounds."""
+    values = unit_keys(timer_rendered, "Timer").get("Unit", [])
+    if values:
+        return values[-1].strip()
+    stem = timer_name[: -len(".timer")] if timer_name.endswith(".timer") else timer_name
+    return f"{stem}.service"
 
 
 def execute_unit_install(
@@ -431,13 +518,31 @@ def execute_unit_install(
             named=named,
         )
 
+    # What the timer ACTIVATES must be the unit being installed: `enable
+    # --now <timer>` starts whatever [Timer] Unit= names, and a tracked, clean
+    # timer naming another service would start it outside the cited bounds
+    # (Loki 02195799). ENAME, naming both.
+    activates = ""
+    if timer_src is not None:
+        activates = timer_activates(timer_rendered, timer_name)
+        if activates != unit:
+            return _refuse(
+                "ENAME",
+                f"timer {timer_name!r} activates {activates!r}, not {unit!r} — a timer "
+                f"installs only beside the service it schedules",
+                declared=activates, timer=timer_name,
+            )
+
     if ledger is None:
         return _refuse(
             "EAMBIG",
             "no governance ledger: an install that cannot be cited is not performed",
         )
 
-    call_args = {"units": [unit], "sources": [source]}
+    # The cited call names everything that will be written AND what gets
+    # enabled: the timer rides in `units` so the bounds check judges it, and
+    # the receipt says what it activates.
+    call_args = {"units": [unit] + ([timer_name] if timer_name else []), "sources": [source]}
     try:
         matches = governing_envelope_ids(VERB, app_id)
     except (OSError, ValueError) as exc:
@@ -488,7 +593,7 @@ def execute_unit_install(
     # Every failure after citation inks a FRANK row — the grant was spent.
     root = Path(destination) if destination is not None else unit_dir()
     root.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     targets: list[tuple[Path, str]] = [(root / unit, rendered)]
     if timer_src is not None:
         targets.append((root / timer_name, timer_rendered))
@@ -498,7 +603,7 @@ def execute_unit_install(
     written: list[str] = []
     for target, body in targets:
         if target.is_file():
-            keep = target.with_name(f"{target.name}.pre-install-{stamp}")
+            keep = _fresh_backup_path(target, stamp)
             os.replace(target, keep)
             backups.append((target, keep))
         tmp = target.with_name(target.name + ".new")
@@ -547,6 +652,9 @@ def execute_unit_install(
             return _fail("EINSTALL", tail or f"{' '.join(argv[2:])} exited {proc.returncode}")
 
     state_after = show_unit(unit, runner=runner)
+    pruned: list[str] = []
+    for target, _ in targets:
+        pruned.extend(_prune_backups(target))
 
     receipt_out = {
         "ok": True, "installed": True, "unit": unit, "source": source,
@@ -554,8 +662,9 @@ def execute_unit_install(
         "template_digest": _digest(src["text"]), "rendered_digest": _digest(rendered),
         "timer_template_digest": _digest(timer_src["text"]) if timer_src else "",
         "replaced": replaced, "previous_digest": previous_digest,
-        "previous_kept": [str(k) for _, k in backups],
-        "timer": timer_name, "written": written,
+        "previous_kept": [str(k) for _, k in backups], "pruned": pruned,
+        "timer": timer_name, "activates": activates, "enabled": enable_target,
+        "written": written,
         "envelope_id": matches[0], "citation_id": result.get("citation_id"),
         "state_before": state_before, "state_after": state_after,
     }
@@ -566,7 +675,8 @@ def execute_unit_install(
             "rendered_digest": receipt_out["rendered_digest"],
             "timer_template_digest": receipt_out["timer_template_digest"],
             "replaced": replaced, "previous_digest": previous_digest,
-            "previous_kept": receipt_out["previous_kept"], "timer": timer_name,
+            "previous_kept": receipt_out["previous_kept"], "pruned": pruned,
+            "timer": timer_name, "activates": activates, "enabled": enable_target,
             "active_state_after": state_after.get("ActiveState"),
             "active_enter_after": state_after.get("ActiveEnterTimestamp"),
             "session": session, "citation_id": result.get("citation_id"),
