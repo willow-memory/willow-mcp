@@ -222,19 +222,82 @@ to a server in-process. For willow-mcp's 170 tools, the combination of
 SDK in-process transport (unit tests) + mcp-assert (conformance) +
 agent-security-harness (security gate) covers the full test surface.
 
-### Repos not yet surveyed
+### Fork audit outcome
 
-Seven MCP forks under `rudi193-cmd/` represent hands-on evaluation of external
-prior art that the survey discusses generically: codebase-memory-mcp,
-multimodels-mcp, mcp-memory-service, basic-memory, ctxvault, hermes-agent,
-claudeclaw. All pushed July–August 2026. Linking which forks were examined to
-which survey conclusions would strengthen provenance.
+The seven MCP forks under `rudi193-cmd/` this survey previously discussed
+generically — codebase-memory-mcp, multimodels-mcp, mcp-memory-service,
+basic-memory, ctxvault, hermes-agent, claudeclaw — were surveyed in a first-pass
+audit (2026-08-18/2026-09-21) alongside ~17 other domain-adjacent forks. All
+seven are **drop**: each is a vanilla or near-vanilla fork of an external project
+carrying no owner work willow-mcp needs. Per-fork notes:
 
-`Nestor` is now a standalone repo under active work (pushed same day as this
-survey) — the survey names it as one of eight unique shapes but never examines
-the implementation. `willow-gate`, `willow-config`, and `willow-compose` form an
-uncovered infrastructure cluster: deployment, gating, and orchestration that the
-MCP tools operate within.
+- **basic-memory** — AGPL-3.0, so licence-excluded regardless of shape, and the
+  fork is unmodified.
+- **mcp-memory-service** — the only one of the seven with substantive owner
+  additions (memory_observe / auto_extract harvest, ranked search, mistake_notes
+  CRUD), but off-domain for willow. Its RRF multi-signal search ranking is the
+  single liftable pattern for KB atom search; mistake_notes is plain correction
+  CRUD, not Mem-ratify's quorum-gated tier promotion.
+- **codebase-memory-mcp** (AST / call-graph), **multimodels-mcp** (model
+  task-router), **ctxvault** (vector-vault typed memory), **hermes-agent** (Nous
+  self-improving agent), **claudeclaw** (Claude Code daemon) — clean forks in
+  orthogonal domains, nothing to salvage.
+
+The wider audit surfaced two things worth keeping, recorded outside this section:
+three external memory systems (ogham-mcp, stash, statewave) in §16, and ShibaClaw
+(Apache-2.0, the claw family) whose owner-built safety machinery — SSRF / DNS-
+rebind guard, Muzzle tool-output framing, install CVE gate — is specced for
+adoption in `docs/design/shibaclaw-safety-adoption-2026-09-21.md`.
+
+A second-pass audit (2026-09-21) covered fourteen further domain-adjacent forks —
+DontFeedTheAI, codejail, redential-cli, ngrok-python, gov-transparency-mcp-fork,
+courtlistener-mcp, python-sdk, litellm, Backlog.md-fork, ArchUnitPython-fork,
+production-readiness-checklist, claude-deep-review, claude_code_RLM,
+awesome-claude-skills — all **drop**. Most are vanilla forks of off-domain or
+infrastructure projects (litellm, ngrok-python, the official MCP python-sdk,
+codejail, the two data-MCP servers). Two carry owner-authored work worth noting
+for provenance, though neither yields an adoptable piece: **DontFeedTheAI**, a
+local secret-scan / anonymisation proxy whose regex patterns overlap willow's
+secret scan and, per the fork's own history, were fed upstream into it (so it is
+drop-as-absorbed); and **redential-cli**, git-history credential attestation
+whose hash-chained receipts and explicit consent model parallel `frank_*` and
+subject consent but are bound to the credential-bundle domain and would need
+rework to reuse. `production-readiness-checklist`'s evidence and risk-exception
+control model is a distant design reference for `frank_*`, nothing more.
+
+A willow-infrastructure pass (2026-09-21) surveyed the standalone `willow-memory`
+repos, all Apache-2.0 and all real code (not stubs):
+
+- **kartikeya** — the Kart task queue plus bubblewrap-sandboxed worker
+  (queue / worker / lanes / scheduler); willow-mcp consumes it via `task_submit`.
+- **willow-gate** — trust-gated access control that *complements* (does not
+  duplicate) willow-mcp's egress gating: a Tier 1–4 hash-chained custody ledger
+  reconciling declared-vs-observed capabilities at session check-out (file
+  check-out kept distinct from egress), a five-rung trust ladder, and Ed25519
+  inter-agent bus signing (`message_integrity.py`). Not yet wired into
+  willow-mcp's pre-tool hook.
+- **ratatosk** — the platform session runtime (prompt→tools loop, tiered
+  provider ladder). It *calls* Nestor tools; it is not Nestor. Nestor's
+  tool-routing verbs (`nestor_tool_route` / `_seal` / `_pending`) are
+  implemented in willow-mcp itself, so "Nestor is a standalone repo" was
+  inaccurate.
+- **willows-grove** — the loopback operator-seat UI (127.0.0.1:8766) plus its
+  own MCP server; the Grove *messaging* seam lives in willow-mcp, the served
+  dashboard here. (Distinct from the archived `willow-grove` repo.)
+- **willow-bot** — the propose-only GitHub App steward (webhook receiver, no
+  merge/approve authority) with a hash-chained deposits ledger.
+- **willow-data-vault** — the schema / bootstrap *blueprint* (SQL for secrets,
+  SOIL, receipts, Kart, KB, intake); willow-mcp instantiates the box from it. It
+  is not a second Vault.
+- **corpus-lens** — a standalone session-log analysis tool with a privacy
+  "Guard" wall (quarantines absolute dates / times / filenames, permits only
+  process-shape analysis).
+- **willow-reconciler** — the deterministic `Idea-Id` reconciler (classifies
+  each idea-pile item LANDED / PARTIAL / NOT_STARTED from git evidence) behind
+  the commit-trailer CI gate.
+
+Still unsurveyed: `willow-config` and `willow-compose` (both private) — the
+deployment / orchestration corner of the cluster.
 
 ## 2. MCP protocol features beyond tools
 
@@ -794,9 +857,131 @@ equivalent.
 
 ---
 
+## 16. Agent memory systems (forks surveyed)
+
+Three memory systems collected as forks under `rudi193-cmd/` during the fork
+audit. All are close in domain to willow-mcp's KB atoms + `lineage_*` +
+Mem-ratify stack, all carry dependable licences, and none was modified in the
+fork — they are external prior art, not owner work. Licences verified against
+the repo LICENSE file.
+
+| Project | Licence | What it is | Nearest willow shape |
+| --- | --- | --- | --- |
+| [ogham-mcp](https://ogham-mcp.dev) | MIT (verified) | Persistent, searchable shared memory for AI coding agents across MCP clients. Postgres + pgvector hybrid search, recall/consolidation, profiles/schema. Reports 85.8% on the AMB memory benchmark | KB atoms + Grove cross-session memory |
+| [stash](https://github.com/alash3al/stash) | Apache-2.0 (verified) | Go. Persistent agent memory that "remembers, recalls, consolidates, and learns." Eight-stage consolidation pipeline (facts → patterns → wisdom), goal/failure tracking, namespaced, Postgres + pgvector | Mem-ratify tier promotion + knowledge refinement |
+| [statewave](https://github.com/smaramwbc/statewave) | Apache-2.0 (verified) | Python. Compile-then-retrieve memory runtime: episodes compiled into typed memories with confidence scores, provenance-tagged, to avoid query-time retrieval noise | `lineage_*` reasoning provenance + Mem-ratify confidence |
+
+**What's borrowable, not adoptable.** None replaces a willow shape; each is a
+whole memory runtime with its own store. Two ideas are worth lifting as design
+references:
+
+- **stash's staged consolidation** (facts → patterns → wisdom) is a concrete
+  shape for how Mem-ratify tiers could *earn* promotion through processing
+  stages rather than quorum alone. Back the pipeline with the `frank_*` ledger
+  for an audit trail of each promotion.
+- **statewave's compile-at-write** model is the inverse of willow's
+  verify-at-read (`knowledge_verify`): it pays the provenance-tagging cost when
+  the episode lands, not when it is recalled. Worth weighing if retrieve-time
+  verification ever becomes a latency floor.
+
+**Verdict: Keep** willow's own KB/lineage/Mem-ratify. ogham is the closest
+cross-client reference; stash and statewave are consolidation/provenance design
+references. The three forks carry no owner work these rows do not capture.
+
+---
+
+## 17. Fleet infrastructure (willow-owned)
+
+Three shapes carried by the standalone `willow-memory` infrastructure repos
+(surveyed in §1's infrastructure pass) that the willow-subsystem sections above
+do not otherwise capture. All Apache-2.0, verified against the repo source.
+
+### Asymmetric bus signing + custody reconciliation (willow-gate)
+
+§7 records willow's agent binding as symmetric HMAC-SHA256 and names "symmetric
+HMAC (no asymmetric federation)" as a gap. `willow-gate` carries both halves. Its
+own agent binding stays HMAC-SHA256 over a canonical header (`trust_level` capped
+at the registered `max_trust`; five rungs Exiled→Rookie→Steady→Veteran→Elder in
+`trust_scale.py`). But `message_integrity.py` signs inter-agent *bus* messages
+with **Ed25519** — `sign_message` / `MessageVerifier.verify` over a canonical
+JSON digest of `(sender, channel, content, nonce, signed_at)`. Asymmetric bus
+signatures are the SPIFFE-style federation step §7 anticipated, already partly in
+place for the Grove message bus.
+
+`custody.py` adds a shape §13's receipt log does not: a Tier 1–4 custody ledger
+(append-only hash chain → session check-in/out reconciliation → file custody +
+lineage + capture-gap detection → PGP-signed checkpoints) whose
+`session_check_out` returns a `Reconciliation` of **declared vs observed**
+capabilities (`declared`, `observed`, `mismatches`, `fail_count_delta`). File
+check-out is a capability distinct from egress ("declaring egress must not excuse
+a checkout"), so a session cannot launder a file grab through an egress
+declaration.
+
+| Alternative | Licence | Comparison |
+| --- | --- | --- |
+| [SPIFFE/SPIRE](https://github.com/spiffe/spire) | **Apache-2.0** | Asymmetric workload identity (§7 already names it as the federation upgrade); willow-gate's Ed25519 bus signing is the lighter, in-place form |
+| [in-toto](https://github.com/in-toto/in-toto) | **Apache-2.0** | Attests declared-vs-performed supply-chain steps; closest analog to custody reconciliation, but for build pipelines, not live agent sessions |
+
+**Verdict: Keep.** The declared-vs-observed reconciliation and the
+egress/checkout distinction have no external equivalent; Ed25519 bus signing is
+the asymmetric step §7 anticipated.
+
+### Process-shape privacy wall (corpus-lens)
+
+`corpus-lens` analyses human+agent session logs for process metrics (authorship,
+deliberation tempo, steering) behind a fail-closed "Guard" wall (`guard.py`,
+stdlib-only). The wall quarantines every absolute anchor — calendar base date,
+timezone, filename→line map — and permits only process-shape analysis. Release is
+capability-gated: three known capabilities (`calendar_time`, `local_tz`,
+`person_inference`), a default profile that grants nothing, and `release(cap,
+justification)` that raises `WallError` on an unknown capability, a missing
+justification, an ungranted capability, or an anchor release without an
+owner_token ("absence of policy is denial"). Person-shaped claims need both
+`person_inference` and an owner_token; unknown claim types are refused outright;
+`scan_egress` re-checks output for quarantined literals before emission; an
+`AuditRecord.sentence()` discloses in plain language what left the wall.
+
+This is §10's exposure-membrane idea (per-destination slicing of persona data)
+applied to *telemetry*: a content/structure wall like the Nest pipeline's, but
+enforced as capability-gated egress with justification and audit.
+
+| Alternative | Licence | Comparison |
+| --- | --- | --- |
+| [Presidio](https://github.com/microsoft/presidio) | MIT | Detects and redacts PII; does not fail-closed-gate release by capability + justification, and has no process-shape-only permit model |
+| [OpenDP](https://github.com/opendp/opendp) | MIT | Adds calibrated noise to aggregates; orthogonal — the Guard withholds anchors rather than perturbing them |
+
+**Verdict: Keep.** No surveyed tool gates telemetry release by capability behind a
+fail-closed "absence of policy is denial" wall with an egress re-scan.
+
+### Deterministic idea→landing reconciliation (willow-reconciler)
+
+`willow-reconciler` classifies each item in an idea pile (e.g. `docs/ideas.md`)
+as LANDED / PARTIAL / NOT_STARTED from git evidence alone — **no model call in
+`classify.py`**: an explicit legend tag first, then a git-inferred tier (an
+`Idea-Id` trailer reachable from HEAD, or a PR number the item names), then
+abstain; each `Verdict` records which rule fired. Two disciplines make it
+trustworthy. `benchmark.py` splits recovery into **self-witnessed** (the trailer
+commit also edited the doc — demonstrates the pipeline, not capability) versus
+**independent** (trailer commit did not touch the doc — the only rate quotable as
+a capability result). And the test corpus is a **hand-written adversarial
+fixture** (`tests/fixtures/adversarial_ideas.md` plus a hand-written `EXPECTED`
+map), authored from the traps' intent rather than generated from the classifier,
+so it cannot drift into agreeing with a regression.
+
+| Alternative | Licence | Comparison |
+| --- | --- | --- |
+| Conventional-commit / `Fixes #NNN` link-closing | various | Links a commit to an issue; does not classify a spec item's landing state, and has no anti-drift benchmark |
+| Requirements-traceability matrices | various | Map requirements to artifacts, but manually maintained; no deterministic git-evidence classifier |
+
+**Verdict: Keep.** The self-witnessed/independent split and the hand-written
+adversarial ground truth (a fixture that cannot drift into agreeing with the code
+it grades) have no external equivalent.
+
+---
+
 ## Summary
 
-Verdicts across all 22 surveyed systems:
+Verdicts across all 25 surveyed systems:
 
 | § | System | Verdict | Compose/Adapt with |
 | --- | --- | --- | --- |
@@ -822,8 +1007,11 @@ Verdicts across all 22 surveyed systems:
 | 14 | Subject consent | **Compose** | OPA + MS Consent-Package model |
 | 15 | SOIL persistence | **Keep** | — |
 | 15 | Lineage (reasoning provenance) | **Keep** | W3C PROV as export format |
+| 17 | willow-gate (bus signing + custody) | **Keep** | SPIFFE / in-toto as references |
+| 17 | corpus-lens (process-shape wall) | **Keep** | Presidio / OpenDP as references |
+| 17 | willow-reconciler (idea→landing) | **Keep** | — |
 
-**Totals: 13 Keep · 3 Adapt · 6 Compose · 0 Adopt**
+**Totals: 16 Keep · 3 Adapt · 6 Compose · 0 Adopt**
 
 The recurring pattern: external tools provide plumbing (extraction, detection,
 policy evaluation, identity). willow-mcp's contribution is the gate — the
