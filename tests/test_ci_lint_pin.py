@@ -170,17 +170,64 @@ def test_every_claim_must_name_the_pin():
     assert v["verdict"] == "refuse" and "names no linter version" in v["reason"]
 
 
+def test_inheritance_never_hides_a_version_and_never_reads_a_pin_as_a_run():
+    """Loki AC8CBA02 I2/I5/I6/I7: a version token anywhere in the
+    inheriting clause names it; a statement of the pin is not a run."""
+    _pin = {"state": "populated", "version": "0.16.7", "source": "tests.yml"}
+    for text in [
+        "ruff 0.16.7 check: All checks passed; ruff format --check 0.15.0: clean",  # I5
+        "ruff 0.16.7 check: All checks passed; ruff format --check: 0.15.0 was used, clean",  # I2
+    ]:
+        v = clp.judge_lint_claim(text, _pin)
+        assert v["verdict"] == "refuse" and v["named"] == "0.15.0", text
+    for text in [
+        "CI pins ruff 0.16.7; ruff check: clean",  # I6
+        "the pin is ruff==0.16.7; lint clean",  # I7
+        "required-version = 0.16.7 in pyproject; ruff check clean",
+    ]:
+        v = clp.judge_lint_claim(text, _pin)
+        assert v["verdict"] == "refuse" and "names no linter version" in v["reason"], text
+    # The honest one-run shapes still accept (I1, C9, I3, and a run that
+    # names the pin beside its outcome).
+    for text in [
+        "ruff 0.16.7 check: All checks passed; format --check: 232 files already formatted",
+        "ruff 0.16.7 (tests.yml pin) check: All checks passed; format --check: 232 files already formatted; 41 passed",
+        "ruff 0.16.7 check src: All checks passed; ruff format --check: clean; 232 files already formatted",
+        "ruff 0.16.7 --version; ruff check: clean",
+    ]:
+        assert clp.judge_lint_claim(text, _pin)["verdict"] == "accept", text
+
+
+def test_other_tools_never_share_a_ruff_version():
+    """Loki AC8CBA02 I11 and its mirror: another tool's outcome is not a
+    ruff claim, and a ruff version is never attached to it."""
+    _pin = {"state": "populated", "version": "0.16.7", "source": "tests.yml"}
+    claims = clp.lint_claims("ruff 0.16.7 check: All checks passed; bandit: no findings")
+    assert [c["clause"] for c in claims] == ["ruff 0.16.7 check: All checks passed"]
+    # Mirror: a wrong ruff version must not make a mypy outcome refuse.
+    v = clp.judge_lint_claim("ruff 0.15.0 check: 3 errors. mypy: no errors", _pin)
+    assert v["verdict"] == "none"
+    assert clp.judge_lint_claim("pytest: 81 passed; mypy: no issues found", _pin)["verdict"] == "none"
+
+
 def test_quoted_spans_are_descriptions_not_claims():
-    """Loki C63A2C48 Q1/Q2: evidence that quotes the rule in backticks or
-    double quotes is describing it; the quoted span is stripped first."""
+    """Loki C63A2C48 Q1/Q2 and AC8CBA02 Q3/Q5: evidence that quotes a rule
+    or a transcript is describing it; the quoted span is stripped first.
+    An apostrophe never opens a quoted span (Q4)."""
     _pin = {"state": "populated", "version": "0.16.7", "source": "tests.yml"}
     for text in [
         "src/ci_lint_pin.py: the clean word is ruff's own outcome phrase (\"All checks passed\") or `clean` adjacent to the linter word",
         "judge: a clean word is `clean` adjacent to the linter word — described, not claimed",
         "_CLEAN_WORD_RE matches “All checks passed” after `ruff`",
+        "over the transcript 'ruff 0.15.0 check: All checks passed' the gate said refuse",  # Q5
+        "adversarial: '81 passed; ruff 0.15.0 check clean' accept 0.15.0",  # Q3
     ]:
         assert clp.judge_lint_claim(text, _pin)["verdict"] == "none", text
+    assert clp.judge_lint_claim("ruff 0.16.7 check: All checks passed; it's clean", _pin)["verdict"] == "accept"  # Q4
     assert clp.judge_lint_claim("ruff 0.15.0 check src: All checks passed", _pin)["verdict"] == "refuse"
+    # The refusal for an unnamed claim names the quoting rule.
+    v = clp.judge_lint_claim("lint clean", _pin)
+    assert v["verdict"] == "refuse" and "backticks" in v["reason"]
 
 
 def test_lookback_spans_a_test_count_but_stops_at_a_disclaimer_or_an_outcome():

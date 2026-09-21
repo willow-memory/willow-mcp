@@ -206,12 +206,35 @@ _DISCLAIMER_RE = re.compile(
 )
 # `ruff 0.16.7`, `ruff==0.16.7`, `ruff (0.16.7)`, `ruff v0.16.7`, `ruff/0.16.7`
 _NAMED_VERSION_RE = re.compile(r"\bruff\b[\s=(/]*v?" + _VERSION, re.IGNORECASE)
+# Any version token at all. A claim clause that carries one — anywhere —
+# names it; it never inherits (Loki AC8CBA02 I2/I5: `ruff format --check
+# 0.15.0: clean` is a 0.15.0 measurement, not an unnamed half).
+_ANY_VERSION_RE = re.compile(r"(?<![\w.])v?(\d+\.\d+(?:\.\d+){0,2})(?![\w.])")
+# A statement of the pin is not a run: `CI pins ruff 0.16.7; ruff check:
+# clean` says which binary CI uses, not which one measured (I6/I7).
+_PIN_WORDING_RE = re.compile(
+    r"\bpin(?:s|ned|ning)?\b|\brequired-version\b|\bCI\s+(?:measures|runs|uses|installs|wants)\b",
+    re.IGNORECASE,
+)
+# Another tool's outcome is never a ruff claim, and never gets a ruff
+# version attached (I11 and its mirror).
+_OTHER_TOOL_RE = re.compile(
+    r"\b(?:bandit|mypy|pyright|pytest|black|flake8|pylint|isort|codeql|semgrep|tox|nox|coverage)\b",
+    re.IGNORECASE,
+)
 
 
 # Quoted spans are descriptions, never measurements: a builder writing
 # "the clean word is `clean` adjacent to the linter word" is quoting the
 # rule, not claiming a run. Real claims carry no quotes (Loki C63A2C48).
-_QUOTED_SPAN_RE = re.compile(r"`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”")
+# Single quotes are stripped only when the span opens after whitespace, a
+# colon or a bracket and runs ≥ 8 chars — an apostrophe (`it's`, `ruff's`)
+# never opens there (Loki AC8CBA02 Q3/Q5).
+_QUOTED_SPAN_RE = re.compile(
+    r"`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”|‘[^’\n]*’"
+    r"|(?<=[\s:(\[])'[^'\n]{8,}?'(?=[\s.,;:)\]]|$)"
+)
+_QUOTE_RULE = "quote a transcript in backticks or double quotes so it is read as a description, not a claim"
 # How far back an outcome-only clause may look for its linter word. A
 # report habitually puts a test count between the tool line and the
 # outcome line ("ruff 0.15.0. Tests: 81 passed. All checks passed."), so
@@ -236,35 +259,69 @@ def lint_claims(text: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     clauses = _clauses(text)
 
+    def _versions_in(clause: str) -> list[str]:
+        """Versions a clause names: `ruff <ver>` first, then any version
+        token in a clause that carries the linter word."""
+        named = [m.group(1) for m in _NAMED_VERSION_RE.finditer(clause)]
+        if named:
+            return named
+        if _LINTER_WORD_RE.search(clause):
+            return [m.group(1) for m in _ANY_VERSION_RE.finditer(clause)]
+        return []
+
     def _inherit(i: int) -> tuple[str, list[str]] | None:
-        """The nearest earlier clause (≤ _LOOKBACK_CLAUSES) that names the
-        linter with a version, or None. Stops at a disclaimer, and past
-        the first step at any clause that carries its own outcome."""
+        """The nearest earlier clause (≤ _LOOKBACK_CLAUSES) that is a RUN of
+        the linter — carries the linter word and a version, no disclaimer,
+        no pin wording — or None. Stops at a disclaimer, and past the first
+        step at any clause that carries its own outcome (Loki AC8CBA02:
+        a mention of the pin is not a run)."""
+        unnamed_run: tuple[str, list[str]] | None = None
         for back in range(1, _LOOKBACK_CLAUSES + 1):
             j = i - back
             if j < 0:
-                return None
+                break
             prev = clauses[j]
-            if _DISCLAIMER_RE.search(prev) or (back > 1 and _CLEAN_WORD_RE.search(prev)):
-                return None
+            if _DISCLAIMER_RE.search(prev):
+                break
             if _LINTER_WORD_RE.search(prev):
-                return prev, [m.group(1) for m in _NAMED_VERSION_RE.finditer(prev)]
-        return None
+                # A pin statement with no outcome is a mention, not a run
+                # ("CI pins ruff 0.16.7"). An outcome-bearing clause that
+                # also names the pin is a run that says so ("ruff 0.16.7
+                # (tests.yml pin) check: All checks passed").
+                if _PIN_WORDING_RE.search(prev) and not _CLEAN_WORD_RE.search(prev):
+                    break
+                vs = _versions_in(prev)
+                if vs:
+                    return prev, vs
+                # A same-tool run with no version of its own ("ruff format
+                # --check: clean") is part of the same report: keep walking
+                # for the clause that named the binary.
+                unnamed_run = unnamed_run or (prev, [])
+                continue
+            if back > 1 and _CLEAN_WORD_RE.search(prev):
+                break  # someone else's outcome: not this report
+        return unnamed_run
 
     for i, clause in enumerate(clauses):
         if not _CLEAN_WORD_RE.search(clause) or _DISCLAIMER_RE.search(clause):
             continue
         if _LINTER_WORD_RE.search(clause):
-            versions = [m.group(1) for m in _NAMED_VERSION_RE.finditer(clause)]
-            if not versions:
+            versions = _versions_in(clause)
+            if not versions and not _OTHER_TOOL_RE.search(clause):
                 # "ruff 0.16.7 check: All checks passed; format --check: 232
                 # files already formatted" — one run, two clauses: the
-                # unnamed half inherits the version the same line named.
+                # unnamed half inherits from the run the same line named.
+                # Only when it carries no version token of its own and
+                # names no other tool.
                 found = _inherit(i)
                 if found and found[1]:
                     out.append({"clause": f"{found[0]} / {clause}", "versions": found[1]})
                     continue
             out.append({"clause": clause, "versions": versions})
+            continue
+        if _OTHER_TOOL_RE.search(clause) or _ANY_VERSION_RE.search(clause):
+            # Another tool's outcome, or an outcome with its own version and
+            # no linter word — neither is a ruff claim (I11 and its mirror).
             continue
         found = _inherit(i)
         if found:
@@ -324,7 +381,8 @@ def judge_lint_claim(evidence: str, pin: dict[str, Any]) -> dict[str, Any]:
             "verdict": "refuse",
             "reason": (
                 f"lint claim names no linter version: {unnamed[0]['clause']!r}{where}. "
-                "A green that does not say which binary measured it is an assertion, not a measurement."
+                "A green that does not say which binary measured it is an assertion, not a measurement "
+                f"(if this line is a quoted transcript, {_QUOTE_RULE})."
             ),
             "named": named,
             "pinned": pinned,
