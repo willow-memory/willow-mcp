@@ -249,6 +249,22 @@ three external memory systems (ogham-mcp, stash, statewave) in §16, and ShibaCl
 rebind guard, Muzzle tool-output framing, install CVE gate — is specced for
 adoption in `docs/design/shibaclaw-safety-adoption-2026-09-21.md`.
 
+A second-pass audit (2026-09-21) covered fourteen further domain-adjacent forks —
+DontFeedTheAI, codejail, redential-cli, ngrok-python, gov-transparency-mcp-fork,
+courtlistener-mcp, python-sdk, litellm, Backlog.md-fork, ArchUnitPython-fork,
+production-readiness-checklist, claude-deep-review, claude_code_RLM,
+awesome-claude-skills — all **drop**. Most are vanilla forks of off-domain or
+infrastructure projects (litellm, ngrok-python, the official MCP python-sdk,
+codejail, the two data-MCP servers). Two carry owner-authored work worth noting
+for provenance, though neither yields an adoptable piece: **DontFeedTheAI**, a
+local secret-scan / anonymisation proxy whose regex patterns overlap willow's
+secret scan and, per the fork's own history, were fed upstream into it (so it is
+drop-as-absorbed); and **redential-cli**, git-history credential attestation
+whose hash-chained receipts and explicit consent model parallel `frank_*` and
+subject consent but are bound to the credential-bundle domain and would need
+rework to reuse. `production-readiness-checklist`'s evidence and risk-exception
+control model is a distant design reference for `frank_*`, nothing more.
+
 `Nestor` is now a standalone repo under active work — the survey names it as one
 of eight unique shapes but never examines the implementation. `willow-gate`,
 `willow-config`, and `willow-compose` form an uncovered infrastructure cluster:
