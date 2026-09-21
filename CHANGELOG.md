@@ -31,6 +31,23 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.66.0](https://github.com/willow-memory/willow-mcp/compare/v2.65.0...v2.66.0) (2026-09-21)
+
+
+### Added
+
+* **deploy:** nestor-ui.service template for unit.install ([a25e0aa](https://github.com/willow-memory/willow-mcp/commit/a25e0aacb8c983d0ea049affc35a7daf559365d4))
+* **hooks:** refuse an Agent spawn without the sealed model pin ([864f45b](https://github.com/willow-memory/willow-mcp/commit/864f45b92785301921677e0b708cadb968330b93))
+
+
+### Fixed
+
+* **hooks:** spawn guard closes Loki's pass-4 shapes — quoted comma-start, stray paren, string prefixes, markdown, curly possessive, case ([36510de](https://github.com/willow-memory/willow-mcp/commit/36510de18b39102be7c5a8e5dfadeeba20bdd4d9))
+* **deploy:** harden nestor-ui.service template per Loki's rework audit ([af76cc4](https://github.com/willow-memory/willow-mcp/commit/af76cc4725d21e2d197ed482ece3335155ea5a3a))
+* **hooks:** close three more regex-boundary defects in the Agent-spawn guard ([bee9881](https://github.com/willow-memory/willow-mcp/commit/bee988154e69d510e6749c9402746f060b781005))
+* **hooks:** close four regex-boundary defects in the Agent-spawn guard ([c39c4b2](https://github.com/willow-memory/willow-mcp/commit/c39c4b29c2e9d07b43dc16ac26dcac5962ce9ea8))
+* **hooks:** rework the Agent-spawn detector after Loki's audit ([6d88e73](https://github.com/willow-memory/willow-mcp/commit/6d88e7360ed47710cb8e72f7b4b43b556123576d))
+
 ## [2.65.0](https://github.com/willow-memory/willow-mcp/compare/v2.64.0...v2.65.0) (2026-09-21)
 
 
