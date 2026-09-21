@@ -244,6 +244,12 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # signer and attaches what it minted — same standing as seal_drain,
         # it reflects a human's seal and mints nothing itself.
         "net_authority_drain",
+        # Envelope retirement sweep (decision 83faa340; gap 4c7512c57a7e):
+        # revokes an active envelope whose bounds named a branch now merged
+        # and gone, or whose max_count FRANK shows spent — same standing as
+        # the two above: mints no new authority and the gate does not
+        # depend on it (a retired row was already unusable).
+        "envelope_retire_sweep",
     }),
     # Cryptographic identity binding (willow-gate seam, Phase 2). The security is
     # the HMAC signature, not this ACL; the group just lets a manifest opt an app
@@ -432,6 +438,11 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # a held row only onto an envelope the uid-994 signer minted from the
         # operator's own seal — no more authority than seal_drain.
         "net_authority_drain",
+        # Envelope retirement sweep (decision 83faa340): revokes an active
+        # envelope whose branch is merged+gone or whose max_count FRANK
+        # shows spent — same standing as net_authority_drain, no new
+        # authority, the gate does not depend on it.
+        "envelope_retire_sweep",
         # Grove — the fleet's shared messaging room (read + write; no egress
         # concern like web_net/integration_net/mcp_federation, so unlike those
         # this rides full_access, same reasoning as knowledge_read/write above)

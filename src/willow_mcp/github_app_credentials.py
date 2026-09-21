@@ -84,7 +84,13 @@ def _make_jwt(app_id: str, pem: str) -> str:
     return token.decode() if isinstance(token, bytes) else token
 
 
-def _api(method: str, url: str, *, bearer: str, body: dict | None = None) -> dict[str, Any]:
+def _api(method: str, url: str, *, bearer: str, body: dict | None = None,
+         timeout: int = 20) -> dict[str, Any]:
+    """`timeout` defaults to 20s (unchanged) but is overridable per call —
+    envelope_retire_sweep clips it to whatever remains of its own wall-clock
+    budget so a single slow row cannot overrun by a full 20s call it has no
+    time left for (rework of Loki's MEDIUM finding on BAA43543/9494D3AF/
+    D81165E5: "the real worst case per row is ~80s of urlopen timeouts")."""
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(
         url,
@@ -99,7 +105,7 @@ def _api(method: str, url: str, *, bearer: str, body: dict | None = None) -> dic
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode()
             return {"ok": True, "status": resp.status, "body": json.loads(raw) if raw else {}}
     except urllib.error.HTTPError as exc:
@@ -109,13 +115,19 @@ def _api(method: str, url: str, *, bearer: str, body: dict | None = None) -> dic
         return {"ok": False, "status": 0, "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def mint_installation_token(repo: str) -> dict[str, Any]:
+def mint_installation_token(repo: str, timeout: int = 20) -> dict[str, Any]:
     """Mint a short-lived installation token for ``org/name``.
 
     On success: ``{ok, token, expires_at, permissions, installation_id, mode: "app"}``.
     On miss (no App coverage / no creds): ``{ok: False, reason, mode}``.
     The caller decides fall-back vs refuse — this module does not push.
-    """
+
+    ``timeout`` (default 20s, unchanged for every existing caller) is
+    passed to BOTH of this function's own HTTP calls — envelope_retire_sweep
+    clips it to whatever remains of its own wall-clock budget so a token
+    mint cannot itself overrun a nearly-exhausted tick (rework of Loki's
+    LOW finding on D81165E5/FAAD3E4A: mints used to always spend up to two
+    full 20s calls regardless of budget left)."""
     repo = (repo or "").strip().strip("/")
     if repo.count("/") != 1:
         return {"ok": False, "mode": "unavailable", "reason": "repo must be org/name"}
@@ -125,7 +137,7 @@ def mint_installation_token(repo: str) -> dict[str, Any]:
         return {"ok": False, "mode": "host", "reason": creds.get("reason", "App credentials missing")}
 
     jwt_token = _make_jwt(creds["app_id"], creds["pem"])
-    inst = _api("GET", f"{_API}/repos/{repo}/installation", bearer=jwt_token)
+    inst = _api("GET", f"{_API}/repos/{repo}/installation", bearer=jwt_token, timeout=timeout)
     if not inst.get("ok"):
         status = int(inst.get("status") or 0)
         if status == 404:
@@ -151,6 +163,7 @@ def mint_installation_token(repo: str) -> dict[str, Any]:
         f"{_API}/app/installations/{installation_id}/access_tokens",
         bearer=jwt_token,
         body={"repositories": [repo_name]},
+        timeout=timeout,
     )
     if not minted.get("ok"):
         return {
