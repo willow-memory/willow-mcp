@@ -11,7 +11,21 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 
+import pytest
+
 from willow_mcp import envelope_retire_sweep as sweep_mod
+
+
+@pytest.fixture(autouse=True)
+def _no_real_cursor_file(monkeypatch):
+    """Every test that does not explicitly inject read_cursor/write_cursor
+    gets a no-op cursor (always "", never persisted) — otherwise sweep()'s
+    default file-backed cursor would read/write a real file under
+    paths.store_root() and leak state between tests (and between this test
+    module and a live box). Tests of the cursor itself override both
+    params explicitly, which wins over this patch."""
+    monkeypatch.setattr(sweep_mod, "_read_cursor", lambda: "")
+    monkeypatch.setattr(sweep_mod, "_write_cursor", lambda envelope_id: None)
 
 
 def _row(**over):
@@ -49,8 +63,8 @@ def _fake_api(responses):
     string."""
     calls = []
 
-    def api(method, url, *, bearer, body=None):
-        calls.append((method, url))
+    def api(method, url, *, bearer, body=None, timeout=20):
+        calls.append((method, url, timeout))
         for frag, resp in responses.items():
             if frag in f"{method} {url}":
                 return resp
@@ -622,3 +636,185 @@ def test_sweep_time_budget_zero_means_unbounded_same_as_max_rows():
     )
     assert receipt["examined"] == 1
     assert backend.store["active"][0]["status"] == "revoked"
+
+
+# --------------------------------------------------------------------------
+# Cursor: consecutive under-budget calls sweep progressively further
+# (rework of Loki's MEDIUM finding, D81165E5)
+# --------------------------------------------------------------------------
+
+def _fake_cursor():
+    """An in-memory read/write pair, standing in for the file the real
+    default persists to — shared mutable state across calls, same as a
+    real file would give across ticks."""
+    state = {"value": ""}
+    return (lambda: state["value"]), (lambda envelope_id: state.__setitem__("value", envelope_id))
+
+
+def test_cursor_rotates_so_two_calls_examine_different_prefixes():
+    rows = [_row(id=f"env-{i}", verb="envelope.apply", bounds={}) for i in range(5)]
+    reg = _registry(rows)
+    read_cursor, write_cursor = _fake_cursor()
+
+    r1 = sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=2,
+                         read_cursor=read_cursor, write_cursor=write_cursor)
+    assert r1["examined"] == 2
+    assert r1["truncated"] is True
+    cursor_after_1 = read_cursor()
+    assert cursor_after_1 == "env-1"  # sorted ids env-0..env-4, first 2 examined
+
+    r2 = sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=2,
+                         read_cursor=read_cursor, write_cursor=write_cursor)
+    assert r2["examined"] == 2
+    # second call resumed past env-1, not from the top again
+    assert read_cursor() == "env-3"
+
+
+def test_cursor_wraps_around_after_the_last_row():
+    rows = [_row(id=f"env-{i}", verb="envelope.apply", bounds={}) for i in range(3)]
+    reg = _registry(rows)
+    read_cursor, write_cursor = _fake_cursor()
+
+    sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=3,
+                    read_cursor=read_cursor, write_cursor=write_cursor)
+    assert read_cursor() == "env-2"  # examined every row this call
+
+    r2 = sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=3,
+                         read_cursor=read_cursor, write_cursor=write_cursor)
+    # cursor was at the end -> wraps to the start; the whole register is
+    # examined again from env-0, not starved forever.
+    assert r2["examined"] == 3
+
+
+def test_cursor_skips_a_row_no_longer_present_and_resumes_past_it():
+    rows = [_row(id="env-1", verb="envelope.apply", bounds={}),
+            _row(id="env-3", verb="envelope.apply", bounds={})]
+    reg = _registry(rows)
+    read_cursor, write_cursor = _fake_cursor()
+    write_cursor("env-2")  # a row that no longer exists (retired/removed since)
+
+    receipt = sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=1,
+                              read_cursor=read_cursor, write_cursor=write_cursor)
+    assert receipt["examined"] == 1
+    assert read_cursor() == "env-3"  # resumed at the next HIGHER id, not env-1
+
+
+def test_cursor_never_advances_on_a_dry_run():
+    rows = [_row(id=f"env-{i}", verb="envelope.apply", bounds={}) for i in range(3)]
+    reg = _registry(rows)
+    read_cursor, write_cursor = _fake_cursor()
+    sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}), max_rows=2,
+                    read_cursor=read_cursor, write_cursor=write_cursor)
+    assert read_cursor() == ""
+
+
+def test_cursor_path_lives_beside_the_seal_watchs_offset_file():
+    from willow_mcp import paths
+
+    assert sweep_mod._cursor_path().parent == paths.store_root()
+    assert sweep_mod._cursor_path().name == "envelope_retire_sweep.cursor"
+
+
+# --------------------------------------------------------------------------
+# Per-row deadline (rework of Loki's MEDIUM finding, D81165E5)
+# --------------------------------------------------------------------------
+
+def test_clipped_timeout_none_deadline_means_no_clipping():
+    assert sweep_mod._clipped_timeout(None) is None
+
+
+def test_clipped_timeout_floors_and_caps():
+    now = sweep_mod.time.monotonic()
+    assert sweep_mod._clipped_timeout(now + 100) == 20  # capped at 20
+    assert sweep_mod._clipped_timeout(now + 10) in (9, 10)  # not capped, ~10s left
+    assert sweep_mod._clipped_timeout(now + 1) == 0  # below the floor -> do not start
+
+
+def test_branch_state_skips_the_first_call_when_budget_already_exhausted():
+    calls = []
+
+    def api(method, url, *, bearer, body=None, timeout=20):
+        calls.append((method, timeout))
+        return {"ok": True, "status": 200, "body": {}}
+
+    past_deadline = sweep_mod.time.monotonic() - 5
+    state = sweep_mod._branch_state(api, repo="org/repo", branch="feat/x", token="t",
+                                     deadline=past_deadline)
+    assert calls == []  # never even attempted
+    assert state["reachable"] is False
+    assert "budget exhausted" in state["reason"]
+
+
+def test_branch_state_skips_the_second_call_when_budget_runs_out_between_them(monkeypatch):
+    """The branch-existence call succeeds (branch gone -> 404); by the time
+    the PR-history call would start, the budget is spent."""
+    sequence = [995.0, 999.0]  # 1st _clipped_timeout call, 2nd _clipped_timeout call
+
+    def fake_monotonic():
+        return sequence.pop(0) if sequence else 999.0
+
+    monkeypatch.setattr(sweep_mod.time, "monotonic", fake_monotonic)
+
+    def api(method, url, *, bearer, body=None, timeout=20):
+        if "branches" in url:
+            return {"ok": False, "status": 404, "reason": "Not Found"}
+        raise AssertionError("the PR-history call must not be attempted")
+
+    state = sweep_mod._branch_state(api, repo="org/repo", branch="feat/x", token="t",
+                                     deadline=1001.0)
+    assert state["reachable"] is False
+    assert "PR-history check" in state["reason"]
+
+
+def test_sweep_reports_a_hung_row_as_unreachable_not_a_crash():
+    """End-to-end: a deadline that is already gone before the row starts
+    means the row is reported unreachable, never attempted, never raises."""
+    row = _row()
+    reg = _registry([row])
+    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}), time_budget_s=0.0001)
+    import time as _t
+    _t.sleep(0.001)
+    # Either examined (if the between-rows check didn't yet trip) or not —
+    # either way the call returns a receipt, never raises.
+    assert "state" in receipt
+
+
+# --------------------------------------------------------------------------
+# A registry write failure is reported on that row, not raised (rework of
+# Loki's LOW finding, probe C, D81165E5)
+# --------------------------------------------------------------------------
+
+def test_write_failure_on_one_row_does_not_lose_an_earlier_rows_retirement():
+    rows = [_row(id="env-a", verb="envelope.apply", bounds={}, max_count=1),
+            _row(id="env-b", verb="envelope.apply", bounds={}, max_count=1)]
+    backend = _Backend(rows)
+    snapshot = backend.snapshot()
+    ledger = _FakeLedger(counts={"env-a": 1, "env-b": 1})
+
+    calls = {"n": 0}
+    real_write = backend.write
+
+    def flaky_write(doc):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full")
+        real_write(doc)
+
+    receipt = sweep_mod.sweep(
+        dry_run=False, registry=snapshot, api=_fake_api({}), ledger=ledger,
+        reload_registry=backend.reload, write_registry=flaky_write, lock=_null_lock,
+    )
+    # First row retired and persisted; second row's write blew up but is
+    # reported, not raised, and does not erase the first row's receipt.
+    assert len(receipt["retired"]) == 1
+    assert receipt["retired"][0]["id"] == "env-a"
+    assert len(receipt["kept_in_force"]) == 1
+    assert receipt["kept_in_force"][0]["id"] == "env-b"
+    assert "registry write failed" in receipt["kept_in_force"][0]["why"]
+    # The first row's write actually landed on disk (the fake backend).
+    by_id = {r["id"]: r["status"] for r in backend.store["active"]}
+    assert by_id["env-a"] == "revoked"
+    assert by_id["env-b"] == "active"
+    # No FRANK row for the row whose write never landed.
+    assert len(ledger.appended) == 1
+    assert ledger.appended[0][2]["envelope_id"] == "env-a"

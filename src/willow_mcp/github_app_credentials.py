@@ -84,7 +84,13 @@ def _make_jwt(app_id: str, pem: str) -> str:
     return token.decode() if isinstance(token, bytes) else token
 
 
-def _api(method: str, url: str, *, bearer: str, body: dict | None = None) -> dict[str, Any]:
+def _api(method: str, url: str, *, bearer: str, body: dict | None = None,
+         timeout: int = 20) -> dict[str, Any]:
+    """`timeout` defaults to 20s (unchanged) but is overridable per call —
+    envelope_retire_sweep clips it to whatever remains of its own wall-clock
+    budget so a single slow row cannot overrun by a full 20s call it has no
+    time left for (rework of Loki's MEDIUM finding on BAA43543/9494D3AF/
+    D81165E5: "the real worst case per row is ~80s of urlopen timeouts")."""
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(
         url,
@@ -99,7 +105,7 @@ def _api(method: str, url: str, *, bearer: str, body: dict | None = None) -> dic
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode()
             return {"ok": True, "status": resp.status, "body": json.loads(raw) if raw else {}}
     except urllib.error.HTTPError as exc:
