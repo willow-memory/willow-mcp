@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.71.0](https://github.com/willow-memory/willow-mcp/compare/v2.70.0...v2.71.0) (2026-09-21)
+
+
+### Added
+
+* **external_guard:** Muzzle — fence tool output in a per-result nonce boundary ([33907f1](https://github.com/willow-memory/willow-mcp/commit/33907f11b5c4ee859643674541a9dd9ea61e5713))
+
 ## [2.70.0](https://github.com/willow-memory/willow-mcp/compare/v2.69.1...v2.70.0) (2026-09-21)
 
 
