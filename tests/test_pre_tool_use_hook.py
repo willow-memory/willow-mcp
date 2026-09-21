@@ -2341,3 +2341,141 @@ def test_check_trust_root_write_blocks_dot_segment_manifest_path():
         "content": '{"permissions": ["task_net"]}',
     })
     assert reason is not None
+
+
+# ── check_agent_spawn: round-4 rework, six items from Loki's fourth audit ──
+# (handoff session_handoff-2026-09-21-78b89408, dispatch 84973DD7).
+
+def test_agent_spawn_comma_start_single_quoted_opening_blocks_fork():
+    """(1) MANDATORY: the comma-start tier's docstring claimed a quoted
+    opening ("'Hanuman', go") was detected, but `^\\**%s` had no leading
+    -quote option and only the trailing-quote form actually matched. An
+    optional leading quote is now consumed right at the `^` anchor."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "'Hanuman', go build it", subagent_type="fork"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+
+
+def test_agent_spawn_comma_start_double_quoted_opening_blocks_fork():
+    """(1) Same fix, double-quoted form."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        '"Hanuman", go build', subagent_type="fork"))
+    assert result is not None
+    assert "fork" in result[1]
+
+
+def test_agent_spawn_comma_start_curly_quoted_opening_blocks_fork():
+    """(1) Same fix, curly-quoted form."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "‘Hanuman’, go build", subagent_type="fork"))
+    assert result is not None
+    assert "fork" in result[1]
+
+
+def test_agent_spawn_session_enter_stray_close_paren_before_app_id_blocks_willow():
+    """(2) A `)` inside a string argument BEFORE app_id used to close the
+    paren-depth walk early, falling to the bare tier where the willow
+    refusal never fires."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(note="a ) b", app_id="willow")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason and "human-orchestrator" in reason
+
+
+def test_agent_spawn_app_id_f_string_prefix_pins_hanuman():
+    """(3) `app_id=f"hanuman"` used to let _APP_ID_RE capture the `f` prefix
+    itself as the id, naming no seat at any tier — a specialist spawn with
+    no pin at all. The prefix is now consumed and discarded."""
+    blocked = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id=f"hanuman", session_id="x")'))
+    assert blocked is not None
+    decision, reason = blocked
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id=f"hanuman", session_id="x")', model="sonnet"))
+    assert allowed is None
+
+
+def test_agent_spawn_app_id_r_string_prefix_pins_hanuman():
+    """(3) Same fix, raw-string prefix."""
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id=r"hanuman", session_id="x")', model="sonnet"))
+    assert allowed is None
+    blocked = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id=r"hanuman", session_id="x")'))
+    assert blocked is not None and blocked[0] == "block"
+
+
+def test_agent_spawn_app_id_b_string_prefix_pins_hanuman():
+    """(3) Same fix, bytes-string prefix."""
+    blocked = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id=b"hanuman", session_id="x")'))
+    assert blocked is not None and blocked[0] == "block"
+
+
+def test_agent_spawn_underscore_bold_you_are_willow_refused():
+    """(4) `__Willow__` (underscore emphasis) used to pass through
+    undetected — only asterisk-only bolding was matched."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are __Willow__"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason and "human-orchestrator" in reason
+
+
+def test_agent_spawn_bold_quoted_you_are_willow_refused():
+    """(4) `**'Willow'**` — bold wrapped around a quoted name — used to pass
+    through undetected."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are **'Willow'**"))
+    assert result is not None
+    assert result[0] == "block" and "willow" in result[1]
+
+
+def test_agent_spawn_underscore_you_are_hanuman_pins_sonnet():
+    """(4) Same underscore-emphasis fix, non-orchestrator variant, proving
+    the builder pin is still enforced (not just a hard refusal)."""
+    blocked = pre_tool_use.check_agent_spawn(_spawn_input("You are _Hanuman_"))
+    assert blocked is not None
+    decision, reason = blocked
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are _Hanuman_", model="sonnet"))
+    assert allowed is None
+
+
+def test_agent_spawn_allows_curly_possessive_willows_auditor():
+    """(5) `You are Willow's auditor` (U+2019 curly apostrophe) hard
+    -refused as the orchestrator seat — the trailing-apostrophe exclusion
+    was ASCII `'` only while the leading-quote class on the same line
+    already listed the curly forms."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Willow’s auditor"))
+    assert result is None
+
+
+def test_agent_spawn_allows_mixed_case_handoff_read_lookup():
+    """(6) `Handoff_Read(...)` on Explore used to pin sonnet because
+    `names_pattern` lacked `re.IGNORECASE` — a capitalised lookup call was
+    never masked out before the bare-app_id tier ran."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'Handoff_Read(app_id="hanuman", handoff_id="x")',
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_allows_willow_adjacent_hyphen_compound():
+    """(6) `You are Willow-adjacent support` hard-refused — the "You are"
+    tier's trailing-boundary exclusion did not exclude a hyphen, unlike the
+    comma-start tier's equivalent exclusion."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Willow-adjacent support"))
+    assert result is None

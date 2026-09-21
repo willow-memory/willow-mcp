@@ -1440,9 +1440,15 @@ def _load_spawn_models() -> dict:
 # Case-insensitive on the keyword AND the seat id — `_detect_specialist_seat`
 # looks the captured text up in a lower-cased id table. Anchored on the
 # keyword so this can't match an unrelated word that merely contains
-# "app_id".
+# "app_id". An optional Python string prefix (`f`, `r`, `b`, `u`, or a pair
+# like `rb`) directly in front of the opening quote is consumed and
+# discarded — `app_id=f"willow"` used to let the prefix letter itself get
+# captured as the id, so neither the session_enter tier nor the bare tier
+# ever found a real seat and the spawn passed with no pin at all
+# (Loki fourth audit 2026-09-21). `str("willow")` is not a prefix and stays
+# a stated limit — the guard does not evaluate the prompt as code.
 _APP_ID_RE = re.compile(
-    r'app_id["\']?\s*[=:]\s*["\'‘’“”]?([A-Za-z][A-Za-z0-9_-]*)',
+    r'app_id["\']?\s*[=:]\s*(?:[rRbBuUfF]{1,2}(?=["\'‘’“”]))?["\'‘’“”]?([A-Za-z][A-Za-z0-9_-]*)',
     re.IGNORECASE,
 )
 
@@ -1493,11 +1499,18 @@ def _mask_read_only_calls(text: str) -> str:
     one every seat actually sees in its own tool list — went unmasked and
     tripped the bare-app_id tier (false positive, Loki third audit
     2026-09-21). The paren-less prose pattern below already carries this
-    same prefix; this pass now matches it."""
+    same prefix; this pass now matches it. `names_pattern` is also compiled
+    with `re.IGNORECASE` — `_READ_ONLY_PROSE_APP_ID_RE` and `_APP_ID_RE`
+    already were, but this pattern was not, so a capitalised call
+    (`Handoff_Read(...)`, `HANDOFF_READ(...)`) went unmasked in the paren
+    pass while the prose pass's `(?!\\s*\\()` refused to treat it as a
+    lookup either, tripping the bare-app_id tier with a sonnet pin (false
+    positive, Loki fourth audit 2026-09-21)."""
     if not text:
         return text
     names_pattern = re.compile(
-        r'(?:(?<=__)|\b)(?:' + '|'.join(re.escape(t) for t in _READ_ONLY_LOOKUP_CALLS) + r')\s*\('
+        r'(?:(?<=__)|\b)(?:' + '|'.join(re.escape(t) for t in _READ_ONLY_LOOKUP_CALLS) + r')\s*\(',
+        re.IGNORECASE,
     )
     out: list = []
     pos = 0
@@ -1550,7 +1563,18 @@ def _find_session_enter_seat(text: str, by_id: dict) -> Optional[dict]:
     still an entry call, so an unclosed paren scans to the end of `text`
     instead of being skipped; over-scanning here can only over-detect, and
     detection at this tier still requires _APP_ID_RE to find a real
-    `app_id=` inside the scanned span."""
+    `app_id=` inside the scanned span.
+
+    A stray `)` INSIDE a string or comment argument that appears BEFORE
+    app_id (`session_enter(note="a ) b", app_id="willow")`) closes the
+    depth walk early, the same way an unbalanced `(` does — the closed
+    span then ends before app_id is reached, _APP_ID_RE finds nothing, and
+    the loop used to `continue` past the call entirely, falling to the
+    weaker bare-app_id tier where the willow refusal never fires
+    (Loki fourth audit 2026-09-21). Same bound as the unclosed-paren fix
+    above: over-scanning can only over-detect, and a real `app_id=` still
+    has to be found. When the closed span comes up empty, the open span
+    (end of call to end of text) is tried as a fallback before giving up."""
     n = len(text)
     for m in re.finditer(r"session_enter\s*\(", text, re.IGNORECASE):
         depth = 1
@@ -1563,6 +1587,8 @@ def _find_session_enter_seat(text: str, by_id: dict) -> Optional[dict]:
             j += 1
         args = text[m.end():j - 1] if not depth else text[m.end():n]
         am = _APP_ID_RE.search(args)
+        if am is None and not depth:
+            am = _APP_ID_RE.search(text[m.end():n])
         if am is None:
             continue
         seat = by_id.get(am.group(1).lower())
@@ -1594,13 +1620,29 @@ def _find_you_are_seat(text: str, rows: list) -> Optional[dict]:
     "Enter as 'Willow'") does not stop `\\**%s` from lining up right after
     it — the leading quote was never itself a boundary problem, but without
     consuming it the name pattern simply did not start where the quote put
-    it."""
+    it.
+
+    Four more edges fixed on the same line (Loki fourth audit 2026-09-21):
+    underscore emphasis (`__Willow__`, `_Hanuman_`) and bold wrapped around
+    a quoted name (`**'Hanuman'**`, `**'Willow'**`) were not detected —
+    `\\**` only ever consumed asterisks, and the optional quote sat before
+    the stars rather than being allowed on either side, so `[*_]*` replaces
+    the star-only run and an optional quote is now permitted on BOTH sides
+    of the name. The trailing-apostrophe exclusion (`(?!'\\w)`) was ASCII
+    single-quote only while the leading-quote class on the same line
+    already lists the curly `‘’“”` forms — "You are Willow's auditor" (U+2019)
+    hard-refused as a false positive; `(?!['’]\\w)` closes the same gap for
+    both quote styles. And the trailing-boundary exclusion (`(?![\\w?])`)
+    did not exclude a hyphen, so "You are Willow-adjacent support" — a
+    compound word, not an address to the seat — hard-refused; `-` joins the
+    exclusion class alongside `\\w` and `?`."""
     best: Optional[dict] = None
     best_pos: Optional[int] = None
     for row in rows:
         for name in filter(None, (row.get("display_name"), row.get("agent_id"))):
             pat = re.compile(
-                r"\b(?:you are|you're|enter as)\s+['\"‘’“”]?\**%s\**(?![\w?])(?!'\w)"
+                r"\b(?:you are|you're|enter as)\s+"
+                r"['\"‘’“”]?[*_]*['\"‘’“”]?%s['\"‘’“”]?[*_]*(?![\w?-])(?!['’]\w)"
                 % re.escape(name),
                 re.IGNORECASE,
             )
@@ -1620,14 +1662,27 @@ def _find_comma_start_seat(text: str, rows: list) -> Optional[dict]:
     read as addressing the seat directly (regex-boundary defect, Loki
     re-audit 2026-09-21). A trailing apostrophe is excluded ONLY when a word
     character follows it (`(?!'\\w)`) — "Hanuman's seat" still does not
-    match, but a quoted opening ("'Hanuman', go") is not itself a boundary
-    (same care as _find_you_are_seat, Loki third audit 2026-09-21)."""
+    match. A quoted opening ("'Hanuman', go", `"Hanuman", go`, `‘Hanuman’,
+    go`) is now DETECTED, not merely "not a boundary" — an optional leading
+    quote (`['"‘’“”]?`) is consumed right after the `^` anchor so the name
+    still lines up after lstrip even when the text opens on a quote mark
+    (MANDATORY fix, Loki fourth audit 2026-09-21: the docstring here and in
+    check_agent_spawn previously claimed this shape was excluded/not a
+    boundary, i.e. detected, but the code had no leading-quote option at all
+    and only the trailing-quote form `Hanuman', go` actually matched — a
+    coverage claim the code did not back up). The trailing-apostrophe
+    exclusion is also widened from ASCII-only to `(?!['’]\\w)` — the same
+    curly-quote gap fixed in _find_you_are_seat (same care as that
+    function, Loki third/fourth audits 2026-09-21)."""
     if not text:
         return None
     stripped = text.lstrip()
     for row in rows:
         for name in filter(None, (row.get("display_name"), row.get("agent_id"))):
-            pat = re.compile(r"^\**%s\**(?![\w-])(?!'\w)\b[,:]?" % re.escape(name), re.IGNORECASE)
+            pat = re.compile(
+                r"^['\"‘’“”]?\**%s\**(?![\w-])(?!['’]\w)\b[,:]?" % re.escape(name),
+                re.IGNORECASE,
+            )
             if pat.match(stripped):
                 return row
     return None
@@ -1790,12 +1845,53 @@ def check_agent_spawn(tool_input: dict) -> Optional["tuple[str, str]"]:
     parentheses ("Run handoff_read with app_id=hanuman") is masked the same
     as its parenthesised form — including the MCP-qualified spelling
     ("mcp__willow-mcp__handoff_read(...)"), since the call-name boundary is
-    `(?:(?<=__)|\\b)` in both the paren and paren-less passes; a display
+    `(?:(?<=__)|\\b)` in both the paren and paren-less passes, and
+    case-insensitively in both (`Handoff_Read(...)`, `HANDOFF_READ(...)`
+    are masked the same as the lowercase spelling — `names_pattern` now
+    carries `re.IGNORECASE`, fixed alongside the other items below); a display
     name directly followed by a hyphen at the start of text ("Hanuman-style
     build notes") is excluded from the comma-start tier as a compound word,
-    not an address to the seat, and a quoted opening ("'Hanuman', go") is
-    NOT excluded — only a hyphen or an apostrophe immediately followed by a
-    word character is."""
+    not an address to the seat, and a quoted opening ("'Hanuman', go",
+    `"Hanuman", go`, `‘Hanuman’, go`) IS now excluded the same way — an
+    optional leading quote is consumed at the `^` anchor in
+    _find_comma_start_seat (MANDATORY fix, Loki fourth audit 2026-09-21 —
+    the prior text here and at the top of _find_comma_start_seat claimed
+    this coverage without the code backing it; only the trailing-quote form
+    `Hanuman', go` actually matched before this fix).
+
+    Five more shapes fixed the same pass (Loki fourth audit 2026-09-21),
+    none a regression of a round 1-3 fix:
+
+    - a stray `)` inside a string or comment argument that appears BEFORE
+      app_id (`session_enter(note="a ) b", app_id="willow")`) used to close
+      the paren-depth walk early and fall to the bare-app_id tier, where
+      the orchestrator/fork refusals do not apply — `_find_session_enter_seat`
+      now falls back to the open span (call-end to end-of-text) when the
+      closed span's app_id search comes up empty;
+    - a Python string prefix or wrapper on the app_id literal
+      (`app_id=f"willow"`, `r"hanuman"`, `b"willow"`, `u"hanuman"`) used to
+      let _APP_ID_RE capture the prefix letter itself as the id, naming no
+      seat at ANY tier — not just the weaker one — so a specialist spawn
+      passed with no pin at all. _APP_ID_RE now consumes an optional
+      one-or-two-letter prefix (`r`/`b`/`u`/`f`, any case, any pairing)
+      immediately before the opening quote. `str("willow")` is not a
+      prefix and remains a stated limit, same class as variable
+      indirection below;
+    - underscore markdown (`__Willow__`, `_Hanuman_`) and bold wrapped
+      around a quoted name (`**'Hanuman'**`, `**'Willow'**`) were not
+      detected in the "You are" tier — only asterisk-only bolding was.
+      `_find_you_are_seat`'s pattern now allows `[*_]*` (not just `\\**`)
+      and an optional quote on either side of the name;
+    - a curly possessive apostrophe (`You are Willow's auditor`, U+2019)
+      hard-refused as the human-orchestrator seat with no retry path — the
+      trailing-apostrophe exclusion was ASCII `'` only while the
+      leading-quote class on the same line already lists `‘’“”`. Both
+      `_find_you_are_seat` and `_find_comma_start_seat` now exclude
+      `(?!['’]\\w)`, covering both quote styles;
+    - `You are Willow-adjacent support` hard-refused the same way — the
+      "You are" tier's trailing-boundary exclusion did not exclude a
+      hyphen, while the comma-start tier already did. `_find_you_are_seat`
+      now excludes `-` alongside `\\w` and `?`."""
     tool_input = tool_input or {}
     prompt = str(tool_input.get("prompt", "") or "")
     description = str(tool_input.get("description", "") or "")
