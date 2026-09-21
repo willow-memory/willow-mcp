@@ -207,6 +207,77 @@ def test_ruff_configured_ignores_a_string_mention(tmp_path):
     assert stop_lint_gate._ruff_configured(tmp_path) is False
 
 
+# ── sealed pair 11ccb0f7 part (4): the green names its ruff ────────────────
+
+
+def _write_pinned_workflow(root: Path, version: str) -> None:
+    wf = root / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "tests.yml").write_text(f"steps:\n  - run: pip install ruff=={version}\n", encoding="utf-8")
+
+
+def test_pin_advisory_names_a_mismatch_but_never_blocks(tmp_path, monkeypatch):
+    """ratatosk #48: measured 0.15.0, CI pinned 0.16.7. The gate says so on
+    stderr; the block decision is check_lint's alone."""
+    _write_ruff_project(tmp_path)
+    _write_pinned_workflow(tmp_path, "0.16.7")
+    monkeypatch.setattr(stop_lint_gate, "_ruff_version", lambda: "0.15.0")
+
+    line = stop_lint_gate.pin_advisory(tmp_path)
+
+    assert line is not None
+    assert "0.15.0" in line and "0.16.7" in line
+    assert "tests.yml" in line
+
+
+def test_pin_advisory_confirms_a_match(tmp_path, monkeypatch):
+    _write_ruff_project(tmp_path)
+    _write_pinned_workflow(tmp_path, "0.16.7")
+    monkeypatch.setattr(stop_lint_gate, "_ruff_version", lambda: "0.16.7")
+
+    line = stop_lint_gate.pin_advisory(tmp_path)
+
+    assert line is not None and "matches the CI pin" in line
+
+
+def test_pin_advisory_is_silent_when_the_repo_pins_nothing(tmp_path, monkeypatch):
+    _write_ruff_project(tmp_path)
+    monkeypatch.setattr(stop_lint_gate, "_ruff_version", lambda: "0.16.7")
+
+    assert stop_lint_gate.pin_advisory(tmp_path) is None
+
+
+def test_main_prints_the_advisory_on_stderr_not_stdout(tmp_path):
+    """The advisory rides stderr; stdout stays the decision channel, so a
+    clean tree with a mismatched pin is still 'allow' to the harness."""
+    _write_ruff_project(tmp_path)
+    (tmp_path / "src" / "good.py").write_text('"""ok."""\n', encoding="utf-8")
+    _write_pinned_workflow(tmp_path, "0.0.1")  # no real ruff is 0.0.1 → guaranteed mismatch
+
+    # The hook imports willow_mcp.ci_lint_pin for the advisory; point the
+    # child at the same willow_mcp this test process imported (a worktree's
+    # src, not whatever editable install the interpreter carries).
+    import willow_mcp
+
+    src_root = str(Path(willow_mcp.__file__).resolve().parents[1])
+    proc = subprocess.run(
+        [sys.executable, str(_HOOK_PATH)],
+        input=json.dumps({"session_id": "abc"}),
+        capture_output=True,
+        text=True,
+        env={
+            **__import__("os").environ,
+            "CLAUDE_PROJECT_DIR": str(tmp_path),
+            "PYTHONPATH": src_root,
+        },
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == ""
+    if stop_lint_gate._resolve_ruff() is not None:
+        assert "CI pins ruff 0.0.1" in proc.stderr
+
+
 def test_ruff_configured_still_true_for_a_real_table(tmp_path):
     """Sanity check the parse-based detection still recognizes a genuine
     `[tool.ruff]` table (and a `[tool.ruff.lint]` sub-table)."""

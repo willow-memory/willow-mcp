@@ -151,6 +151,46 @@ def check_lint(root: Path) -> Optional[str]:
     return None
 
 
+def _ruff_version() -> Optional[str]:
+    """The version string of the ruff this gate would run, or None."""
+    argv_prefix = _resolve_ruff()
+    if argv_prefix is None:
+        return None
+    try:
+        proc = subprocess.run([*argv_prefix, "--version"], capture_output=True, text=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    out = (proc.stdout or "").strip()
+    return out.split()[-1] if out else None
+
+
+def pin_advisory(root: Path) -> Optional[str]:
+    """Sealed pair 11ccb0f7 part (4): say which ruff measured this green and
+    whether it is the one CI pins. Advisory only — printed to stderr, never
+    a block — because a version mismatch is a fact about the measurement,
+    not a violation in the code; verify_handoff is where a mismatched
+    *claim* is refused. Returns None when the repo pins nothing, the pin
+    cannot be read, or willow_mcp is not importable from this interpreter."""
+    try:
+        from willow_mcp.ci_lint_pin import ci_lint_pin
+    except Exception:
+        return None
+    if not _ruff_configured(root):
+        return None
+    pin = ci_lint_pin(root)
+    measured = _ruff_version()
+    if pin.get("state") != "populated" or not measured:
+        return None
+    pinned = pin.get("version")
+    if measured == pinned:
+        return f"willow-mcp: lint measured with ruff {measured} — matches the CI pin ({pin.get('source')})."
+    return (
+        f"willow-mcp: lint measured with ruff {measured} but CI pins ruff {pinned} "
+        f"({pin.get('source')}) — a green here is not a green there; name the version "
+        "in the handoff and re-measure with the pinned binary."
+    )
+
+
 def main() -> None:
     try:
         raw = sys.stdin.read()
@@ -165,9 +205,13 @@ def main() -> None:
     if payload.get("stop_hook_active"):
         sys.exit(0)
 
-    reason = check_lint(_project_dir())
+    root = _project_dir()
+    reason = check_lint(root)
     if reason:
         print(json.dumps({"decision": "block", "reason": reason}))
+    advisory = pin_advisory(root)
+    if advisory:
+        print(advisory, file=sys.stderr)
     sys.exit(0)
 
 
