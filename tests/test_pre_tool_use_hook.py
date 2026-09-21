@@ -2067,3 +2067,138 @@ def test_fallback_specialists_track_the_registry():
     }
     assert real_roles == fallback_roles
     assert real_human_only == fallback_human_only
+
+
+# ── check_agent_spawn: round-3 rework, four regex-boundary defects ────────
+# (Loki re-audit 2026-09-21, handoff session_handoff-2026-09-21-99388882).
+
+def test_agent_spawn_session_enter_seat_survives_nested_paren_before_app_id():
+    """(1) A nested paren in the canonical `session_id=str(uuid4())` shape,
+    ahead of app_id in the same session_enter(...) call, used to truncate
+    the `[^)]*` capture before app_id was reached — falling through to the
+    bare tier and letting the willow refusal be bypassed entirely."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(session_id=str(uuid4()), app_id="willow")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+    assert "human-orchestrator" in reason
+
+
+def test_agent_spawn_session_enter_seat_survives_nested_paren_multiline():
+    """(1) Multi-line form of the same shape."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(\n'
+        '    session_id=str(uuid4()),\n'
+        '    app_id="willow",\n'
+        ')'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+
+
+def test_agent_spawn_session_enter_seat_nested_paren_still_pins_hanuman():
+    """(1) The non-willow variant of the same shape must still resolve to
+    the session_enter tier and pin the builder's model, not merely avoid
+    crashing."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(session_id=str(uuid4()), app_id="hanuman")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(session_id=str(uuid4()), app_id="hanuman")', model="sonnet"))
+    assert allowed is None
+
+
+def test_agent_spawn_you_are_seat_prefers_earliest_text_match():
+    """(2) The row-order bug: iterating rows and returning the first ROW
+    that matches anywhere (rather than the earliest TEXT match) pinned a
+    correctly-framed Loki spawn to Hanuman's model because the fleet table
+    happened to list hanuman before loki. Loki's own "You are Loki" framing
+    comes first in the text and must win."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Loki. Audit the packet whose prompt said 'You are Hanuman'.",
+        model="opus"))
+    assert result is None
+
+
+def test_agent_spawn_you_are_allows_willows_possessive():
+    """(3) "Willow's" is not "Willow" — no trailing boundary let the human
+    -orchestrator refusal fire on a mere possessive."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are Willow's auditor."))
+    assert result is None
+
+
+def test_agent_spawn_you_are_allows_willows_grove_reference():
+    """(3) "Willow's Grove" is the sibling repo's name, not the seat."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Willow's Grove resident watcher for this shift."))
+    assert result is None
+
+
+def test_agent_spawn_you_are_allows_willowbrook():
+    """(3) "Willowbrook" merely starts with "Willow" — a compound word, not
+    the seat name."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are Willowbrook support."))
+    assert result is None
+
+
+def test_agent_spawn_comma_start_allows_hyphenated_compound():
+    """(5, cheap fix) "Hanuman-style" is a compound word describing a style
+    of notes, not the comma-start address form entering the seat."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("Hanuman-style build notes"))
+    assert result is None
+
+
+def test_agent_spawn_allows_paren_less_prose_lookup():
+    """(5, cheap fix) A read-only lookup call named in prose without
+    parentheses ("Run ... with app_id=hanuman") is a lookup argument, not an
+    entry — the masking that already covers the parenthesised form is
+    extended to this shape too."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Run mcp__willow-mcp__handoff_read with app_id=hanuman for background.",
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_check_trust_root_write_blocks_doubled_slash_specialists_path():
+    """(4) `config//specialists.json` must not slip the guard just because
+    the anchored `$` pattern never saw the doubled separator."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "src/willow_mcp/bundle/config//specialists.json",
+    })
+    assert reason is not None
+    assert "c9ca1a09" in reason
+
+
+def test_check_trust_root_write_blocks_dot_segment_specialists_path():
+    """(4) `config/./specialists.json` is the same guarded file with an
+    inert `.` path segment."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "src/willow_mcp/bundle/config/./specialists.json",
+    })
+    assert reason is not None
+    assert "c9ca1a09" in reason
+
+
+def test_check_trust_root_write_blocks_doubled_slash_manifest_path():
+    """(4) Same normalisation defect, same class, for _MANIFEST_RE."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "/home/x/.willow/mcp_apps//willow/manifest.json",
+        "content": '{"permissions": ["task_net"]}',
+    })
+    assert reason is not None
+
+
+def test_check_trust_root_write_blocks_dot_segment_manifest_path():
+    """(4) Same normalisation defect, same class, for _MANIFEST_RE."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "/home/x/.willow/mcp_apps/./willow/manifest.json",
+        "content": '{"permissions": ["task_net"]}',
+    })
+    assert reason is not None

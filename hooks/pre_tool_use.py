@@ -1288,18 +1288,26 @@ def check_owned_db_file_write(tool_input: dict) -> Optional[str]:
 
 def check_trust_root_write(tool_input: dict) -> Optional[str]:
     """Block a Write/Edit that mints a lease, writes an identity secret, slips
-    `task_net` into a manifest, or edits the spawn guard's own pin table."""
+    `task_net` into a manifest, or edits the spawn guard's own pin table.
+
+    The path is `os.path.normpath`-ed before every path regex below
+    (`_LEASE_DIR_RE`, `_KEYSTORE_RE`, `_SPAWN_CONFIG_RE`, `_MANIFEST_RE`) —
+    normpath collapses a doubled separator (`config//specialists.json`) and a
+    `.` segment (`config/./specialists.json`) alike, so a caller cannot slip
+    a guarded write past these anchored-on-`$` patterns with either spelling
+    (regex-boundary defect, Loki re-audit 2026-09-21)."""
     tool_input = tool_input or {}
     path = str(tool_input.get("file_path", "") or "")
     if not path:
         return None
-    if _LEASE_DIR_RE.search(path):
+    normalized = os.path.normpath(path)
+    if _LEASE_DIR_RE.search(normalized):
         return _SELF_GRANT_REASON
-    if _KEYSTORE_RE.search(path):
+    if _KEYSTORE_RE.search(normalized):
         return _KEYSTORE_REASON
-    if _SPAWN_CONFIG_RE.search(path):
+    if _SPAWN_CONFIG_RE.search(normalized):
         return _SPAWN_CONFIG_REASON
-    if _MANIFEST_RE.search(path):
+    if _MANIFEST_RE.search(normalized):
         # Only the permissions that carry escalation. Editing a manifest for any
         # other reason is ordinary work and must not be blocked.
         written = " ".join(str(tool_input.get(k, "") or "")
@@ -1453,12 +1461,31 @@ _READ_ONLY_LOOKUP_CALLS = frozenset({
 })
 
 
+# The paren-less prose shape ("Run handoff_read with app_id=hanuman") names
+# the same lookup call but never opens a `(...)` argument list at all, so the
+# paren-depth masking below never sees it. Matched separately and only the
+# `app_id=<seat>` fragment is blanked, not the call name — a read-only call
+# named without parens is still a lookup, not an entry, and must not trip the
+# bare-app_id tier either. Bounded to a short run of non-sentence-ending text
+# between the call name and app_id= so this cannot reach across an unrelated
+# later sentence.
+_READ_ONLY_PROSE_APP_ID_RE = re.compile(
+    r'(?:(?<=__)|\b)(?:' + '|'.join(re.escape(t) for t in _READ_ONLY_LOOKUP_CALLS) + r')\b'
+    r'(?!\s*\()'
+    r'[^\n.;(]{0,40}?(app_id\s*[=:]\s*[\'"]?[A-Za-z][A-Za-z0-9_-]*)',
+    re.IGNORECASE,
+)
+
+
 def _mask_read_only_calls(text: str) -> str:
     """Blank the parenthesised argument text of any _READ_ONLY_LOOKUP_CALLS
     invocation in `text`, so a bare app_id=<seat> that appears only as an
     argument to a lookup cannot trip the bare-app_id detection tier. Uses a
     simple paren-depth counter, not a full parser — good enough for the
-    single-call-per-mention shapes this guard sees in a prompt/description."""
+    single-call-per-mention shapes this guard sees in a prompt/description.
+    A second pass then blanks the paren-LESS prose shape ("Run handoff_read
+    with app_id=hanuman") the same way — masking only the app_id=<seat>
+    fragment, since the call name itself carries no seat framing."""
     if not text:
         return text
     names_pattern = re.compile(
@@ -1482,7 +1509,14 @@ def _mask_read_only_calls(text: str) -> str:
         out.append(" " * (j - m.end()))
         pos = j
     out.append(text[pos:])
-    return "".join(out)
+    masked = "".join(out)
+
+    def _blank_app_id(m: "re.Match[str]") -> str:
+        start, end = m.span(1)
+        prefix_len = start - m.start()
+        return m.group(0)[:prefix_len] + " " * (end - start)
+
+    return _READ_ONLY_PROSE_APP_ID_RE.sub(_blank_app_id, masked)
 
 
 def _find_session_enter_seat(text: str, by_id: dict) -> Optional[dict]:
@@ -1491,9 +1525,29 @@ def _find_session_enter_seat(text: str, by_id: dict) -> Optional[dict]:
     elsewhere in the same text. Fixes the order bug where a caller citing
     another seat's packet by app_id (`dispatch_read(app_id="hanuman", ...)`)
     ahead of its own `session_enter(app_id="loki")` got pinned to the wrong
-    seat's model."""
-    for m in re.finditer(r"session_enter\s*\(([^)]*)\)", text, re.IGNORECASE):
-        am = _APP_ID_RE.search(m.group(1))
+    seat's model.
+
+    Walks paren DEPTH from the `session_enter(` opening to its matching
+    close (multi-line; the same counting approach _mask_read_only_calls
+    uses) instead of a `[^)]*` regex, so a nested paren inside the call's
+    own arguments — the canonical `session_id=str(uuid4())` shape — does
+    not truncate the argument span before app_id is reached (regex-boundary
+    defect, Loki re-audit 2026-09-21)."""
+    n = len(text)
+    for m in re.finditer(r"session_enter\s*\(", text, re.IGNORECASE):
+        depth = 1
+        j = m.end()
+        while j < n and depth:
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+            j += 1
+        if depth:
+            # No matching close in this text — nothing to scan.
+            continue
+        args = text[m.end():j - 1]
+        am = _APP_ID_RE.search(args)
         if am is None:
             continue
         seat = by_id.get(am.group(1).lower())
@@ -1505,31 +1559,44 @@ def _find_session_enter_seat(text: str, by_id: dict) -> Optional[dict]:
 def _find_you_are_seat(text: str, rows: list) -> Optional[dict]:
     """"You are <Display name>" / "You're <Display name>" / "Enter as
     <Display name>" framing, case-insensitive, tolerant of markdown bolding
-    around the name. A trailing "?" is excluded (`(?!\\?)`) so a question
-    like "You are Loki? no — ask claude-code-guide" is not read as entry
-    framing."""
+    around the name. Returns the seat matched EARLIEST in the text, not the
+    first ROW that happens to match anywhere — a prompt quoting a later
+    speaker's own framing (e.g. an auditor's prompt reporting "the packet
+    whose prompt said 'You are Hanuman'") must not out-rank the seat
+    actually named first (regex-boundary defect, Loki re-audit 2026-09-21).
+    A trailing word character or apostrophe is excluded (`(?![\\w'])`) so
+    "You are Willow's auditor" / "You are Willowbrook support" do not match
+    "Willow"; a trailing "?" is also excluded so a question like "You are
+    Loki? no — ask claude-code-guide" is not read as entry framing."""
+    best: Optional[dict] = None
+    best_pos: Optional[int] = None
     for row in rows:
         for name in filter(None, (row.get("display_name"), row.get("agent_id"))):
             pat = re.compile(
-                r"\b(?:you are|you're|enter as)\s+\**%s\**(?!\?)" % re.escape(name),
+                r"\b(?:you are|you're|enter as)\s+\**%s\**(?![\w'?])" % re.escape(name),
                 re.IGNORECASE,
             )
-            if pat.search(text):
-                return row
-    return None
+            m = pat.search(text)
+            if m is not None and (best_pos is None or m.start() < best_pos):
+                best_pos = m.start()
+                best = row
+    return best
 
 
 def _find_comma_start_seat(text: str, rows: list) -> Optional[dict]:
     """`<Display name>,` (or bare `<agent_id>`) opening the text — "Hanuman,
     build the thing. Enter as the builder seat first." — checked against
     each of `prompt` and `description` separately, since either can open
-    this way."""
+    this way. A trailing word character, apostrophe, or hyphen is excluded
+    (`(?![\\w'-])`) so a compound word ("Hanuman-style build notes",
+    "Hanuman's seat") does not read as addressing the seat directly
+    (regex-boundary defect, Loki re-audit 2026-09-21)."""
     if not text:
         return None
     stripped = text.lstrip()
     for row in rows:
         for name in filter(None, (row.get("display_name"), row.get("agent_id"))):
-            pat = re.compile(r"^\**%s\**\b[,:]?" % re.escape(name), re.IGNORECASE)
+            pat = re.compile(r"^\**%s\**(?![\w'-])\b[,:]?" % re.escape(name), re.IGNORECASE)
             if pat.match(stripped):
                 return row
     return None
@@ -1643,7 +1710,35 @@ def check_agent_spawn(tool_input: dict) -> Optional["tuple[str, str]"]:
     argument keys) is not established, so main() only wires this to the
     Claude Code `Agent` tool_name. The other nine guards in this module are
     unaffected and still route through cursor_permission_for_guard as
-    before."""
+    before.
+
+    Stated limits (Loki re-audit 2026-09-21) — detection is regex over
+    prompt/description text, not semantic understanding, and these shapes
+    pass through undetected:
+
+    - base64 (or other) encoding of the seat-naming text;
+    - zero-width characters or markdown formatting split MID-WORD through a
+      seat's name (e.g. a zero-width space inside "Han​uman"), as
+      opposed to markdown bolding AROUND a whole name, which IS detected;
+    - variable indirection — `seat = "hanuman"; session_enter(app_id=seat)`,
+      or a variable assigned earlier and referenced later — since the guard
+      never evaluates the prompt as code, only pattern-matches its literal
+      text;
+    - a stateless fork with an empty description and a prompt like "continue
+      as before": the hook has no memory of a prior turn's "You are Hanuman"
+      framing, so a fork resuming a specialist persona by implication rather
+      than restating it passes through unrefused. This is a property of the
+      hook running once per tool call with no session state, not a gap in
+      any one regex.
+
+    Two prose shapes were found and are NOT limits — they are masked out
+    before the bare-app_id tier runs (see _mask_read_only_calls /
+    _READ_ONLY_PROSE_APP_ID_RE): a read-only lookup call named without
+    parentheses ("Run handoff_read with app_id=hanuman") is masked the same
+    as its parenthesised form; a display name directly followed by a
+    hyphen or apostrophe at the start of text ("Hanuman-style build notes")
+    is excluded from the comma-start tier as a compound word, not an
+    address to the seat."""
     tool_input = tool_input or {}
     prompt = str(tool_input.get("prompt", "") or "")
     description = str(tool_input.get("description", "") or "")
