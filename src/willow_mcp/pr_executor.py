@@ -281,12 +281,26 @@ def execute_pr_open(
                 "auth_mode": "app"}
     pr = resp.get("body") or {}
     number = pr.get("number")
+    # Who asked, on the record the steward reads (sealed pair 11ccb0f7,
+    # part 1): the citation above already carries ``actor`` + ``session``
+    # for the ledger; the receipt says the same under ``opened_by`` and the
+    # watch row under ``$WILLOW_HOME/willow-bot/pr_watch.json`` is what
+    # lets ``steward_ci`` post a red on this PR to that seat's channel
+    # without willow-mcp in-process. Never fatal: the PR is open.
+    from . import pr_watch as _watch
+
+    watch: dict = {"state": "empty", "reason": "no PR number in GitHub's response"}
+    if number:
+        watch = _watch.record(repo=repo, number=number, app_id=app_id,
+                              session_id=session, head=head)
     return {
         "ok": True, "opened": True, "repo": repo, "head": head, "base": base,
         "number": number, "url": pr.get("html_url"), "draft": bool(draft),
         "envelope_id": matches[0], "auth_mode": "app",
         "citation_id": result.get("citation_id"), "status": resp.get("status"),
         "operator": _put_in_front_of_the_operator(call, repo, number, auth["token"]),
+        "opened_by": _watch.opened_by(app_id, session),
+        "watch": watch,
         "preflight": preflight, "template": template_check,
     }
 
