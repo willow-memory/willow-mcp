@@ -890,9 +890,98 @@ references. The three forks carry no owner work these rows do not capture.
 
 ---
 
+## 17. Fleet infrastructure (willow-owned)
+
+Three shapes carried by the standalone `willow-memory` infrastructure repos
+(surveyed in §1's infrastructure pass) that the willow-subsystem sections above
+do not otherwise capture. All Apache-2.0, verified against the repo source.
+
+### Asymmetric bus signing + custody reconciliation (willow-gate)
+
+§7 records willow's agent binding as symmetric HMAC-SHA256 and names "symmetric
+HMAC (no asymmetric federation)" as a gap. `willow-gate` carries both halves. Its
+own agent binding stays HMAC-SHA256 over a canonical header (`trust_level` capped
+at the registered `max_trust`; five rungs Exiled→Rookie→Steady→Veteran→Elder in
+`trust_scale.py`). But `message_integrity.py` signs inter-agent *bus* messages
+with **Ed25519** — `sign_message` / `MessageVerifier.verify` over a canonical
+JSON digest of `(sender, channel, content, nonce, signed_at)`. Asymmetric bus
+signatures are the SPIFFE-style federation step §7 anticipated, already partly in
+place for the Grove message bus.
+
+`custody.py` adds a shape §13's receipt log does not: a Tier 1–4 custody ledger
+(append-only hash chain → session check-in/out reconciliation → file custody +
+lineage + capture-gap detection → PGP-signed checkpoints) whose
+`session_check_out` returns a `Reconciliation` of **declared vs observed**
+capabilities (`declared`, `observed`, `mismatches`, `fail_count_delta`). File
+check-out is a capability distinct from egress ("declaring egress must not excuse
+a checkout"), so a session cannot launder a file grab through an egress
+declaration.
+
+| Alternative | Licence | Comparison |
+| --- | --- | --- |
+| [SPIFFE/SPIRE](https://github.com/spiffe/spire) | **Apache-2.0** | Asymmetric workload identity (§7 already names it as the federation upgrade); willow-gate's Ed25519 bus signing is the lighter, in-place form |
+| [in-toto](https://github.com/in-toto/in-toto) | **Apache-2.0** | Attests declared-vs-performed supply-chain steps; closest analog to custody reconciliation, but for build pipelines, not live agent sessions |
+
+**Verdict: Keep.** The declared-vs-observed reconciliation and the
+egress/checkout distinction have no external equivalent; Ed25519 bus signing is
+the asymmetric step §7 anticipated.
+
+### Process-shape privacy wall (corpus-lens)
+
+`corpus-lens` analyses human+agent session logs for process metrics (authorship,
+deliberation tempo, steering) behind a fail-closed "Guard" wall (`guard.py`,
+stdlib-only). The wall quarantines every absolute anchor — calendar base date,
+timezone, filename→line map — and permits only process-shape analysis. Release is
+capability-gated: three known capabilities (`calendar_time`, `local_tz`,
+`person_inference`), a default profile that grants nothing, and `release(cap,
+justification)` that raises `WallError` on an unknown capability, a missing
+justification, an ungranted capability, or an anchor release without an
+owner_token ("absence of policy is denial"). Person-shaped claims need both
+`person_inference` and an owner_token; unknown claim types are refused outright;
+`scan_egress` re-checks output for quarantined literals before emission; an
+`AuditRecord.sentence()` discloses in plain language what left the wall.
+
+This is §10's exposure-membrane idea (per-destination slicing of persona data)
+applied to *telemetry*: a content/structure wall like the Nest pipeline's, but
+enforced as capability-gated egress with justification and audit.
+
+| Alternative | Licence | Comparison |
+| --- | --- | --- |
+| [Presidio](https://github.com/microsoft/presidio) | MIT | Detects and redacts PII; does not fail-closed-gate release by capability + justification, and has no process-shape-only permit model |
+| [OpenDP](https://github.com/opendp/opendp) | MIT | Adds calibrated noise to aggregates; orthogonal — the Guard withholds anchors rather than perturbing them |
+
+**Verdict: Keep.** No surveyed tool gates telemetry release by capability behind a
+fail-closed "absence of policy is denial" wall with an egress re-scan.
+
+### Deterministic idea→landing reconciliation (willow-reconciler)
+
+`willow-reconciler` classifies each item in an idea pile (e.g. `docs/ideas.md`)
+as LANDED / PARTIAL / NOT_STARTED from git evidence alone — **no model call in
+`classify.py`**: an explicit legend tag first, then a git-inferred tier (an
+`Idea-Id` trailer reachable from HEAD, or a PR number the item names), then
+abstain; each `Verdict` records which rule fired. Two disciplines make it
+trustworthy. `benchmark.py` splits recovery into **self-witnessed** (the trailer
+commit also edited the doc — demonstrates the pipeline, not capability) versus
+**independent** (trailer commit did not touch the doc — the only rate quotable as
+a capability result). And the test corpus is a **hand-written adversarial
+fixture** (`tests/fixtures/adversarial_ideas.md` plus a hand-written `EXPECTED`
+map), authored from the traps' intent rather than generated from the classifier,
+so it cannot drift into agreeing with a regression.
+
+| Alternative | Licence | Comparison |
+| --- | --- | --- |
+| Conventional-commit / `Fixes #NNN` link-closing | various | Links a commit to an issue; does not classify a spec item's landing state, and has no anti-drift benchmark |
+| Requirements-traceability matrices | various | Map requirements to artifacts, but manually maintained; no deterministic git-evidence classifier |
+
+**Verdict: Keep.** The self-witnessed/independent split and the hand-written
+adversarial ground truth (a fixture that cannot drift into agreeing with the code
+it grades) have no external equivalent.
+
+---
+
 ## Summary
 
-Verdicts across all 22 surveyed systems:
+Verdicts across all 25 surveyed systems:
 
 | § | System | Verdict | Compose/Adapt with |
 | --- | --- | --- | --- |
@@ -918,8 +1007,11 @@ Verdicts across all 22 surveyed systems:
 | 14 | Subject consent | **Compose** | OPA + MS Consent-Package model |
 | 15 | SOIL persistence | **Keep** | — |
 | 15 | Lineage (reasoning provenance) | **Keep** | W3C PROV as export format |
+| 17 | willow-gate (bus signing + custody) | **Keep** | SPIFFE / in-toto as references |
+| 17 | corpus-lens (process-shape wall) | **Keep** | Presidio / OpenDP as references |
+| 17 | willow-reconciler (idea→landing) | **Keep** | — |
 
-**Totals: 13 Keep · 3 Adapt · 6 Compose · 0 Adopt**
+**Totals: 16 Keep · 3 Adapt · 6 Compose · 0 Adopt**
 
 The recurring pattern: external tools provide plumbing (extraction, detection,
 policy evaluation, identity). willow-mcp's contribution is the gate — the
