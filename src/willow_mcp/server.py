@@ -2826,6 +2826,20 @@ def task_submit(
         blocked = None
     if blocked:
         return blocked
+
+    # Pre-exec CVE gate (P3): if the task installs packages, audit them before
+    # they ever reach the sandbox. Degrades open exactly like check_kart_task —
+    # an audit that cannot run must not turn submission into a traceback.
+    try:
+        from . import install_audit
+        install_blocked = install_audit.gate_task(task or "")
+    except Exception as exc:
+        import logging
+        logging.getLogger("willow_mcp.server").warning("install_audit failed: %s", exc)
+        install_blocked = None
+    if install_blocked:
+        return install_blocked
+
     lane = (lane or "").strip().lower()
     if lane not in ("fast", "batch"):
         return {"error": f"invalid_lane: expected fast|batch, got {lane!r}"}
