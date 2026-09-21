@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.72.0](https://github.com/willow-memory/willow-mcp/compare/v2.71.0...v2.72.0) (2026-09-21)
+
+
+### Added
+
+* **install_audit:** pre-exec CVE gate on package-install task bodies ([f2a01df](https://github.com/willow-memory/willow-mcp/commit/f2a01df8c54691669075bec7d04705302fc649c6))
+
 ## [2.71.0](https://github.com/willow-memory/willow-mcp/compare/v2.70.0...v2.71.0) (2026-09-21)
 
 
