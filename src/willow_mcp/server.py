@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 131 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 132 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -228,6 +228,13 @@ def _authority_check_enabled() -> bool:
     not change live gate behavior until an operator flips this on."""
     return os.environ.get("WILLOW_MCP_AUTHORITY_CHECK", "").strip().lower() in (
         "1", "true", "yes", "on")
+
+
+#: Decision c8572a92: how long a seal-minted envelope stays valid, counted
+#: from the moment the signer mints it (after the seal), not from submit.
+#: One hour — enough for the steward tick to release the row and a worker
+#: to claim it; well inside lease.MAX_TTL_SECONDS.
+_HELD_NET_TTL_SECONDS = 60 * 60
 
 
 def _enforce_db_perimeter() -> bool:
@@ -1715,6 +1722,43 @@ def seal_drain(app_id: str, max_records: int = 0, backfill: bool = False) -> dic
     return _drain.drain(seed_at_eof_if_absent=not backfill, **kwargs)
 
 
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("net_authority_drain")
+def net_authority_drain(app_id: str, max_rows: int = 0) -> dict:
+    """One tick of seal-driven network authority (sealed decision c8572a92
+    as amended by 6b305258; gap 6031199ac4e1): for every task row held at
+    `held_net_authorization`, read its sealed pair from the vault's
+    nestor.db, hand the sealed bytes to the net signer (the uid-994 owner of
+    the egress key, over its socket), attach the envelope it minted, and
+    release the row to `pending`; then mint any sealed standing-lease
+    request. seal_drain's sibling — the willow-bot steward calls both every
+    tick, and the desk calls this one by hand to prove a seal end to end.
+
+    No new authority: this mints nothing itself. The signer verifies the
+    operator's seal against a public-only ring and derives every binding
+    from the sealed text; a row with no seal stays held, a row whose seal
+    does not verify is refused and inked, and the envelope is re-verified
+    against the ROW here before it is attached.
+
+    Three-state, never collapsed. `state` is `unreachable` when the queue,
+    the store, or the confirmed `tasks` mapping cannot be reached (nothing
+    consumed); `empty` when no held row and no lease request is waiting;
+    `populated` otherwise, with `tasks` (the drain receipt: per-row
+    waiting / minted / refused / unreachable and `counts`) and `leases`
+    (the lease receipt) side by side — each half keeps its own state, so a
+    signer that is down reads as `unreachable` on the rows it could not
+    serve while the tick itself still reports what it saw.
+
+    `max_rows` bounds the task half of one tick (default 200; the rest is
+    next tick, `truncated: true`)."""
+    from . import net_authority as _na
+
+    kwargs = {}
+    if max_rows and max_rows > 0:
+        kwargs["max_rows"] = int(max_rows)
+    return _na.tick(app_id=app_id, pg=get_pg(), **kwargs)
+
+
 # ── Identity binding (willow-gate seam — check-in / check-out) ───────────────────
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -2671,6 +2715,15 @@ def task_submit(
     trust-root failure denies network. Signing is available only through the local
     interactive `willow-mcp sign-net-task` CLI; no MCP tool can mint authority.
 
+    Without a `network_authorization` the submission is HELD, not refused
+    (decision c8572a92): the row lands as `held_net_authorization` — a status
+    the worker never claims — and one Nestor decision pair binding exactly what
+    the envelope will sign is proposed; the response carries `pair_id` and the
+    one line to seal. The operator's seal mints the envelope through the
+    net signer (a separate process running as the egress key's owner) and
+    releases the row; a sealed pair stands in for the standing lease for that
+    one task.
+
     Task text is security-scanned at SUBMIT time (defense-in-depth): a task the
     Kart scanner would refuse — destructive, exfiltration, secret access, obfusc-
     ation, or resource-exhaustion (fork bomb / spin / disk-fill) — is rejected
@@ -2744,7 +2797,11 @@ def task_submit(
         # A capability that never expires is indistinguishable from one that was
         # self-granted an hour ago; a lease has a clock and an issuer.
         lease_state = lease.read_lease(app_id)
-        if lease_state["status"] != "active":
+        # Decision c8572a92: a submission with NO envelope takes the held path
+        # below, where the operator's seal stands in for the lease for that
+        # one task. The standing lease is required only when the caller
+        # brings a terminal-minted envelope — that path is unchanged.
+        if lease_state["status"] != "active" and network_authorization:
             from . import egress_pause, gate_request
 
             # The ask names the exact task, not the app — the operator's
@@ -2851,13 +2908,24 @@ def task_submit(
             task, localhost=allow_localhost
         )
         if not network_authorization:
-            return {
-                "error": (
-                    "net_authorization_denied: shared network access requires an "
-                    "operator-signed per-task envelope from "
-                    "`willow-mcp sign-net-task`"
-                )
-            }
+            # Decision c8572a92: no envelope is a REQUEST, not a refusal. The
+            # row is held (a status the worker never claims), one Nestor pair
+            # binding exactly what the envelope will sign is proposed, and the
+            # operator's seal — not a terminal — is what mints it. The
+            # standing-lease check above is deliberately not required on
+            # this path: the seal satisfies the lease for that task.
+            from . import net_authority
+
+            if not fields["network_authorization"]["column"]:
+                return {"error": (
+                    "schema_unusable: the confirmed tasks mapping has no "
+                    "'network_authorization' column; apply the reviewed migration "
+                    "and reconfirm the mapping before submitting network work")}
+            return net_authority.hold_and_propose(
+                pg=pg, fields=fields, app_id=app_id, agent=agent, task=task,
+                lane=lane, scope=egress_authorization.NETWORK_SCOPE,
+                ttl_seconds=_HELD_NET_TTL_SECONDS, write_param=_write_param,
+            )
         public_key = egress_authorization.public_key_path()
         if public_key is None:
             return {

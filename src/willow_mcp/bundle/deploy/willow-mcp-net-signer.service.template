@@ -1,0 +1,37 @@
+# systemd SYSTEM unit template for the willow-mcp net signer (decision c8572a92).
+# Runs as the egress key's owner so the seat (uid 1000) never reads private.pem.
+# It receives the SEALED bytes over a local socket — the bound line, a rule,
+# and the task text the operator read (amending pair 6b305258) — verifies the
+# operator's seal against a public-only ring, derives the task hash from the
+# sealed body itself, and signs. Nothing outside the seal is a fact to it.
+# Rendered by `python -m willow_mcp.net_signer install`; installed by the ONE
+# root line that command prints once the ring is staged.
+[Unit]
+Description=willow-mcp net signer — seal to task envelope, as the egress key owner
+After=local-fs.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+RuntimeDirectory=willow-net-signer
+RuntimeDirectoryMode=0750
+UMask=0117
+Environment="WILLOW_HOME=@WILLOW_HOME@"
+Environment="WILLOW_MCP_APPS_ROOT=@APPS_ROOT@"
+Environment="WILLOW_NET_SIGNER_KEY=@KEY@"
+Environment="WILLOW_NET_SIGNER_RING=@RING@"
+Environment="WILLOW_NET_SIGNER_SOCKET=@SOCKET@"
+ExecStart=@PYTHON@ -m willow_mcp.net_signer serve --socket @SOCKET@ --key @KEY@ --ring @RING@
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+# ProtectSystem=strict + ReadWritePaths=@APPS_ROOT@/_net_leases is the right
+# posture once the lease root is reachable by this user; on a box whose
+# WILLOW_HOME sits under a 700 home (gap 8ef0e691b6c2) the mount namespace
+# would fail to set up and the unit would not start, so it is left off here
+# and the signer reports `unreachable` on a lease it cannot write instead.
+
+[Install]
+WantedBy=multi-user.target

@@ -1142,22 +1142,44 @@ def test_task_submit_allow_localhost_requires_and_binds_signed_authority(
     assert '"network_authorization"' in insert_sql
 
 
-def test_task_submit_allow_net_requires_signed_envelope(tmp_path, monkeypatch):
+def test_task_submit_allow_net_without_envelope_is_held_and_proposed(tmp_path, monkeypatch):
+    # Decision c8572a92: no envelope is a request, not a refusal. The row is
+    # held under a status the worker never claims, and ONE Nestor pair binding
+    # exactly what the envelope will sign is proposed. No standing lease is
+    # needed on this path — the operator's seal is the lease for that task.
+    from willow_mcp import decision_bridge, net_authority
+
     app = _app_with_perms(
         tmp_path, monkeypatch, "unsigned", ["full_access", "task_net"]
     )
     _operator_consents(tmp_path)
-    _operator_leases(app)
     fake = _FakePg(columns=_TASKS_COLUMNS)
     monkeypatch.setattr(server, "get_pg", lambda: fake)
     server.schema_confirm_mapping(app_id=app, table="tasks")
+    proposed = []
+
+    def _propose(app_id, record_id, store=None, db_path=None):
+        proposed.append((app_id, record_id))
+        return {"pair_id": "pair-held", "record_id": record_id, "status": "draft"}
+
+    monkeypatch.setattr(decision_bridge, "propose", _propose)
 
     result = server.task_submit(
         app_id=app, task="curl https://example.com", allow_net=True
     )
 
-    assert "operator-signed per-task envelope" in result["error"]
-    assert not any("INSERT" in sql for sql, _ in fake.executed)
+    assert result["status"] == net_authority.HELD_STATUS, result
+    assert result["pair_id"] == "pair-held"
+    bound, body = net_authority.split_sealed_text(result["seal_this"])
+    assert bound["task_id"] == result["task_id"] and bound["scope"] == "network"
+    assert bound["submitted_by"] == app
+    assert body == "curl https://example.com\n# allow_net"   # the human seals the text itself
+    assert "task_hash" not in result["seal_this"]
+    insert_sql, params = fake.executed[-1]
+    assert insert_sql.startswith("INSERT INTO tasks")
+    assert params[1] == "curl https://example.com\n# allow_net"
+    assert net_authority.HELD_STATUS in params
+    assert proposed == [(app, net_authority.record_id_for_task(result["task_id"]))]
 
 
 def test_task_submit_network_denied_when_envelope_column_unmapped(
@@ -1372,12 +1394,17 @@ def test_task_submit_allow_net_denied_without_a_lease(tmp_path, monkeypatch):
     # B-32: capability + consent are necessary but not sufficient. Without an
     # operator-issued lease there is nothing time-boxing the grant, and a grant
     # that never expires cannot be distinguished from one taken an hour ago.
+    # The standing lease governs the terminal-minted envelope path (decision
+    # c8572a92 moved the no-envelope path to a held row + seal, where the
+    # seal is the lease for that task) — so these lease tests bring an envelope.
     app = _app_with_perms(tmp_path, monkeypatch, "leaseless", ["full_access", "task_net"])
     _operator_consents(tmp_path)
     fake = _FakePg(columns=_TASKS_COLUMNS)
     monkeypatch.setattr(server, "get_pg", lambda: fake)
+    envelope = _accepted_network_envelope(tmp_path, monkeypatch)
 
-    result = server.task_submit(app_id=app, task="curl https://example.com", allow_net=True)
+    result = server.task_submit(app_id=app, task="curl https://example.com", allow_net=True,
+                                network_authorization=envelope)
 
     assert "lease_denied" in result["error"]
     assert "grant-net" in result["error"]  # names the only path that issues one
@@ -1397,8 +1424,10 @@ def test_task_submit_allow_net_denied_when_lease_expired(tmp_path, monkeypatch):
     path.write_text(json.dumps(record))
     fake = _FakePg(columns=_TASKS_COLUMNS)
     monkeypatch.setattr(server, "get_pg", lambda: fake)
+    envelope = _accepted_network_envelope(tmp_path, monkeypatch)
 
-    result = server.task_submit(app_id=app, task="curl https://example.com", allow_net=True)
+    result = server.task_submit(app_id=app, task="curl https://example.com", allow_net=True,
+                                network_authorization=envelope)
 
     assert "lease_denied" in result["error"]
     assert "expired" in result["error"]
@@ -1418,8 +1447,10 @@ def test_task_submit_allow_net_denied_when_lease_names_another_app(tmp_path, mon
     path.write_text(json.dumps(record))
     fake = _FakePg(columns=_TASKS_COLUMNS)
     monkeypatch.setattr(server, "get_pg", lambda: fake)
+    envelope = _accepted_network_envelope(tmp_path, monkeypatch)
 
-    result = server.task_submit(app_id=app, task="curl https://example.com", allow_net=True)
+    result = server.task_submit(app_id=app, task="curl https://example.com", allow_net=True,
+                                network_authorization=envelope)
 
     assert "lease_denied" in result["error"]
     assert "mismatch" in result["error"]
@@ -1434,8 +1465,10 @@ def test_task_submit_allow_net_denied_when_lease_unparseable(tmp_path, monkeypat
     lease.lease_path("corrupt").write_text("{ not json")
     fake = _FakePg(columns=_TASKS_COLUMNS)
     monkeypatch.setattr(server, "get_pg", lambda: fake)
+    envelope = _accepted_network_envelope(tmp_path, monkeypatch)
 
-    result = server.task_submit(app_id=app, task="curl https://example.com", allow_net=True)
+    result = server.task_submit(app_id=app, task="curl https://example.com", allow_net=True,
+                                network_authorization=envelope)
 
     assert "lease_denied" in result["error"]
     assert "malformed" in result["error"]
