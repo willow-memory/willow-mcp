@@ -138,6 +138,23 @@ TEMPLATE = (
 )
 TIMER = "[Unit]\nDescription=tick\n\n[Timer]\nOnUnitActiveSec=60s\nUnit=@UNIT@\n\n[Install]\nWantedBy=timers.target\n"
 
+# A fixture snapshot of $WILLOW_HOME/env's KEY= NAMES (never values), as read
+# by Loki's audit (session_handoff f4e07d8e, Kart probes KJKTYUCC/BKCJ5ZDX):
+# the 6 NESTOR_ keys the UI needs, plus every other key currently in the
+# box's canonical env. The template's UnsetEnvironment= line is hand-
+# maintained against a list like this one (see the template's own header
+# comment on why it cannot be generated at render time); this fixture is
+# what that hand-maintenance is checked against.
+ENV_FILE_KEYS = [
+    "ANTHROPIC_API_KEY", "CEREBRAS_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
+    "HF_API_KEY", "NESTOR_DB", "NESTOR_KEYRING", "NESTOR_PERSONAL_DB",
+    "NESTOR_PERSONAL_LEDGER", "NESTOR_REQUIRE_SEAL_KEY", "NESTOR_SEAL_KEY",
+    "OPENROUTER_API_KEY", "WILLOW_EDGE_GROQ_MODEL", "WILLOW_EDGE_OLLAMA_MODEL",
+    "WILLOW_GEMINI_MODEL", "WILLOW_HOME", "WILLOW_INFERENCE_PROVIDER",
+    "WILLOW_KEYRING", "WILLOW_OLLAMA_MODEL", "WILLOW_PG_DB", "WILLOW_PG_USER",
+    "WILLOW_STORE_ROOT", "WILLOW_VAULT_BOX",
+]
+
 
 @pytest.fixture
 def github_root(tmp_path):
@@ -390,6 +407,156 @@ def test_unfillable_placeholder_is_ETEMPLATE(home, tmp_path, monkeypatch, github
     out = _install(pg, _Fake(), github_root, dest)
     assert out["error"] == "ETEMPLATE" and "NOT_A_THING" in out["reason"]
     assert _citations(pg) == [] and not (dest / UNIT).exists()
+
+
+def test_real_deploy_template_renders_clean(home, tmp_path, monkeypatch, github_root, dest):
+    """The tracked ``deploy/nestor-ui.service.template`` — not this file's own
+    ``TEMPLATE`` fixture constant — is what row 17 actually installs. Render
+    IT through :func:`execute_unit_install`: the declared name matches, every
+    ``@PLACEHOLDER@`` the real file carries resolves from ``values`` with
+    none left over, the ``EnvironmentFile=`` line survives into the rendered
+    unit, no ``--db``/``--domain`` lands on the command line, and the bounds
+    judge names exactly ``nestor-ui.service`` — no ``Also=``/``Alias=``/
+    start-key extra widening what row 17 sealed."""
+    _charter(tmp_path, monkeypatch)
+    real = Path(__file__).resolve().parent.parent / "deploy" / "nestor-ui.service.template"
+    text = real.read_text(encoding="utf-8")
+    assert uix.declared_unit_name(text, real) == UNIT
+    _tmpl_path(github_root).write_text(text, encoding="utf-8")
+    pg = _FakeGovernancePg()
+    # WILLOW_HOME and HOME deliberately do NOT start with /home/ here: this
+    # is what proves the rendered unit carries no hardcoded /home/<user> of
+    # its own (Loki f4e07d8e finding 4 — @HOME@ is fillable and named in the
+    # template's own comment, yet ExecStart/WorkingDirectory used to
+    # hardcode /home/sean-campbell) — only what render_values() supplies.
+    out = _install(pg, _Fake(), github_root, dest,
+                    values={"PYTHON": "/v/bin/python", "WILLOW_HOME": "/srv/wh",
+                            "HOME": "/srv/operator", "UNIT": UNIT})
+    assert out["ok"] and out["installed"], out
+    assert out["judged_units"] == [UNIT]
+    rendered = (dest / UNIT).read_text()
+    assert "@" not in rendered, "every placeholder in the real template must resolve from values"
+    assert "EnvironmentFile=/srv/wh/env" in rendered
+    exec_line = next(line for line in rendered.splitlines() if line.startswith("ExecStart="))
+    assert "--db" not in exec_line and "--domain" not in exec_line
+    assert exec_line.endswith("/nestor-ui")  # the console script, no argv at all
+    assert exec_line.startswith("ExecStart=/srv/operator/"), exec_line
+    work_line = next(line for line in rendered.splitlines() if line.startswith("WorkingDirectory="))
+    assert work_line.startswith("WorkingDirectory=/srv/operator/"), work_line
+    assert "/home/" not in rendered, "no hardcoded /home/<user> may survive rendering"
+
+    # (1) env over-share (Loki MEDIUM finding): UnsetEnvironment= names every
+    # non-NESTOR_ key a fixture snapshot of $WILLOW_HOME/env carries, and no
+    # NESTOR_ key at all — the UI needs NESTOR_DB/NESTOR_KEYRING/
+    # NESTOR_SEAL_KEY/NESTOR_REQUIRE_SEAL_KEY (NESTOR_PERSONAL_* pass through
+    # unmentioned; they are inert extras, not exposure).
+    unset_line = next(line for line in rendered.splitlines() if line.startswith("UnsetEnvironment="))
+    unset_keys = set(unset_line[len("UnsetEnvironment="):].split())
+    fixture_nestor = {k for k in ENV_FILE_KEYS if k.startswith("NESTOR_")}
+    fixture_other = {k for k in ENV_FILE_KEYS if k not in fixture_nestor}
+    assert fixture_other <= unset_keys, sorted(fixture_other - unset_keys)
+    assert not (unset_keys & fixture_nestor), sorted(unset_keys & fixture_nestor)
+
+    # (2) hardening (Loki MEDIUM/LOW findings): NoNewPrivileges / PrivateTmp
+    # are free and correct for a --user unit; KillSignal=SIGINT is the only
+    # signal ui.main's KeyboardInterrupt handler closes the store on;
+    # KillMode stays mixed (no children today, correct if one is ever added).
+    service_keys = uix.unit_keys(rendered, "Service")
+    assert service_keys.get("NoNewPrivileges") == ["true"]
+    assert service_keys.get("PrivateTmp") == ["true"]
+    assert service_keys.get("KillSignal") == ["SIGINT"]
+    assert service_keys.get("KillMode") == ["mixed"]
+
+
+# ── every tracked deploy/*.template, not just nestor-ui's own ───────────────
+
+_DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
+
+#: Fake-but-complete values for each template's real CONTENT placeholders —
+#: never a placeholder that appears only inside a comment. That distinction
+#: is the whole point of this test: proving which templates still carry an
+#: unfillable `@WORD@`-shaped token in prose (Loki f4e07d8e / probe
+#: AL1N2PKL — render_template's placeholder scan runs over the whole
+#: rendered text, comments included).
+_DEPLOY_TEMPLATE_CONTENT_VALUES = {
+    "nestor-ui.service.template": {"WILLOW_HOME": "/srv/wh", "HOME": "/srv/op"},
+    "willow-mcp-serve.service.template": {
+        "WORKDIR": "/srv/wd", "VENV": "/srv/venv/bin/python",
+        "PORT": "8767", "HOST": "127.0.0.1",
+    },
+    "willow-mcp-serve-system.service.template": {
+        "RUNTIME_USER": "willow-runtime", "WORKDIR": "/srv/wd",
+        "WILLOW_HOME": "/srv/wh", "VENV": "/srv/venv/bin/python",
+        "PORT": "8767", "HOST": "127.0.0.1",
+    },
+    "willow-mcp-voice.service.template": {
+        "WORKDIR": "/srv/wd", "WILLOW_HOME": "/srv/wh", "APP_ID": "willow",
+        "WAKE_MODELS": "hey-willow", "KOKORO_URL": "http://127.0.0.1:9",
+        "KOKORO_VOICE": "af", "HANDLER": "default",
+        "PYTHON": "/srv/venv/bin/python", "VOICE_EXTRA": "--no-extra-flags",
+    },
+    "willow-mcp-worker.service.template": {
+        "WORKDIR": "/srv/wd", "WILLOW_HOME": "/srv/wh",
+        "WILLOW_STORE_ROOT": "/srv/store", "WILLOW_PG_DB": "willow",
+        "WILLOW_PG_USER": "willow", "APP_ID": "willow", "LANE": "fast",
+        "HEARTBEAT_ROOT": "/srv/hb", "KART_SANDBOX_CONFIG": "/srv/kart.json",
+        "PYTHON": "/srv/venv/bin/python",
+    },
+    "willow-mcp-worker@.service.template": {
+        "WORKDIR": "/srv/wd", "WILLOW_HOME": "/srv/wh",
+        "WILLOW_STORE_ROOT": "/srv/store", "WILLOW_PG_DB": "willow",
+        "WILLOW_PG_USER": "willow", "APPID": "willow",
+        "HEARTBEAT_ROOT": "/srv/hb", "KART_SANDBOX_CONFIG": "/srv/kart.json",
+        "VENV": "/srv/venv/bin/python",
+    },
+}
+
+#: Templates Loki found carrying a literal `@PLACEHOLDERS@`-shaped token
+#: inside a header COMMENT — not content. Fixing these is out of scope for
+#: this rework (gap-worthy, filed separately per the handoff's "Next bite");
+#: xfailed here, with the reason, so a future accidental fix is noticed
+#: rather than silently changing this test's meaning.
+_DEPLOY_TEMPLATE_ETEMPLATE_XFAIL = {
+    "willow-mcp-serve.service.template": (
+        "Loki f4e07d8e / probe AL1N2PKL: header comment writes a literal "
+        "@PLACEHOLDERS@ token; the placeholder scan covers comments, so "
+        "this refuses ETEMPLATE no matter what content values are given."
+    ),
+    "willow-mcp-serve-system.service.template": (
+        "same defect as willow-mcp-serve.service.template (Loki f4e07d8e / "
+        "probe AL1N2PKL): '@PLACEHOLDERS@' in the header comment."
+    ),
+    "willow-mcp-worker@.service.template": (
+        "same defect (Loki f4e07d8e / probe AL1N2PKL): '@PLACEHOLDERS@' in "
+        "the header comment."
+    ),
+}
+
+
+@pytest.mark.parametrize("template_name", sorted(p.name for p in _DEPLOY_DIR.glob("*.template")))
+def test_every_tracked_deploy_template_renders_or_xfails_on_comment_placeholder(template_name):
+    """Every template tracked under `deploy/` renders clean through the same
+    `render_template` row 17 uses, given fake-but-complete values for its
+    real content placeholders — except the three Loki found carrying an
+    unfillable placeholder-shaped token inside a COMMENT (serve,
+    serve-system, worker@): those refuse ETEMPLATE no matter what content
+    values are supplied, and this test asserts that refusal rather than
+    fixing it (out of scope here — see the handoff's gap note)."""
+    assert template_name in _DEPLOY_TEMPLATE_CONTENT_VALUES, (
+        f"{template_name} is tracked under deploy/ but this test does not "
+        f"know its content placeholders yet — add them, don't skip"
+    )
+    path = _DEPLOY_DIR / template_name
+    text = path.read_text(encoding="utf-8")
+    unit = uix.declared_unit_name(text, path)
+    values = dict(_DEPLOY_TEMPLATE_CONTENT_VALUES[template_name])
+    reason = _DEPLOY_TEMPLATE_ETEMPLATE_XFAIL.get(template_name)
+    if reason:
+        with pytest.raises(ValueError, match="PLACEHOLDERS"):
+            uix.render_template(text, unit, values=values)
+        pytest.xfail(reason)
+    rendered = uix.render_template(text, unit, values=values)
+    assert "@" not in rendered
 
 
 def test_unsafe_value_is_ETEMPLATE(home, tmp_path, monkeypatch, github_root, dest):
