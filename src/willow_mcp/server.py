@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 132 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 133 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -2392,6 +2392,37 @@ def gap_delete(app_id: str, gap_id: str) -> dict:
     retained (deleted=1) and just stops appearing in gap_list. Returns
     {deleted, id}, or {error: not_found}."""
     return gap_backlog.delete(gap_id)
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("gap_retopic")
+def gap_retopic(app_id: str, gap_id: str, topic: str, note: str = "") -> dict:
+    """Move a gap under a new topic (gap 42ec50583126). The id is unchanged;
+    `topic_history` on the record keeps every move as {from, to, at, by,
+    note}; a FRANK `gap_retopic` event is written when the ledger is reachable
+    (the move stands even when it is not — the record says so). Refuses an
+    unknown id, an empty topic, and a topic equal to the current one
+    (`already`). Gated with gap_promote: renaming a backlog entry is
+    curating the fleet-shared backlog, not logging to it. Returns {id, topic,
+    previous, frank}."""
+    out = gap_backlog.retopic(gap_id, topic, by=app_id, note=note)
+    if "error" in out:
+        return out
+    pg = get_pg()
+    if not pg:
+        out["frank"] = {"state": "unreachable", "reason": "postgres_unavailable"}
+        return out
+    try:
+        from .governance_ledger import GovernanceLedger
+
+        rec = GovernanceLedger(pg).append("willow", "gap_retopic", {
+            "gap_id": gap_id, "from": out["previous"], "to": out["topic"],
+            "by": app_id, "note": note,
+        })
+        out["frank"] = {"state": "populated", "id": rec}
+    except Exception as exc:  # noqa: BLE001 — the retopic happened; a ledger miss is reported, not hidden
+        out["frank"] = {"state": "unreachable", "reason": f"{type(exc).__name__}: {exc}"}
+    return out
 
 
 @mcp.tool(annotations=_ANNO_DESTRUCTIVE)
@@ -5289,6 +5320,7 @@ def pr_checks_read(app_id: str, repo: str, ref: str = "", pr: int = 0,
     try:
         return _pr_checks.read_pr_checks(
             app_id, repo=repo, ref=ref, pr=pr, log_tail=log_tail, project=project,
+            store=_store,
         )
     except Exception as exc:
         return {"state": "unreachable", "reason": f"pr_checks_read_failed: {exc}"}

@@ -300,6 +300,11 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     # folded into gap_write — same reasoning as schema_admin below.
     "gap_promote": frozenset({
         "gap_promote",
+        # Renaming a gap's topic (gap 42ec50583126) curates the FLEET-SHARED
+        # backlog the same way promoting does — it changes what every seat's
+        # gap_list(topic=...) answers — so it rides the curator's group rather
+        # than everyday gap_write. No new group (packet 4DA24CFD).
+        "gap_retopic",
     }),
     # Confirming a schema mapping unlocks write tools for a whole table — a
     # more consequential act than any single write, so it's gated as its
@@ -439,7 +444,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         "receipts_tail",
         # Gap backlog
         "gap_log", "gap_list", "gap_resolve", "gap_delete", "gap_purge_topic",
-        "gap_promote",
+        "gap_promote", "gap_retopic",
         # Lineage / provenance ("story of this willow")
         "lineage_why", "lineage_list", "lineage_record", "lineage_link",
         # Friction floor (relationship smoke detector)

@@ -140,6 +140,46 @@ def resolve(gap_id: str, note: str = "") -> dict[str, Any]:
     return {"id": gap_id, "status": "resolved"}
 
 
+def retopic(gap_id: str, topic: str, *, by: str, note: str = "") -> dict[str, Any]:
+    """Move a gap under a new topic, keeping the move on the record.
+
+    Gap 42ec50583126 (apk/keyboard-act): ``log`` fixes ``topic`` at creation
+    and the backlog is fleet-shared rather than in any seat's store_scope, so
+    nothing could rename a gap — the apk/keyboard-act list had to be built as
+    carrier rows citing their sources. This is the honest verb: the topic
+    changes, ``topic_history`` appends ``{from, to, at, by, note}`` so the old
+    name is never lost, and the record's id is unchanged (the id is derived
+    from the ORIGINAL topic+question at log time and stays stable — a later
+    ``log`` under the old topic would bump this same row, which is the point:
+    one gap, one id).
+
+    Refuses an unknown id (``not_found``), an empty topic, and a topic equal to
+    the current one (``already``). Promoted gaps may be re-topiced — the
+    knowledge atom they point at is unaffected. Returns ``{id, topic,
+    previous}``. Bookkeeping only; the FRANK event is the caller's.
+    """
+    topic = (topic or "").strip()
+    if not topic:
+        return {"error": "topic is required"}
+    existing = _store.get(_COLLECTION, gap_id)
+    if not existing:
+        return {"error": "not_found", "id": gap_id}
+    previous = existing.get("topic") or ""
+    if previous == topic:
+        return {"error": "already", "id": gap_id, "topic": topic}
+
+    record = _strip_meta(existing)
+    record["topic"] = topic
+    history = list(record.get("topic_history") or [])
+    entry: dict[str, Any] = {"from": previous, "to": topic, "at": _now(), "by": by or ""}
+    if note:
+        entry["note"] = note
+    history.append(entry)
+    record["topic_history"] = history
+    _store.update(_COLLECTION, gap_id, record)
+    return {"id": gap_id, "topic": topic, "previous": previous}
+
+
 def delete(gap_id: str) -> dict[str, Any]:
     """Soft-delete a single gap — for clearing junk or test entries the backlog
     accumulated, without touching the collection's real gaps (which is why this
