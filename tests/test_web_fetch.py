@@ -425,3 +425,190 @@ def test_fetch_guarded_carries_a_post_and_drops_the_body_on_a_302():
 ])
 def test_method_after_matches_requests_own_rules(method, code, expected):
     assert web_fetch._method_after(method, code) == expected
+
+
+# --------------------------------------------------------------------------- #
+# IP pinning — closing the resolve/connect race the guard documents. The
+# scripted transport above bypasses `_new_conn`, so pinning is proven here at
+# the socket, against a real loopback server with a spied resolver. `live_dns`
+# opts these out of the no-resolver fixture; the connections they make are to
+# 127.0.0.1 only.
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_pinned_returns_the_vetted_addresses():
+    """The IPs `validate_fetch_url` vetted, kept so the caller can dial only them."""
+    err, ips = web_fetch.resolve_pinned("https://example.com/x")
+    assert err is None
+    assert ips == ["93.184.216.34"]
+
+
+def test_resolve_pinned_blocks_a_private_target_and_pins_nothing():
+    def private(host, port, *a, **k):
+        return [(2, 1, 6, "", ("10.1.2.3", port or 0))]
+
+    with patch.object(web_fetch.socket, "getaddrinfo", private):
+        err, ips = web_fetch.resolve_pinned("https://sneaky.example/")
+    assert err is not None and err.startswith("blocked host")
+    assert ips == []
+
+
+def test_resolve_pinned_agrees_with_validate_fetch_url():
+    """The two must never diverge — one delegates to the other."""
+    for url in ("https://example.com/", "http://127.0.0.1/", "ftp://x/",
+                "https://169.254.169.254/", "not a url"):
+        assert web_fetch.validate_fetch_url(url) == web_fetch.resolve_pinned(url)[0]
+
+
+def test_resolve_pinned_on_the_proxy_path_pins_nothing(monkeypatch):
+    """Behind a proxy the name is not resolved here, so there is nothing to pin;
+    the transport reads the empty list as 'dial as usual' and the proxy dials."""
+    monkeypatch.setattr(web_fetch.urllib.request, "getproxies",
+                        lambda: {"https": "http://proxy:8080"})
+    monkeypatch.setattr(web_fetch.urllib.request, "proxy_bypass", lambda h: False)
+    monkeypatch.setattr(
+        web_fetch.socket, "getaddrinfo",
+        lambda *a, **k: pytest.fail("resolved a name on the proxied path"))
+    err, ips = web_fetch.resolve_pinned("https://example.com/")
+    assert err is None and ips == []
+
+
+def test_the_real_session_mounts_pinning_and_the_test_double_does_not():
+    import requests as real_requests
+
+    real = web_fetch._no_redirect_session(real_requests)
+    assert isinstance(getattr(real, "_willow_pins", None), dict)
+    assert type(real.get_adapter("https://x/")).__name__ == "_PinnedHTTPAdapter"
+
+    shim, _ = transport([(200, {}, b"")])
+    fake = web_fetch._no_redirect_session(shim)
+    assert not hasattr(fake, "_willow_pins")
+
+
+def test_the_hop_loop_pins_each_host_from_a_fresh_vet():
+    """Every hop records its vetted addresses in the session pin map, keyed the
+    same way the pool manager reads it, immediately before the request."""
+    import requests as real_requests
+    from fake_transport import ScriptedAdapter
+
+    adapter = ScriptedAdapter([(200, HTML, b"<p>x</p>")])
+    session = real_requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session._willow_pins = {}
+
+    resp, followed = web_fetch._request_checking_every_hop(
+        session, "GET", "https://example.com/", timeout=5)
+    resp.close()
+    assert session._willow_pins[web_fetch._pin_key("example.com")] == ["93.184.216.34"]
+
+
+@pytest.mark.live_dns
+def test_the_pinned_adapter_dials_the_vetted_ip_and_never_resolves_the_name():
+    """The crux. A pinned host is dialled at its vetted address with no second
+    name lookup — the lookup a rebinding attacker would answer differently. The
+    name still rides in the Host header and (for TLS) the SNI, because urllib3
+    keeps those on `.host`, which pinning leaves alone."""
+    import http.server
+    import socketserver
+    import threading
+
+    import requests as real_requests
+    from urllib3.util import connection as u3c
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — http.server API
+            self.server.seen_host = self.headers.get("Host")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"pinned-ok")
+
+        def log_message(self, *a):
+            pass
+
+    srv = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    looked_up: list[str] = []
+    real_gai = u3c.socket.getaddrinfo
+
+    def spy(host, *a, **k):
+        looked_up.append(host)
+        if host == "pinned.test":
+            raise AssertionError("the pinned path resolved the name")
+        return real_gai(host, *a, **k)
+
+    try:
+        pins = {web_fetch._pin_key("pinned.test"): ["127.0.0.1"]}
+        adapter = web_fetch._pin_classes()["adapter"](pins)
+        session = real_requests.Session()
+        session.mount("http://", adapter)
+        with patch.object(u3c.socket, "getaddrinfo", spy):
+            resp = session.get(f"http://pinned.test:{port}/", timeout=5)
+        assert resp.status_code == 200 and resp.text == "pinned-ok"
+        assert srv.seen_host == f"pinned.test:{port}"   # name preserved, not the IP
+        assert "pinned.test" not in looked_up            # the name was never resolved
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.live_dns
+def test_the_pinned_adapter_fails_closed_when_no_vetted_address_connects():
+    """When every pinned address is unreachable the adapter raises rather than
+    fall through to a name lookup that could land somewhere never vetted."""
+    import socket as _socket
+
+    import requests as real_requests
+
+    probe = _socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()  # nothing listens here now → connection refused
+
+    pins = {web_fetch._pin_key("pinned.test"): ["127.0.0.1"]}
+    adapter = web_fetch._pin_classes()["adapter"](pins)
+    session = real_requests.Session()
+    session.mount("http://", adapter)
+    with pytest.raises(real_requests.exceptions.RequestException):
+        session.get(f"http://pinned.test:{dead_port}/", timeout=2)
+
+
+# ── the audit half: an egress refusal is a `denied` receipt, not a bare error ──
+
+
+def test_a_blocked_fetch_carries_a_structured_egress_reason():
+    out, _ = _fetch([(200, HTML, b"")], url="https://169.254.169.254/latest/")
+    assert out["ok"] is False
+    assert out["egress_denied"] == "private_target"
+
+
+def test_a_refused_redirect_carries_the_redirect_reason():
+    out, _ = _fetch([(302, {"Location": "https://169.254.169.254/latest/"}, b"")])
+    assert out["ok"] is False
+    assert out["egress_denied"] == "redirect_refused"
+
+
+def test_egress_denial_is_recorded_as_a_denied_receipt(tmp_path, monkeypatch):
+    """The reason SSRF attempts stay in the audit trail. The pipeline used to
+    file an egress refusal as a bare `error`, indistinguishable from a transport
+    failure; it is now `denied` with a structured `egress.<reason>`."""
+    from willow_mcp import server
+    from willow_mcp.receipts import ReceiptLog
+
+    monkeypatch.setattr(server, "_receipt_log", ReceiptLog(str(tmp_path / "r.db")))
+    monkeypatch.setattr(server, "_gate", lambda app_id, tool: (app_id, None))
+
+    @server._guarded("test_egress_probe")
+    def probe(app_id=""):
+        return {"ok": False, "url": "http://169.254.169.254/latest/",
+                "error": "blocked host: 169.254.169.254",
+                "egress_denied": "private_target"}
+
+    out = probe(app_id="tester")
+    assert out["egress_denied"] == "private_target"  # result passes through unchanged
+    rows = server._receipt_log.tail("tester")
+    assert rows[0]["outcome"] == "denied"
+    assert rows[0]["detail"].startswith("egress.private_target")
+    assert [r["outcome"] for r in rows].count("ok") == 0

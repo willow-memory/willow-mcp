@@ -151,15 +151,26 @@ def _proxy_dials_for(url: str) -> bool:
         return True
 
 
-def _is_blocked_host(hostname: str, *, resolve: bool = True) -> bool:
+def _vet_host(hostname: str, *, resolve: bool = True) -> tuple[bool, list[str]]:
+    """`(blocked, vetted_ips)` — the address view of a host and whether any is off-limits.
+
+    The same decision `_is_blocked_host` makes, but it keeps the addresses that
+    passed so a caller can PIN a connection to them. `vetted_ips` is meaningful
+    only when `blocked` is False; it is empty on the paths that resolve nothing
+    — a bare name behind a proxy — where there is nothing to pin because the
+    proxy, not this process, resolves and dials. A single off-limits address
+    fails the whole host, so the returned list is only ever the safe addresses
+    of a host with no unsafe ones.
+    """
     hosts = _dialled_hosts(hostname)
     if not hosts:
-        return True
+        return True, []
+    vetted: list[str] = []
     for host in hosts:
         if host in ("localhost", "localhost.localdomain", "ip6-localhost"):
-            return True
+            return True, []
         if host.endswith(".local") or host.endswith(".internal"):
-            return True
+            return True, []
 
         literal = _as_address(host)
         if literal is not None:
@@ -194,8 +205,57 @@ def _is_blocked_host(hostname: str, *, resolve: bool = True) -> bool:
                 or addr.is_unspecified
                 or not addr.is_global
             ):
-                return True
-    return False
+                return True, []
+            vetted.append(str(addr))
+    return False, vetted
+
+
+def _is_blocked_host(hostname: str, *, resolve: bool = True) -> bool:
+    return _vet_host(hostname, resolve=resolve)[0]
+
+
+def _pin_key(host: str) -> str:
+    """The host under which a pin is stored and looked up.
+
+    Both sides — the hop loop that records a pin and the pool manager that
+    reads it — normalise the name the same way urllib3 keys a pool: lowered,
+    de-bracketed, no trailing dot. Two spellings of one host must land on one
+    key, or a pin recorded under one is invisible to the connection made under
+    the other and the fetch silently falls back to an unpinned dial.
+    """
+    return (host or "").strip().strip("[]").lower().rstrip(".")
+
+
+def resolve_pinned(url: str) -> tuple[str | None, list[str]]:
+    """`validate_fetch_url`, and the vetted addresses to pin the connection to.
+
+    Returns `(error, pinned_ips)`. `error` is exactly what `validate_fetch_url`
+    returns (the latter delegates here). When it is None the caller may connect
+    **only** to `pinned_ips` and must not resolve the name again — which is what
+    closes the residual `validate_fetch_url` documents. `pinned_ips` is empty on
+    the proxy path (the destination is not resolved here, so there is nothing to
+    pin — the proxy resolves and dials, and a literal is still refused), which
+    the transport reads as "do not pin, dial as usual".
+    """
+    raw = (url or "").strip()
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return "unparseable URL", []
+    if parsed.scheme not in ("http", "https"):
+        return f"unsupported scheme: {parsed.scheme!r} (http/https only)", []
+    if not parsed.netloc:
+        return "missing hostname", []
+    try:
+        hostname = parsed.hostname
+    except ValueError:
+        # A bracketed netloc that is not an IP literal. Neither view can say
+        # where this goes, and "nobody could tell" is not permission.
+        return "blocked host: cannot be parsed", []
+    blocked, ips = _vet_host(hostname or "", resolve=not _proxy_dials_for(raw))
+    if blocked:
+        return f"blocked host: {parsed.hostname}", []
+    return None, ips
 
 
 def validate_fetch_url(url: str) -> str | None:
@@ -205,33 +265,17 @@ def validate_fetch_url(url: str) -> str | None:
     obvious thing to write and is defeated by pointing a public name at
     `127.0.0.1`; this one used to be exactly that.
 
-    **Residual, stated rather than papered over.** Resolving here and connecting
-    afterwards are two separate lookups, so a name that answers public now and
-    private a moment later still gets through. Closing that needs the connection
-    pinned to the address that was checked, which requests does not expose. It
-    raises the cost from "set a DNS record" to "win a race". Behind a proxy the
-    name is not resolved here at all, so a name only the proxy can resolve to a
-    private address is the proxy's ACL to enforce — literal addresses are still
-    refused either way, because the proxy will CONNECT to whatever it is named.
+    **The resolve/connect residual, now closed on the direct path.** Resolving
+    here and connecting afterwards are two separate lookups, so a name that
+    answered public here and private a moment later used to get through. The
+    transport now pins: `fetch_guarded` dials only the addresses `resolve_pinned`
+    vetted and never re-resolves the name (`_PinnedHTTPAdapter`), so the
+    connect-time lookup an attacker would race is gone. Behind a proxy the name
+    is not resolved here at all — a name only the proxy can resolve to a private
+    address is the proxy's ACL to enforce — but a literal is still refused
+    either way, because the proxy will CONNECT to whatever it is named.
     """
-    raw = (url or "").strip()
-    try:
-        parsed = urlparse(raw)
-    except ValueError:
-        return "unparseable URL"
-    if parsed.scheme not in ("http", "https"):
-        return f"unsupported scheme: {parsed.scheme!r} (http/https only)"
-    if not parsed.netloc:
-        return "missing hostname"
-    try:
-        hostname = parsed.hostname
-    except ValueError:
-        # A bracketed netloc that is not an IP literal. Neither view can say
-        # where this goes, and "nobody could tell" is not permission.
-        return "blocked host: cannot be parsed"
-    if _is_blocked_host(hostname or "", resolve=not _proxy_dials_for(raw)):
-        return f"blocked host: {parsed.hostname}"
-    return None
+    return resolve_pinned(url)[0]
 
 
 def validate_hop(previous_url: str, next_url: str) -> str | None:
@@ -268,7 +312,18 @@ def validate_hop(previous_url: str, next_url: str) -> str | None:
 
 
 class RefusedFetch(Exception):
-    """The URL, or a hop in its redirect chain, failed the destination check."""
+    """The URL, or a hop in its redirect chain, failed the destination check.
+
+    `reason_code` classifies the refusal for the audit trail — `private_target`
+    for a blocked destination, `redirect_refused` for a hop the responder chose
+    that we would not take (a metadata redirect, an https downgrade). It is None
+    for a refusal that is not a security denial (too many redirects), so the
+    receipt pipeline records those as an ordinary error, not a `denied`.
+    """
+
+    def __init__(self, message: str, *, reason_code: str | None = None):
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 def _read_capped(resp, max_bytes: int) -> bytes:
@@ -317,6 +372,109 @@ def _method_after(method: str, code: int) -> str:
     return m
 
 
+_PIN_CLASSES: dict | None = None
+
+
+def _pin_classes() -> dict:
+    """Build (once) the urllib3 subclasses that dial a pre-vetted address.
+
+    Deferred behind `_require_requests`: this module imports without requests
+    installed, and urllib3 rides in with it. The connection subclass overrides
+    only `_new_conn` — the socket target — and leaves `.host` untouched, so the
+    Host header, the TLS SNI and the certificate hostname stay bound to the name
+    urllib3 would otherwise have used. Only the address dialled moves, to one the
+    guard already vetted, so the second name lookup a rebinding attacker would
+    answer differently never happens.
+
+    The pool manager reads a per-host pin from the map the adapter carries and
+    stamps it onto that host's pool. A host with no pin — the proxy path (where
+    requests routes through its own ProxyManager, not this one), or any route the
+    loop did not pin — falls back to a stock dial, so the pinning is additive and
+    never breaks an unrecognised route.
+    """
+    global _PIN_CLASSES
+    if _PIN_CLASSES is not None:
+        return _PIN_CLASSES
+    from requests.adapters import DEFAULT_POOLBLOCK, HTTPAdapter
+    from urllib3.connection import HTTPConnection, HTTPSConnection
+    from urllib3.poolmanager import PoolManager
+    from urllib3.util import connection as _u3conn
+
+    class _PinMixin:
+        def __init__(self, *a, pinned_ips=None, **kw):
+            self._pinned_ips = list(pinned_ips or [])
+            super().__init__(*a, **kw)
+
+        def _new_conn(self):
+            if not self._pinned_ips:
+                # No pin for this host (proxy path, or a route the loop did not
+                # reach): dial as urllib3 normally would.
+                return super()._new_conn()
+            last_exc: OSError | None = None
+            for ip in self._pinned_ips:
+                try:
+                    return _u3conn.create_connection(
+                        (ip, self.port),
+                        self.timeout,
+                        source_address=self.source_address,
+                        socket_options=self.socket_options,
+                    )
+                except OSError as exc:
+                    last_exc = exc
+            # Every vetted address was unreachable. Fail closed with the last
+            # transport error rather than fall through to a name lookup that
+            # could land on an address nothing vetted.
+            raise last_exc if last_exc is not None else OSError(
+                "no pinned address was dialable")
+
+    class _PinnedHTTPConnection(_PinMixin, HTTPConnection):
+        pass
+
+    class _PinnedHTTPSConnection(_PinMixin, HTTPSConnection):
+        pass
+
+    class _PinnedPoolManager(PoolManager):
+        def __init__(self, pins: dict, **kw):
+            self._pins = pins
+            super().__init__(**kw)
+
+        def _new_pool(self, scheme, host, port, request_context=None):
+            pool = super()._new_pool(scheme, host, port,
+                                     request_context=request_context)
+            ips = self._pins.get(_pin_key(host))
+            if ips:
+                pool.ConnectionCls = (_PinnedHTTPSConnection if scheme == "https"
+                                      else _PinnedHTTPConnection)
+                pool.conn_kw["pinned_ips"] = ips
+            return pool
+
+    class _PinnedHTTPAdapter(HTTPAdapter):
+        """Dials only the IPs a guard vetted for the host.
+
+        The pin map is shared with the caller — the hop loop fills in each host's
+        vetted addresses before the request that dials it — and only ever read
+        here, so a host is pinned by the time its pool is built. Redirects are
+        not this adapter's concern; the chain is still driven by hand with
+        `allow_redirects=False`.
+        """
+
+        def __init__(self, pins: dict, **kw):
+            self._pins = pins  # set before super().__init__ calls init_poolmanager
+            super().__init__(**kw)
+
+        def init_poolmanager(self, connections, maxsize, block=DEFAULT_POOLBLOCK,
+                             **pool_kwargs):
+            self._pool_connections = connections
+            self._pool_maxsize = maxsize
+            self._pool_block = block
+            self.poolmanager = _PinnedPoolManager(
+                self._pins, num_pools=connections, maxsize=maxsize,
+                block=block, **pool_kwargs)
+
+    _PIN_CLASSES = {"adapter": _PinnedHTTPAdapter}
+    return _PIN_CLASSES
+
+
 def _no_redirect_session(requests):
     """A `requests.Session` that will not compute a redirect target.
 
@@ -342,7 +500,19 @@ def _no_redirect_session(requests):
         def resolve_redirects(self, *args, **kwargs):
             return iter(())
 
-    return _NoRedirectSession()
+    session = _NoRedirectSession()
+    # Pinning is a property of the real transport. The scripted test double
+    # (fake_transport) models no sockets and exposes no `.adapters`, so it opts
+    # out here exactly as it opts out of real DNS — its BaseAdapter is left
+    # mounted untouched, and `_request_checking_every_hop` sees no pin map to
+    # fill. The real `requests` module always has `.adapters`.
+    if hasattr(requests, "adapters"):
+        pins: dict[str, list[str]] = {}
+        adapter = _pin_classes()["adapter"](pins)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session._willow_pins = pins
+    return session
 
 
 def _request_checking_every_hop(session, method: str, url: str, *,
@@ -365,7 +535,24 @@ def _request_checking_every_hop(session, method: str, url: str, *,
         hdrs.update(headers)
     current, current_method, current_data = url, (method or "GET").upper(), data
     followed: list[str] = []
+    pins = getattr(session, "_willow_pins", None)
     for _ in range(_MAX_REDIRECTS + 1):
+        # Pin the address for THIS hop immediately before dialling it, from a
+        # fresh vet, and let the transport connect only to what was just vetted
+        # (`_PinnedHTTPAdapter`). The first URL is pre-validated by the caller
+        # and every later hop by `validate_hop` below; re-vetting here is what
+        # ties the pin to the connect, so the only window left is between this
+        # line and the socket — with no second name lookup in it. One extra,
+        # OS-cached lookup per hop on the direct path; the proxy path vets
+        # nothing here and pins nothing, and the transport dials as usual.
+        if pins is not None:
+            err, ips = resolve_pinned(current)
+            if err:
+                raise RefusedFetch(f"refusing {current} — {err}",
+                                   reason_code="private_target")
+            host = urlparse(current).hostname
+            if host:
+                pins[_pin_key(host)] = ips
         resp = session.request(current_method, current, headers=hdrs,
                                data=current_data, timeout=timeout,
                                allow_redirects=False, stream=True)
@@ -380,7 +567,8 @@ def _request_checking_every_hop(session, method: str, url: str, *,
         err = validate_hop(current, nxt)
         if err:
             raise RefusedFetch(
-                f"refusing redirect from {current} — {err}")
+                f"refusing redirect from {current} — {err}",
+                reason_code="redirect_refused")
         nxt_method = _method_after(current_method, resp.status_code)
         followed.append(nxt)
         current, current_data = nxt, (current_data if nxt_method == current_method
@@ -427,7 +615,9 @@ def fetch_guarded(url: str, *, method: str = "GET", data=None, headers=None,
     """
     err = validate_fetch_url(url)
     if err:
-        raise RefusedFetch(err)
+        raise RefusedFetch(
+            err,
+            reason_code="private_target" if err.startswith("blocked host") else None)
     return _fetch_validated(url, method=method, data=data, headers=headers,
                             timeout=timeout, max_bytes=max_bytes)
 
@@ -449,7 +639,10 @@ def fetch_url(
 
     err = validate_fetch_url(url)
     if err:
-        return {"ok": False, "url": url, "error": err}
+        out = {"ok": False, "url": url, "error": err}
+        if err.startswith("blocked host"):
+            out["egress_denied"] = "private_target"
+        return out
 
     requests = _require_requests()
     try:
@@ -457,7 +650,10 @@ def fetch_url(
                                                 max_bytes=max_bytes)
     except RefusedFetch as exc:
         log.warning("fetch refused %s: %s", url, exc)
-        return {"ok": False, "url": url, "error": str(exc)}
+        out = {"ok": False, "url": url, "error": str(exc)}
+        if getattr(exc, "reason_code", None):
+            out["egress_denied"] = exc.reason_code
+        return out
     except requests.RequestException as exc:
         log.warning("fetch failed %s: %s", url, exc)
         return {"ok": False, "url": url, "error": str(exc)}

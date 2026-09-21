@@ -1216,7 +1216,17 @@ def _guarded(tool_name: str, *, list_error: bool = False, paginated: bool = Fals
 
             probe = (result[0] if (isinstance(result, list) and result
                                     and isinstance(result[0], dict)) else result)
-            if isinstance(probe, dict) and "error" in probe:
+            if isinstance(probe, dict) and probe.get("egress_denied"):
+                # An outbound fetch refused for a destination reason (SSRF /
+                # DNS-rebind guard in web_fetch): a policy denial, not a
+                # transport error, so it earns the `denied` outcome with a
+                # structured `egress.<reason>` — an attempted-SSRF row an
+                # operator can find, which the previous log.warning-only path
+                # left out of the audit trail entirely.
+                _receipt_log.record(
+                    effective_app_id, tool_name, "denied",
+                    f"egress.{probe['egress_denied']}: {probe.get('url', '')}"[:300])
+            elif isinstance(probe, dict) and "error" in probe:
                 _receipt_log.record(effective_app_id, tool_name, "error", str(probe["error"]))
             else:
                 # The meter rides in `detail` as JSON so it is INSIDE the entry
