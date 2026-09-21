@@ -4,9 +4,10 @@ write path split under pair `b74019ac`) — the broker never publishes.
 bounds, the sealed pair's real ed25519 `seal_sig` against the keyring, the
 strict grammar, no escalation group, per-seat pre-state) and writes ONE
 request under `$WILLOW_HOME/manifest_grants/pending/<pair_id>.json`, citing
-the envelope only after the file is durable. `manifest_grant_apply` — the
-trust-owner unit, never the broker, never Kart — re-verifies fresh and does
-the actual sign+publish through `manifest_admin.set_permission`, no
+the envelope only after the file is durable. `manifest_grant_apply` — a
+broker-owned systemd --user unit, never Kart, running as the broker's own
+uid (no distinct trust-owner identity exists on this box) — re-verifies
+fresh and does the actual sign+publish through `manifest_admin.set_permission`, no
 `privileged_publisher` (it already owns the trust root). Sibling of
 `test_unit_install.py`: a fake FRANK ledger + a real envelope registry in
 tmp_path, the sealed pair lives in a per-test SOIL `Store` plus a genuinely
@@ -1109,9 +1110,11 @@ def test_apply_refuses_eperm_pending_when_grants_dirs_are_not_writable(
 def test_apply_refuses_ewronguser_when_it_does_not_own_apps_root(
     home, tmp_path, monkeypatch,
 ):
-    """Loki finding 3: the unit must run AS the trust owner. Simulated here
-    by stat-mocking a mismatched owning uid rather than actually chowning
-    (no root in the test sandbox) — the check itself is what is exercised."""
+    """Loki finding 3: the unit must run AS the uid that owns apps_root (the
+    trust root) — this box has no distinct trust-owner identity, so that uid
+    is the broker's own. Simulated here by stat-mocking a mismatched owning
+    uid rather than actually chowning (no root in the test sandbox) — the
+    check itself is what is exercised."""
     grants_root = home / "manifest_grants"
     apps_root = home / "mcp_apps"
     apps_root.mkdir(parents=True, exist_ok=True)
@@ -1308,6 +1311,79 @@ def test_replaying_a_consumed_done_citation_after_revoke_is_eforged(
     assert kart_manifest["permissions"] == []
 
 
+def test_replay_refused_by_frank_even_after_done_file_deleted(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit 5, LIMIT: `_consumed_citation_ids` reads ONLY `done/`,
+    which is a convenience cache of consumption, not the durable record —
+    FRANK's own `manifest_granted` event (naming `citation_id`) is. Deleting
+    `done/<pair_id>.json` must not resurrect a byte-copy of the same request
+    as grantable; the FRANK event it already produced still refuses it."""
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req, applied = _request_and_apply(home, store, ledger, apps_root=home / "mcp_apps",
+                                      grants_root=grants_root)
+    assert applied["ok"] is True, applied
+
+    done_path = grants_root / "done" / "pair-mg-1.json"
+    done_record = json.loads(done_path.read_text())
+    done_path.unlink()  # the done/ cache is gone; FRANK's own event is not
+
+    replay = {k: v for k, v in done_record.items() if k != "result"}
+    (grants_root / "pending").mkdir(parents=True, exist_ok=True)
+    (grants_root / "pending" / "pair-mg-1.json").write_text(json.dumps(replay, default=str))
+
+    applied2 = mgx.manifest_grant_apply(ledger=ledger, apps_root=home / "mcp_apps",
+                                        grants_root=grants_root)
+    result = applied2["processed"][0]
+    assert result["error"] == "eforged"
+    assert "manifest_granted" in result["reason"]
+    kart_manifest = json.loads((home / "mcp_apps" / "kart" / "manifest.json").read_text())
+    assert kart_manifest["permissions"] == ["store_read"]  # unchanged by the replay attempt
+
+
+def test_consumed_citation_check_refuses_when_frank_unreachable(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """The FRANK `manifest_granted` replay check must never treat 'could not
+    ask' as 'nothing found' — an unreachable ledger is refused by name,
+    never silently passed through toward a grant."""
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-mg-1",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert req["ok"] is True, req
+
+    real_all_events = ledger.all_events
+
+    def _flaky_all_events(event_type, *, match):
+        if event_type == mgx.EVENT:
+            raise RuntimeError("simulated Postgres outage")
+        return real_all_events(event_type, match=match)
+
+    monkeypatch.setattr(ledger, "all_events", _flaky_all_events)
+    applied = mgx.manifest_grant_apply(ledger=ledger, apps_root=home / "mcp_apps",
+                                       grants_root=grants_root)
+    result = applied["processed"][0]
+    assert result["error"] == "EUNREACH"
+    assert "unreachable" in result["reason"]
+    kart_manifest = json.loads((home / "mcp_apps" / "kart" / "manifest.json").read_text())
+    assert kart_manifest["permissions"] == []
+
+
 def test_stale_lock_with_dead_pid_is_reclaimed(
     home, tmp_path, monkeypatch, store, ring_with_sean,
 ):
@@ -1361,6 +1437,113 @@ def test_lock_with_live_pid_is_never_reclaimed_regardless_of_age(
     lock_dir.mkdir(parents=True, exist_ok=True)
     old = (datetime.now(timezone.utc) - timedelta(seconds=700)).isoformat()
     (lock_dir / "pair-mg-1.lock").write_text(json.dumps({"pid": os.getpid(), "created_at": old}))
+
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["error"] == "EALREADY"
+
+
+def test_stale_lock_reclaim_renames_rather_than_unlinks(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit 5, LIMIT: reclaiming used to unlink the stale lock by name
+    and re-create it — a TOCTOU window where two concurrent reclaimers could
+    each judge the same lock stale and the second one's unlink removed the
+    FIRST reclaimer's fresh, live lock. The winning path now renames the
+    stale lock aside (a `.reclaimed-<ts>-<pid>` forensic trail) before
+    acquiring a fresh lock at the original name."""
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    lock_dir = grants_root / "pending"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    dead_pid = 2**30
+    old = (datetime.now(timezone.utc) - timedelta(seconds=700)).isoformat()
+    lock_path = lock_dir / "pair-mg-1.lock"
+    lock_path.write_text(json.dumps({"pid": dead_pid, "created_at": old}))
+
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["ok"] is True, out
+    assert out.get("reclaimed_stale_lock") is True
+    reclaimed = list(lock_dir.glob("pair-mg-1.lock.reclaimed-*"))
+    assert len(reclaimed) == 1
+    # the fresh lock created at the original name is released at the end of
+    # the (successful) locked call, same as any uncontested request
+    assert not lock_path.exists()
+
+
+def test_stale_lock_reclaim_toctou_closed_by_rename(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """A reclaimer that loses the rename race (the stale lock is already
+    gone by the time it tries — another reclaimer won it first) falls
+    through to the ordinary EALREADY a contended lock always returns,
+    rather than unlinking whatever now sits at that path."""
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    lock_dir = grants_root / "pending"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    dead_pid = 2**30
+    old = (datetime.now(timezone.utc) - timedelta(seconds=700)).isoformat()
+    lock_path = lock_dir / "pair-mg-1.lock"
+    lock_path.write_text(json.dumps({"pid": dead_pid, "created_at": old}))
+
+    real_rename = Path.rename
+
+    def _lose_the_race(self, target):
+        if self == lock_path:
+            raise FileNotFoundError("simulated: another reclaimer already renamed this lock")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _lose_the_race)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["error"] == "EALREADY"
+    # the loser never touched the path — it is exactly as this simulated
+    # race left it (still the original stale lock, untouched)
+    assert lock_path.exists()
+
+
+def test_legacy_body_less_lock_older_than_ten_minutes_is_reclaimed(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit 5, LIMIT: the pre-`pid`/`created_at` lock format wrote an
+    empty file. Such a lock carries no pid to check, but an old enough
+    mtime is still a legitimate abandonment signal — treated as stale by
+    file age alone, the same bound a pid-bearing lock is held to. No
+    deployment has produced one of these yet; the format existed before
+    this lock body did."""
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    lock_dir = grants_root / "pending"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "pair-mg-1.lock"
+    lock_path.write_text("")
+    old = datetime.now(timezone.utc).timestamp() - 700
+    os.utime(lock_path, (old, old))
+
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["ok"] is True, out
+    assert out.get("reclaimed_stale_lock") is True
+
+
+def test_young_legacy_body_less_lock_is_not_reclaimed(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    lock_dir = grants_root / "pending"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    (lock_dir / "pair-mg-1.lock").write_text("")
 
     out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
     assert out["error"] == "EALREADY"

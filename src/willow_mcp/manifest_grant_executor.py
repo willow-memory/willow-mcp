@@ -37,10 +37,19 @@ in the same process identity:
   never true of a broker-installed ``--user`` unit regardless of what the
   template said. What this split actually buys, restated honestly: the
   request/apply split is an AUDIT-TRAIL boundary, not a privilege one — see
-  the module-level note below and executor:294-321 / 973-976. The real
-  privilege boundary on this box is Kart's read-only bind on ``config/``,
-  ``nestor.db`` and ``manifest_grants/`` (gap ``85716b25d9a8``) and a uid
-  split, if the operator ever performs one — then, and only then, does
+  the module-level note above :func:`_broker_signing_key_path` (the signing
+  note) and :func:`_apply_one`'s own signature/citation checks — named by
+  function rather than by line number, since a fixed line range goes stale
+  the moment either section grows (a prior version of this note cited
+  ``executor:294-321 / 973-976``, which had already drifted to
+  ``352-397 / 1122-1128`` by Loki audit 5 and would drift again the moment
+  this docstring itself changed). The real privilege boundary on this box is
+  that ``config/verifiers.json``, ``env`` and ``manifest_grants/`` (its
+  ``broker_signing_key`` included) are ABSENT from Kart's view of
+  ``$WILLOW_HOME`` — not merely read-only-bound; only ``nestor.db`` is
+  actually a read-only bind there (measured from inside the sandbox, Loki
+  audit 5) — and a uid split (gap ``85716b25d9a8``), if the operator ever
+  performs one — then, and only then, does
   ``manifest_grant_apply`` running as a distinct identity from the broker
   mean anything. ``manifest_grant_apply`` drains ``pending/``: RE-verifies
   the seal and every seat's pre-state fresh (a pending request can sit for
@@ -132,6 +141,40 @@ uid (gap ``85716b25d9a8``: the actual uid split is not built). The socket
 check is a diagnostic that turns a cryptic gpg failure into a named one,
 nothing more. The request side (:func:`manifest_grant_request`) makes no
 such check at all — it never signs.
+
+Known limits, stated plainly rather than left to be rediscovered (Loki
+audit 5):
+
+* CITE-CRASH — a ``pending/`` record with no citation to confirm (its write
+  crashed before ``citation_id`` landed, or it was never signed) is refused
+  ``eforged`` by :func:`_apply_one`. ``eforged`` is not in
+  :data:`RETRYABLE_ERRORS`, so this is terminal by shape: the spent citation
+  is not recoverable through any call this module offers, and the operator
+  clears the ``failed/`` entry by hand;
+* an ``eunexpected`` raised AFTER a seat's manifest was already granted and
+  its FRANK receipt already inked (e.g. a crash between the grant and the
+  move to ``done/``) retries like any other ``eunexpected`` — but the
+  retried apply then finds the seat's manifest has moved since the
+  request's ``pre_state`` was recorded, and correctly refuses ``edrift``.
+  The request ends up ``failed`` even though the grant is live and
+  receipted in FRANK: truthful in FRANK, misleading in
+  :func:`manifest_grant_status`;
+* MOVE — a request the apply uid cannot move out of ``pending/`` (its
+  ``failed/`` destination unwritable, say) can leave a half-state: the
+  original stays in ``pending/`` untouched, a copy of the failure lands in
+  ``failed/`` on every tick, :func:`manifest_grant_status` still reports
+  ``pending`` (``_existing_request_state`` checks ``pending/`` first), and
+  a retry refuses ``EALREADY`` rather than requeuing anything;
+* :func:`manifest_grant_retry` proceeds with ``ledger=None`` when Postgres
+  is unreachable at retry time: the request is requeued to ``pending/``
+  with no FRANK ``manifest_grant_retried`` event and ``receipt_id=None`` —
+  unlike :func:`manifest_grant_request`, which refuses outright rather than
+  proceed unrecorded when Postgres is down;
+* :meth:`GovernanceLedger.all_events` — used both by the FRANK
+  ``manifest_granted`` replay check above :data:`EVENT` and by
+  :func:`_apply_one`'s own citation lookup — fetches every row of the
+  event type and filters in Python; O(N) per tick, not indexed by
+  ``citation_id`` or ``envelope_id``.
 """
 from __future__ import annotations
 
@@ -140,6 +183,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -248,15 +292,31 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _stale_lock(lock_path: Path, *, max_age_s: float = _STALE_LOCK_AGE_S) -> bool:
-    """True only when the lock names a pid that is provably not running AND
-    is at least ``max_age_s`` old. A lock this process cannot parse, whose
-    pid is still alive, or that is simply young, is never reclaimed —
-    ambiguity always resolves to 'leave it alone.'"""
+    """True only when the lock is provably abandoned AND at least
+    ``max_age_s`` old. A lock naming a pid that is still alive, or that is
+    simply young, is never reclaimed — ambiguity always resolves to 'leave
+    it alone.'
+
+    A legacy body-less lock (the pre-``pid``/``created_at`` format wrote no
+    body at all) carries no pid to check; its file mtime is the only signal
+    available, so it is treated as stale once that mtime is at least
+    ``max_age_s`` old — the same bound a pid-bearing lock is held to. Loki
+    audit 5 noted this case was previously never reclaimed at all (no
+    deployment has produced one yet, but the format existed before this
+    lock body did)."""
     try:
-        info = json.loads(lock_path.read_text(encoding="utf-8"))
+        raw = lock_path.read_text(encoding="utf-8")
+        mtime = lock_path.stat().st_mtime
+    except OSError:
+        return False
+    text = raw.strip()
+    if not text:
+        return (time.time() - mtime) >= max_age_s
+    try:
+        info = json.loads(text)
         pid = int(info["pid"])
         created_at = info["created_at"]
-    except (OSError, ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError):
         return False
     try:
         created = datetime.fromisoformat(created_at)
@@ -735,7 +795,8 @@ def manifest_grant_request(
     ink the FRANK envelope citation. Never signs, never touches a seat's
     manifest — that is :func:`manifest_grant_apply`'s job, run as a separate
     call (an audit-trail split, not a privilege boundary on this box — see
-    the module docstring and executor:294-321).
+    the module docstring's note above :func:`_broker_signing_key_path` and
+    :func:`_apply_one`'s own signature/citation checks).
 
     Returns ``{ok: True, state: "requested", pending_path, citation_id,
     envelope_id, pair_id}`` or a refusal dict. ``app_id`` must be the
@@ -780,10 +841,30 @@ def manifest_grant_request(
         # 10 minutes whose recorded pid is no longer alive is reclaimed; a
         # live pid, or a lock too young to judge either way, is left alone.
         if _stale_lock(lock_path):
+            # Loki audit 5, LIMIT (stale-lock reclaim TOCTOU): unlinking the
+            # stale lock by name and then re-creating it left a window where
+            # two concurrent reclaimers could each judge the SAME lock
+            # stale and both unlink+acquire — the second reclaimer's unlink
+            # removes the FIRST reclaimer's freshly created (and perfectly
+            # live) lock, not the dead one either of them meant to clear.
+            # Renaming the stale lock to a name unique to this attempt
+            # first closes it: `rename` is atomic, so only one reclaimer's
+            # rename of the SAME original path can succeed. A reclaimer
+            # that loses the race sees `FileNotFoundError` (the file it
+            # tried to rename is already gone) and falls through to the
+            # ordinary EALREADY a contended lock always returns — it never
+            # touches the winner's lock file.
+            reclaim_path = lock_path.with_name(
+                f"{lock_path.name}.reclaimed-{int(time.time() * 1000)}-{os.getpid()}"
+            )
             try:
-                lock_path.unlink()
+                lock_path.rename(reclaim_path)
             except OSError:
-                pass
+                return _refuse(
+                    "EALREADY",
+                    f"a manifest.grant request for pair_id={pair_id!r} is already being "
+                    "written by a concurrent call — one request per sealed pair",
+                )
             try:
                 lock_fd = _acquire()
                 reclaimed_stale_lock = True
@@ -1195,6 +1276,30 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
                       f"citation_id={citation_id!r} was already consumed by a prior "
                       "done/ grant — a spent citation is never replayable, regardless "
                       "of a valid broker_sig or a matching pair_id")
+    # Loki audit 5, LIMIT: the check above reads ONLY done/ — a durable
+    # record that can be deleted out from under it (REPLAY-3), after which
+    # a byte-copy of a granted request is refused only incidentally, by
+    # `edrift`, if the manifest it targets happens to have moved. The
+    # actual durable record of consumption is FRANK's own `manifest_granted`
+    # event, which names `citation_id` and is append-only — done/ is a
+    # convenience cache of it, never the other way around. Ask FRANK
+    # directly, every time, regardless of what done/ shows. A ledger this
+    # process cannot even query is never treated as "found nothing" — that
+    # would silently let a replay through on the one occasion the durable
+    # record can't be read, which is worse than refusing.
+    try:
+        granted_events = ledger.all_events(EVENT, match={"citation_id": citation_id})
+    except Exception as exc:  # noqa: BLE001 — ledger unreachable is refused, never swallowed as "not found"
+        return _fail("EUNREACH",
+                      "FRANK ledger unreachable while checking for a prior "
+                      f"{EVENT!r} event naming citation_id={citation_id!r}: "
+                      f"{type(exc).__name__}: {exc} — refusing rather than treating an "
+                      "unreachable ledger as 'not previously consumed'")
+    if granted_events:
+        return _fail("eforged",
+                      f"citation_id={citation_id!r} already has a FRANK {EVENT!r} event "
+                      "recorded — already consumed, regardless of whether done/ still "
+                      "holds the record it was consumed from")
 
     # 5. Pre-state is mandatory, not optional (Loki audit 3, finding 2:
     # drift was skipped whenever pre_state was simply absent). A request

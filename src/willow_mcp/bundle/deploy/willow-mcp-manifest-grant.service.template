@@ -25,6 +25,17 @@
 # on this box that is the broker itself, so the check passes here and
 # would correctly refuse a mismatched identity after a real uid split.
 #
+# What the pending request's own broker_sig proves, precisely: that SOME
+# uid-1000 process holding broker_signing_key wrote it — never "the broker,
+# uniquely" (no uid split exists on this box, gap 85716b25d9a8). The actual
+# privilege boundary here is Kart's sandbox view, measured from inside it
+# (sandbox edit, 2026-09-21): config/verifiers.json, env, and
+# manifest_grants/ (broker_signing_key included) are ABSENT from a Kart
+# task's $WILLOW_HOME — not merely read-only — while nestor.db is present
+# but bound read-only (O_RDWR -> EROFS). A uid split, if the operator ever
+# performs one, is what would turn broker_sig into "the broker, and only
+# the broker" rather than "some uid-1000 process."
+#
 # Loki audit 3, finding 3 (superseded by the above): a prior version of
 # this template carried no WILLOW_KEYRING and no WILLOW_PGP_FINGERPRINT —
 # so get_keyring() returned None (every apply EACCES'd, then EALREADY
