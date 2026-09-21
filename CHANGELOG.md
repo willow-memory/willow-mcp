@@ -31,6 +31,24 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.69.0](https://github.com/willow-memory/willow-mcp/compare/v2.68.0...v2.69.0) (2026-09-21)
+
+
+### Added
+
+* **dispatch:** cited-packet read for auditors and reworkers ([22636c6](https://github.com/willow-memory/willow-mcp/commit/22636c62f4fb95b85a8a9e0e3fdd7d49e4b08b83))
+* **dispatch:** cited-packet read, dispatch_withdraw, no autoclaim, and EREGISTRY on a steered registry ([42dd4da](https://github.com/willow-memory/willow-mcp/commit/42dd4da0f3cfbfe3fb15baefeecf1773e886cd74))
+* **dispatch:** dispatch_withdraw, and a bare session_enter binds nothing ([3217b4b](https://github.com/willow-memory/willow-mcp/commit/3217b4b4dcf9281daa34aec60779d7664dce796a))
+* **envelopes:** EREGISTRY when the resolved registry is not the home's own ([ee2dd14](https://github.com/willow-memory/willow-mcp/commit/ee2dd14229fb5cf899c03dcf888bb0a96a899cb8))
+
+
+### Fixed
+
+* **db:** get_pg honors PGUSER before falling back to the OS account ([905592f](https://github.com/willow-memory/willow-mcp/commit/905592f8a1df58967f9ab6a919e3ffe174c71aa5))
+* **dispatch:** a citation vouches only from an entitled sender; no self-send ([24c5a38](https://github.com/willow-memory/willow-mcp/commit/24c5a38d4c05ab3872fed11522607ca1c69f83df))
+* **docs:** tool counts follow dispatch_withdraw ([446192c](https://github.com/willow-memory/willow-mcp/commit/446192c7617bbcfcc509cf0bb49b73c32d0aab3a))
+* **tests:** pin the desk fixture's app_id instead of trusting ambient WILLOW_APP_ID ([a568236](https://github.com/willow-memory/willow-mcp/commit/a5682361fdb544f0100746348bcdb95361213008))
+
 ## [2.68.0](https://github.com/willow-memory/willow-mcp/compare/v2.67.0...v2.68.0) (2026-09-21)
 
 
