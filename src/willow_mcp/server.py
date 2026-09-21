@@ -6863,8 +6863,22 @@ _VERDICT_SEVERITY_SUBCHECKS: dict[str, dict[str, str]] = {
 }
 
 # Deliberately exempt from the verdict (informational, B-18): a dry roster or a
-# bare env snapshot is not a defect.
-_VERDICT_INFORMATIONAL_SUBCHECKS = frozenset({"build_leases", "env"})
+# bare env snapshot is not a defect. Nor is a count of security events the guards
+# already CAUGHT — a blocked SSRF/boundary-forge/vuln-install is the system
+# working, so `security_signals` informs the operator without moving the verdict.
+_VERDICT_INFORMATIONAL_SUBCHECKS = frozenset({"build_leases", "env", "security_signals"})
+
+
+def _diag_security_signals(app_id: str) -> dict:
+    """Recent security events the guards caught for THIS app (P1/P2/P3 receipts).
+
+    Read-only over the app's own receipts; never raises — a summary that cannot
+    read reports itself unavailable rather than breaking the self-check."""
+    from . import security_signals
+    try:
+        return security_signals.summarize(_receipt_log, app_id)
+    except Exception:
+        return {"available": False, "detail": "security-signal summary unavailable"}
 
 # Static problem text for the severity-driven sub-checks (detail is suffixed
 # with the probe's own `error`/`detail` when present).
@@ -7451,6 +7465,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
     envelope_registry = _diag_envelope_registry()
     split_brain_check = _diag_split_brain()
     env = _diag_env()
+    security_signals_check = _diag_security_signals(eff)
 
     checks = {"store": store, "postgres": postgres, "rings": rings,
               "schema": schema, "manifest": manifest, "identity_bindings": bindings,
@@ -7459,7 +7474,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
               "severance": severance, "uid_separation": uid_separation,
               "store_db_perms": store_db_perms, "keyring": keyring,
               "envelope_registry": envelope_registry, "split_brain": split_brain_check,
-              "env": env}
+              "security_signals": security_signals_check, "env": env}
     # Construction-time completeness guard: every computed sub-check must be
     # wired into the verdict (or explicitly exempt) — gap 37d44bfa1f4c.
     _assert_verdict_considers(checks)
