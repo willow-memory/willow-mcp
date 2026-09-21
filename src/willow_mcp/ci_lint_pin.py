@@ -179,14 +179,19 @@ _LINTER_WORD_RE = re.compile(
     r"\bruff\b(?![-_.]\w)|\blint(?:er|ing)?\b|\bformat(?:ter|ting)?\b(?=[^\n]{0,30}\b(?:check|clean|ok|pass))",
     re.IGNORECASE,
 )
-# The clean word, tied to a check rather than a test count: "clean", "All
-# checks passed", "no/0 errors|violations|findings", "green", "ok", "already
-# formatted", "checks passed". A bare "N passed" is a test count and is NOT
-# here on purpose.
+# The clean word is a LINT-OUTCOME phrase: ruff's own output ("All checks
+# passed", "N files already formatted", "no/0 errors|violations|findings")
+# or `clean` adjacent to the linter word ("ruff clean", "lint clean",
+# "format --check clean"). Never a bare colour or mood word — `green`/`ok`
+# turned "the green-claim gate reads the ruff pin" into a refused claim
+# (Loki 7AA9F436). A bare "N passed" is a test count and is not here.
+_LINTER_TOKEN = r"(?:ruff\b(?![-_.]\w)|lint(?:er|ing)?\b|format(?:ter|ting)?\b)"
 _CLEAN_WORD_RE = re.compile(
-    r"\bclean\b|\ball checks? passed\b|\bchecks? passed\b|\bgreen\b|\bok\b"
+    r"\ball checks? passed\b|\bchecks? passed\b"
     r"|\b(?:no|0|zero)\s+(?:errors?|violations?|findings?|issues?|warnings?)\b"
-    r"|\balready formatted\b|\bno (?:changes|files) would be reformatted\b|\bpasses\b",
+    r"|\balready formatted\b|\bno (?:changes|files) would be reformatted\b"
+    r"|\b" + _LINTER_TOKEN + r"[^\n;|]{0,40}?\bclean\b"
+    r"|\bclean\b[^\n;|]{0,20}?\b" + _LINTER_TOKEN,
     re.IGNORECASE,
 )
 # Honest non-claims: the tool was not run, or the line reports what was NOT
@@ -207,15 +212,23 @@ def _clauses(text: str) -> list[str]:
 def lint_claims(text: str) -> list[dict[str, Any]]:
     """Every clause of ``text`` that claims lint-clean, with the ruff
     versions that clause names. A clause is a claim when it carries a linter
-    word AND a clean word AND no disclaimer."""
+    word AND a clean word AND no disclaimer. A clause that carries only the
+    clean word looks back ONE clause for the linter word and its version —
+    "ruff 0.15.0 was used. All checks passed." is the #48 shape written as
+    two sentences and must not walk past the gate (Loki 7AA9F436)."""
     out: list[dict[str, Any]] = []
-    for clause in _clauses(text):
-        if not _LINTER_WORD_RE.search(clause) or not _CLEAN_WORD_RE.search(clause):
+    clauses = _clauses(text)
+    for i, clause in enumerate(clauses):
+        if not _CLEAN_WORD_RE.search(clause) or _DISCLAIMER_RE.search(clause):
             continue
-        if _DISCLAIMER_RE.search(clause):
+        if _LINTER_WORD_RE.search(clause):
+            versions = [m.group(1) for m in _NAMED_VERSION_RE.finditer(clause)]
+            out.append({"clause": clause, "versions": versions})
             continue
-        versions = [m.group(1) for m in _NAMED_VERSION_RE.finditer(clause)]
-        out.append({"clause": clause, "versions": versions})
+        prev = clauses[i - 1] if i > 0 else ""
+        if prev and _LINTER_WORD_RE.search(prev) and not _DISCLAIMER_RE.search(prev):
+            versions = [m.group(1) for m in _NAMED_VERSION_RE.finditer(prev)]
+            out.append({"clause": f"{prev} / {clause}", "versions": versions})
     return out
 
 

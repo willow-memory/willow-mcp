@@ -119,6 +119,37 @@ def test_honest_non_claims_are_not_judged():
         assert clp.judge_lint_claim(text, _pin)["verdict"] == "none", text
 
 
+def test_prose_with_a_colour_word_is_not_a_claim():
+    """Loki 7AA9F436 E2/E3: a bare `green`/`ok` beside the tool's name is
+    prose, not a measurement — the sentence describing this feature must
+    not be refused by it."""
+    _pin = {"state": "populated", "version": "0.15.0", "source": "tests.yml"}
+    for text in [
+        "the green claim gate reads the ruff pin",
+        "the green-claim gate now reads the ruff pin via ci_lint_pin",
+        "the lint job went green on CI (ruff 0.16.7)",
+        "ruff is ok to bump; lint job untouched",
+    ]:
+        assert clp.judge_lint_claim(text, _pin)["verdict"] == "none", text
+
+
+def test_clean_claim_split_across_a_clause_looks_back_for_the_linter():
+    """Loki 7AA9F436 S1: the #48 shape written as two sentences, a newline,
+    or an em-dash must still be judged — and refused on the wrong version."""
+    _pin = {"state": "populated", "version": "0.16.7", "source": "tests.yml"}
+    for text in [
+        "ruff 0.15.0 was used. All checks passed.",
+        "ruff 0.15.0\nAll checks passed",
+        "Ruff v0.15.0 — All checks passed!",
+    ]:
+        v = clp.judge_lint_claim(text, _pin)
+        assert v["verdict"] == "refuse", text
+        assert v["named"] == "0.15.0" and "0.16.7" in v["reason"], text
+    assert clp.judge_lint_claim("ruff 0.16.7 was used. All checks passed.", _pin)["verdict"] == "accept"
+    assert clp.judge_lint_claim("pytest -q. All checks passed.", _pin)["verdict"] == "none"
+    assert clp.judge_lint_claim("ruff 0.15.0 not run. All checks passed.", _pin)["verdict"] == "none"
+
+
 def test_version_is_the_one_adjacent_to_the_clean_claim():
     """'CI pins ruff==0.16.7; measured with ruff 0.15.0: All checks passed'
     is a 0.15.0 measurement — order in the string must not decide."""
