@@ -4276,7 +4276,14 @@ def dispatch_send(
     is resolved automatically (the common case); pass it only after an
     ``EAMBIG`` names your options in ``envelope_ids``. It can only select
     among envelopes that already govern you — naming one that does not
-    returns ``ENOENT``, so it disambiguates and never widens."""
+    returns ``ENOENT``, so it disambiguates and never widens.
+
+    A packet addressed to its own sender is refused ``EINVAL`` before the
+    envelope gate runs (no quota spent): it is the shape a seat would use to
+    mint its own citation (Loki 40A353F2, A1)."""
+    if (app_id or "").strip().lower() == (to_app or "").strip().lower():
+        return {"error": "EINVAL", "message": "a packet cannot be sent to its sender",
+                "from_app": app_id, "to_app": to_app}
     # #333: cite-before-act. `role` is resolved here with dispatch.py's own
     # fallback (`role or to_app`, lowercased) so the bounds an envelope is
     # checked against name the same task_class dispatch.py will actually
@@ -4358,7 +4365,7 @@ def dispatch_read(app_id: str, dispatch_id: str) -> dict:
     if grant.get("error"):
         return grant
     if grant.get("via"):
-        pkt = {**pkt, "via": grant["via"], "via_status": grant.get("via_status")}
+        pkt = {**pkt, **grant}
     return pkt
 
 
@@ -4376,7 +4383,8 @@ def _packet_read_grant(app_id: str, dispatch_id: str, meta: dict, tool: str) -> 
     if grant:
         _receipt_log.record(
             app_id, tool, "ok",
-            json.dumps({"citation_read": dispatch_id.upper(), "via": grant["via"]},
+            json.dumps({"citation_read": dispatch_id.upper(), "via": grant["via"],
+                        "via_from": grant.get("via_from", "")},
                        separators=(",", ":")),
         )
         return grant
@@ -4474,7 +4482,7 @@ def handoff_read(app_id: str, dispatch_id: str) -> dict:
         return grant
     out = handoff_stack.handoff_read(dispatch_id)
     if grant.get("via") and not out.get("error"):
-        out = {**out, "via": grant["via"], "via_status": grant.get("via_status")}
+        out = {**out, **grant}
     return out
 
 
@@ -4505,18 +4513,25 @@ def agent_clear(
 
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("dispatch_withdraw")
-def dispatch_withdraw(app_id: str, dispatch_id: str, reason: str) -> dict:
+def dispatch_withdraw(
+    app_id: str, dispatch_id: str, reason: str, force: bool = False,
+) -> dict:
     """Retire a dispatch packet the orchestrator no longer wants worked:
     pending → withdrawn (gap afa515539c0a). Orchestrator-only, same group as
     verify_handoff / agent_clear. A `working` packet is withdrawn only when
     no session of the assignee is still bound to it as working — otherwise
-    `EBUSY` naming the session, because liveness beyond the session record
-    cannot be known here. `withdrawn` is terminal: dispatch_accept,
-    session_enter(dispatch_id=...) and handoff_write_v4 refuse
-    invalid_transition, and the packet never appears as pending again.
-    Writes a `dispatch_withdraw` event to the FRANK ledger when one is
-    reachable. Returns {id, previous, status}."""
-    out = dispatch_stack.dispatch_withdraw(dispatch_id, reason, by_app=app_id)
+    `EBUSY` naming the session ids and the reconcile path
+    (session_reconcile on each), because liveness beyond the session record
+    cannot be known here. `force=True` withdraws over the bound sessions
+    anyway — for a seat that is gone — and records them on the packet
+    (`forced_over_sessions`) and in the FRANK event. `withdrawn` is
+    terminal: dispatch_accept, session_enter(dispatch_id=...) and
+    handoff_write_v4 refuse invalid_transition, and the packet never
+    appears as pending again. Writes a `dispatch_withdraw` event to the
+    FRANK ledger when one is reachable. Returns {id, previous, status}."""
+    out = dispatch_stack.dispatch_withdraw(
+        dispatch_id, reason, by_app=app_id, force=force,
+    )
     if out.get("error"):
         return out
     pg = get_pg()
@@ -4527,6 +4542,8 @@ def dispatch_withdraw(app_id: str, dispatch_id: str, reason: str) -> dict:
                 "willow", "dispatch_withdraw",
                 {"dispatch_id": out["dispatch_id"], "previous": out["previous"],
                  "to_app": out.get("to_app"), "reason": out.get("reason"),
+                 "forced": bool(out.get("forced_over_sessions")),
+                 "forced_over_sessions": list(out.get("forced_over_sessions") or []),
                  "actor": app_id, "session": _current_orchestrator_session() or ""},
             )
         except Exception as exc:  # the withdrawal is on disk; the ledger fault is reported, not hidden

@@ -80,14 +80,49 @@ def test_withdraw_unknown_packet(home):
     assert ds.dispatch_withdraw("00000000", "x", by_app="willow")["error"]
 
 
-def test_withdraw_working_with_live_session_is_ebusy(home):
+def test_withdraw_working_with_live_session_is_ebusy_naming_the_reconcile_path(home):
     did = _pending()
     ds.session_enter("hanuman", "sess-live", dispatch_id=did)
     out = ds.dispatch_withdraw(did, "changed my mind", by_app="willow")
     assert out["error"] == "EBUSY"
     assert out["sessions"] == ["sess-live"]
-    assert "sess-live" in out["message"]
+    assert out["reconcile"] == [
+        {"tool": "session_reconcile", "app_id": "hanuman", "session_id": "sess-live"}
+    ]
+    assert "sess-live" in out["message"] and "session_reconcile" in out["message"]
+    assert "force=True" in out["message"]
     assert ds.dispatch_read(did)["status"]["status"] == "working"
+
+
+def test_accepted_then_dead_seat_is_ebusy_until_forced(home):
+    """Loki 40A353F2 B1: dispatch_accept binds a session, so a dead seat's
+    packet stays EBUSY; the orchestrator withdraws it with force=True and
+    the forced-over sessions are recorded on the packet."""
+    did = _pending()
+    ds.dispatch_accept(did, "hanuman", session_id="sess-dead")
+    assert ds.dispatch_withdraw(did, "seat is gone", by_app="willow")["error"] == "EBUSY"
+    out = ds.dispatch_withdraw(did, "seat is gone", by_app="willow", force=True)
+    assert out["status"] == "withdrawn" and out["previous"] == "working"
+    assert out["forced_over_sessions"] == ["sess-dead"]
+    status = json.loads((home / "dispatch" / did / "status.json").read_text())
+    assert status["forced_over_sessions"] == ["sess-dead"]
+
+
+def test_force_is_honoured_for_the_orchestrator_only(home):
+    did = _pending()
+    ds.dispatch_accept(did, "hanuman", session_id="sess-dead")
+    out = ds.dispatch_withdraw(did, "mine", by_app="loki", force=True)
+    assert out["error"] == "EBUSY"
+    assert ds.dispatch_read(did)["status"]["status"] == "working"
+
+
+def test_force_on_a_pending_packet_records_nothing_extra(home):
+    did = _pending()
+    out = ds.dispatch_withdraw(did, "dropped", by_app="willow", force=True)
+    assert out["status"] == "withdrawn"
+    assert "forced_over_sessions" not in out
+    status = json.loads((home / "dispatch" / did / "status.json").read_text())
+    assert "forced_over_sessions" not in status
 
 
 def test_withdraw_working_with_no_live_session_succeeds(home):
@@ -223,6 +258,32 @@ def test_tool_writes_frank_event_when_ledger_reachable(seats, monkeypatch):
     assert content["previous"] == "pending"
     assert content["reason"] == "superseded by 03DCABBB"
     assert content["actor"] == "willow"
+    assert content["forced"] is False and content["forced_over_sessions"] == []
+
+
+def test_tool_forced_withdraw_lists_the_bound_sessions_in_frank(seats, monkeypatch):
+    appended = []
+
+    class _Ledger:
+        def __init__(self, pg):
+            pass
+
+        def append(self, project, event_type, content):
+            appended.append(content)
+            return 7
+
+    import willow_mcp.governance_ledger as gl
+    monkeypatch.setattr(gl, "GovernanceLedger", _Ledger)
+    monkeypatch.setattr(server, "get_pg", lambda: object())
+    did = _pending()
+    ds.dispatch_accept(did, "hanuman", session_id="sess-dead")
+    busy = server.dispatch_withdraw("willow", did, "seat is gone")
+    assert busy["error"] == "EBUSY" and busy["reconcile"][0]["session_id"] == "sess-dead"
+    out = server.dispatch_withdraw("willow", did, "seat is gone", force=True)
+    assert out["status"] == "withdrawn" and out["frank_id"] == 7
+    (content,) = appended
+    assert content["forced"] is True
+    assert content["forced_over_sessions"] == ["sess-dead"]
 
 
 def test_tool_ebusy_passes_through(seats, monkeypatch):

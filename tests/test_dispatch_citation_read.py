@@ -50,35 +50,43 @@ def _builder_packet(done: bool = True) -> str:
     return did
 
 
-def _audit_packet(cites: str, ref_style: str = "bare", accept: bool = True) -> str:
+def _audit_packet(
+    cites: str, ref_style: str = "bare", accept: bool = True,
+    sender: str = "willow", to: str = "loki",
+) -> str:
     ref = {
         "bare": cites,
         "prefixed": f"dispatch:{cites}",
-        "prose": f"dispatch {cites} (Hanuman handoff, verified)",
     }[ref_style]
     sent = ds.dispatch_send(
-        "willow", "loki", "# Audit\n\nRead the builder's packet.\n",
+        sender, to, "# Audit\n\nRead the builder's packet.\n",
         summary="audit", context_refs=[ref, "Nestor pair 11ccb0f7 (sealed)"],
     )
+    assert "dispatch_id" in sent, sent
     did = sent["dispatch_id"]
     if accept:
-        ds.dispatch_accept(did, "loki", session_id="s-audit")
+        ds.dispatch_accept(did, to, session_id=f"s-audit-{to}")
     return did
 
 
 # ── citation_set: the id parse ───────────────────────────────────────────────
 
-def test_citation_set_parses_bare_prefixed_and_prose_and_ignores_the_rest():
+def test_citation_set_takes_only_bare_and_prefixed_entries():
+    """Loki 40A353F2 A2: an entry cites only when it IS the id. Prose is not a
+    citation — "see dispatch DEADBEEF-ish notes" used to mint DEADBEEF."""
     meta = {"context_refs": [
         "67E344A9",
-        "dispatch:73d3e5d8",
+        " dispatch:73d3e5d8 ",
         "dispatch 74E87D5C (Hanuman handoff, verified; handoff.json in the packet dir)",
+        "see dispatch DEADBEEF-ish notes",
+        "dispatch:DEADBEEF-ish",
+        "DEADBEEF0",
         "Nestor pair 11ccb0f7-6323-40ef-84a5-913336395b03 (sealed)",
         "FRANK 2ff5a399-2041-41a4-845d-129ace0f9f2c",
         "gap 6ac14a6c7a0b",
         42,
     ]}
-    assert ds.citation_set(meta) == {"67E344A9", "73D3E5D8", "74E87D5C"}
+    assert ds.citation_set(meta) == {"67E344A9", "73D3E5D8"}
 
 
 def test_citation_set_empty_when_no_refs():
@@ -106,20 +114,23 @@ def test_unrelated_seat_refused_with_the_citation_hint(seats):
 
 # ── the citation grant ───────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("style", ["bare", "prefixed", "prose"])
-def test_citing_packet_working_grants_read_with_via(seats, style):
+@pytest.mark.parametrize("style", ["bare", "prefixed"])
+def test_orchestrator_audit_packet_citing_build_packet_grants_read_with_via(seats, style):
+    """The case the feature exists for: willow → loki audit citing the
+    willow → hanuman build packet."""
     builder = _builder_packet()
     audit = _audit_packet(builder, ref_style=style)
     out = server.dispatch_read("loki", builder)
     assert out.get("error") is None, out
     assert out["via"] == audit and out["via_status"] == "working"
+    assert out["via_from"] == "willow"
     assert "Ship it" in out["assignment"]
     ho_out = server.handoff_read("loki", builder)
     assert ho_out["via"] == audit
     assert ho_out["handoff"]["findings"][0]["evidence"] == ["a.py:1"]
 
 
-def test_citation_read_is_receipted_with_via(seats):
+def test_citation_read_is_receipted_with_via_and_who_vouched(seats):
     builder = _builder_packet()
     audit = _audit_packet(builder)
     server.dispatch_read("loki", builder)
@@ -127,7 +138,76 @@ def test_citation_read_is_receipted_with_via(seats):
     hits = [r for r in rows if r.get("detail") and "citation_read" in r["detail"]]
     assert hits, rows
     detail = json.loads(hits[0]["detail"])
-    assert detail == {"citation_read": builder, "via": audit}
+    assert detail == {"citation_read": builder, "via": audit, "via_from": "willow"}
+
+
+# ── who may vouch (Loki 40A353F2, A1) ────────────────────────────────────────
+
+def test_a_seat_cannot_mint_its_own_citation(seats):
+    """Loki's reproduction: loki → loki citing X (a willow → hanuman packet loki
+    is no party to), accept, read X. Refused at the send; and even a
+    self-addressed packet planted on disk vouches for nothing."""
+    builder = _builder_packet()
+    sent = ds.dispatch_send("loki", "loki", "# Mine\n", context_refs=[builder])
+    assert sent["error"] == "EINVAL"
+    assert "sent to its sender" in sent["message"]
+    assert server.dispatch_send("loki", "loki", "# Mine\n", context_refs=[builder])["error"] == "EINVAL"
+    assert ds.citation_read_access("loki", builder) is None
+    assert server.dispatch_read("loki", builder)["error"] == "not_party_to_dispatch"
+
+
+def test_planted_self_addressed_packet_vouches_for_nothing(seats, home):
+    """Belt and braces: bypass dispatch_send's refusal by rewriting a real
+    packet's from_app to loki and re-signing it with the runtime key — the
+    signature verifies, but from_app loki is no party to the cited packet,
+    so citation_may_vouch says no."""
+    from willow_mcp import dispatch_signing
+    builder = _builder_packet()
+    audit = _audit_packet(builder)  # willow → loki, working, cites builder
+    assert ds.citation_read_access("loki", builder)["via"] == audit
+    meta_path = home / "dispatch" / audit / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["from_app"] = "loki"
+    meta.pop("signature", None)
+    meta["signature"] = dispatch_signing.sign_meta(meta)
+    meta_path.write_text(json.dumps(meta))
+    assert dispatch_signing.signature_status(meta) == dispatch_signing.SIG_VALID
+    assert ds.citation_read_access("loki", builder) is None
+
+
+def test_specialist_sender_vouches_only_when_party_to_the_cited_packet(seats):
+    """hanuman → loki citing the willow → hanuman build packet: granted, and
+    only because hanuman is to_app of the cited one."""
+    builder = _builder_packet()
+    handoff = _audit_packet(builder, sender="hanuman", to="loki")
+    out = server.dispatch_read("loki", builder)
+    assert out.get("error") is None, out
+    assert out["via"] == handoff and out["via_from"] == "hanuman"
+
+
+def test_specialist_stranger_to_the_cited_packet_cannot_vouch(seats):
+    """jeles → loki citing the willow → hanuman build packet: jeles is no
+    party to it, so its packet opens nothing to loki."""
+    builder = _builder_packet()
+    _audit_packet(builder, sender="jeles", to="loki")
+    assert ds.citation_read_access("loki", builder) is None
+    assert server.dispatch_read("loki", builder)["error"] == "not_party_to_dispatch"
+
+
+def test_citation_may_vouch_rules():
+    cited = {"from_app": "willow", "to_app": "hanuman", "reply_to": "willow"}
+    assert ds.citation_may_vouch({"from_app": "willow"}, cited) is True
+    assert ds.citation_may_vouch({"from_app": "hanuman"}, cited) is True
+    assert ds.citation_may_vouch({"from_app": "HANUMAN"}, cited) is True
+    assert ds.citation_may_vouch({"from_app": "loki"}, cited) is False
+    assert ds.citation_may_vouch({"from_app": ""}, cited) is False
+    assert ds.citation_may_vouch({}, cited) is False
+
+
+def test_citation_of_a_missing_packet_grants_nothing(seats):
+    sent = ds.dispatch_send("willow", "loki", "# x\n", context_refs=["0BADF00D"])
+    ds.dispatch_accept(sent["dispatch_id"], "loki", session_id="s")
+    assert ds.citation_read_access("loki", "0BADF00D") is None
 
 
 def test_citing_packet_still_pending_grants_nothing(seats):

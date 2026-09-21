@@ -349,6 +349,13 @@ def propose(
     FRANK ledger when one is available; ledger-write failure is reported in
     the returned dict but does not roll back the sidecar write (mirrors the
     discipline sign-session uses for its ledger append).
+
+    Deliberately NOT guarded by ``EREGISTRY`` (:func:`registry_mismatch`):
+    a proposal has no force wherever it lands, and a specialist's
+    auto-propose on a gate miss must be able to queue into whatever registry
+    its process resolves — a steered resolve costs nothing here. The guard
+    sits on the operator acts (ratify / reject / revoke), where a write to
+    the wrong file is a "ratified" the desk cannot see (gap 4c7512c57a7e).
     """
     if _keyring.enabled():
         # Attribution rail is active. Every gate below is inside the

@@ -238,6 +238,12 @@ def dispatch_send(
     misses stay silent."""
     if not (assignment_md or "").strip():
         return {"error": "assignment_required"}
+    if (from_app or "").strip().lower() == (to_app or "").strip().lower():
+        # Loki 40A353F2 A1: a self-addressed packet is the shape a seat uses
+        # to mint its own citation (send to self citing X, accept, read X).
+        # Refused regardless of envelope — there is no legitimate self-send.
+        return {"error": "EINVAL", "message": "a packet cannot be sent to its sender",
+                "from_app": from_app, "to_app": to_app}
     did = (dispatch_id or new_dispatch_id()).upper()
     # B-52/#241: refuse to write into a redirected dispatch/ tree -- if the
     # root itself is a symlink, mkdir would happily create the new packet
@@ -423,42 +429,65 @@ def dispatch_read(dispatch_id: str) -> dict:
 # Read only — never accept, handoff, or clear through a citation. Depth one —
 # a citation of a citation grants nothing. Anything a citation allows is
 # receipted with `via: P` so the trail says how the read was allowed.
+#
+# Who may vouch (Loki 40A353F2, A1): `dispatch_send` is filesystem-backed and
+# eight specialist manifests hold it, so a seat can write a packet to itself
+# citing any id and accept it — a citation a specialist authored for its own
+# reader is not a relationship, it is a request. A citing packet grants a
+# read only when its `from_app` is the orchestrator or is itself a party to
+# the cited packet: the vouching identity must already be entitled to what it
+# is vouching for. A packet cannot be sent to its sender at all
+# (`dispatch_send` refuses EINVAL), which closes the trivial shape outright.
 
+# A context_ref cites a packet only when the entry IS the id (``67E344A9``) or
+# ``dispatch:<id>`` — nothing else. Prose extraction was dropped (Loki
+# 40A353F2, A2): "see dispatch DEADBEEF-ish notes" minted DEADBEEF.
 _CITATION_ID_RE = re.compile(r"^(?:dispatch:)?([0-9A-Fa-f]{8})$")
-# Prose refs like "dispatch 67E344A9 (Hanuman handoff, verified)" cite too —
-# the id is the 8-hex token following the word dispatch.
-_CITATION_PROSE_RE = re.compile(r"\bdispatch(?:_id)?\s*[:=]?\s*([0-9A-Fa-f]{8})\b")
 CITATION_READ_STATUSES = frozenset({"working", "complete", "verified"})
 
 
 def citation_set(meta: dict) -> set[str]:
-    """The dispatch ids a packet's ``context_refs`` name — bare (``67E344A9``),
-    prefixed (``dispatch:67E344A9``), or inside prose (``dispatch 67E344A9
-    (...)``). Refs that carry no id contribute nothing."""
+    """The dispatch ids a packet's ``context_refs`` name: entries that are
+    exactly a bare id (``67E344A9``) or ``dispatch:67E344A9``. Any other
+    entry — prose, a longer token, an id with a suffix — contributes
+    nothing; a citation is a deliberate entry, not a mention."""
     out: set[str] = set()
     for ref in meta.get("context_refs") or []:
         if not isinstance(ref, str):
             continue
-        text = ref.strip()
-        m = _CITATION_ID_RE.match(text)
+        m = _CITATION_ID_RE.match(ref.strip())
         if m:
-            out.add(m.group(1).upper())
-            continue
-        for m in _CITATION_PROSE_RE.finditer(text):
             out.add(m.group(1).upper())
     return out
 
 
+def citation_may_vouch(citing_meta: dict, cited_meta: dict) -> bool:
+    """Whether the author of the citing packet is entitled to vouch for a
+    read of the cited one: the orchestrator always is; any other sender only
+    when it is itself a party (from_app / to_app / reply_to) to the cited
+    packet. A specialist that is a stranger to the cited packet cannot open
+    it to its own reader by writing a packet that cites it."""
+    sender = (citing_meta.get("from_app") or "").strip().lower()
+    if not sender:
+        return False
+    if is_orchestrator_app(sender):
+        return True
+    return is_dispatch_party(sender, cited_meta)
+
+
 def citation_read_access(app_id: str, target_dispatch_id: str) -> dict | None:
-    """Return ``{"via": <citing packet id>, "via_status": ...}`` when
-    ``app_id`` may read the packet ``target_dispatch_id`` through a citation,
-    else ``None``.
+    """Return ``{"via": <citing packet id>, "via_status": ..., "via_from":
+    ...}`` when ``app_id`` may read the packet ``target_dispatch_id``
+    through a citation, else ``None``.
 
     Grounds: a packet P with ``to_app == app_id``, status in
-    :data:`CITATION_READ_STATUSES`, and ``target_dispatch_id`` in P's
-    citation set. P must itself verify (signature, no symlink) — a forged
-    citing packet grants nothing. Only P's own context_refs are consulted:
-    what P cites is readable, what P's citations cite is not.
+    :data:`CITATION_READ_STATUSES`, ``target_dispatch_id`` in P's citation
+    set, and P's ``from_app`` entitled to vouch (:func:`citation_may_vouch`:
+    the orchestrator, or a party to the cited packet). P must itself verify
+    (signature, no symlink) — a forged citing packet grants nothing. Only
+    P's own context_refs are consulted: what P cites is readable, what P's
+    citations cite is not. The cited packet must exist and verify too — a
+    citation of nothing grants nothing.
     """
     who = (app_id or "").strip().lower()
     target = (target_dispatch_id or "").strip().upper()
@@ -466,6 +495,12 @@ def citation_read_access(app_id: str, target_dispatch_id: str) -> dict | None:
         return None
     disp_root = dispatch_root()
     if disp_root.is_symlink() or not disp_root.is_dir():
+        return None
+    cited_dir = disp_root / target
+    if cited_dir.is_symlink() or not cited_dir.is_dir() or packet_symlink_refused(cited_dir):
+        return None
+    cited_meta = _read_json(cited_dir / "meta.json")
+    if not cited_meta or not _meta_is_well_formed(cited_meta):
         return None
     for child in sorted(disp_root.iterdir(), key=lambda p: p.name):
         if child.is_symlink() or not child.is_dir() or packet_symlink_refused(child):
@@ -479,19 +514,26 @@ def citation_read_access(app_id: str, target_dispatch_id: str) -> dict | None:
             continue
         if target not in citation_set(meta):
             continue
+        if not citation_may_vouch(meta, cited_meta):
+            continue
         if dispatch_signing.signature_status(meta) != dispatch_signing.SIG_VALID:
             continue
         st = _read_json(child / "status.json") or {}
         cur = st.get("status") or meta.get("status") or "pending"
         if cur not in CITATION_READ_STATUSES:
             continue
-        return {"via": str(meta.get("dispatch_id") or child.name).upper(), "via_status": cur}
+        return {
+            "via": str(meta.get("dispatch_id") or child.name).upper(),
+            "via_status": cur,
+            "via_from": (meta.get("from_app") or "").strip().lower(),
+        }
     return None
 
 
 NOT_PARTY_HINT = (
-    "not a party to this packet; cite this id in your packet's context_refs "
-    "to read it (a working or complete packet that cites it grants read only)"
+    "not a party to this packet; a working or complete packet addressed to you "
+    "that lists this id in its context_refs grants read only — and only when "
+    "that packet was sent by the orchestrator or by a party to this one"
 )
 
 
@@ -1105,19 +1147,30 @@ def _sessions_bound_to(app_id: str, dispatch_id: str) -> list[dict]:
     return out
 
 
-def dispatch_withdraw(dispatch_id: str, reason: str, *, by_app: str) -> dict:
+def dispatch_withdraw(
+    dispatch_id: str, reason: str, *, by_app: str, force: bool = False,
+) -> dict:
     """Orchestrator retires a packet: pending → withdrawn (gap afa515539c0a).
 
     ``working`` → ``withdrawn`` only when no session record of the assignee
     is still bound to the packet as ``working``; when one is, the packet is
-    refused ``EBUSY`` naming the session — liveness beyond the session
-    record cannot be known here, and withdrawing a packet a seat is working
-    would strand its handoff. ``withdrawn`` is terminal: ``dispatch_accept``,
-    ``session_enter(dispatch_id=...)`` and ``handoff_write_v4`` all refuse
-    ``invalid_transition``; ``_pending_for_app`` and ``dispatch_list(
-    status="pending")`` never return it. The reason is recorded on
-    status.json; the FRANK ``dispatch_withdraw`` event is the server
-    wrapper's (it holds the ledger).
+    refused ``EBUSY`` naming the session ids and the reconcile path
+    (``session_reconcile`` on each, which moves the record off working) —
+    liveness beyond the session record cannot be known here, and withdrawing
+    a packet a seat is working would strand its handoff. ``dispatch_accept``
+    binds a session, so an accepted packet whose seat died stays EBUSY until
+    someone reconciles it; ``force=True`` is the orchestrator's way past that
+    (Loki 40A353F2, B1): the withdrawal proceeds, the bound session ids are
+    recorded on status.json as ``forced_over_sessions`` and returned, and
+    the server wrapper puts them in the FRANK event. ``force`` is honoured
+    only for an orchestrator ``by_app``; anyone else gets EBUSY as before.
+
+    ``withdrawn`` is terminal: ``dispatch_accept``, ``session_enter(
+    dispatch_id=...)`` and ``handoff_write_v4`` all refuse
+    ``invalid_transition``; ``dispatch_list(status="pending")`` never
+    returns it. The reason is recorded on status.json; the FRANK
+    ``dispatch_withdraw`` event is the server wrapper's (it holds the
+    ledger).
     """
     if not (reason or "").strip():
         return {"error": "reason_required", "dispatch_id": dispatch_id}
@@ -1128,30 +1181,49 @@ def dispatch_withdraw(dispatch_id: str, reason: str, *, by_app: str) -> dict:
     cur = pkt.get("status", {}).get("status", "pending")
     if cur == "withdrawn":
         return {"error": "already", "dispatch_id": did, "status": cur}
+    forced_over: list[str] = []
     if cur == "working":
         bound = _sessions_bound_to(pkt["meta"].get("to_app", ""), did)
         if bound:
-            return {
-                "error": "EBUSY",
-                "dispatch_id": did,
-                "status": cur,
-                "sessions": [r.get("session_id") for r in bound],
-                "message": (
-                    f"{pkt['meta'].get('to_app')} session(s) "
-                    f"{', '.join(str(r.get('session_id')) for r in bound)} still "
-                    "bound to this packet as working; liveness beyond the session "
-                    "record cannot be known here — wait for the handoff or clear "
-                    "the session first"
-                ),
-            }
+            session_ids = [str(r.get("session_id")) for r in bound]
+            if force and is_orchestrator_app(by_app):
+                forced_over = session_ids
+            else:
+                to_app = pkt["meta"].get("to_app")
+                return {
+                    "error": "EBUSY",
+                    "dispatch_id": did,
+                    "status": cur,
+                    "sessions": session_ids,
+                    "reconcile": [
+                        {"tool": "session_reconcile", "app_id": to_app, "session_id": s}
+                        for s in session_ids
+                    ],
+                    "message": (
+                        f"{to_app} session(s) {', '.join(session_ids)} still bound "
+                        "to this packet as working; liveness beyond the session "
+                        "record cannot be known here. Wait for the handoff, "
+                        f"reconcile the session(s) (session_reconcile(app_id={to_app!r}, "
+                        "session_id=<id>, ...)), or — orchestrator only, for a seat "
+                        "that is gone — withdraw with force=True; the forced-over "
+                        "sessions are recorded on the packet and in FRANK."
+                    ),
+                }
     elif cur != "pending":
         return {"error": "invalid_transition", "from": cur, "to": "withdrawn",
                 "dispatch_id": did}
+    extra: dict[str, Any] = {}
+    if forced_over:
+        extra["forced_over_sessions"] = forced_over
     dispatch_set_status(
         did, "withdrawn",
         withdrawn_at=_utc_now(),
         withdrawn_by=by_app,
         withdraw_reason=reason.strip(),
+        **extra,
     )
-    return {"dispatch_id": did, "previous": cur, "status": "withdrawn",
-            "to_app": pkt["meta"].get("to_app"), "reason": reason.strip()}
+    out = {"dispatch_id": did, "previous": cur, "status": "withdrawn",
+           "to_app": pkt["meta"].get("to_app"), "reason": reason.strip()}
+    if forced_over:
+        out["forced_over_sessions"] = forced_over
+    return out
