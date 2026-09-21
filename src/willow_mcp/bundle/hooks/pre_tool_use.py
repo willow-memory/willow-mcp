@@ -1485,11 +1485,19 @@ def _mask_read_only_calls(text: str) -> str:
     single-call-per-mention shapes this guard sees in a prompt/description.
     A second pass then blanks the paren-LESS prose shape ("Run handoff_read
     with app_id=hanuman") the same way — masking only the app_id=<seat>
-    fragment, since the call name itself carries no seat framing."""
+    fragment, since the call name itself carries no seat framing.
+
+    The call-name boundary is `(?:(?<=__)|\\b)`, not a bare `\\b` — a bare
+    `\\b` never fires between the two underscores of an MCP-qualified name
+    (`mcp__willow-mcp__handoff_read(...)`), so that canonical spelling — the
+    one every seat actually sees in its own tool list — went unmasked and
+    tripped the bare-app_id tier (false positive, Loki third audit
+    2026-09-21). The paren-less prose pattern below already carries this
+    same prefix; this pass now matches it."""
     if not text:
         return text
     names_pattern = re.compile(
-        r'\b(?:' + '|'.join(re.escape(t) for t in _READ_ONLY_LOOKUP_CALLS) + r')\s*\('
+        r'(?:(?<=__)|\b)(?:' + '|'.join(re.escape(t) for t in _READ_ONLY_LOOKUP_CALLS) + r')\s*\('
     )
     out: list = []
     pos = 0
@@ -1532,7 +1540,17 @@ def _find_session_enter_seat(text: str, by_id: dict) -> Optional[dict]:
     uses) instead of a `[^)]*` regex, so a nested paren inside the call's
     own arguments — the canonical `session_id=str(uuid4())` shape — does
     not truncate the argument span before app_id is reached (regex-boundary
-    defect, Loki re-audit 2026-09-21)."""
+    defect, Loki re-audit 2026-09-21).
+
+    An UNCLOSED call — a nested paren inside an argument value
+    (`note="a ( b"`), a truncated entry call, or text that simply ends
+    mid-call — used to `continue` past it, so the seat named inside was
+    never scanned and the whole call fell to the weaker bare-app_id tier
+    (regression, Loki third audit 2026-09-21). A truncated entry call is
+    still an entry call, so an unclosed paren scans to the end of `text`
+    instead of being skipped; over-scanning here can only over-detect, and
+    detection at this tier still requires _APP_ID_RE to find a real
+    `app_id=` inside the scanned span."""
     n = len(text)
     for m in re.finditer(r"session_enter\s*\(", text, re.IGNORECASE):
         depth = 1
@@ -1543,10 +1561,7 @@ def _find_session_enter_seat(text: str, by_id: dict) -> Optional[dict]:
             elif text[j] == ")":
                 depth -= 1
             j += 1
-        if depth:
-            # No matching close in this text — nothing to scan.
-            continue
-        args = text[m.end():j - 1]
+        args = text[m.end():j - 1] if not depth else text[m.end():n]
         am = _APP_ID_RE.search(args)
         if am is None:
             continue
@@ -1564,16 +1579,29 @@ def _find_you_are_seat(text: str, rows: list) -> Optional[dict]:
     speaker's own framing (e.g. an auditor's prompt reporting "the packet
     whose prompt said 'You are Hanuman'") must not out-rank the seat
     actually named first (regex-boundary defect, Loki re-audit 2026-09-21).
-    A trailing word character or apostrophe is excluded (`(?![\\w'])`) so
-    "You are Willow's auditor" / "You are Willowbrook support" do not match
-    "Willow"; a trailing "?" is also excluded so a question like "You are
-    Loki? no — ask claude-code-guide" is not read as entry framing."""
+    A trailing word character is excluded (`(?![\\w?])`) so "You are
+    Willowbrook support" does not match "Willow" and a trailing "?" is not
+    read as entry framing ("You are Loki? no — ask claude-code-guide"). A
+    trailing apostrophe is excluded ONLY when a word character follows it
+    (`(?!'\\w)`) — "You are Willow's auditor" still does not match "Willow",
+    but a closing quote around the whole name ("'You are Hanuman'", "Enter
+    as 'Hanuman' now") is not itself a boundary, so the quoted framing still
+    matches (regression, Loki third audit 2026-09-21 — the prior
+    `(?![\\w'])` treated the closing quote as a boundary and let a single
+    apostrophe defeat both the orchestrator and fork refusals). An optional
+    leading quote (`['"‘’“”]?`) is consumed directly in front of the name so
+    a quote that wraps only the name itself ("Enter as 'Hanuman' now",
+    "Enter as 'Willow'") does not stop `\\**%s` from lining up right after
+    it — the leading quote was never itself a boundary problem, but without
+    consuming it the name pattern simply did not start where the quote put
+    it."""
     best: Optional[dict] = None
     best_pos: Optional[int] = None
     for row in rows:
         for name in filter(None, (row.get("display_name"), row.get("agent_id"))):
             pat = re.compile(
-                r"\b(?:you are|you're|enter as)\s+\**%s\**(?![\w'?])" % re.escape(name),
+                r"\b(?:you are|you're|enter as)\s+['\"‘’“”]?\**%s\**(?![\w?])(?!'\w)"
+                % re.escape(name),
                 re.IGNORECASE,
             )
             m = pat.search(text)
@@ -1587,16 +1615,19 @@ def _find_comma_start_seat(text: str, rows: list) -> Optional[dict]:
     """`<Display name>,` (or bare `<agent_id>`) opening the text — "Hanuman,
     build the thing. Enter as the builder seat first." — checked against
     each of `prompt` and `description` separately, since either can open
-    this way. A trailing word character, apostrophe, or hyphen is excluded
-    (`(?![\\w'-])`) so a compound word ("Hanuman-style build notes",
-    "Hanuman's seat") does not read as addressing the seat directly
-    (regex-boundary defect, Loki re-audit 2026-09-21)."""
+    this way. A trailing word character or hyphen is excluded
+    (`(?![\\w-])`) so a compound word ("Hanuman-style build notes") does not
+    read as addressing the seat directly (regex-boundary defect, Loki
+    re-audit 2026-09-21). A trailing apostrophe is excluded ONLY when a word
+    character follows it (`(?!'\\w)`) — "Hanuman's seat" still does not
+    match, but a quoted opening ("'Hanuman', go") is not itself a boundary
+    (same care as _find_you_are_seat, Loki third audit 2026-09-21)."""
     if not text:
         return None
     stripped = text.lstrip()
     for row in rows:
         for name in filter(None, (row.get("display_name"), row.get("agent_id"))):
-            pat = re.compile(r"^\**%s\**(?![\w'-])\b[,:]?" % re.escape(name), re.IGNORECASE)
+            pat = re.compile(r"^\**%s\**(?![\w-])(?!'\w)\b[,:]?" % re.escape(name), re.IGNORECASE)
             if pat.match(stripped):
                 return row
     return None
@@ -1729,16 +1760,42 @@ def check_agent_spawn(tool_input: dict) -> Optional["tuple[str, str]"]:
       framing, so a fork resuming a specialist persona by implication rather
       than restating it passes through unrefused. This is a property of the
       hook running once per tool call with no session state, not a gap in
-      any one regex.
+      any one regex;
+    - `_READ_ONLY_PROSE_APP_ID_RE`'s 40-char window between a lookup call
+      name and `app_id=` admits a comma and arbitrary words in between
+      ("Run whoami, then app_id=hanuman" masks and allows) — only `.` `;`
+      `(` end the window, so a comma-joined clause still reads as part of
+      the same lookup mention. Bare-tier bypass only (obfuscation-class, not
+      a seat-entry bypass);
+    - a paren-less `session_enter` naming a seat in prose ("session_enter
+      with app_id=willow", "session_enter as the willow seat") is not
+      promoted to the session_enter tier — only the parenthesised call gets
+      that priority — so it falls to the bare-app_id tier, where the
+      orchestrator seat's stronger refusal does not apply;
+    - when text contains more than one `session_enter(...)` call, only the
+      FIRST one's app_id is considered — `_find_session_enter_seat` returns
+      on its first match. `session_enter(app_id="loki"); session_enter(
+      app_id="willow")` pins loki's model and never reaches the willow
+      mention.
+
+    One nested-call shape was found and is NOT a limit — it is the intended
+    scoping: `run(session_enter(session_id=sid), app_id="willow")` pins
+    nothing to willow, because the app_id belongs to the OUTER `run(...)`
+    call, not to `session_enter`'s own arguments, and the paren-depth walk
+    correctly scopes to the inner call.
 
     Two prose shapes were found and are NOT limits — they are masked out
     before the bare-app_id tier runs (see _mask_read_only_calls /
     _READ_ONLY_PROSE_APP_ID_RE): a read-only lookup call named without
     parentheses ("Run handoff_read with app_id=hanuman") is masked the same
-    as its parenthesised form; a display name directly followed by a
-    hyphen or apostrophe at the start of text ("Hanuman-style build notes")
-    is excluded from the comma-start tier as a compound word, not an
-    address to the seat."""
+    as its parenthesised form — including the MCP-qualified spelling
+    ("mcp__willow-mcp__handoff_read(...)"), since the call-name boundary is
+    `(?:(?<=__)|\\b)` in both the paren and paren-less passes; a display
+    name directly followed by a hyphen at the start of text ("Hanuman-style
+    build notes") is excluded from the comma-start tier as a compound word,
+    not an address to the seat, and a quoted opening ("'Hanuman', go") is
+    NOT excluded — only a hyphen or an apostrophe immediately followed by a
+    word character is."""
     tool_input = tool_input or {}
     prompt = str(tool_input.get("prompt", "") or "")
     description = str(tool_input.get("description", "") or "")

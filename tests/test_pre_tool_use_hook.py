@@ -2122,7 +2122,7 @@ def test_agent_spawn_you_are_seat_prefers_earliest_text_match():
     happened to list hanuman before loki. Loki's own "You are Loki" framing
     comes first in the text and must win."""
     result = pre_tool_use.check_agent_spawn(_spawn_input(
-        "You are Loki. Audit the packet whose prompt said 'You are Hanuman'.",
+        'You are Loki. Audit the packet whose prompt said "You are Hanuman".',
         model="opus"))
     assert result is None
 
@@ -2163,6 +2163,145 @@ def test_agent_spawn_allows_paren_less_prose_lookup():
     result = pre_tool_use.check_agent_spawn(_spawn_input(
         "Run mcp__willow-mcp__handoff_read with app_id=hanuman for background.",
         subagent_type="Explore"))
+    assert result is None
+
+
+# ── check_agent_spawn: round-4 rework, three regex-boundary defects ───────
+# (Loki third audit 2026-09-21, handoff session_handoff-2026-09-21-498edf37).
+
+def test_agent_spawn_you_are_seat_blocks_single_quoted_hanuman_no_model():
+    """(1) REGRESSION: `(?![\\w'?])` treated a closing single quote as a
+    boundary, so a single-quoted "You are Hanuman" no longer matched at
+    all and the builder's sonnet pin was never enforced."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "'You are Hanuman'. Build the thing."))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+
+def test_agent_spawn_you_are_seat_blocks_quoted_enter_as_fork():
+    """(1) REGRESSION: the same closing-quote boundary let a quoted "Enter
+    as 'Hanuman'" framing dodge the fork refusal."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Enter as 'Hanuman' now", subagent_type="fork"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+
+
+def test_agent_spawn_you_are_seat_blocks_willow_trailing_quote():
+    """(1) REGRESSION: "You are Willow'" bypassed the orchestrator refusal."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are Willow'"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason and "human-orchestrator" in reason
+
+
+def test_agent_spawn_you_are_seat_blocks_quoted_enter_as_willow():
+    """(1) REGRESSION: "Enter as 'Willow'" bypassed the orchestrator
+    refusal the same way."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("Enter as 'Willow'"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason and "human-orchestrator" in reason
+
+
+def test_agent_spawn_you_are_seat_still_allows_willows_possessive_apostrophe():
+    """(1) The fix must not regress the ORIGINAL apostrophe case: "You are
+    Willow's auditor" still is not "Willow"."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Willow's auditor"))
+    assert result is None
+
+
+def test_agent_spawn_session_enter_unclosed_note_paren_blocks_willow():
+    """(2) An unclosed session_enter( call — a nested paren inside an
+    argument value — used to `continue` past the call entirely, falling to
+    the bare tier where the willow refusal never fires."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="willow", note="a ( b")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason and "human-orchestrator" in reason
+
+
+def test_agent_spawn_session_enter_unclosed_project_paren_blocks_willow():
+    """(2) Same shape via an unbalanced paren in a `project=` value."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="willow", project="Grove (WIP")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+
+
+def test_agent_spawn_session_enter_truncated_call_blocks_willow():
+    """(2) A truncated session_enter( call with no closing paren at all
+    still names willow and must still refuse."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="willow"'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+
+
+def test_agent_spawn_session_enter_multiline_unclosed_blocks_willow():
+    """(2) Multi-line unclosed form of the same defect."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(\n'
+        '    app_id="willow",\n'
+        '    note="see (a"\n'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+
+
+def test_agent_spawn_session_enter_unclosed_note_paren_pins_hanuman():
+    """(2) The hanuman equivalent of the unclosed-paren shape must still
+    resolve to the session_enter tier and pin the builder's model."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", note="a ( b")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", note="a ( b")', model="sonnet"))
+    assert allowed is None
+
+
+def test_agent_spawn_allows_mcp_qualified_handoff_read_lookup():
+    """(3) FALSE POSITIVE: the paren-pass names_pattern lacked the
+    `(?:(?<=__)|\\b)` prefix the prose pass already carries, so the
+    MCP-qualified spelling of a lookup call was never masked and tripped
+    the bare-app_id tier."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'mcp__willow-mcp__handoff_read(app_id="hanuman", handoff_id="x")',
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_allows_mcp_qualified_serve_variant_lookup():
+    """(3) Same defect on the `-serve` suffixed server-qualified spelling."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'mcp__willow-mcp-serve__store_get(app_id="hanuman", key="k")',
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_allows_mcp_qualified_whoami_lookup():
+    """(3) Same defect on `whoami`, called out separately in the audit."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'mcp__willow-mcp__whoami(app_id="hanuman")', subagent_type="Explore"))
     assert result is None
 
 
