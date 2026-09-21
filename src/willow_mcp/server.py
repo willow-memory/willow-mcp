@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 132 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 133 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -5152,6 +5152,55 @@ def unit_reload_execute(
         )
     except Exception as exc:
         return {"ok": False, "reloaded": False, "error": f"unit_reload_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def unit_install_execute(
+    app_id: str,
+    unit: str,
+    source: str,
+    envelope_id: str = "",
+    project: str = "",
+    task_id: str = "",
+) -> dict:
+    """Write, enable and start a systemd `--user` unit from a template tracked
+    in a named repo, performed by THIS process under the `unit.install`
+    envelope that governs `app_id` (verb 17, sealed `197aafa5`) — the sibling
+    of `unit_reload_execute`: reload restarts a unit that exists onto pulled
+    code, install creates or replaces the unit definition itself. `source` is
+    `org/name@relative/path.template`; the checkout is resolved the way
+    `git_pull_execute` resolves one, and the file must be tracked and clean
+    at HEAD — never free text. Refuses before any citation: the broker's own
+    unit (`EPERM`), the user bus unreachable (`EUNREACH`), no clone / not
+    tracked / dirty / HEAD unreadable (`ENOSRC`), a template whose declared
+    name (`# unit: <name>` header, else the filename minus `.template`) is
+    not `unit` (`ENAME`), a placeholder this process cannot fill
+    (`ETEMPLATE`). Then: write `~/.config/systemd/user/<unit>` (and the
+    `.timer` sibling shipped beside a `.service` template), `daemon-reload`,
+    `enable --now`. Returns the source sha, template and rendered digests,
+    whether an existing unit was replaced (and its digest), before/after
+    state, and the FRANK `unit_install` citation id. Gated as envelope_apply,
+    beside the reload."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import unit_install_executor
+        from .governance_ledger import GovernanceLedger
+
+        return unit_install_executor.execute_unit_install(
+            app_id,
+            unit=unit,
+            source=source,
+            envelope_id=envelope_id,
+            project=project or (source.split("@", 1)[0] if "@" in source else "fleet"),
+            session=_current_orchestrator_session(),
+            task_id=task_id,
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "installed": False, "error": f"unit_install_execute_failed: {exc}"}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
