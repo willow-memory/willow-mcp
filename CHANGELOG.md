@@ -36,18 +36,17 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **handoff:** a green claim names its linter — ci_lint_pin resolves the repo's CI pin and the pre-handoff verify judges lint claims against it ([51879f0](https://github.com/willow-memory/willow-mcp/commit/51879f08cd178c6a56b33261ec52792dd8d23199))
 * **handoff:** a green claim names its linter, judged against the CI pin ([74652f0](https://github.com/willow-memory/willow-mcp/commit/74652f0ad33700b59a11da77cdb9c0d8d7630e95))
 
 
 ### Fixed
 
-* **ci_lint_pin:** clean word is a lint-outcome phrase; look back one clause for the linter ([4fbcfc0](https://github.com/willow-memory/willow-mcp/commit/4fbcfc074d272b2ef3488bbe0f97a131daafa297))
-* **ci_lint_pin:** inheritance needs a run of the same tool and a clause with no version of its own ([e1e297c](https://github.com/willow-memory/willow-mcp/commit/e1e297c2f270231abd20567b4dc8cd88a85923b1))
-* **ci_lint_pin:** judge every claim; strip quoted spans; look back three clauses ([a553031](https://github.com/willow-memory/willow-mcp/commit/a55303134769def5bf5a2b002bad297062268021))
-* **ci_lint_pin:** judge only a claim of lint-clean, by clause; parse pyproject pins ([45d8f99](https://github.com/willow-memory/willow-mcp/commit/45d8f99b5cf89b46cc1dc8b6b974da99eacb8fc7))
-* **ci_lint_pin:** possessive ruff's is a name; skipped is a disclaimer only beside the tool; one-run report halves inherit the version ([2a4cb11](https://github.com/willow-memory/willow-mcp/commit/2a4cb116a94637aaa706847d65fa36e05bab8930))
 * **ci_lint_pin:** runtime versions are not ruff's; pin wording in a clause names the pin; outcome-first is judged; scope stated; adversarial set pinned ([c25eec0](https://github.com/willow-memory/willow-mcp/commit/c25eec0bcb987795ba0f97bd213f8d1a3934be93))
+* **ci_lint_pin:** inheritance needs a run of the same tool and a clause with no version of its own ([e1e297c](https://github.com/willow-memory/willow-mcp/commit/e1e297c2f270231abd20567b4dc8cd88a85923b1))
+* **ci_lint_pin:** possessive ruff's is a name; skipped is a disclaimer only beside the tool; one-run report halves inherit the version ([2a4cb11](https://github.com/willow-memory/willow-mcp/commit/2a4cb116a94637aaa706847d65fa36e05bab8930))
+* **ci_lint_pin:** judge every claim; strip quoted spans; look back three clauses ([a553031](https://github.com/willow-memory/willow-mcp/commit/a55303134769def5bf5a2b002bad297062268021))
+* **ci_lint_pin:** clean word is a lint-outcome phrase; look back one clause for the linter ([4fbcfc0](https://github.com/willow-memory/willow-mcp/commit/4fbcfc074d272b2ef3488bbe0f97a131daafa297))
+* **ci_lint_pin:** judge only a claim of lint-clean, by clause; parse pyproject pins ([45d8f99](https://github.com/willow-memory/willow-mcp/commit/45d8f99b5cf89b46cc1dc8b6b974da99eacb8fc7))
 
 ## [2.62.0](https://github.com/willow-memory/willow-mcp/compare/v2.61.0...v2.62.0) (2026-09-21)
 
