@@ -472,6 +472,18 @@ def test_real_deploy_template_renders_clean(home, tmp_path, monkeypatch, github_
 
 _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
+#: The manifest-grant apply unit's own templates live under the MCP bundle
+#: (row 17's `source` can name either tracked location), not the top-level
+#: `deploy/` dir every other template in this parametrize comes from —
+#: included here by name only, resolved against this dir when not found
+#: under `_DEPLOY_DIR`.
+_BUNDLE_DEPLOY_DIR = (Path(__file__).resolve().parent.parent / "src" / "willow_mcp"
+                      / "bundle" / "deploy")
+_BUNDLE_DEPLOY_TEMPLATE_NAMES = (
+    "willow-mcp-manifest-grant.service.template",
+    "willow-mcp-manifest-grant.timer.template",
+)
+
 #: Fake-but-complete values for each template's real CONTENT placeholders —
 #: never a placeholder that appears only inside a comment. That distinction
 #: is the whole point of this test: proving which templates still carry an
@@ -509,6 +521,16 @@ _DEPLOY_TEMPLATE_CONTENT_VALUES = {
         "HEARTBEAT_ROOT": "/srv/hb", "KART_SANDBOX_CONFIG": "/srv/kart.json",
         "VENV": "/srv/venv/bin/python",
     },
+    # WILLOW_KEYRING / WILLOW_PGP_FINGERPRINT are deliberately absent here:
+    # the fixed template no longer asks for either as a content placeholder
+    # (EnvironmentFile=@WILLOW_HOME@/env supplies them at run time instead —
+    # see the template's own header comment) — these are the ONLY keys
+    # render_values() actually resolves for this unit.
+    "willow-mcp-manifest-grant.service.template": {
+        "WILLOW_HOME": "/srv/wh", "PYTHON": "/srv/venv/bin/python",
+        "NESTOR_DB": "/srv/wh/nestor.db",
+    },
+    "willow-mcp-manifest-grant.timer.template": {"SERVICE_UNIT": "willow-mcp-manifest-grant.service"},
 }
 
 #: Templates Loki found carrying a literal `@PLACEHOLDERS@`-shaped token
@@ -533,20 +555,26 @@ _DEPLOY_TEMPLATE_ETEMPLATE_XFAIL = {
 }
 
 
-@pytest.mark.parametrize("template_name", sorted(p.name for p in _DEPLOY_DIR.glob("*.template")))
+@pytest.mark.parametrize("template_name", sorted(
+    {p.name for p in _DEPLOY_DIR.glob("*.template")} | set(_BUNDLE_DEPLOY_TEMPLATE_NAMES)
+))
 def test_every_tracked_deploy_template_renders_or_xfails_on_comment_placeholder(template_name):
-    """Every template tracked under `deploy/` renders clean through the same
-    `render_template` row 17 uses, given fake-but-complete values for its
-    real content placeholders — except the three Loki found carrying an
-    unfillable placeholder-shaped token inside a COMMENT (serve,
-    serve-system, worker@): those refuse ETEMPLATE no matter what content
-    values are supplied, and this test asserts that refusal rather than
-    fixing it (out of scope here — see the handoff's gap note)."""
+    """Every template tracked under `deploy/` (plus the manifest-grant apply
+    unit's own bundle templates — a second tracked source `unit_install_execute`
+    accepts) renders clean through the same `render_template` row 17 uses,
+    given fake-but-complete values for its real content placeholders —
+    except the three Loki found carrying an unfillable placeholder-shaped
+    token inside a COMMENT (serve, serve-system, worker@): those refuse
+    ETEMPLATE no matter what content values are supplied, and this test
+    asserts that refusal rather than fixing it (out of scope here — see the
+    handoff's gap note)."""
     assert template_name in _DEPLOY_TEMPLATE_CONTENT_VALUES, (
         f"{template_name} is tracked under deploy/ but this test does not "
         f"know its content placeholders yet — add them, don't skip"
     )
     path = _DEPLOY_DIR / template_name
+    if not path.exists():
+        path = _BUNDLE_DEPLOY_DIR / template_name
     text = path.read_text(encoding="utf-8")
     unit = uix.declared_unit_name(text, path)
     values = dict(_DEPLOY_TEMPLATE_CONTENT_VALUES[template_name])
