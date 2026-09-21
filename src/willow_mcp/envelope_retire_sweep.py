@@ -84,15 +84,14 @@ not lose the receipt for rows already retired earlier in the same call
 (rework of Loki's LOW finding, probe C, D81165E5).
 
 **Bounding against the steward's 90s call budget (rework of Loki's MEDIUM
-finding, twice reworked).** A live register with hundreds of
+finding, three times reworked).** A live register with hundreds of
 branch-bound/counted rows can need dozens of GitHub round trips and hundreds
 of FRANK counts; the client that calls this tool
 (``willow_bot.steward.mcp_client``) times the whole call out at 90s.
 ``time_budget_s`` (default 60s — well inside that 90s, and inside it by
 design rather than by luck) stops examining FURTHER rows once elapsed
 wall-clock crosses it, checked BETWEEN rows so nothing in flight is left
-half-applied. Two more pieces close the gap D81165E5 found in the first
-version of this bound:
+half-applied.
 
 * **A cursor**, so consecutive under-budget calls do not all examine the
   identical prefix and starve the tail. Rows are ordered by id and rotated
@@ -102,20 +101,27 @@ version of this bound:
   (its row was retired or removed) resumes from the next id in sorted
   order rather than restarting at the top. ``max_rows`` (0 = unbounded) is
   an additional, independent row-count cap on top of the wall-clock bound.
-* **A per-row deadline.** A single row's OWN network calls used to run at
-  the shared client's full 20s timeout regardless of how little budget was
-  left, so one hung row could overrun the tick by multiples of that 20s
-  (Loki's probe: ~80s of urlopen timeouts possible in the worst case, ~140s
-  past the 90s client). Each of :func:`_branch_state`'s HTTP calls is now
-  given ``min(20, time remaining in the budget)`` as its OWN timeout
-  (``github_app_credentials._api``'s new ``timeout`` kwarg), and a call
-  whose remaining budget is already ``<= 0`` is never even started — it is
-  reported ``unreachable`` with the reason named instead. This bounds a
-  single row's overrun to at most one clipped call, not several calls at
-  the shared 20s ceiling apiece. It does not make the check itself
-  mid-call preemptive (no Python HTTP client can be interrupted mid-syscall
-  without its own watchdog thread, which this module does not add) — it
-  bounds how much timeout budget any one call is ever GIVEN.
+  An unwritable cursor store is reported, not swallowed — the receipt's
+  ``cursor`` field is three-state (``populated``/``absent``/``unreachable``;
+  rework of Loki's LOW finding, FAAD3E4A).
+* **A per-row deadline that ENDS THE CALL, not the row's chances.** A
+  single row's OWN network calls used to run at the shared client's full
+  20s timeout regardless of how little budget was left, so one hung row
+  could overrun the tick by multiples of that 20s (Loki's probe: ~80s of
+  urlopen timeouts possible in the worst case, ~140s past the 90s client).
+  The first rework clipped each of :func:`_branch_state`'s HTTP calls to
+  ``min(20, time remaining)`` — but a row whose clip came back ``0`` was
+  still reported ``unreachable`` and counted as ``examined``, so once the
+  budget dropped below the floor EVERY remaining row came back instantly:
+  the loop never actually stopped, the cursor raced to the end, and the
+  receipt claimed full coverage of a register three rows of which were
+  ever really looked at (Loki's probe 7AFN806Y, FAAD3E4A). A row needing a
+  network call is now checked BEFORE it starts (not inside
+  :func:`_branch_state`): a zero clip means the call is over — the row is
+  neither examined nor unreachable, the cursor does not advance onto it,
+  and ``truncated`` is set. App token mints are the SAME clipped timeout,
+  checked at the SAME point (a mint used to run unclipped and before any
+  deadline check at all — Loki's probe I overran a 2.5s budget to 4.0s).
 """
 from __future__ import annotations
 
@@ -178,24 +184,50 @@ def _cursor_path():
     return paths.store_root() / _CURSOR_FILENAME
 
 
-def _read_cursor() -> str:
+def _read_cursor_state() -> tuple:
+    """``(value, state)`` — ``state`` is ``"populated"`` (a prior position
+    was read), ``"absent"`` (no cursor file yet — a fresh register, or the
+    first tick ever; normal, not an error), or ``"unreachable"`` (the file
+    could not even be checked/read — permissions, a read-only mount).
+    Distinguishing absent from unreachable is what lets the receipt say
+    which one is true instead of both silently behaving like "start over"
+    (rework of Loki's LOW finding, FAAD3E4A: "an unwritable store root is
+    silent: no cursor field in the receipt, identical prefix every call")."""
+    path = _cursor_path()
     try:
-        return _cursor_path().read_text(encoding="utf-8").strip()
+        exists = path.exists()
     except OSError:
-        return ""
+        return "", "unreachable"
+    if not exists:
+        return "", "absent"
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "", "unreachable"
+    return (value, "populated") if value else ("", "absent")
 
 
-def _write_cursor(envelope_id: str) -> None:
+def _read_cursor() -> str:
+    """Bare-string convenience wrapper over :func:`_read_cursor_state` for
+    the rotation logic, which only ever needs the value."""
+    return _read_cursor_state()[0]
+
+
+def _write_cursor(envelope_id: str) -> bool:
+    """``True`` on a successful persist, ``False`` on any OS failure — the
+    caller (``sweep``) surfaces a ``False`` as ``cursor.state=unreachable``
+    in the receipt rather than swallowing it (same finding as above: a
+    silently-failed write used to look identical to a successful one, and
+    every subsequent call re-examined the same prefix forever)."""
     path = _cursor_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(envelope_id, encoding="utf-8")
         os.replace(tmp, path)
-    except OSError:  # pragma: no cover — a cursor we cannot persist just
-        # means the next call starts from the top again; never fatal to
-        # the sweep that already ran.
-        pass
+        return True
+    except OSError:
+        return False
 
 
 def _rotate_from_cursor(rows: list, cursor_id: str) -> list:
@@ -462,14 +494,14 @@ def sweep(
     reload_registry: Optional[Callable[[], dict]] = None,
     write_registry: Optional[Callable[[dict], None]] = None,
     lock: Optional[Callable[..., Any]] = None,
-    read_cursor: Optional[Callable[[], str]] = None,
-    write_cursor: Optional[Callable[[str], None]] = None,
+    read_cursor: Optional[Callable[[], tuple]] = None,
+    write_cursor: Optional[Callable[[str], bool]] = None,
 ) -> dict:
     """One pass over a SNAPSHOT of the active register, retiring rows
     per-row under a fresh re-read (see module docstring). Three-state
     receipt (INVARIANTS §1): ``{state: populated|empty|unreachable,
     examined, retired: [...], kept_standing, kept_in_force: [...],
-    unreachable: [...], dry_run, truncated}``.
+    unreachable: [...], dry_run, truncated, cursor: {state, value}}``.
 
     ``registry`` is the classification snapshot — injectable for tests;
     default reads the live one through :func:`envelope_authoring`'s own
@@ -499,7 +531,21 @@ def sweep(
     under-budget calls sweep progressively further into the register
     instead of re-examining the same prefix forever. The cursor only
     advances on a live call (``dry_run=False``) — a by-hand dry run never
-    perturbs the live tick's progress.
+    perturbs the live tick's progress. ``read_cursor`` returns ``(value,
+    state)`` (``state`` in ``populated``/``absent``/``unreachable``);
+    ``write_cursor`` returns a success bool. The receipt's own ``cursor``
+    field reports the outcome honestly (rework of Loki's LOW finding,
+    FAAD3E4A: an unwritable cursor store used to fail silently and every
+    call re-examined the same prefix with no sign why).
+
+    A row whose class needs a network round trip (``branch_bound``) is
+    never even started once there is not enough of the wall-clock budget
+    left for one more call — that row is NOT counted in ``examined`` and
+    the cursor does NOT advance onto it; the call ends there instead
+    (rework of Loki's MEDIUM finding, probe 7AFN806Y, FAAD3E4A: a zero
+    clipped timeout used to mean "every remaining row is instantly
+    unreachable," burning the whole tail as fake-examined progress and
+    defeating the cursor).
 
     A dry run performs every read (remote lookups, FRANK counts) and
     reports the SAME shape with ``retired`` meaning "would retire" —
@@ -535,13 +581,14 @@ def sweep(
     _reload = reload_registry or _authoring._load_registry
     _write = write_registry or (lambda doc: _authoring._atomic_write(path, doc))
     _lock = lock or _default_lock
-    _read_cursor_fn = read_cursor or _read_cursor
+    _read_cursor_fn = read_cursor or _read_cursor_state
     _write_cursor_fn = write_cursor or _write_cursor
 
+    cursor_id, cursor_read_state = _read_cursor_fn()
     all_rows = [r for r in (reg.get("active") or [])
                 if isinstance(r, dict) and r.get("id") and not _authoring._is_revoked(r)]
     all_rows_sorted = sorted(all_rows, key=lambda r: r.get("id") or "")
-    ordered = _rotate_from_cursor(all_rows_sorted, _read_cursor_fn())
+    ordered = _rotate_from_cursor(all_rows_sorted, cursor_id)
     rows = ordered[:max_rows] if max_rows and max_rows > 0 else ordered
     truncated = len(rows) < len(all_rows_sorted)
 
@@ -554,11 +601,12 @@ def sweep(
 
     token_cache: dict[str, dict] = {}
 
-    def _token_for(repo: str) -> dict:
+    def _token_for(repo: str, mint_timeout: Optional[int]) -> dict:
         if repo not in token_cache:
             from . import github_app_credentials as gac
 
-            token_cache[repo] = gac.mint_installation_token(repo)
+            kwargs = {} if mint_timeout is None else {"timeout": mint_timeout}
+            token_cache[repo] = gac.mint_installation_token(repo, **kwargs)
         return token_cache[repo]
 
     started = time.monotonic()
@@ -569,11 +617,23 @@ def sweep(
         if time_budget_s and (time.monotonic() - started) >= time_budget_s:
             truncated = True
             break
-        examined += 1
         envelope_id = row.get("id")
-        last_examined_id = envelope_id
         verb = row.get("verb") or ""
         shape = classify(row)
+
+        # A zero clipped timeout means THIS CALL IS OVER, not "every
+        # remaining row is unreachable" (rework of Loki's MEDIUM finding,
+        # probe 7AFN806Y, FAAD3E4A): once there is not enough budget left
+        # for even one more network round trip, stop here — do not count
+        # this row as examined, do not advance the cursor onto it, and do
+        # not spend a token mint (or a branch check) that has no time left
+        # to complete honestly.
+        if shape["class"] == "branch_bound" and _clipped_timeout(deadline) == 0:
+            truncated = True
+            break
+
+        examined += 1
+        last_examined_id = envelope_id
 
         if shape["class"] == "standing":
             kept_standing += 1
@@ -585,7 +645,7 @@ def sweep(
                 unreachable.append({"id": envelope_id, "verb": verb,
                                     "why": f"bounds carry no usable repo (got {repo!r})"})
                 continue
-            auth = _token_for(repo)
+            auth = _token_for(repo, _clipped_timeout(deadline))
             if not auth.get("ok"):
                 unreachable.append({"id": envelope_id, "verb": verb,
                                     "why": f"could not mint installation token for "
@@ -661,9 +721,17 @@ def sweep(
 
     # Advance the round-robin cursor only on a live call (rework of Loki's
     # MEDIUM finding, D81165E5) — a dry run must never perturb the live
-    # tick's progress through the register.
+    # tick's progress through the register. The write's own success/failure
+    # is what the receipt's `cursor` field reports below (rework of Loki's
+    # LOW finding, FAAD3E4A: a failed write used to be silent).
     if not dry_run and last_examined_id is not None:
-        _write_cursor_fn(last_examined_id)
+        cursor_written_ok = _write_cursor_fn(last_examined_id)
+        cursor_report = {
+            "state": "populated" if cursor_written_ok else "unreachable",
+            "value": last_examined_id if cursor_written_ok else None,
+        }
+    else:
+        cursor_report = {"state": cursor_read_state, "value": cursor_id or None}
 
     if not all_rows:
         state = "empty"
@@ -680,5 +748,6 @@ def sweep(
         kept_in_force=kept_in_force,
         unreachable=unreachable,
         truncated=truncated,
+        cursor=cursor_report,
     )
     return receipt

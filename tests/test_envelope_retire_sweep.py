@@ -19,13 +19,14 @@ from willow_mcp import envelope_retire_sweep as sweep_mod
 @pytest.fixture(autouse=True)
 def _no_real_cursor_file(monkeypatch):
     """Every test that does not explicitly inject read_cursor/write_cursor
-    gets a no-op cursor (always "", never persisted) — otherwise sweep()'s
-    default file-backed cursor would read/write a real file under
-    paths.store_root() and leak state between tests (and between this test
-    module and a live box). Tests of the cursor itself override both
-    params explicitly, which wins over this patch."""
-    monkeypatch.setattr(sweep_mod, "_read_cursor", lambda: "")
-    monkeypatch.setattr(sweep_mod, "_write_cursor", lambda envelope_id: None)
+    gets a no-op cursor (always absent, writes always "succeed" without
+    touching disk) — otherwise sweep()'s default file-backed cursor would
+    read/write a real file under paths.store_root() and leak state between
+    tests (and between this test module and a live box). Tests of the
+    cursor itself override both params explicitly, which wins over this
+    patch."""
+    monkeypatch.setattr(sweep_mod, "_read_cursor_state", lambda: ("", "absent"))
+    monkeypatch.setattr(sweep_mod, "_write_cursor", lambda envelope_id: True)
 
 
 def _row(**over):
@@ -77,7 +78,7 @@ def _fake_api(responses):
 def _monkeypatch_mint(monkeypatch, *, ok=True, token="tok"):
     from willow_mcp import github_app_credentials as gac
 
-    def fake_mint(repo):
+    def fake_mint(repo, timeout=20):
         if ok:
             return {"ok": True, "mode": "app", "token": token}
         return {"ok": False, "mode": "unavailable", "reason": "no creds in test"}
@@ -643,12 +644,25 @@ def test_sweep_time_budget_zero_means_unbounded_same_as_max_rows():
 # (rework of Loki's MEDIUM finding, D81165E5)
 # --------------------------------------------------------------------------
 
-def _fake_cursor():
+def _fake_cursor(*, writable=True):
     """An in-memory read/write pair, standing in for the file the real
     default persists to — shared mutable state across calls, same as a
-    real file would give across ticks."""
+    real file would give across ticks. `read_cursor()` returns `(value,
+    state)` and `write_cursor(id)` returns a success bool, matching
+    sweep()'s injectable contract. `writable=False` simulates an
+    unwritable store root: every write fails and the value never changes."""
     state = {"value": ""}
-    return (lambda: state["value"]), (lambda envelope_id: state.__setitem__("value", envelope_id))
+
+    def read():
+        return (state["value"], "populated") if state["value"] else ("", "absent")
+
+    def write(envelope_id):
+        if not writable:
+            return False
+        state["value"] = envelope_id
+        return True
+
+    return read, write
 
 
 def test_cursor_rotates_so_two_calls_examine_different_prefixes():
@@ -660,14 +674,15 @@ def test_cursor_rotates_so_two_calls_examine_different_prefixes():
                          read_cursor=read_cursor, write_cursor=write_cursor)
     assert r1["examined"] == 2
     assert r1["truncated"] is True
-    cursor_after_1 = read_cursor()
-    assert cursor_after_1 == "env-1"  # sorted ids env-0..env-4, first 2 examined
+    assert read_cursor()[0] == "env-1"  # sorted ids env-0..env-4, first 2 examined
+    assert r1["cursor"] == {"state": "populated", "value": "env-1"}
 
     r2 = sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=2,
                          read_cursor=read_cursor, write_cursor=write_cursor)
     assert r2["examined"] == 2
     # second call resumed past env-1, not from the top again
-    assert read_cursor() == "env-3"
+    assert read_cursor()[0] == "env-3"
+    assert r2["cursor"] == {"state": "populated", "value": "env-3"}
 
 
 def test_cursor_wraps_around_after_the_last_row():
@@ -677,7 +692,7 @@ def test_cursor_wraps_around_after_the_last_row():
 
     sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=3,
                     read_cursor=read_cursor, write_cursor=write_cursor)
-    assert read_cursor() == "env-2"  # examined every row this call
+    assert read_cursor()[0] == "env-2"  # examined every row this call
 
     r2 = sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=3,
                          read_cursor=read_cursor, write_cursor=write_cursor)
@@ -696,16 +711,41 @@ def test_cursor_skips_a_row_no_longer_present_and_resumes_past_it():
     receipt = sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=1,
                               read_cursor=read_cursor, write_cursor=write_cursor)
     assert receipt["examined"] == 1
-    assert read_cursor() == "env-3"  # resumed at the next HIGHER id, not env-1
+    assert read_cursor()[0] == "env-3"  # resumed at the next HIGHER id, not env-1
 
 
 def test_cursor_never_advances_on_a_dry_run():
     rows = [_row(id=f"env-{i}", verb="envelope.apply", bounds={}) for i in range(3)]
     reg = _registry(rows)
     read_cursor, write_cursor = _fake_cursor()
-    sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}), max_rows=2,
-                    read_cursor=read_cursor, write_cursor=write_cursor)
-    assert read_cursor() == ""
+    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}), max_rows=2,
+                              read_cursor=read_cursor, write_cursor=write_cursor)
+    assert read_cursor()[0] == ""
+    assert receipt["cursor"] == {"state": "absent", "value": None}
+
+
+def test_cursor_reports_unreachable_when_the_store_root_is_unwritable():
+    """Rework of Loki's LOW finding (FAAD3E4A): an unwritable store root
+    used to be silent — no cursor field, identical prefix every call."""
+    rows = [_row(id=f"env-{i}", verb="envelope.apply", bounds={}) for i in range(3)]
+    reg = _registry(rows)
+    read_cursor, write_cursor = _fake_cursor(writable=False)
+
+    r1 = sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=2,
+                         read_cursor=read_cursor, write_cursor=write_cursor)
+    assert r1["cursor"] == {"state": "unreachable", "value": None}
+    # the failed write means the value never actually changed
+    assert read_cursor()[0] == ""
+
+    r2 = sweep_mod.sweep(dry_run=False, registry=reg, api=_fake_api({}), max_rows=2,
+                         read_cursor=read_cursor, write_cursor=write_cursor)
+    # honest: still the same prefix, and the receipt still says why
+    assert r1["examined"] == r2["examined"] == 2
+    assert r2["cursor"]["state"] == "unreachable"
+
+
+def test_cursor_state_populated_absent_unreachable_are_the_only_values():
+    assert sweep_mod._read_cursor_state()[1] in ("populated", "absent", "unreachable")
 
 
 def test_cursor_path_lives_beside_the_seal_watchs_offset_file():
@@ -766,17 +806,119 @@ def test_branch_state_skips_the_second_call_when_budget_runs_out_between_them(mo
     assert "PR-history check" in state["reason"]
 
 
-def test_sweep_reports_a_hung_row_as_unreachable_not_a_crash():
-    """End-to-end: a deadline that is already gone before the row starts
-    means the row is reported unreachable, never attempted, never raises."""
+def test_sweep_ends_the_call_not_a_crash_when_deadline_is_already_gone(monkeypatch):
+    """End-to-end: a deadline already in the past means the row is never
+    examined and never attempted — not marked unreachable, not counted,
+    the call simply ends (rework of Loki's MEDIUM finding, probe
+    7AFN806Y, FAAD3E4A)."""
     row = _row()
     reg = _registry([row])
-    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}), time_budget_s=0.0001)
-    import time as _t
-    _t.sleep(0.001)
-    # Either examined (if the between-rows check didn't yet trip) or not —
-    # either way the call returns a receipt, never raises.
-    assert "state" in receipt
+    monkeypatch.setattr(sweep_mod.time, "monotonic", lambda: 1000.0)
+    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}), time_budget_s=1.0)
+    assert receipt["examined"] == 0
+    assert receipt["retired"] == receipt["kept_in_force"] == receipt["unreachable"] == []
+    assert receipt["truncated"] is True
+
+
+# --------------------------------------------------------------------------
+# Reproduction of Loki's probe 7AFN806Y (FAAD3E4A): 20 rows, a budget that
+# only fits a handful of network calls, three consecutive live calls — the
+# old bug burned the whole tail as fake "unreachable, examined" progress
+# with truncated=False; the fix must show real, bounded progress instead.
+# --------------------------------------------------------------------------
+
+def test_probe_7AFN806Y_never_claims_full_coverage_and_makes_real_progress(monkeypatch):
+    n = 20
+    rows = [_row(id=f"env-{i:02d}",
+                 bounds={"repo": "org/repo", "branches": [f"feat/{i:02d}"],
+                         "remote": "origin", "force": False})
+            for i in range(n)]
+    reg = _registry(rows)
+    clock = {"t": 0.0}
+
+    def fake_monotonic():
+        return clock["t"]
+
+    monkeypatch.setattr(sweep_mod.time, "monotonic", fake_monotonic)
+    _monkeypatch_mint(monkeypatch)
+
+    def api(method, url, *, bearer, body=None, timeout=20):
+        clock["t"] += 1.0  # simulate ~1s of real network cost per call
+        if "/branches/" in url:
+            return {"ok": True, "status": 200, "body": {"name": "x"}}  # still exists
+        raise AssertionError("branch exists -> the PR-history call is never reached")
+
+    read_cursor, write_cursor = _fake_cursor()
+    per_call_examined = []
+    for _ in range(3):
+        r = sweep_mod.sweep(dry_run=False, registry=reg, api=api, ledger=_FakeLedger(),
+                            time_budget_s=6.0, read_cursor=read_cursor, write_cursor=write_cursor)
+        assert r["truncated"] is True  # never claims full coverage of 20 rows
+        assert r["examined"] < n
+        per_call_examined.append({e["id"] for e in r["kept_in_force"]})
+
+    # Real progress: each call must not re-examine exactly the same set the
+    # first call did (the bug's signature: env-01..03 forever).
+    assert per_call_examined[1] != per_call_examined[0]
+    assert per_call_examined[2] != per_call_examined[0]
+    # And across the three calls, meaningfully more of the register has
+    # actually been looked at than what any single call covered alone.
+    total_seen = set().union(*per_call_examined)
+    assert len(total_seen) > len(per_call_examined[0])
+
+
+# --------------------------------------------------------------------------
+# App token mints: clipped to the SAME budget, checked at the SAME point
+# (rework of Loki's LOW finding, probe I, FAAD3E4A)
+# --------------------------------------------------------------------------
+
+def test_mint_never_called_when_budget_is_already_under_the_floor(monkeypatch):
+    row = _row()
+    reg = _registry([row])
+    monkeypatch.setattr(sweep_mod.time, "monotonic", lambda: 1000.0)
+    mint_calls = []
+
+    def fake_mint(repo, timeout=20):
+        mint_calls.append(timeout)
+        return {"ok": True, "mode": "app", "token": "t"}
+
+    from willow_mcp import github_app_credentials as gac
+    monkeypatch.setattr(gac, "mint_installation_token", fake_mint)
+
+    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}), time_budget_s=1.0)
+    assert mint_calls == []
+    assert receipt["examined"] == 0
+    assert receipt["truncated"] is True
+
+
+def test_mint_receives_the_clipped_timeout_not_a_flat_20(monkeypatch):
+    row = _row()
+    reg = _registry([row])
+    monkeypatch.setattr(sweep_mod.time, "monotonic", lambda: 1000.0)
+    mint_calls = []
+
+    def fake_mint(repo, timeout=20):
+        mint_calls.append(timeout)
+        return {"ok": False, "mode": "unavailable", "reason": "stub"}
+
+    from willow_mcp import github_app_credentials as gac
+    monkeypatch.setattr(gac, "mint_installation_token", fake_mint)
+
+    sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}), time_budget_s=10.0)
+    assert mint_calls == [10]  # min(20, 10s remaining), not the flat default
+
+
+def test_github_app_credentials_mint_installation_token_default_unchanged():
+    """Rework guard: every EXISTING caller of mint_installation_token
+    (pr_executor, push_executor) calls it with just `repo` — the new
+    `timeout` kwarg must default to 20, matching the client's prior
+    hardcoded behavior exactly."""
+    import inspect
+
+    from willow_mcp import github_app_credentials as gac
+
+    sig = inspect.signature(gac.mint_installation_token)
+    assert sig.parameters["timeout"].default == 20
 
 
 # --------------------------------------------------------------------------

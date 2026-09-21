@@ -115,13 +115,19 @@ def _api(method: str, url: str, *, bearer: str, body: dict | None = None,
         return {"ok": False, "status": 0, "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def mint_installation_token(repo: str) -> dict[str, Any]:
+def mint_installation_token(repo: str, timeout: int = 20) -> dict[str, Any]:
     """Mint a short-lived installation token for ``org/name``.
 
     On success: ``{ok, token, expires_at, permissions, installation_id, mode: "app"}``.
     On miss (no App coverage / no creds): ``{ok: False, reason, mode}``.
     The caller decides fall-back vs refuse — this module does not push.
-    """
+
+    ``timeout`` (default 20s, unchanged for every existing caller) is
+    passed to BOTH of this function's own HTTP calls — envelope_retire_sweep
+    clips it to whatever remains of its own wall-clock budget so a token
+    mint cannot itself overrun a nearly-exhausted tick (rework of Loki's
+    LOW finding on D81165E5/FAAD3E4A: mints used to always spend up to two
+    full 20s calls regardless of budget left)."""
     repo = (repo or "").strip().strip("/")
     if repo.count("/") != 1:
         return {"ok": False, "mode": "unavailable", "reason": "repo must be org/name"}
@@ -131,7 +137,7 @@ def mint_installation_token(repo: str) -> dict[str, Any]:
         return {"ok": False, "mode": "host", "reason": creds.get("reason", "App credentials missing")}
 
     jwt_token = _make_jwt(creds["app_id"], creds["pem"])
-    inst = _api("GET", f"{_API}/repos/{repo}/installation", bearer=jwt_token)
+    inst = _api("GET", f"{_API}/repos/{repo}/installation", bearer=jwt_token, timeout=timeout)
     if not inst.get("ok"):
         status = int(inst.get("status") or 0)
         if status == 404:
@@ -157,6 +163,7 @@ def mint_installation_token(repo: str) -> dict[str, Any]:
         f"{_API}/app/installations/{installation_id}/access_tokens",
         bearer=jwt_token,
         body={"repositories": [repo_name]},
+        timeout=timeout,
     )
     if not minted.get("ok"):
         return {
