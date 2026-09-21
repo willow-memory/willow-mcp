@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.73.0](https://github.com/willow-memory/willow-mcp/compare/v2.72.0...v2.73.0) (2026-09-21)
+
+
+### Added
+
+* **diagnostic:** per-app security-signal summary over the receipt log ([c8ebfa5](https://github.com/willow-memory/willow-mcp/commit/c8ebfa52407da6474317186641149839eca33952))
+
 ## [2.72.0](https://github.com/willow-memory/willow-mcp/compare/v2.71.0...v2.72.0) (2026-09-21)
 
 
