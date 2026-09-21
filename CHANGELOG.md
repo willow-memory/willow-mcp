@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **pr_checks_read:** extract the CI failure block from the full job log ([194ed57](https://github.com/willow-memory/willow-mcp/commit/194ed578bb1873f40e158e1d2561bb4b99d36e89))
 * **pr_checks_read:** extract the CI failure block from the full job log ([8132f12](https://github.com/willow-memory/willow-mcp/commit/8132f125e6681be4de163ad35d1c5a90a3d9ccf9))
 
 
