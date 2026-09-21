@@ -684,8 +684,14 @@ def fetch_url(
             "error": f"external-guard BLOCKED: {label}",
         }
 
-    body = external_guard.SANDWICH_TEMPLATE.format(content=text) if wrap else text
-    return {
+    # Frame in the per-result Muzzle boundary when wrapping. `escaped` is True
+    # if the content tried to carry a tool_output boundary — surfaced as
+    # `guard_escape` so the pipeline can receipt the forge attempt.
+    if wrap:
+        body, escaped = external_guard.frame(text, tool="web_fetch")
+    else:
+        body, escaped = text, False
+    out = {
         "ok": True,
         "url": url,
         "final_url": str(resp.url),
@@ -700,3 +706,6 @@ def fetch_url(
         "content": body,
         "wrapped": wrap,
     }
+    if escaped:
+        out["guard_escape"] = True
+    return out
