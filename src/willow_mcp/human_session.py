@@ -49,6 +49,12 @@ ORCHESTRATOR_WRITE_TOOLS = frozenset({
     "envelope_propose",
     "envelope_ratify",
     "envelope_reject",
+    # manifest_grant_execute (verb 18, #DE196AA9) writes into the trust root
+    # itself (mcp_apps/*/manifest.json). It is gated `envelope_apply` and is
+    # orchestrator-only inside the executor (`is_orchestrator_app`), but that
+    # inner check is a narrowing refusal, not the sole boundary — the same
+    # willow-seat-forgery argument above applies here unchanged.
+    "manifest_grant_execute",
 })
 
 # PR3: sidecar format tokens. v1 = original attest-session payload (PGP

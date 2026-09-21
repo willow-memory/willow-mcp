@@ -8558,17 +8558,25 @@ def _cmd_sign_manifest(args) -> None:
 def _cmd_manifest_grant(args) -> None:
     """`willow-mcp manifest-grant <pair_id> --envelope <id>` — the CLI wrapper
     around `manifest_grant_execute` (verb 18, `manifest.grant`), same code
-    path as the MCP tool. Runs as the orchestrator seat (`app_id="willow"`);
-    the executor itself refuses inside Kart and outside PGP-signed manifests
-    exactly as the MCP tool does — this wrapper adds no separate authority,
-    it is a keyboard door onto the same broker call."""
+    path as the MCP tool. `app_id` is resolved the same way every other CLI
+    command resolves it (`--app-id` / `$WILLOW_APP_ID`, default `willow`) —
+    not hardcoded, so a CLI invocation under a non-default orchestrator
+    identity is refused by the executor's own `is_orchestrator_app` check
+    instead of silently running as `willow` regardless of who called it.
+    Operator-terminal only, same non-forgeable tty-ownership guard
+    `allow-permission`/`deny-permission` use (Loki finding 6: an env-only
+    Kart check is not enough here either — this wrapper adds no separate
+    authority, it is a keyboard door onto the same broker call, so it needs
+    the same presence proof those sibling permission commands require)."""
     from . import manifest_grant_executor
     from .governance_ledger import GovernanceLedger
+    from .human_session import require_operator_terminal
 
+    require_operator_terminal()
     pg = get_pg()
     ledger = GovernanceLedger(pg) if pg else None
     result = manifest_grant_executor.execute_manifest_grant(
-        "willow",
+        args.app_id,
         envelope_id=args.envelope or "",
         pair_id=args.pair_id,
         project="willow-mcp",
@@ -10073,6 +10081,10 @@ def _build_parser():
     manifest_grant_p.add_argument(
         "--envelope", dest="envelope", default="",
         help="which active manifest.grant envelope to cite (required if more than one governs 'willow')",
+    )
+    manifest_grant_p.add_argument(
+        "--app-id", dest="app_id", default=os.environ.get("WILLOW_APP_ID", "willow"),
+        help="orchestrator identity to run as (default $WILLOW_APP_ID or 'willow')",
     )
 
     attest_session_p = subparsers.add_parser(
