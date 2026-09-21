@@ -1146,27 +1146,39 @@ def test_render_manifest_grant_service_template_has_no_user_line_or_trust_owner(
     """Fix 3 (unit honesty, pair 6bd11def): the service template must NOT
     carry a User= line or claim a trust-owner identity — a non-root --user
     manager can only run a unit as itself (systemd.exec). It must render
-    with WILLOW_KEYRING=/WILLOW_PGP_FINGERPRINT= filled, the ExecStartPre
-    that provisions manifest_grants/{pending,done,failed}, and no literal
-    /home/ path leaking in (no per-user identity baked into the unit)."""
+    with the ExecStartPre that provisions manifest_grants/{pending,done,
+    failed}, and no literal /home/ path leaking in (no per-user identity
+    baked into the unit).
+
+    Deliberately does NOT set WILLOW_KEYRING / WILLOW_PGP_FINGERPRINT in
+    the environment before calling render_values(): a real
+    `unit_install_execute` call never has either (WILLOW_KEYRING sits in
+    Kart's env_deny by design; WILLOW_PGP_FINGERPRINT is never exported
+    into the broker's own shell) — a prior version of this test supplied
+    both as fake env values, which hid the ETEMPLATE this row 17 defect
+    actually produced. Rendering here uses ONLY the keys render_values()
+    resolves for a plain process (WILLOW_MCP_APPS_ROOT/WILLOW_HOME set,
+    nothing else) and must still come back with no `@` placeholder left
+    unresolved."""
     from willow_mcp import unit_install_executor as uix
 
     apps_root = tmp_path / "mcp_apps"
     apps_root.mkdir()
     monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(apps_root))
-    monkeypatch.setenv("WILLOW_KEYRING", str(tmp_path / "verifiers.json"))
-    monkeypatch.setenv("WILLOW_PGP_FINGERPRINT", "ABCD1234")
+    monkeypatch.delenv("WILLOW_KEYRING", raising=False)
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "wh"))
 
     values = uix.render_values("willow-mcp-manifest-grant.service")
     assert "TRUST_OWNER" not in values
-    assert values.get("WILLOW_KEYRING") == str(tmp_path / "verifiers.json")
-    assert values.get("WILLOW_PGP_FINGERPRINT") == "ABCD1234"
+    assert "WILLOW_KEYRING" not in values
+    assert "WILLOW_PGP_FINGERPRINT" not in values
 
     template_path = (Path(__file__).resolve().parent.parent / "src" / "willow_mcp" / "bundle"
                      / "deploy" / "willow-mcp-manifest-grant.service.template")
     rendered = uix.render_template(template_path.read_text(encoding="utf-8"),
                                    "willow-mcp-manifest-grant.service", values=values)
+    assert "@" not in rendered
     # The [Service] block, minus ExecStart= (this dev box's own venv
     # interpreter path, not an identity claim) — the section that would
     # carry a User= directive or a baked-in per-user identity, if either
@@ -1174,8 +1186,28 @@ def test_render_manifest_grant_service_template_has_no_user_line_or_trust_owner(
     service_block = rendered.split("[Service]", 1)[1].split("ExecStart=", 1)[0]
     assert "User=" not in service_block
     assert "/home/" not in service_block
-    assert "Environment=\"WILLOW_KEYRING=" in rendered
-    assert "Environment=\"WILLOW_PGP_FINGERPRINT=ABCD1234\"" in rendered
+    # WILLOW_KEYRING / WILLOW_PGP_FINGERPRINT come from the broker's own
+    # canonical env file at run time, never a baked Environment= line —
+    # the fix for the ETEMPLATE this test used to hide.
+    assert f'EnvironmentFile={tmp_path / "wh"}/env' in rendered
+    assert "Environment=\"WILLOW_KEYRING=" not in rendered
+    assert "Environment=\"WILLOW_PGP_FINGERPRINT=" not in rendered
+    assert f'Environment="WILLOW_HOME={tmp_path / "wh"}"' in rendered
+    unset_line = next(line for line in rendered.splitlines() if line.startswith("UnsetEnvironment="))
+    unset_keys = set(unset_line[len("UnsetEnvironment="):].split())
+    assert {
+        "WILLOW_STORE_ROOT", "WILLOW_PG_DB", "WILLOW_PG_USER",
+        "NESTOR_SEAL_KEY", "NESTOR_REQUIRE_SEAL_KEY", "NESTOR_KEYRING",
+        "NESTOR_DB", "NESTOR_PERSONAL_DB", "NESTOR_PERSONAL_LEDGER",
+        "RATATOSK_GROVE_CHANNEL",
+    } <= unset_keys
+    assert not ({
+        "WILLOW_HOME", "WILLOW_KEYRING", "WILLOW_PGP_FINGERPRINT", "WILLOW_NESTOR_DB",
+        "WILLOW_MCP_APPS_ROOT", "WILLOW_MCP_PYTHON", "WILLOW_APP_ID", "WILLOW_IN_KART",
+    } & unset_keys)
+    service_keys = uix.unit_keys(rendered, "Service")
+    assert service_keys.get("NoNewPrivileges") == ["true"]
+    assert service_keys.get("PrivateTmp") == ["true"]
     assert "ExecStartPre=" in rendered
     assert "manifest_grants/pending" in rendered
     assert "manifest_grants/done" in rendered
