@@ -1,6 +1,6 @@
 # Spec: Adopt ShibaClaw safety machinery into willow-mcp
 
-- Status: Draft
+- Status: Draft — **P1 landed** (see the P1 status note below); P2/P3 open
 - Date: 2026-09-21
 - Source: fork audit (rudi193-cmd/ShibaClaw, Apache-2.0)
 - Scope: egress target validation, tool-output framing, install gating
@@ -45,6 +45,32 @@ This spec covers three adoptions (P1-P3) and one explicit non-adoption (P4).
 ---
 
 ## P1 (priority: highest) - Egress target validation + IP pinning
+
+> **Status (landed):** most of P1 was already shipped and the port would have
+> been redundant. `web_fetch.validate_fetch_url` already refuses the whole
+> blocked-range matrix (v4/v6 private, loopback, link-local, reserved,
+> multicast, non-global, the metadata address) with hostname *resolution* — not
+> ShibaClaw's name-only pattern match — plus IP-literal normalisation
+> (`inet_aton` tricks, percent-escapes), a per-hop redirect check, and an
+> https→http downgrade refusal. All outbound (web_search, mai/parser,
+> mcp_federation) funnels through it. So the port of `network.py`'s
+> `validate_url_target` was **not** adopted; it is a subset of what ships.
+>
+> Two pieces of P1 were genuinely missing and were the ones built:
+>
+> 1. **IP pinning (the crux).** `validate_fetch_url` resolved at check time and
+>    `requests` re-resolved at connect time — the rebind window this spec calls
+>    load-bearing. Closed by `web_fetch.resolve_pinned` (keeps the vetted
+>    addresses) + `_PinnedHTTPAdapter`, which dials only those addresses and
+>    never re-resolves the name. TLS SNI, the certificate hostname and the Host
+>    header stay bound to the name (urllib3 keeps those on `.host`; only the
+>    socket target moves). The proxy path pins nothing and dials as before.
+> 2. **Structured egress-denial receipts.** A refusal used to be a bare
+>    `log.warning`, filed by the pipeline as an ordinary `error`. It is now a
+>    `denied` receipt carrying `egress.private_target` / `egress.redirect_refused`
+>    — an attempted-SSRF row an operator can find, which is P1's "what completes
+>    it". (`egress.rebind_mismatch` is unneeded on the direct path: pinning
+>    *prevents* the rebind rather than detecting it after the fact.)
 
 ### Design
 

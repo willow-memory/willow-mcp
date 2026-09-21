@@ -306,6 +306,9 @@ packages = ["src/willow_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "live_dns: test needs a real resolver — opts out of the no-live-DNS stub in test_web_fetch (e.g. a socket-level pinning test that dials 127.0.0.1)",
+]
 
 [tool.ruff]
 line-length = 120
