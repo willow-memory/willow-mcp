@@ -31,6 +31,22 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.64.0](https://github.com/willow-memory/willow-mcp/compare/v2.63.0...v2.64.0) (2026-09-21)
+
+
+### Added
+
+* **mcp:** unit_install_execute — brokered systemd --user install from a tracked template (verb 17) ([39a278c](https://github.com/willow-memory/willow-mcp/commit/39a278c6b83decfef103b4f3edc2312d9849b54e))
+* **governance:** syscall-table row 17 — unit.install (sealed 197aafa5) ([5e217d2](https://github.com/willow-memory/willow-mcp/commit/5e217d2e87b40a18e96e7debe6ad018eda507322))
+
+
+### Fixed
+
+* **mcp:** unit_install — [Unit] start-dependencies are judged; refusals name the unit (Loki 1AEBF250) ([3584045](https://github.com/willow-memory/willow-mcp/commit/3584045243df91da2a185316ec64947ad3f04ca4))
+* **mcp:** unit_install — every name an enable creates or starts is judged by the bounds (Loki 0B774ED3) ([f9871bd](https://github.com/willow-memory/willow-mcp/commit/f9871bddfa85d104722590e137e618e45ad4d789))
+* **mcp:** unit_install — a timer activates only the unit it ships with; continuation lines; origin-only; bounded backups (Loki 02195799) ([18ccec8](https://github.com/willow-memory/willow-mcp/commit/18ccec85dc27d50271c9392f502cd704f2f3f783))
+* **mcp:** unit_install enforces the seal on what is installed, not on the argument (Loki FECF6FED) ([83df315](https://github.com/willow-memory/willow-mcp/commit/83df3153300e6903ebe1ba1f848694a764d3f4ce))
+
 ## [2.63.0](https://github.com/willow-memory/willow-mcp/compare/v2.62.0...v2.63.0) (2026-09-21)
 
 
