@@ -205,17 +205,31 @@ _DISCLAIMER_RE = re.compile(
 _NAMED_VERSION_RE = re.compile(r"\bruff\b[\s=(/]*v?" + _VERSION, re.IGNORECASE)
 
 
+# Quoted spans are descriptions, never measurements: a builder writing
+# "the clean word is `clean` adjacent to the linter word" is quoting the
+# rule, not claiming a run. Real claims carry no quotes (Loki C63A2C48).
+_QUOTED_SPAN_RE = re.compile(r"`[^`\n]*`|\"[^\"\n]*\"|“[^”\n]*”")
+# How far back an outcome-only clause may look for its linter word. A
+# report habitually puts a test count between the tool line and the
+# outcome line ("ruff 0.15.0. Tests: 81 passed. All checks passed."), so
+# one clause is the wrong boundary; three covers the ordinary shape.
+_LOOKBACK_CLAUSES = 3
+
+
 def _clauses(text: str) -> list[str]:
-    return [c.strip() for c in _CLAUSE_SPLIT_RE.split(text or "") if c and c.strip()]
+    stripped = _QUOTED_SPAN_RE.sub(" ", text or "")
+    return [c.strip() for c in _CLAUSE_SPLIT_RE.split(stripped) if c and c.strip()]
 
 
 def lint_claims(text: str) -> list[dict[str, Any]]:
     """Every clause of ``text`` that claims lint-clean, with the ruff
     versions that clause names. A clause is a claim when it carries a linter
     word AND a clean word AND no disclaimer. A clause that carries only the
-    clean word looks back ONE clause for the linter word and its version —
-    "ruff 0.15.0 was used. All checks passed." is the #48 shape written as
-    two sentences and must not walk past the gate (Loki 7AA9F436)."""
+    outcome looks back up to ``_LOOKBACK_CLAUSES`` for the nearest clause
+    with a linter word, stopping at a disclaimer or at a clause that itself
+    carries an outcome — "ruff 0.15.0 was used. Tests: 81 passed. All checks
+    passed." is the #48 shape as a report and must not walk past the gate
+    (Loki 7AA9F436, C63A2C48)."""
     out: list[dict[str, Any]] = []
     clauses = _clauses(text)
     for i, clause in enumerate(clauses):
@@ -225,10 +239,17 @@ def lint_claims(text: str) -> list[dict[str, Any]]:
             versions = [m.group(1) for m in _NAMED_VERSION_RE.finditer(clause)]
             out.append({"clause": clause, "versions": versions})
             continue
-        prev = clauses[i - 1] if i > 0 else ""
-        if prev and _LINTER_WORD_RE.search(prev) and not _DISCLAIMER_RE.search(prev):
-            versions = [m.group(1) for m in _NAMED_VERSION_RE.finditer(prev)]
-            out.append({"clause": f"{prev} / {clause}", "versions": versions})
+        for back in range(1, _LOOKBACK_CLAUSES + 1):
+            j = i - back
+            if j < 0:
+                break
+            prev = clauses[j]
+            if _DISCLAIMER_RE.search(prev) or (back > 1 and _CLEAN_WORD_RE.search(prev)):
+                break
+            if _LINTER_WORD_RE.search(prev):
+                versions = [m.group(1) for m in _NAMED_VERSION_RE.finditer(prev)]
+                out.append({"clause": f"{prev} / {clause}", "versions": versions})
+                break
     return out
 
 
@@ -258,8 +279,10 @@ def judge_lint_claim(evidence: str, pin: dict[str, Any]) -> dict[str, Any]:
 
     * pin ``unreachable`` → ``advisory`` (never refuse on what could not be read).
     * a claim naming no version → ``refuse`` (with the pin in the message).
-    * pin ``empty`` → ``accept`` any named version.
-    * any claim's named version == pinned → ``accept``; else ``refuse`` naming both.
+    * pin ``empty`` → ``accept`` when every claim names some version.
+    * judged PER CLAIM: every claim must name the pin; one claim naming
+      another version refuses, naming it (a half-measured tree does not
+      pass beside a measured one — Loki C63A2C48).
     """
     claims = lint_claims(evidence)
     pinned = pin.get("version")
@@ -275,30 +298,33 @@ def judge_lint_claim(evidence: str, pin: dict[str, Any]) -> dict[str, Any]:
             "named": named,
             "pinned": None,
         }
-    if not named:
+    unnamed = [c for c in claims if not c["versions"]]
+    if unnamed:
         where = f" — CI pins ruff {pinned} ({pin.get('source')})" if pinned else ""
         return {
             "verdict": "refuse",
             "reason": (
-                f"lint claim names no linter version: {claims[0]['clause']!r}{where}. "
+                f"lint claim names no linter version: {unnamed[0]['clause']!r}{where}. "
                 "A green that does not say which binary measured it is an assertion, not a measurement."
             ),
-            "named": None,
+            "named": named,
             "pinned": pinned,
         }
     if state == "empty" or not pinned:
-        return {"verdict": "accept", "reason": "repo pins no linter version; named version accepted", "named": named, "pinned": None}
-    if pinned in named_all:
-        return {"verdict": "accept", "reason": f"ruff {pinned} matches the CI pin ({pin.get('source')})", "named": pinned, "pinned": pinned}
-    return {
-        "verdict": "refuse",
-        "reason": (
-            f"lint measured with ruff {named} but CI pins ruff {pinned} ({pin.get('source')}) — "
-            "different default rule sets; re-measure with the pinned binary"
-        ),
-        "named": named,
-        "pinned": pinned,
-    }
+        return {"verdict": "accept", "reason": "repo pins no linter version; named versions accepted", "named": named, "pinned": None}
+    wrong = [c for c in claims if pinned not in c["versions"]]
+    if wrong:
+        bad = wrong[0]["versions"][0]
+        return {
+            "verdict": "refuse",
+            "reason": (
+                f"lint measured with ruff {bad} but CI pins ruff {pinned} ({pin.get('source')}) "
+                f"in {wrong[0]['clause']!r} — different default rule sets; re-measure with the pinned binary"
+            ),
+            "named": bad,
+            "pinned": pinned,
+        }
+    return {"verdict": "accept", "reason": f"ruff {pinned} matches the CI pin ({pin.get('source')}) in every claim", "named": pinned, "pinned": pinned}
 
 
 def judge_findings(findings: list, pin: dict[str, Any]) -> list[dict[str, Any]]:

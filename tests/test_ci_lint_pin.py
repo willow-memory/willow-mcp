@@ -150,6 +150,45 @@ def test_clean_claim_split_across_a_clause_looks_back_for_the_linter():
     assert clp.judge_lint_claim("ruff 0.15.0 not run. All checks passed.", _pin)["verdict"] == "none"
 
 
+def test_every_claim_must_name_the_pin():
+    """Loki C63A2C48 C7: a wrong-version clean claim riding beside a
+    pinned-version one must refuse — a half-measured tree does not pass."""
+    _pin = {"state": "populated", "version": "0.16.7", "source": "tests.yml"}
+    v = clp.judge_lint_claim("ruff 0.15.0 clean on src; ruff 0.16.7 clean on tests", _pin)
+    assert v["verdict"] == "refuse"
+    assert v["named"] == "0.15.0" and "0.16.7" in v["reason"] and "src" in v["reason"]
+    v = clp.judge_lint_claim("ruff 0.16.7 clean on src; ruff 0.16.7 format --check clean", _pin)
+    assert v["verdict"] == "accept"
+    v = clp.judge_lint_claim("ruff 0.16.7 check clean; format clean", _pin)
+    assert v["verdict"] == "refuse" and "names no linter version" in v["reason"]
+
+
+def test_quoted_spans_are_descriptions_not_claims():
+    """Loki C63A2C48 Q1/Q2: evidence that quotes the rule in backticks or
+    double quotes is describing it; the quoted span is stripped first."""
+    _pin = {"state": "populated", "version": "0.16.7", "source": "tests.yml"}
+    for text in [
+        "src/ci_lint_pin.py: the clean word is ruff's own outcome phrase (\"All checks passed\") or `clean` adjacent to the linter word",
+        "judge: a clean word is `clean` adjacent to the linter word — described, not claimed",
+        "_CLEAN_WORD_RE matches “All checks passed” after `ruff`",
+    ]:
+        assert clp.judge_lint_claim(text, _pin)["verdict"] == "none", text
+    assert clp.judge_lint_claim("ruff 0.15.0 check src: All checks passed", _pin)["verdict"] == "refuse"
+
+
+def test_lookback_spans_a_test_count_but_stops_at_a_disclaimer_or_an_outcome():
+    """Loki C63A2C48 L2: 'ruff 0.15.0. Tests: 81 passed. All checks passed.'
+    is the ordinary report shape and must be judged."""
+    _pin = {"state": "populated", "version": "0.16.7", "source": "tests.yml"}
+    v = clp.judge_lint_claim("ruff 0.15.0. Tests: 81 passed. All checks passed.", _pin)
+    assert v["verdict"] == "refuse" and v["named"] == "0.15.0"
+    assert clp.judge_lint_claim("ruff 0.16.7. Tests: 81 passed. 2 skipped. All checks passed.", _pin)["verdict"] == "accept"
+    assert clp.judge_lint_claim("ruff 0.15.0. a. b. c. All checks passed.", _pin)["verdict"] == "none"
+    assert clp.judge_lint_claim("ruff 0.15.0. ruff not run. All checks passed.", _pin)["verdict"] == "none"
+    claims = clp.lint_claims("ruff 0.15.0. All checks passed. pytest. All checks passed.")
+    assert len(claims) == 1 and claims[0]["versions"] == ["0.15.0"]
+
+
 def test_version_is_the_one_adjacent_to_the_clean_claim():
     """'CI pins ruff==0.16.7; measured with ruff 0.15.0: All checks passed'
     is a 0.15.0 measurement — order in the string must not decide."""
