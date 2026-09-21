@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **install_audit:** pre-exec CVE gate on package-install task bodies ([c13a642](https://github.com/willow-memory/willow-mcp/commit/c13a642fb28ad71db16469e37c28c6b8e5453690))
 * **install_audit:** pre-exec CVE gate on package-install task bodies ([f2a01df](https://github.com/willow-memory/willow-mcp/commit/f2a01df8c54691669075bec7d04705302fc649c6))
 
 ## [2.71.0](https://github.com/willow-memory/willow-mcp/compare/v2.70.0...v2.71.0) (2026-09-21)
