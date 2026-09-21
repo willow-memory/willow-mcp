@@ -55,6 +55,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -80,6 +81,26 @@ _PLACEHOLDER_RE = re.compile(r"@([A-Z][A-Z0-9_]*)@")
 
 def _refuse(errno: str, reason: str, **extra) -> dict:
     return {"ok": False, "error": errno, "reason": reason, "installed": False, **extra}
+
+
+#: The one keyboard guard every `install` CLI shares (reloader, net_signer,
+#: and the server's repo-sweep / worker / voice service actions). The
+#: keyboard path stays for a box with no broker, behind `--keyboard`, so
+#: typing it is a stated choice and not the default a runbook copies.
+KEYBOARD_REFUSAL = (
+    "install: use unit_install_execute (verb 17, unit.install) — the broker "
+    "writes, enables and starts the unit from the tracked template under an "
+    "envelope with a FRANK receipt. On a box with no broker, pass --keyboard."
+)
+
+
+def keyboard_install_refused(args, *, out=None) -> bool:
+    """True (and the refusal printed to ``out`` or stderr) when an ``install``
+    CLI was invoked without ``--keyboard``. Callers return exit 2."""
+    if getattr(args, "keyboard", False):
+        return False
+    print(KEYBOARD_REFUSAL, file=out or sys.stderr)
+    return True
 
 
 def unit_dir() -> Path:
@@ -182,8 +203,15 @@ def _file_ask(app_id: str, *, unit: str, source: str, errno: str, reason: str,
     )
 
 
-def _resolve_source(repo: str, rel: str, *, root: Optional[Path], runner) -> dict:
-    """The tracked template for ``repo@rel`` or an ``ENOSRC`` refusal."""
+def _resolve_clone(repo: str, *, root: Optional[Path], runner) -> dict:
+    """The verified clone of ``repo`` and its HEAD, or an ``ENOSRC`` refusal.
+
+    HEAD must be reachable from a remote-tracking ref: the seal's rationale
+    is that a unit is *reviewable in a PR before it is ever installable*,
+    and a local-only commit — a branch the builder never pushed, a detached
+    HEAD nobody else can see — is not (Loki FECF6FED; same shape as gap
+    fedcaaba36b7, resolved against branches that never landed). A
+    local-only template is therefore not installable through this verb."""
     from .pull_executor import resolve_clone_status
 
     status = resolve_clone_status(repo, root=root, runner=runner)
@@ -194,36 +222,106 @@ def _resolve_source(repo: str, rel: str, *, root: Optional[Path], runner) -> dic
                                      f"{status.get('candidates')}")
         return _refuse("ENOSRC", f"no verified clone of {repo!r} under the github root")
     clone = Path(clone)
-    tracked = _git(clone, "ls-files", "--error-unmatch", "--", rel, runner=runner)
-    if tracked.returncode != 0:
+    head = _git(clone, "rev-parse", "HEAD", runner=runner)
+    if head.returncode != 0 or not (head.stdout or "").strip():
+        return _refuse("ENOSRC", f"could not read HEAD of {clone}")
+    sha = (head.stdout or "").strip()
+    on_remote = _git(clone, "branch", "-r", "--contains", "HEAD", runner=runner)
+    if on_remote.returncode != 0 or not (on_remote.stdout or "").strip():
+        return _refuse("ENOSRC", f"HEAD {sha[:12]} of {repo!r} is not on any remote — "
+                                 f"a unit installs from a commit that was reviewable in a PR, "
+                                 f"never from a local-only commit")
+    return {"ok": True, "clone": clone, "head": sha,
+            "remote_refs": [r.strip() for r in on_remote.stdout.splitlines() if r.strip()]}
+
+
+def _read_tracked(clone: Path, repo: str, rel: str, *, runner) -> dict:
+    """One tracked, clean, in-tree regular file at HEAD — or ``ENOSRC``.
+
+    ``git ls-files --error-unmatch`` says git tracks *something* at ``rel``;
+    it says nothing about a symlink's target (git tracks the link). A tracked
+    symlink pointing outside the tree would install whatever the target holds
+    at install time, and the receipt's digest would be of that, not of what a
+    PR reviewer saw (Loki FECF6FED). So: refuse a symlink outright
+    (``lstat``, and mode ``120000`` from ``ls-files -s``), and refuse any path
+    whose realpath is not under the clone's realpath. Digest what the PR
+    shows."""
+    ls = _git(clone, "ls-files", "-s", "--error-unmatch", "--", rel, runner=runner)
+    if ls.returncode != 0:
         return _refuse("ENOSRC", f"{rel!r} is not a tracked file in {repo!r}")
+    mode = (ls.stdout or "").split(None, 1)[0] if (ls.stdout or "").strip() else ""
+    if mode == "120000":
+        return _refuse("ENOSRC", f"{rel!r} in {repo!r} is a tracked symlink — "
+                                 f"a unit installs from a file, never through a link")
     dirty = _git(clone, "status", "--porcelain", "--", rel, runner=runner)
     if dirty.returncode != 0:
         return _refuse("ENOSRC", f"could not read the status of {rel!r} in {repo!r}")
     if (dirty.stdout or "").strip():
         return _refuse("ENOSRC", f"{rel!r} in {repo!r} has uncommitted changes — "
                                  f"a unit installs from HEAD, never from a dirty tree")
-    head = _git(clone, "rev-parse", "HEAD", runner=runner)
-    if head.returncode != 0 or not (head.stdout or "").strip():
-        return _refuse("ENOSRC", f"could not read HEAD of {clone}")
     path = clone / rel
+    if path.is_symlink():
+        return _refuse("ENOSRC", f"{rel!r} in {repo!r} is a symlink on disk — "
+                                 f"a unit installs from a file, never through a link")
+    try:
+        inside = path.resolve().is_relative_to(clone.resolve())
+    except OSError as exc:
+        return _refuse("ENOSRC", f"could not resolve {path}: {exc}")
+    if not inside or not path.is_file():
+        return _refuse("ENOSRC", f"{rel!r} resolves outside {repo!r}'s tree or is not a regular file")
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         return _refuse("ENOSRC", f"could not read {path}: {exc}")
-    return {"ok": True, "clone": clone, "path": path, "text": text,
-            "head": (head.stdout or "").strip()}
+    return {"ok": True, "path": path, "text": text}
 
 
-def _timer_sibling(path: Path) -> Optional[Path]:
-    """``foo.service.template`` -> ``foo.timer.template`` beside it, when it
-    exists; the timer is installed with its service so ``Unit=`` never
-    points at a service that was not written."""
-    name = path.name
-    if not name.endswith(".service.template"):
+def _timer_sibling_rel(rel: str) -> Optional[str]:
+    """``foo.service.template`` -> ``foo.timer.template`` (a repo-relative
+    path, so the timer goes through the SAME tracked/clean/in-tree checks as
+    the service; a timer that fails them refuses the install — Loki
+    FECF6FED found an untracked sibling being the unit actually enabled)."""
+    if not rel.endswith(".service.template"):
         return None
-    cand = path.with_name(name[: -len(".service.template")] + ".timer.template")
-    return cand if cand.is_file() else None
+    return rel[: -len(".service.template")] + ".timer.template"
+
+
+_SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*$")
+#: Keys whose values name OTHER units. `enable` honours Alias= (creates the
+#: alias name), Also= (enables the named units); the rest bind or order —
+#: naming the broker's unit in any of them is content the argument-level
+#: EPERM was written to forbid (Loki FECF6FED, finding 3).
+_UNIT_NAMING_KEYS = {
+    "Install": ("Alias", "Also", "WantedBy", "RequiredBy", "UpheldBy"),
+    "Unit": ("Requires", "Requisite", "Wants", "BindsTo", "PartOf", "Upholds",
+             "Conflicts", "Before", "After", "OnFailure", "OnSuccess",
+             "PropagatesReloadTo", "ReloadPropagatedFrom", "JoinsNamespaceOf"),
+    "Timer": ("Unit",),
+    "Socket": ("Service",),
+    "Path": ("Unit",),
+}
+
+
+def broker_units_named(rendered: str) -> list[str]:
+    """Every unit name in the rendered text's naming keys that is the
+    broker's — an EPERM before citation when non-empty."""
+    hits: list[str] = []
+    section = ""
+    for raw in rendered.splitlines():
+        line = raw.strip()
+        m = _SECTION_RE.match(line)
+        if m:
+            section = m.group("name").strip()
+            continue
+        if not line or line.startswith(("#", ";")) or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip() not in _UNIT_NAMING_KEYS.get(section, ()):
+            continue
+        for name in value.split():
+            if is_broker_unit(name):
+                hits.append(f"[{section}] {key.strip()}={name}")
+    return hits
 
 
 def execute_unit_install(
@@ -276,7 +374,11 @@ def execute_unit_install(
             cause=state_before.get("cause"), detail=state_before.get("detail"),
         )
 
-    src = _resolve_source(repo, rel, root=github_root, runner=runner)
+    clone_info = _resolve_clone(repo, root=github_root, runner=runner)
+    if not clone_info.get("ok"):
+        return clone_info
+    clone, head_sha = clone_info["clone"], clone_info["head"]
+    src = _read_tracked(clone, repo, rel, runner=runner)
     if not src.get("ok"):
         return src
     declared = declared_unit_name(src["text"], src["path"])
@@ -285,12 +387,23 @@ def execute_unit_install(
             "ENAME", f"template {rel!r} declares unit {declared!r}, not {unit!r}",
             declared=declared,
         )
+    # The timer sibling is a repo-relative path put through the SAME
+    # tracked/clean/in-tree/regular-file checks as the service; an absent
+    # sibling is "no timer", a present one that fails them refuses the whole
+    # install (a timer is the unit that actually gets enabled).
+    timer_rel = _timer_sibling_rel(rel)
+    timer_src: Optional[dict] = None
+    timer_name = ""
+    if timer_rel is not None and (clone / timer_rel).exists():
+        timer_src = _read_tracked(clone, repo, timer_rel, runner=runner)
+        if not timer_src.get("ok"):
+            timer_src["reason"] = f"timer sibling: {timer_src['reason']}"
+            return timer_src
+        timer_name = declared_unit_name("", timer_src["path"])
     # One value set for the service and its timer: `@UNIT@` is the service
     # in both (a timer's `Unit=` names the service it schedules — rendering
     # them apart is how a timer drifts from its service, which the fleet's
     # own installers render together for exactly that reason).
-    timer_path = _timer_sibling(src["path"])
-    timer_name = declared_unit_name("", timer_path) if timer_path is not None else ""
     vals = dict(values) if values is not None else render_values(unit)
     vals.setdefault("SERVICE_UNIT", unit)
     if timer_name:
@@ -299,15 +412,24 @@ def execute_unit_install(
         rendered = render_template(src["text"], unit, values=vals)
     except ValueError as exc:
         return _refuse("ETEMPLATE", str(exc))
-
     timer_rendered = ""
-    if timer_path is not None:
+    if timer_src is not None:
         try:
-            timer_rendered = render_template(
-                timer_path.read_text(encoding="utf-8"), unit, values=vals,
-            )
-        except (OSError, ValueError) as exc:
-            return _refuse("ETEMPLATE", f"timer sibling {timer_path.name}: {exc}")
+            timer_rendered = render_template(timer_src["text"], unit, values=vals)
+        except ValueError as exc:
+            return _refuse("ETEMPLATE", f"timer sibling {timer_rel}: {exc}")
+
+    # EPERM on CONTENT, not only on the argument: `enable` creates Alias=
+    # names and enables Also= units, so a template naming the broker's unit
+    # in [Install]/[Unit]/[Timer] reaches the name the argument check forbids.
+    named = broker_units_named(rendered) + [f"timer: {h}" for h in broker_units_named(timer_rendered)]
+    if named:
+        return _refuse(
+            "EPERM",
+            f"the rendered unit names the broker's own unit — never grantable, "
+            f"regardless of bounds: {'; '.join(named)}",
+            named=named,
+        )
 
     if ledger is None:
         return _refuse(
@@ -359,17 +481,57 @@ def execute_unit_install(
         return out
 
     # ── the act ──────────────────────────────────────────────────────────────
+    # Replace is reversible: the previous unit is kept beside the new one as
+    # `<unit>.pre-install-<ts>` and put back if enable fails, so a failed
+    # install never leaves a changed definition of what runs under the
+    # operator's identity with only a sha256 surviving (Loki FECF6FED).
+    # Every failure after citation inks a FRANK row — the grant was spent.
     root = Path(destination) if destination is not None else unit_dir()
     root.mkdir(parents=True, exist_ok=True)
-    target = root / unit
-    replaced = target.is_file()
-    previous_digest = _digest(target.read_text(encoding="utf-8")) if replaced else ""
-    written = [str(target)]
-    target.write_text(rendered, encoding="utf-8")
-    if timer_path is not None:
-        timer_target = root / timer_name
-        timer_target.write_text(timer_rendered, encoding="utf-8")
-        written.append(str(timer_target))
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    targets: list[tuple[Path, str]] = [(root / unit, rendered)]
+    if timer_src is not None:
+        targets.append((root / timer_name, timer_rendered))
+    replaced = (root / unit).is_file()
+    previous_digest = _digest((root / unit).read_text(encoding="utf-8")) if replaced else ""
+    backups: list[tuple[Path, Path]] = []
+    written: list[str] = []
+    for target, body in targets:
+        if target.is_file():
+            keep = target.with_name(f"{target.name}.pre-install-{stamp}")
+            os.replace(target, keep)
+            backups.append((target, keep))
+        tmp = target.with_name(target.name + ".new")
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, target)
+        written.append(str(target))
+
+    def _fail(errno: str, reason: str) -> dict:
+        restored = []
+        for target, _ in targets:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+        for target, keep in backups:
+            try:
+                os.replace(keep, target)
+                restored.append(str(target))
+            except OSError as exc:  # noqa: PERF203 — report, never hide
+                restored.append(f"{target}: restore failed: {exc}")
+        out = {"ok": False, "installed": False, "error": errno, "reason": reason,
+               "written": written, "restored": restored, "previous_digest": previous_digest,
+               "envelope_id": matches[0], "citation_id": result.get("citation_id")}
+        try:
+            out["receipt_id"] = ledger.append(project, f"{EVENT}_failed", {
+                "actor": app_id, "unit": unit, "source": source, "repo": repo, "path": rel,
+                "head": head_sha, "errno": errno, "reason": reason, "written": written,
+                "restored": restored, "previous_digest": previous_digest,
+                "session": session, "citation_id": result.get("citation_id"),
+            })
+        except Exception as exc:  # noqa: BLE001 — the failure happened; the receipt failing is reported, not hidden
+            out["receipt_error"] = f"{type(exc).__name__}: {exc}"
+        return out
 
     enable_target = timer_name or unit
     for argv in (["systemctl", "--user", "daemon-reload"],
@@ -377,25 +539,22 @@ def execute_unit_install(
         try:
             proc = _run(argv, runner=runner, timeout=_SYSTEMCTL_TIMEOUT_S)
         except FileNotFoundError:
-            return {"ok": False, "installed": False, "error": "EUNREACH", "reason": "systemctl_missing",
-                    "written": written, "envelope_id": matches[0], "citation_id": result.get("citation_id")}
+            return _fail("EUNREACH", "systemctl_missing")
         except subprocess.TimeoutExpired:
-            return {"ok": False, "installed": False, "error": "ETIMEDOUT",
-                    "reason": f"{' '.join(argv[2:])} exceeded {_SYSTEMCTL_TIMEOUT_S}s",
-                    "written": written, "envelope_id": matches[0], "citation_id": result.get("citation_id")}
+            return _fail("ETIMEDOUT", f"{' '.join(argv[2:])} exceeded {_SYSTEMCTL_TIMEOUT_S}s")
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip()[-300:]
-            return {"ok": False, "installed": False, "error": "EINSTALL",
-                    "reason": tail or f"{' '.join(argv[2:])} exited {proc.returncode}",
-                    "written": written, "envelope_id": matches[0], "citation_id": result.get("citation_id")}
+            return _fail("EINSTALL", tail or f"{' '.join(argv[2:])} exited {proc.returncode}")
 
     state_after = show_unit(unit, runner=runner)
 
     receipt_out = {
         "ok": True, "installed": True, "unit": unit, "source": source,
-        "repo": repo, "path": rel, "head": src["head"],
+        "repo": repo, "path": rel, "head": head_sha, "remote_refs": clone_info["remote_refs"],
         "template_digest": _digest(src["text"]), "rendered_digest": _digest(rendered),
+        "timer_template_digest": _digest(timer_src["text"]) if timer_src else "",
         "replaced": replaced, "previous_digest": previous_digest,
+        "previous_kept": [str(k) for _, k in backups],
         "timer": timer_name, "written": written,
         "envelope_id": matches[0], "citation_id": result.get("citation_id"),
         "state_before": state_before, "state_after": state_after,
@@ -403,9 +562,11 @@ def execute_unit_install(
     try:
         rec = ledger.append(project, EVENT, {
             "actor": app_id, "unit": unit, "source": source, "repo": repo, "path": rel,
-            "head": src["head"], "template_digest": receipt_out["template_digest"],
-            "rendered_digest": receipt_out["rendered_digest"], "replaced": replaced,
-            "previous_digest": previous_digest, "timer": timer_name,
+            "head": head_sha, "template_digest": receipt_out["template_digest"],
+            "rendered_digest": receipt_out["rendered_digest"],
+            "timer_template_digest": receipt_out["timer_template_digest"],
+            "replaced": replaced, "previous_digest": previous_digest,
+            "previous_kept": receipt_out["previous_kept"], "timer": timer_name,
             "active_state_after": state_after.get("ActiveState"),
             "active_enter_after": state_after.get("ActiveEnterTimestamp"),
             "session": session, "citation_id": result.get("citation_id"),

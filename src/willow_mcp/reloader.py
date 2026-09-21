@@ -83,15 +83,6 @@ _ENV_REPO = "WILLOW_RELOADER_REPO"
 
 _SYSTEMCTL_TIMEOUT_S = 15
 
-#: Verb 17 (`unit.install`, sealed 197aafa5): installing a unit is a broker
-#: act under an envelope, not a keyboard act. The CLI keeps the keyboard
-#: path for a box with no broker, behind `--keyboard`, so typing it is a
-#: stated choice and not the default a runbook copies.
-KEYBOARD_REFUSAL = (
-    "install: use unit_install_execute (verb 17, unit.install) — the broker "
-    "writes, enables and starts the unit from the tracked template under an "
-    "envelope with a FRANK receipt. On a box with no broker, pass --keyboard."
-)
 
 
 # ── configuration ─────────────────────────────────────────────────────────────
@@ -456,8 +447,9 @@ def main(argv: Optional[list] = None) -> int:
         # Due-and-failed is the only exit that should wake anyone.
         return 1 if (out.get("act") and not out.get("reloaded")) else 0
     if args.command == "install":
-        if not args.keyboard:
-            print(KEYBOARD_REFUSAL, file=sys.stderr)
+        # Verb 17 (unit.install, sealed 197aafa5): one shared keyboard guard.
+        from .unit_install_executor import keyboard_install_refused
+        if keyboard_install_refused(args):
             return 2
         print(json.dumps(install_services(config, reload=not args.no_reload, interval=args.interval), indent=2))
         return 0

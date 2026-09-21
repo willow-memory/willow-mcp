@@ -565,13 +565,12 @@ def main(argv: Optional[list] = None) -> int:
         return 0
 
     if args.command == "install":
-        if not args.keyboard:
-            # Verb 17 (unit.install, sealed 197aafa5): the unit file is a
-            # broker act under an envelope. The signer is a SYSTEM unit whose
-            # root line stays the operator's, so this path is kept — but
-            # behind a flag, so typing it is a stated choice, not the default.
-            from .reloader import KEYBOARD_REFUSAL
-            print(KEYBOARD_REFUSAL, file=sys.stderr)
+        # Verb 17 (unit.install, sealed 197aafa5): the unit file is a broker
+        # act under an envelope. The signer is a SYSTEM unit whose root line
+        # stays the operator's, so this path is kept — behind the shared
+        # --keyboard guard, so typing it is a stated choice, not the default.
+        from .unit_install_executor import keyboard_install_refused
+        if keyboard_install_refused(args):
             return 2
         out = stage_install(stage_dir=Path(args.stage_dir) if args.stage_dir else None,
                             group=args.group)

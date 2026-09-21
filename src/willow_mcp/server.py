@@ -8001,6 +8001,18 @@ def _cmd_voice(args) -> None:
     VoiceDaemon(config).run()
 
 
+_KEYBOARD_HELP = "I am at a keyboard on a box with no broker; write the units by hand (verb 17 otherwise)"
+
+
+def _keyboard_install_refused(args) -> bool:
+    """Verb 17 (unit.install, sealed 197aafa5): the three `*-service install`
+    actions are the same keyboard act reloader/net_signer gate — one shared
+    guard, five call sites."""
+    from .unit_install_executor import keyboard_install_refused
+
+    return keyboard_install_refused(args)
+
+
 def _cmd_voice_service(args) -> None:
     from . import voice_service
 
@@ -8014,6 +8026,8 @@ def _cmd_voice_service(args) -> None:
         kokoro_voice=args.kokoro_voice,
         handler=args.handler,
     )
+    if args.action == "install" and _keyboard_install_refused(args):
+        raise SystemExit(2)
     if args.action == "install":
         result = voice_service.install(cfg)
     elif args.action == "status":
@@ -8174,6 +8188,8 @@ def _cmd_repo_sweep_service(args) -> None:
     if args.collection:
         overrides["collection"] = args.collection
     config = replace(config, **overrides)
+    if args.action == "install" and _keyboard_install_refused(args):
+        raise SystemExit(2)
     try:
         if args.action == "install":
             result = repo_sweep_service.install_services(config)
@@ -8205,6 +8221,8 @@ def _cmd_worker_service(args) -> None:
         app_id=args.app_id,
         heartbeat_root=Path(args.heartbeat_root).expanduser().resolve(),
     )
+    if args.action == "install" and _keyboard_install_refused(args):
+        raise SystemExit(2)
     try:
         if args.action == "install":
             result = worker_service.install_services(config)
@@ -9800,6 +9818,7 @@ def _build_parser():
         "repo-sweep-service",
         help="Install/status/uninstall the weekly repo-sweep timer without starting it")
     sweep_service_p.add_argument("action", choices=["install", "status", "uninstall"])
+    sweep_service_p.add_argument("--keyboard", action="store_true", help=_KEYBOARD_HELP)
     sweep_service_p.add_argument("--root", default=None)
     sweep_service_p.add_argument("--oncalendar", default=None,
                                  help="systemd OnCalendar (default 'Mon *-*-* 04:00:00')")
@@ -9810,6 +9829,7 @@ def _build_parser():
         help="Install/status/uninstall standalone fast+batch user units without starting or stopping them",
     )
     worker_service_p.add_argument("action", choices=["install", "status", "uninstall"])
+    worker_service_p.add_argument("--keyboard", action="store_true", help=_KEYBOARD_HELP)
     _service_home = os.environ.get("WILLOW_HOME", str(Path.home() / ".willow"))
     worker_service_p.add_argument("--python", default=sys.executable)
     worker_service_p.add_argument("--workdir", default=str(Path.cwd()))
@@ -9845,6 +9865,7 @@ def _build_parser():
         help="Install/status/uninstall the voice ingress systemd user unit",
     )
     voice_service_p.add_argument("action", choices=["install", "status", "uninstall"])
+    voice_service_p.add_argument("--keyboard", action="store_true", help=_KEYBOARD_HELP)
     voice_service_p.add_argument("--python", default=sys.executable)
     voice_service_p.add_argument("--workdir", default=str(Path.cwd()))
     voice_service_p.add_argument("--willow-home", default=_service_home)

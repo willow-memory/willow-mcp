@@ -168,7 +168,9 @@ class _Fake:
     `installed` flips `show` from unit_unknown to active after enable."""
 
     def __init__(self, *, tracked=True, dirty="", head="abc123", remote_ok=True,
-                 show_rc_before=1, bus_down=False, enable_rc=0, reload_rc=0):
+                 show_rc_before=1, bus_down=False, enable_rc=0, reload_rc=0,
+                 on_remote="  origin/master\n", mode="100644",
+                 timer_tracked=True, timer_dirty=""):
         self.tracked = tracked
         self.dirty = dirty
         self.head = head
@@ -177,6 +179,10 @@ class _Fake:
         self.bus_down = bus_down
         self.enable_rc = enable_rc
         self.reload_rc = reload_rc
+        self.on_remote = on_remote
+        self.mode = mode
+        self.timer_tracked = timer_tracked
+        self.timer_dirty = timer_dirty
         self.calls: list[list[str]] = []
         self._enabled = False
 
@@ -210,10 +216,15 @@ class _Fake:
                 return subprocess.CompletedProcess(argv, 0, "master\n", "")
             if rest == ["rev-parse", "HEAD"]:
                 return subprocess.CompletedProcess(argv, 0, self.head + "\n", "")
-            if rest[:2] == ["ls-files", "--error-unmatch"]:
-                return subprocess.CompletedProcess(argv, 0 if self.tracked else 1, "", "" if self.tracked else "error: pathspec")
+            if rest == ["branch", "-r", "--contains", "HEAD"]:
+                return subprocess.CompletedProcess(argv, 0, self.on_remote, "")
+            is_timer = rest and rest[-1].endswith(".timer.template")
+            if rest[:3] == ["ls-files", "-s", "--error-unmatch"]:
+                tracked = self.timer_tracked if is_timer else self.tracked
+                stdout = f"{self.mode} 0123456789abcdef0123456789abcdef01234567 0\t{rest[-1]}\n" if tracked else ""
+                return subprocess.CompletedProcess(argv, 0 if tracked else 1, stdout, "" if tracked else "error: pathspec")
             if rest[:2] == ["status", "--porcelain"]:
-                return subprocess.CompletedProcess(argv, 0, self.dirty, "")
+                return subprocess.CompletedProcess(argv, 0, self.timer_dirty if is_timer else self.dirty, "")
             raise AssertionError(f"unexpected git call {rest}")
         raise AssertionError(f"unexpected call {argv}")
 
@@ -395,6 +406,181 @@ def test_willow_2_0_reference_is_ETEMPLATE(home, tmp_path, monkeypatch, github_r
     assert out["error"] == "ETEMPLATE"
 
 
+# ── Loki FECF6FED: the seal's clauses hold for what is INSTALLED ─────────────
+
+def _tmpl_path(github_root):
+    return github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.service.template"
+
+
+def test_tracked_symlink_out_of_tree_is_ENOSRC(home, tmp_path, monkeypatch, github_root, dest):
+    """git tracks the LINK; read_text would follow it. Refused by lstat."""
+    _charter(tmp_path, monkeypatch)
+    outside = tmp_path / "outside.template"
+    outside.write_text("# unit: nestor-ui.service\n[Service]\nExecStart=/bin/evil\n")
+    p = _tmpl_path(github_root)
+    p.unlink()
+    p.symlink_to(outside)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["error"] == "ENOSRC" and "symlink" in out["reason"]
+    assert _citations(pg) == [] and not (dest / UNIT).exists()
+
+
+def test_symlink_mode_from_ls_files_is_ENOSRC_even_if_target_is_in_tree(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    out = _install(_FakeGovernancePg(), _Fake(mode="120000"), github_root, dest)
+    assert out["error"] == "ENOSRC" and "symlink" in out["reason"]
+
+
+def test_tracked_symlink_to_in_tree_file_is_still_ENOSRC(home, tmp_path, monkeypatch, github_root, dest):
+    """Even a link that stays inside the tree is refused — a unit installs
+    from a file, and the digest must be of what a PR shows."""
+    _charter(tmp_path, monkeypatch)
+    p = _tmpl_path(github_root)
+    real = p.with_name("real.service.template")
+    real.write_text(TEMPLATE)
+    p.unlink()
+    p.symlink_to(real)
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["error"] == "ENOSRC"
+
+
+def test_untracked_timer_sibling_refuses_the_whole_install(home, tmp_path, monkeypatch, github_root, dest):
+    """The timer is the unit that actually gets enabled; it goes through the
+    same tracked/clean checks as the service or the install refuses."""
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(TIMER)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(timer_tracked=False), github_root, dest)
+    assert out["error"] == "ENOSRC" and out["reason"].startswith("timer sibling:")
+    assert _citations(pg) == [] and not (dest / UNIT).exists() and not (dest / "nestor-ui.timer").exists()
+
+
+def test_dirty_timer_sibling_refuses(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(TIMER)
+    out = _install(_FakeGovernancePg(), _Fake(timer_dirty=" M deploy/nestor-ui.timer.template\n"), github_root, dest)
+    assert out["error"] == "ENOSRC" and "timer sibling" in out["reason"]
+
+
+def test_timer_digest_is_in_the_receipt(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(TIMER)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["ok"] and out["timer_template_digest"] == uix._digest(TIMER)
+    assert _receipts(pg)[0]["content"]["timer_template_digest"] == uix._digest(TIMER)
+
+
+@pytest.mark.parametrize("line", [
+    "[Install]\nAlias=willow-mcp-serve.service\n",
+    "[Install]\nAlso=willow-mcp-serve.service\n",
+    "[Install]\nWantedBy=willow-mcp.service\n",
+    "[Unit]\nRequires=willow-mcp-serve.service\n",
+    "[Unit]\nBindsTo=WILLOW-MCP-SERVE.socket\n",
+    "[Install]\nAlias=willow-mcp-serve@1.service\n",
+])
+def test_content_naming_the_broker_unit_is_EPERM_before_citation(home, tmp_path, monkeypatch, github_root, dest, line):
+    _charter(tmp_path, monkeypatch)
+    _tmpl_path(github_root).write_text(TEMPLATE + line)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["error"] == "EPERM" and out["named"], out
+    assert _citations(pg) == [] and not (dest / UNIT).exists()
+
+
+def test_timer_unit_naming_the_broker_is_EPERM(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(
+        "[Timer]\nOnUnitActiveSec=60s\nUnit=willow-mcp-serve.service\n")
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["error"] == "EPERM" and out["named"][0].startswith("timer:")
+
+
+def test_a_comment_or_description_naming_the_broker_is_not_EPERM(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    _tmpl_path(github_root).write_text(
+        "# unit: nestor-ui.service\n# restarts beside willow-mcp-serve.service\n"
+        "[Unit]\nDescription=lives next to willow-mcp-serve.service\n[Service]\nExecStart=@PYTHON@ -m nestor ui\n")
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["ok"], out
+
+
+def test_broker_units_named_parses_sections():
+    assert uix.broker_units_named("[Install]\nAlias=a.service willow-mcp-serve.service\n") == \
+        ["[Install] Alias=willow-mcp-serve.service"]
+    assert uix.broker_units_named("[Service]\nExecStart=/bin/willow-mcp-serve.service\n") == []
+    assert uix.broker_units_named("Alias=willow-mcp-serve.service\n") == []  # no section
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("willow-mcp-serve.service", True),
+    ("willow-mcp.service", True),
+    ("willow-mcp-serve@1.service", True),
+    ("willow-mcp-serve.socket", True),
+    ("Willow-MCP-Serve.timer", True),
+    ("willow-mcp-serve-helper.service", False),
+    ("x/willow-mcp.service", False),
+    ("willow-bot.service", False),
+    ("", False),
+])
+def test_is_broker_unit_matches_stem_instance_and_type(name, expected):
+    from willow_mcp.unit_reload_executor import is_broker_unit
+    assert is_broker_unit(name) is expected
+
+
+def test_local_only_head_is_ENOSRC(home, tmp_path, monkeypatch, github_root, dest):
+    """'Reviewable in a PR' — a HEAD on no remote-tracking ref installs nothing."""
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(on_remote=""), github_root, dest)
+    assert out["error"] == "ENOSRC" and "not on any remote" in out["reason"]
+    assert _citations(pg) == []
+
+
+def test_remote_refs_are_in_the_receipt(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    out = _install(_FakeGovernancePg(), _Fake(on_remote="  origin/master\n  origin/feat/x\n"), github_root, dest)
+    assert out["ok"] and out["remote_refs"] == ["origin/master", "origin/feat/x"]
+
+
+def test_replace_then_fail_restores_the_previous_unit_and_inks_a_failure_row(
+        home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    old = "[Unit]\nDescription=old\n"
+    (dest / UNIT).write_text(old)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(enable_rc=1), github_root, dest)
+    assert out["ok"] is False and out["error"] == "EINSTALL"
+    assert (dest / UNIT).read_text() == old, "previous unit must be back in place"
+    assert out["restored"] == [str(dest / UNIT)]
+    assert out["previous_digest"] == uix._digest(old)
+    failed = [r for r in pg.rows if r["event_type"] == f"{uix.EVENT}_failed"]
+    assert len(failed) == 1 and failed[0]["content"]["errno"] == "EINSTALL"
+    assert out["receipt_id"] == failed[0]["id"]
+    assert _receipts(pg) == []
+    # no stray .new / .pre-install files left behind on a restore
+    assert sorted(p.name for p in dest.iterdir()) == [UNIT]
+
+
+def test_fresh_install_then_fail_removes_the_written_unit(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(reload_rc=1), github_root, dest)
+    assert out["error"] == "EINSTALL" and not (dest / UNIT).exists()
+    assert [r for r in pg.rows if r["event_type"] == f"{uix.EVENT}_failed"]
+
+
+def test_successful_replace_keeps_the_previous_unit_beside_it(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    (dest / UNIT).write_text("[Unit]\nDescription=old\n")
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["ok"] and out["replaced"] and len(out["previous_kept"]) == 1
+    kept = Path(out["previous_kept"][0])
+    assert kept.is_file() and kept.name.startswith(f"{UNIT}.pre-install-")
+    assert kept.read_text() == "[Unit]\nDescription=old\n"
+
+
 # ── envelope discipline ───────────────────────────────────────────────────────
 
 def test_no_envelope_refuses_ENOENT_and_files_the_ask(home, tmp_path, monkeypatch, github_root, dest):
@@ -426,15 +612,19 @@ def test_source_outside_bounds_is_refused(home, tmp_path, monkeypatch, github_ro
 
 def test_envelope_consumed_only_on_success(home, tmp_path, monkeypatch, github_root, dest):
     """A cited-then-failed enable leaves a granted citation (the act was
-    authorized) but no `unit_install` receipt — and a second try under a
-    max_count=1 grant is EDQUOT, which is the honest reading: the grant was
-    spent on an act that did not complete, and that is visible."""
+    authorized), a `unit_install_failed` row naming the errno, and no
+    `unit_install` receipt — and a second try under a max_count=1 grant is
+    EDQUOT, which is the honest reading: the grant was spent on an act that
+    did not complete, and that is visible in the ledger."""
     _charter(tmp_path, monkeypatch, max_count=1)
     pg = _FakeGovernancePg()
     out = _install(pg, _Fake(enable_rc=1), github_root, dest)
     assert out["ok"] is False and out["error"] == "EINSTALL"
     assert _receipts(pg) == []
     assert len(_citations(pg)) == 1
+    assert [r for r in pg.rows if r["event_type"] == f"{uix.EVENT}_failed"]
+    again = _install(pg, _Fake(), github_root, dest)
+    assert again["error"] == "EDQUOT"
 
 
 def test_no_ledger_is_EAMBIG_before_any_write(home, tmp_path, monkeypatch, github_root, dest):
@@ -456,3 +646,38 @@ def test_reloader_install_runs_with_keyboard(capsys, monkeypatch, tmp_path):
     monkeypatch.setattr(reloader, "install_services", lambda *a, **k: called.setdefault("ok", True) and {"installed": []})
     assert reloader.main(["install", "--keyboard", "--no-reload"]) == 0
     assert called == {"ok": True}
+
+
+@pytest.mark.parametrize("cmd,module,fn", [
+    ("repo-sweep-service", "repo_sweep_service", "install_services"),
+    ("worker-service", "worker_service", "install_services"),
+    ("voice-service", "voice_service", "install"),
+])
+def test_server_service_install_actions_share_the_keyboard_guard(capsys, monkeypatch, cmd, module, fn):
+    """One helper, five call sites: the three server `*-service install`
+    actions refuse without --keyboard exactly like reloader/net_signer."""
+    import importlib
+
+    from willow_mcp import server
+
+    mod = importlib.import_module(f"willow_mcp.{module}")
+    monkeypatch.setattr(mod, fn, lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
+    parser = server._build_parser() if hasattr(server, "_build_parser") else None
+    if parser is None:
+        pytest.skip("server exposes no parser builder to drive; guard covered by the shared-helper test")
+    args = parser.parse_args([cmd, "install"] + (["--wake-models", "x"] if cmd == "voice-service" else []))
+    handler = {"repo-sweep-service": server._cmd_repo_sweep_service,
+               "worker-service": server._cmd_worker_service,
+               "voice-service": server._cmd_voice_service}[cmd]
+    with pytest.raises(SystemExit) as exc:
+        handler(args)
+    assert exc.value.code == 2
+    assert "unit_install_execute" in capsys.readouterr().err
+
+
+def test_keyboard_guard_helper_is_the_one_all_sites_use(capsys):
+    from types import SimpleNamespace
+
+    assert uix.keyboard_install_refused(SimpleNamespace(keyboard=True)) is False
+    assert uix.keyboard_install_refused(SimpleNamespace()) is True
+    assert "unit_install_execute" in capsys.readouterr().err
