@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **web_fetch:** pin the outbound connection to the vetted IP; receipt egress denials ([bb8f134](https://github.com/willow-memory/willow-mcp/commit/bb8f134c55811d6913321ca492cb4e73c17ab8f9))
 * **web_fetch:** pin the outbound connection to the vetted IP; receipt egress denials ([30b581e](https://github.com/willow-memory/willow-mcp/commit/30b581e661828c47c40250f4347e58f4fcd55b2d))
 
 ## [2.69.1](https://github.com/willow-memory/willow-mcp/compare/v2.69.0...v2.69.1) (2026-09-21)
