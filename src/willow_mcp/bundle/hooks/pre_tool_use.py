@@ -1,6 +1,6 @@
 """willow-mcp Claude Code hook — PreToolUse.
 
-Nine guards:
+Ten guards:
 - The willow seat does not use Shell (2026-09-14, gap 715d89fe3c90): for the
   human-orchestrator seat every Bash command is blocked, and the refusal
   names the fleet tool that replaces it — Read / search_code / detect_changes
@@ -50,8 +50,32 @@ Nine guards:
   a manifest to add an egress capability (`task_net` / `integration_net` /
   `web_net` / `mcp_federation`), the Grove relay capability (`grove_relay`), or
   any write-capable permission group (blocks).
+- Spawn guard (sealed rule c9ca1a09, pair 72f528ab / record b4a8cbe7, gap
+  20e6d23971dc): the harness `Agent` tool, when the spawn prompt OR
+  description names a fleet seat by ENTERING it — `session_enter(app_id=
+  "<seat>"`, a case-insensitive `app_id`/`APP_ID`/JSON `"app_id": "<seat>"`
+  shape (straight or curly quotes), "You are <Display name>" / "You're
+  <Display name>" / "Enter as <Display name>" framing (markdown-bolded or
+  not), `<Display name>,` opening the text, or a `personas/<seat>.md`
+  reference. A bare `app_id=<seat>` that appears only as an argument to a
+  read-only lookup call (`handoff_read`, `dispatch_read`, `session_read`,
+  `store_get`, …) is a MENTION, not an entry, and is not matched. The
+  orchestrator seat (`willow`) is a spawn target only under the two
+  strongest framings (`session_enter(` or a "You are"/"You're"/"Enter as"
+  sentence) — a bare `app_id=willow` mention inside a lookup never refuses a
+  non-seat spawn. Any other named seat whose role appears in
+  `specialists.json`'s `model_hint_session` field (the same field the
+  fleet's "no self-assigned models" guarantee already names — one source,
+  not a second table) must be spawned with `model=` set to that role's
+  pinned value — missing or mismatched blocks. `subagent_type="fork"`
+  (matched case-insensitively) is refused for ANY named seat regardless of
+  the table, since a fork inherits the caller's model and cannot carry a
+  pin. A prompt/description naming no known seat (Explore, Plan, a plain
+  general-purpose spawn) is untouched. Cursor dialect is explicitly out of
+  scope for this one guard (see check_agent_spawn's docstring) — the other
+  nine guards above are unaffected (blocks; see check_agent_spawn).
 
-That third guard is the sudo invariant (FRANK `90e52ab7`) enforced where the
+That egress-keys guard above (bullet 9) is the sudo invariant (FRANK `90e52ab7`) enforced where the
 agent actually acts: *a model may REQUEST egress, never CONFIRM it.* It is a
 guardrail, not a control — a hook lives in the agent's own harness and an agent
 that bypasses it faces no OS-level obstacle on a single-uid host. The control is
@@ -846,6 +870,21 @@ _KEYSTORE_REASON = (
     "standing, never CONFIRM it (sudo invariant, D2). Reading is fine; writing is not."
 )
 
+# Sealed rule c9ca1a09: the file that decides the Agent-spawn model pin —
+# specialists.json's own model_hint_session field, either the bundle copy or
+# a top-level config/ shadow — is not fleet-writable. Matches both filenames
+# so a reintroduced spawn_models.json (the split-brain the rework removed)
+# stays guarded too, not just the file that replaced it.
+_SPAWN_CONFIG_RE = re.compile(r"(?:^|/)(?:bundle/)?config/(?:spawn_models|specialists)\.json$")
+_SPAWN_CONFIG_REASON = (
+    "willow-mcp: this writes specialists.json — the file whose model_hint_session "
+    "field the Agent-spawn guard reads to decide a seat's pinned model (sealed "
+    "rule c9ca1a09, pair 72f528ab). A seat editing its own pin table to raise or "
+    "drop a pin is the same self-grant class the manifest guard above refuses: an "
+    "agent may REQUEST a repin, never CONFIRM it itself (sudo invariant, FRANK "
+    "90e52ab7). Ask the operator to ratify the change; do not write the file."
+)
+
 
 # "Retaking the seat": adding a WRITE-capable permission group (or widening
 # store_scope to everything) to a manifest re-grants the very authority the
@@ -1248,17 +1287,27 @@ def check_owned_db_file_write(tool_input: dict) -> Optional[str]:
 
 
 def check_trust_root_write(tool_input: dict) -> Optional[str]:
-    """Block a Write/Edit that mints a lease, writes an identity secret, or slips
-    `task_net` into a manifest."""
+    """Block a Write/Edit that mints a lease, writes an identity secret, slips
+    `task_net` into a manifest, or edits the spawn guard's own pin table.
+
+    The path is `os.path.normpath`-ed before every path regex below
+    (`_LEASE_DIR_RE`, `_KEYSTORE_RE`, `_SPAWN_CONFIG_RE`, `_MANIFEST_RE`) —
+    normpath collapses a doubled separator (`config//specialists.json`) and a
+    `.` segment (`config/./specialists.json`) alike, so a caller cannot slip
+    a guarded write past these anchored-on-`$` patterns with either spelling
+    (regex-boundary defect, Loki re-audit 2026-09-21)."""
     tool_input = tool_input or {}
     path = str(tool_input.get("file_path", "") or "")
     if not path:
         return None
-    if _LEASE_DIR_RE.search(path):
+    normalized = os.path.normpath(path)
+    if _LEASE_DIR_RE.search(normalized):
         return _SELF_GRANT_REASON
-    if _KEYSTORE_RE.search(path):
+    if _KEYSTORE_RE.search(normalized):
         return _KEYSTORE_REASON
-    if _MANIFEST_RE.search(path):
+    if _SPAWN_CONFIG_RE.search(normalized):
+        return _SPAWN_CONFIG_REASON
+    if _MANIFEST_RE.search(normalized):
         # Only the permissions that carry escalation. Editing a manifest for any
         # other reason is ordinary work and must not be blocked.
         written = " ".join(str(tool_input.get(k, "") or "")
@@ -1272,6 +1321,619 @@ def check_trust_root_write(tool_input: dict) -> Optional[str]:
             or _SCOPE_ALL_RE.search(written)
         ):
             return _SEAT_ESCALATION_REASON
+    return None
+
+
+_SPAWN_GUARD_RULE = "c9ca1a09"
+
+# Fallback specialist rows, used only when config/specialists.json can't be
+# read (deleted, malformed, or this hook copy has no config/ sibling — see
+# _bundle_config_candidates). A missing registry must not silently disable
+# the spawn guard for every seat; it degrades to this literal set instead.
+# Kept in step with the shipped registry by
+# tests/test_pre_tool_use_hook.py::test_fallback_specialists_track_the_registry.
+_FALLBACK_SPECIALISTS = [
+    {"agent_id": "hanuman", "display_name": "Hanuman", "role": "builder", "human_only": False},
+    {"agent_id": "loki", "display_name": "Loki", "role": "auditor", "human_only": False},
+    {"agent_id": "jeles", "display_name": "Jeles", "role": "librarian", "human_only": False},
+    {"agent_id": "ada", "display_name": "Ada", "role": "operator", "human_only": False},
+    {"agent_id": "skirnir", "display_name": "Skirnir", "role": "witness", "human_only": False},
+    {"agent_id": "vishwakarma", "display_name": "Vishwakarma", "role": "architect", "human_only": False},
+    {"agent_id": "heimdallr", "display_name": "Heimdallr", "role": "gatekeeper", "human_only": False},
+    {"agent_id": "binder", "display_name": "The Binder", "role": "records", "human_only": False},
+    {"agent_id": "willow", "display_name": "Willow", "role": "orchestrator", "human_only": True},
+]
+
+# Role -> required Agent-spawn session model, sealed pair c9ca1a09. Mirrors
+# specialists.json's own model_hint_session field; used only if that file
+# can't be read at all (see _load_spawn_models).
+_FALLBACK_SPAWN_MODELS = {"builder": "sonnet", "auditor": "opus"}
+
+# The harness's short session-model aliases. specialists.json's
+# model_hint_session field is overloaded: for most rows it's a literal
+# Anthropic model id (e.g. "claude-haiku-4-5-20251001") or null, meaning
+# "inherit the caller's default" — neither is a spawn-guard pin. Only a row
+# whose value is one of these short aliases is read as a pin, which is how
+# a single field serves both purposes without a second table (finding:
+# split-brain between specialists.json and a duplicate spawn_models.json).
+_SHORT_MODEL_ALIASES = frozenset({"sonnet", "opus", "haiku"})
+
+
+def _bundle_config_candidates(filename: str) -> list[str]:
+    """Where a bundle config JSON lives relative to THIS file. This module
+    ships at two paths that must stay byte-identical
+    (src/willow_mcp/bundle/hooks/pre_tool_use.py and the top-level
+    hooks/pre_tool_use.py mirror tested against it), and each copy reaches
+    the SAME real bundle config by a different relative path — never both.
+    The bundle copy has config/ as a direct sibling of hooks/; that is the
+    only candidate that exists in a real install, so if it's there, it's the
+    one path returned. The top-level mirror has no sibling config/ at all —
+    it's a test-only copy, not an install shape — so it walks up to the repo
+    root and back down to the bundle's own config/ instead. Picking one
+    shape rather than trying both (one of which is always a dead path in any
+    given install) keeps production reading exactly the one real file.
+    Tests may monkeypatch this whole function to point at a fixture
+    directory instead of either real path."""
+    hook_dir = os.path.dirname(os.path.abspath(__file__))
+    sibling_config = os.path.join(hook_dir, "..", "config")
+    if os.path.isdir(sibling_config):
+        return [os.path.join(sibling_config, filename)]
+    return [os.path.join(hook_dir, "..", "src", "willow_mcp", "bundle", "config", filename)]
+
+
+def _load_json_config(filename: str) -> Optional[dict]:
+    """Best-effort stdlib-only JSON load, same fail-safe shape as
+    _load_remote_posture above: a missing/malformed file at any candidate
+    path is silently skipped, never raised."""
+    for path in _bundle_config_candidates(filename):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _load_specialist_rows() -> "tuple[list[dict], bool]":
+    """Load specialist + orchestrator rows from config/specialists.json.
+    Returns (rows, used_fallback)."""
+    data = _load_json_config("specialists.json")
+    rows: list = []
+    if isinstance(data, dict):
+        for row in data.get("specialists") or []:
+            if isinstance(row, dict) and row.get("agent_id"):
+                rows.append(row)
+        orch = data.get("orchestrator_seat")
+        if isinstance(orch, dict) and orch.get("agent_id"):
+            rows.append(orch)
+    if rows:
+        return rows, False
+    return _FALLBACK_SPECIALISTS, True
+
+
+def _load_spawn_models() -> dict:
+    """Role -> required Agent-spawn model, derived from the SAME
+    specialists.json rows _load_specialist_rows reads — one source, not a
+    duplicated spawn_models.json (the split-brain the rework closed). A
+    row's model_hint_session pins its role only when the value is one of
+    _SHORT_MODEL_ALIASES; a full Anthropic model id or null is a session
+    hint for something else, not a spawn-guard pin. Config, not code
+    (sealed pair c9ca1a09): editing specialists.json changes the guard's
+    behaviour with no code edit — see
+    test_pre_tool_use_hook.py::test_agent_spawn_table_reads_specialists_json_not_code.
+    Falls back to _FALLBACK_SPAWN_MODELS only when specialists.json can't be
+    read at all."""
+    rows, used_fallback = _load_specialist_rows()
+    if used_fallback:
+        return dict(_FALLBACK_SPAWN_MODELS)
+    table: dict = {}
+    for row in rows:
+        role = row.get("role")
+        hint = row.get("model_hint_session")
+        if role and isinstance(hint, str) and hint in _SHORT_MODEL_ALIASES:
+            table[role] = hint
+    return table or dict(_FALLBACK_SPAWN_MODELS)
+
+
+# Matches an app_id shape naming a seat: `app_id="<seat>"`, `app_id: <seat>`,
+# `APP_ID="<seat>"`, JSON `"app_id": "<seat>"`, straight or curly quotes.
+# Case-insensitive on the keyword AND the seat id — `_detect_specialist_seat`
+# looks the captured text up in a lower-cased id table. Anchored on the
+# keyword so this can't match an unrelated word that merely contains
+# "app_id". An optional Python string prefix (`f`, `r`, `b`, `u`, or a pair
+# like `rb`) directly in front of the opening quote is consumed and
+# discarded — `app_id=f"willow"` used to let the prefix letter itself get
+# captured as the id, so neither the session_enter tier nor the bare tier
+# ever found a real seat and the spawn passed with no pin at all
+# (Loki fourth audit 2026-09-21). `str("willow")` is not a prefix and stays
+# a stated limit — the guard does not evaluate the prompt as code.
+_APP_ID_RE = re.compile(
+    r'app_id["\']?\s*[=:]\s*(?:[rRbBuUfF]{1,2}(?=["\'‘’“”]))?["\'‘’“”]?([A-Za-z][A-Za-z0-9_-]*)',
+    re.IGNORECASE,
+)
+
+# The read-only lookup calls a prompt or description can legitimately quote
+# an app_id into as an ARGUMENT, not an entry — handoff_read(app_id="hanuman")
+# names hanuman as the packet to read, not a seat to become. Masked out
+# before the bare-app_id detection tier runs (see _mask_read_only_calls) so
+# these never trip it; session_enter is deliberately absent from this set —
+# it is the entry call, scanned first, at full priority, never masked.
+_READ_ONLY_LOOKUP_CALLS = frozenset({
+    "handoff_read", "dispatch_read", "session_read", "store_get",
+    "store_list", "store_search", "store_search_all", "dispatch_list",
+    "task_status", "task_list", "whoami", "verify_handoff",
+    "kb_journal_read", "specialist_get", "specialist_list",
+    "diagnostic_summary", "fleet_status", "fleet_health",
+})
+
+
+# The paren-less prose shape ("Run handoff_read with app_id=hanuman") names
+# the same lookup call but never opens a `(...)` argument list at all, so the
+# paren-depth masking below never sees it. Matched separately and only the
+# `app_id=<seat>` fragment is blanked, not the call name — a read-only call
+# named without parens is still a lookup, not an entry, and must not trip the
+# bare-app_id tier either. Bounded to a short run of non-sentence-ending text
+# between the call name and app_id= so this cannot reach across an unrelated
+# later sentence.
+_READ_ONLY_PROSE_APP_ID_RE = re.compile(
+    r'(?:(?<=__)|\b)(?:' + '|'.join(re.escape(t) for t in _READ_ONLY_LOOKUP_CALLS) + r')\b'
+    r'(?!\s*\()'
+    r'[^\n.;(]{0,40}?(app_id\s*[=:]\s*[\'"]?[A-Za-z][A-Za-z0-9_-]*)',
+    re.IGNORECASE,
+)
+
+
+def _mask_read_only_calls(text: str) -> str:
+    """Blank the parenthesised argument text of any _READ_ONLY_LOOKUP_CALLS
+    invocation in `text`, so a bare app_id=<seat> that appears only as an
+    argument to a lookup cannot trip the bare-app_id detection tier. Uses a
+    simple paren-depth counter, not a full parser — good enough for the
+    single-call-per-mention shapes this guard sees in a prompt/description.
+    A second pass then blanks the paren-LESS prose shape ("Run handoff_read
+    with app_id=hanuman") the same way — masking only the app_id=<seat>
+    fragment, since the call name itself carries no seat framing.
+
+    The call-name boundary is `(?:(?<=__)|\\b)`, not a bare `\\b` — a bare
+    `\\b` never fires between the two underscores of an MCP-qualified name
+    (`mcp__willow-mcp__handoff_read(...)`), so that canonical spelling — the
+    one every seat actually sees in its own tool list — went unmasked and
+    tripped the bare-app_id tier (false positive, Loki third audit
+    2026-09-21). The paren-less prose pattern below already carries this
+    same prefix; this pass now matches it. `names_pattern` is also compiled
+    with `re.IGNORECASE` — `_READ_ONLY_PROSE_APP_ID_RE` and `_APP_ID_RE`
+    already were, but this pattern was not, so a capitalised call
+    (`Handoff_Read(...)`, `HANDOFF_READ(...)`) went unmasked in the paren
+    pass while the prose pass's `(?!\\s*\\()` refused to treat it as a
+    lookup either, tripping the bare-app_id tier with a sonnet pin (false
+    positive, Loki fourth audit 2026-09-21)."""
+    if not text:
+        return text
+    names_pattern = re.compile(
+        r'(?:(?<=__)|\b)(?:' + '|'.join(re.escape(t) for t in _READ_ONLY_LOOKUP_CALLS) + r')\s*\(',
+        re.IGNORECASE,
+    )
+    out: list = []
+    pos = 0
+    n = len(text)
+    for m in names_pattern.finditer(text):
+        if m.start() < pos:
+            continue
+        out.append(text[pos:m.end()])
+        depth = 1
+        j = m.end()
+        while j < n and depth:
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+            j += 1
+        out.append(" " * (j - m.end()))
+        pos = j
+    out.append(text[pos:])
+    masked = "".join(out)
+
+    def _blank_app_id(m: "re.Match[str]") -> str:
+        start, end = m.span(1)
+        prefix_len = start - m.start()
+        return m.group(0)[:prefix_len] + " " * (end - start)
+
+    return _READ_ONLY_PROSE_APP_ID_RE.sub(_blank_app_id, masked)
+
+
+def _find_session_enter_seat(text: str, by_id: dict) -> Optional[dict]:
+    """Highest-priority tier: the seat named INSIDE a session_enter(...)
+    call's own arguments — the entry call itself, not a mention of the seat
+    elsewhere in the same text. Fixes the order bug where a caller citing
+    another seat's packet by app_id (`dispatch_read(app_id="hanuman", ...)`)
+    ahead of its own `session_enter(app_id="loki")` got pinned to the wrong
+    seat's model.
+
+    Walks paren DEPTH from the `session_enter(` opening to its matching
+    close (multi-line; the same counting approach _mask_read_only_calls
+    uses) instead of a `[^)]*` regex, so a nested paren inside the call's
+    own arguments — the canonical `session_id=str(uuid4())` shape — does
+    not truncate the argument span before app_id is reached (regex-boundary
+    defect, Loki re-audit 2026-09-21).
+
+    An UNCLOSED call — a nested paren inside an argument value
+    (`note="a ( b"`), a truncated entry call, or text that simply ends
+    mid-call — used to `continue` past it, so the seat named inside was
+    never scanned and the whole call fell to the weaker bare-app_id tier
+    (regression, Loki third audit 2026-09-21). A truncated entry call is
+    still an entry call, so an unclosed paren scans to the end of `text`
+    instead of being skipped; over-scanning here can only over-detect, and
+    detection at this tier still requires _APP_ID_RE to find a real
+    `app_id=` inside the scanned span.
+
+    A stray `)` INSIDE a string or comment argument that appears BEFORE
+    app_id (`session_enter(note="a ) b", app_id="willow")`) closes the
+    depth walk early, the same way an unbalanced `(` does — the closed
+    span then ends before app_id is reached, _APP_ID_RE finds nothing, and
+    the loop used to `continue` past the call entirely, falling to the
+    weaker bare-app_id tier where the willow refusal never fires
+    (Loki fourth audit 2026-09-21). Same bound as the unclosed-paren fix
+    above: over-scanning can only over-detect, and a real `app_id=` still
+    has to be found. When the closed span comes up empty, the open span
+    (end of call to end of text) is tried as a fallback before giving up."""
+    n = len(text)
+    for m in re.finditer(r"session_enter\s*\(", text, re.IGNORECASE):
+        depth = 1
+        j = m.end()
+        while j < n and depth:
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+            j += 1
+        args = text[m.end():j - 1] if not depth else text[m.end():n]
+        am = _APP_ID_RE.search(args)
+        if am is None and not depth:
+            am = _APP_ID_RE.search(text[m.end():n])
+        if am is None:
+            continue
+        seat = by_id.get(am.group(1).lower())
+        if seat is not None:
+            return seat
+    return None
+
+
+def _find_you_are_seat(text: str, rows: list) -> Optional[dict]:
+    """"You are <Display name>" / "You're <Display name>" / "Enter as
+    <Display name>" framing, case-insensitive, tolerant of markdown bolding
+    around the name. Returns the seat matched EARLIEST in the text, not the
+    first ROW that happens to match anywhere — a prompt quoting a later
+    speaker's own framing (e.g. an auditor's prompt reporting "the packet
+    whose prompt said 'You are Hanuman'") must not out-rank the seat
+    actually named first (regex-boundary defect, Loki re-audit 2026-09-21).
+    A trailing word character is excluded (`(?![\\w?])`) so "You are
+    Willowbrook support" does not match "Willow" and a trailing "?" is not
+    read as entry framing ("You are Loki? no — ask claude-code-guide"). A
+    trailing apostrophe is excluded ONLY when a word character follows it
+    (`(?!'\\w)`) — "You are Willow's auditor" still does not match "Willow",
+    but a closing quote around the whole name ("'You are Hanuman'", "Enter
+    as 'Hanuman' now") is not itself a boundary, so the quoted framing still
+    matches (regression, Loki third audit 2026-09-21 — the prior
+    `(?![\\w'])` treated the closing quote as a boundary and let a single
+    apostrophe defeat both the orchestrator and fork refusals). An optional
+    leading quote (`['"‘’“”]?`) is consumed directly in front of the name so
+    a quote that wraps only the name itself ("Enter as 'Hanuman' now",
+    "Enter as 'Willow'") does not stop `\\**%s` from lining up right after
+    it — the leading quote was never itself a boundary problem, but without
+    consuming it the name pattern simply did not start where the quote put
+    it.
+
+    Four more edges fixed on the same line (Loki fourth audit 2026-09-21):
+    underscore emphasis (`__Willow__`, `_Hanuman_`) and bold wrapped around
+    a quoted name (`**'Hanuman'**`, `**'Willow'**`) were not detected —
+    `\\**` only ever consumed asterisks, and the optional quote sat before
+    the stars rather than being allowed on either side, so `[*_]*` replaces
+    the star-only run and an optional quote is now permitted on BOTH sides
+    of the name. The trailing-apostrophe exclusion (`(?!'\\w)`) was ASCII
+    single-quote only while the leading-quote class on the same line
+    already lists the curly `‘’“”` forms — "You are Willow's auditor" (U+2019)
+    hard-refused as a false positive; `(?!['’]\\w)` closes the same gap for
+    both quote styles. And the trailing-boundary exclusion (`(?![\\w?])`)
+    did not exclude a hyphen, so "You are Willow-adjacent support" — a
+    compound word, not an address to the seat — hard-refused; `-` joins the
+    exclusion class alongside `\\w` and `?`."""
+    best: Optional[dict] = None
+    best_pos: Optional[int] = None
+    for row in rows:
+        for name in filter(None, (row.get("display_name"), row.get("agent_id"))):
+            pat = re.compile(
+                r"\b(?:you are|you're|enter as)\s+"
+                r"['\"‘’“”]?[*_]*['\"‘’“”]?%s['\"‘’“”]?[*_]*(?![\w?-])(?!['’]\w)"
+                % re.escape(name),
+                re.IGNORECASE,
+            )
+            m = pat.search(text)
+            if m is not None and (best_pos is None or m.start() < best_pos):
+                best_pos = m.start()
+                best = row
+    return best
+
+
+def _find_comma_start_seat(text: str, rows: list) -> Optional[dict]:
+    """`<Display name>,` (or bare `<agent_id>`) opening the text — "Hanuman,
+    build the thing. Enter as the builder seat first." — checked against
+    each of `prompt` and `description` separately, since either can open
+    this way. A trailing word character or hyphen is excluded
+    (`(?![\\w-])`) so a compound word ("Hanuman-style build notes") does not
+    read as addressing the seat directly (regex-boundary defect, Loki
+    re-audit 2026-09-21). A trailing apostrophe is excluded ONLY when a word
+    character follows it (`(?!'\\w)`) — "Hanuman's seat" still does not
+    match. A quoted opening ("'Hanuman', go", `"Hanuman", go`, `‘Hanuman’,
+    go`) is now DETECTED, not merely "not a boundary" — an optional leading
+    quote (`['"‘’“”]?`) is consumed right after the `^` anchor so the name
+    still lines up after lstrip even when the text opens on a quote mark
+    (MANDATORY fix, Loki fourth audit 2026-09-21: the docstring here and in
+    check_agent_spawn previously claimed this shape was excluded/not a
+    boundary, i.e. detected, but the code had no leading-quote option at all
+    and only the trailing-quote form `Hanuman', go` actually matched — a
+    coverage claim the code did not back up). The trailing-apostrophe
+    exclusion is also widened from ASCII-only to `(?!['’]\\w)` — the same
+    curly-quote gap fixed in _find_you_are_seat (same care as that
+    function, Loki third/fourth audits 2026-09-21)."""
+    if not text:
+        return None
+    stripped = text.lstrip()
+    for row in rows:
+        for name in filter(None, (row.get("display_name"), row.get("agent_id"))):
+            pat = re.compile(
+                r"^['\"‘’“”]?\**%s\**(?![\w-])(?!['’]\w)\b[,:]?" % re.escape(name),
+                re.IGNORECASE,
+            )
+            if pat.match(stripped):
+                return row
+    return None
+
+
+def _find_persona_path_seat(text: str, by_id: dict) -> Optional[dict]:
+    """A `personas/<seat>.md` reference — "Read personas/hanuman.md and
+    adopt it" is entry framing even with no app_id= or "You are" in sight."""
+    m = re.search(r"personas/([A-Za-z0-9_-]+)\.md", text, re.IGNORECASE)
+    if m is None:
+        return None
+    return by_id.get(m.group(1).lower())
+
+
+def _find_bare_app_id_seat(text: str, by_id: dict) -> Optional[dict]:
+    """Weakest tier: a bare app_id=<seat> with no other framing at all
+    (`{"app_id": "hanuman"}`, `app_id: hanuman` alone). Callers must mask
+    read-only lookup calls out of `text` first (see _mask_read_only_calls).
+    A mention on a line that also says "grep" ("grep app_id=loki in tests")
+    is a search reference, not an entry, and is skipped."""
+    for m in _APP_ID_RE.finditer(text):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        line = text[line_start: line_end if line_end != -1 else len(text)]
+        if re.search(r"\bgrep\b", line, re.IGNORECASE):
+            continue
+        seat = by_id.get(m.group(1).lower())
+        if seat is not None:
+            return seat
+    return None
+
+
+# Tier names, strongest first — see _detect_specialist_seat. Only the two
+# strongest are enough to refuse the human_only orchestrator seat; a bare
+# mention (app_id=, persona path, comma-start) of `willow` in a lookup
+# prompt must not hard-refuse a non-seat spawn.
+_TIER_SESSION_ENTER = "session_enter"
+_TIER_YOU_ARE = "you_are"
+_TIER_COMMA_START = "comma_start"
+_TIER_PERSONA_PATH = "persona_path"
+_TIER_BARE_APP_ID = "bare_app_id"
+_HUMAN_ONLY_TIERS = frozenset({_TIER_SESSION_ENTER, _TIER_YOU_ARE})
+
+
+def _detect_specialist_seat(prompt: str, description: str, rows: list) -> Optional["tuple[dict, str]"]:
+    """Find the fleet seat a spawn's prompt OR description names by
+    ENTERING it, and which tier matched (see the _TIER_* constants). Scans
+    both fields — a fork's description ("hanuman builds") can carry the same
+    framing its prompt does. Returns None when neither field names a known
+    seat by entry — an ordinary Explore/Plan/general-purpose spawn, or a
+    prompt that only MENTIONS a seat inside a read-only lookup call, is not
+    this guard's business."""
+    by_id = {row["agent_id"].lower(): row for row in rows if row.get("agent_id")}
+    combined = "\n".join(t for t in (prompt, description) if t)
+    if not combined:
+        return None
+
+    seat = _find_session_enter_seat(combined, by_id)
+    if seat is not None:
+        return seat, _TIER_SESSION_ENTER
+
+    seat = _find_you_are_seat(combined, rows)
+    if seat is not None:
+        return seat, _TIER_YOU_ARE
+
+    for text in (prompt, description):
+        seat = _find_comma_start_seat(text, rows)
+        if seat is not None:
+            return seat, _TIER_COMMA_START
+
+    seat = _find_persona_path_seat(combined, by_id)
+    if seat is not None:
+        return seat, _TIER_PERSONA_PATH
+
+    seat = _find_bare_app_id_seat(_mask_read_only_calls(combined), by_id)
+    if seat is not None:
+        return seat, _TIER_BARE_APP_ID
+
+    return None
+
+
+def check_agent_spawn(tool_input: dict) -> Optional["tuple[str, str]"]:
+    """Sealed rule c9ca1a09 (pair 72f528ab, record b4a8cbe7, gap
+    20e6d23971dc): a specialist Agent spawn must carry the model its role is
+    pinned to, and a fork can never carry one at all — a spawn is a one-shot
+    decision with no cheap do-over once the wrong model is loaded, so this
+    always blocks rather than warns. Refuses:
+
+    - the orchestrator seat (willow) as a spawn target, but ONLY when named
+      by the two strongest framings (session_enter(...) or a "You are" /
+      "You're" / "Enter as" sentence) — a bare app_id=willow mention (a
+      lookup argument, a persona-path reference, or text that merely opens
+      with the word "Willow") is not an attempt to become the seat and is
+      not refused this way;
+    - subagent_type="fork" (case-insensitive) naming any other specialist
+      seat by any framing tier — a fork inherits the parent's model and
+      cannot be pinned;
+    - a pinned-role seat (role present in specialists.json's
+      model_hint_session, via _load_spawn_models) spawned with no model, or
+      a model that isn't the table's value for that role.
+
+    Detection scans prompt AND description — see _detect_specialist_seat —
+    and prefers the seat named inside a session_enter(...) call over any
+    other mention in the same text. A prompt/description naming no known
+    seat by entry (Explore, Plan, an unpinned general-purpose spawn, or a
+    prompt that only mentions a seat inside a read-only lookup call) passes
+    through untouched.
+
+    Cursor dialect is explicitly OUT of scope for this one guard: Cursor's
+    equivalent-tool payload shape for a specialist spawn (tool name and
+    argument keys) is not established, so main() only wires this to the
+    Claude Code `Agent` tool_name. The other nine guards in this module are
+    unaffected and still route through cursor_permission_for_guard as
+    before.
+
+    Stated limits (Loki re-audit 2026-09-21) — detection is regex over
+    prompt/description text, not semantic understanding, and these shapes
+    pass through undetected:
+
+    - base64 (or other) encoding of the seat-naming text;
+    - zero-width characters or markdown formatting split MID-WORD through a
+      seat's name (e.g. a zero-width space inside "Han​uman"), as
+      opposed to markdown bolding AROUND a whole name, which IS detected;
+    - variable indirection — `seat = "hanuman"; session_enter(app_id=seat)`,
+      or a variable assigned earlier and referenced later — since the guard
+      never evaluates the prompt as code, only pattern-matches its literal
+      text;
+    - a stateless fork with an empty description and a prompt like "continue
+      as before": the hook has no memory of a prior turn's "You are Hanuman"
+      framing, so a fork resuming a specialist persona by implication rather
+      than restating it passes through unrefused. This is a property of the
+      hook running once per tool call with no session state, not a gap in
+      any one regex;
+    - `_READ_ONLY_PROSE_APP_ID_RE`'s 40-char window between a lookup call
+      name and `app_id=` admits a comma and arbitrary words in between
+      ("Run whoami, then app_id=hanuman" masks and allows) — only `.` `;`
+      `(` end the window, so a comma-joined clause still reads as part of
+      the same lookup mention. Bare-tier bypass only (obfuscation-class, not
+      a seat-entry bypass);
+    - a paren-less `session_enter` naming a seat in prose ("session_enter
+      with app_id=willow", "session_enter as the willow seat") is not
+      promoted to the session_enter tier — only the parenthesised call gets
+      that priority — so it falls to the bare-app_id tier, where the
+      orchestrator seat's stronger refusal does not apply;
+    - when text contains more than one `session_enter(...)` call, only the
+      FIRST one's app_id is considered — `_find_session_enter_seat` returns
+      on its first match. `session_enter(app_id="loki"); session_enter(
+      app_id="willow")` pins loki's model and never reaches the willow
+      mention.
+
+    One nested-call shape was found and is NOT a limit — it is the intended
+    scoping: `run(session_enter(session_id=sid), app_id="willow")` pins
+    nothing to willow, because the app_id belongs to the OUTER `run(...)`
+    call, not to `session_enter`'s own arguments, and the paren-depth walk
+    correctly scopes to the inner call.
+
+    Two prose shapes were found and are NOT limits — they are masked out
+    before the bare-app_id tier runs (see _mask_read_only_calls /
+    _READ_ONLY_PROSE_APP_ID_RE): a read-only lookup call named without
+    parentheses ("Run handoff_read with app_id=hanuman") is masked the same
+    as its parenthesised form — including the MCP-qualified spelling
+    ("mcp__willow-mcp__handoff_read(...)"), since the call-name boundary is
+    `(?:(?<=__)|\\b)` in both the paren and paren-less passes, and
+    case-insensitively in both (`Handoff_Read(...)`, `HANDOFF_READ(...)`
+    are masked the same as the lowercase spelling — `names_pattern` now
+    carries `re.IGNORECASE`, fixed alongside the other items below); a display
+    name directly followed by a hyphen at the start of text ("Hanuman-style
+    build notes") is excluded from the comma-start tier as a compound word,
+    not an address to the seat, and a quoted opening ("'Hanuman', go",
+    `"Hanuman", go`, `‘Hanuman’, go`) IS now excluded the same way — an
+    optional leading quote is consumed at the `^` anchor in
+    _find_comma_start_seat (MANDATORY fix, Loki fourth audit 2026-09-21 —
+    the prior text here and at the top of _find_comma_start_seat claimed
+    this coverage without the code backing it; only the trailing-quote form
+    `Hanuman', go` actually matched before this fix).
+
+    Five more shapes fixed the same pass (Loki fourth audit 2026-09-21),
+    none a regression of a round 1-3 fix:
+
+    - a stray `)` inside a string or comment argument that appears BEFORE
+      app_id (`session_enter(note="a ) b", app_id="willow")`) used to close
+      the paren-depth walk early and fall to the bare-app_id tier, where
+      the orchestrator/fork refusals do not apply — `_find_session_enter_seat`
+      now falls back to the open span (call-end to end-of-text) when the
+      closed span's app_id search comes up empty;
+    - a Python string prefix or wrapper on the app_id literal
+      (`app_id=f"willow"`, `r"hanuman"`, `b"willow"`, `u"hanuman"`) used to
+      let _APP_ID_RE capture the prefix letter itself as the id, naming no
+      seat at ANY tier — not just the weaker one — so a specialist spawn
+      passed with no pin at all. _APP_ID_RE now consumes an optional
+      one-or-two-letter prefix (`r`/`b`/`u`/`f`, any case, any pairing)
+      immediately before the opening quote. `str("willow")` is not a
+      prefix and remains a stated limit, same class as variable
+      indirection below;
+    - underscore markdown (`__Willow__`, `_Hanuman_`) and bold wrapped
+      around a quoted name (`**'Hanuman'**`, `**'Willow'**`) were not
+      detected in the "You are" tier — only asterisk-only bolding was.
+      `_find_you_are_seat`'s pattern now allows `[*_]*` (not just `\\**`)
+      and an optional quote on either side of the name;
+    - a curly possessive apostrophe (`You are Willow's auditor`, U+2019)
+      hard-refused as the human-orchestrator seat with no retry path — the
+      trailing-apostrophe exclusion was ASCII `'` only while the
+      leading-quote class on the same line already lists `‘’“”`. Both
+      `_find_you_are_seat` and `_find_comma_start_seat` now exclude
+      `(?!['’]\\w)`, covering both quote styles;
+    - `You are Willow-adjacent support` hard-refused the same way — the
+      "You are" tier's trailing-boundary exclusion did not exclude a
+      hyphen, while the comma-start tier already did. `_find_you_are_seat`
+      now excludes `-` alongside `\\w` and `?`."""
+    tool_input = tool_input or {}
+    prompt = str(tool_input.get("prompt", "") or "")
+    description = str(tool_input.get("description", "") or "")
+    subagent_type = str(tool_input.get("subagent_type", "") or "").strip().lower()
+    model = str(tool_input.get("model", "") or "")
+    rows, used_fallback = _load_specialist_rows()
+    detected = _detect_specialist_seat(prompt, description, rows)
+    if detected is None:
+        return None
+    seat, tier = detected
+    agent_id = seat.get("agent_id", "")
+    note = (
+        " (specialists.json unreadable — literal fallback registry used)"
+        if used_fallback else ""
+    )
+    if seat.get("human_only"):
+        if tier not in _HUMAN_ONLY_TIERS:
+            # A bare mention of the orchestrator seat (lookup argument,
+            # persona path, comma-start) is not an attempt to enter it.
+            return None
+        return "block", (
+            f"willow-mcp: sealed rule {_SPAWN_GUARD_RULE} — the '{agent_id}' "
+            "seat is the human-orchestrator seat and is never an Agent spawn "
+            f"target{note}. Dispatch it a packet instead."
+        )
+    role = seat.get("role", "")
+    required = _load_spawn_models().get(role)
+    if subagent_type == "fork":
+        hint = f', model="{required}"' if required else ""
+        return "block", (
+            f"willow-mcp: sealed rule {_SPAWN_GUARD_RULE} — this prompt/description "
+            f"names the '{agent_id}' seat with subagent_type=\"fork\"{note}, and a "
+            "fork cannot carry a model pin. Retry with "
+            f'subagent_type="general-purpose"{hint}.'
+        )
+    if required and model != required:
+        return "block", (
+            f"willow-mcp: sealed rule {_SPAWN_GUARD_RULE} — the '{agent_id}' "
+            f"seat (role '{role}') is pinned to model=\"{required}\"{note}, "
+            f"got model={model!r}. Retry with "
+            f'subagent_type="general-purpose", model="{required}".'
+        )
     return None
 
 
@@ -1420,6 +2082,18 @@ def main() -> None:
                 from willow_mcp.cursor_hook_io import emit_claude_warn
 
                 emit_claude_warn(reason)
+    elif tool_name == "Agent" or tool_base == "Agent":
+        spawned = check_agent_spawn(tool_input)
+        if spawned:
+            _decision, reason = spawned
+            if cursor_dialect:
+                from willow_mcp.cursor_hook_io import cursor_permission_for_guard
+
+                cursor_permission_for_guard(_decision, reason)
+                sys.exit(0)
+            from willow_mcp.cursor_hook_io import emit_claude_block
+
+            emit_claude_block(reason)
     if cursor_dialect:
         from willow_mcp.cursor_hook_io import emit_cursor_permission
 

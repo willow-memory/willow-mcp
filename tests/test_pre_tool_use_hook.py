@@ -1772,3 +1772,710 @@ def test_seat_write_tools_cover_every_exclusive_write_tool():
     assert not (actual - expected), (
         "_SEAT_WRITE_TOOLS has extras not exclusive-write: %s" % sorted(actual - expected)
     )
+
+
+# ── check_agent_spawn: the spawn-model guard (sealed rule c9ca1a09) ───────
+
+def _spawn_input(prompt, subagent_type="general-purpose", model=""):
+    return {
+        "prompt": prompt,
+        "subagent_type": subagent_type,
+        "model": model,
+        "description": "test spawn",
+    }
+
+
+def test_agent_spawn_builder_pinned_sonnet_allowed():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", session_id="x")', model="sonnet"))
+    assert result is None
+
+
+def test_agent_spawn_builder_unpinned_refused():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", session_id="x")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+
+def test_agent_spawn_builder_pinned_opus_refused():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", session_id="x")', model="opus"))
+    assert result is not None
+    assert result[0] == "block"
+
+
+def test_agent_spawn_auditor_pinned_opus_allowed():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="loki", session_id="x")', model="opus"))
+    assert result is None
+
+
+def test_agent_spawn_auditor_as_fork_refused():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="loki", session_id="x")',
+        subagent_type="fork", model="opus"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+
+
+def test_agent_spawn_explore_no_seat_prompt_allowed():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Find every usage of foo() across the repo.", subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_willow_seat_refused():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="willow", session_id="x")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+    assert "human-orchestrator" in reason
+
+
+def test_agent_spawn_detects_you_are_display_name_framing():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Loki, the audit seat for this dispatch.", subagent_type="fork"))
+    assert result is not None
+    assert "fork" in result[1]
+
+
+def test_agent_spawn_registry_unreadable_fallback_still_refuses_fork(monkeypatch):
+    monkeypatch.setattr(
+        pre_tool_use, "_bundle_config_candidates",
+        lambda filename: ["/nonexistent/does/not/exist/%s" % filename],
+    )
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="loki", session_id="x")',
+        subagent_type="fork", model="opus"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+    assert "fallback" in reason
+
+
+def test_agent_spawn_table_reads_specialists_json_not_code(tmp_path, monkeypatch):
+    """The role->model pin is read from specialists.json's own
+    model_hint_session field at call time, not hardcoded — one source, not a
+    duplicated spawn_models.json — proven by pointing the loader at a tmp
+    copy with a different pin. This is a loader-level fact, not permission
+    to self-assign: the PRODUCTION path stays refused regardless (see
+    test_check_trust_root_write_blocks_specialists_json below)."""
+    custom = tmp_path / "specialists.json"
+    custom.write_text(json.dumps({
+        "specialists": [
+            {"agent_id": "hanuman", "display_name": "Hanuman", "role": "builder",
+             "model_hint_session": "haiku", "human_only": False},
+        ],
+        "orchestrator_seat": {
+            "agent_id": "willow", "display_name": "Willow", "role": "orchestrator",
+            "human_only": True,
+        },
+    }))
+    real_candidates = pre_tool_use._bundle_config_candidates
+
+    def _patched(filename):
+        if filename == "specialists.json":
+            return [str(custom)]
+        return real_candidates(filename)
+
+    monkeypatch.setattr(pre_tool_use, "_bundle_config_candidates", _patched)
+
+    refused = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", session_id="x")', model="sonnet"))
+    assert refused is not None, "sonnet must now be refused — the tmp copy pins haiku"
+
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", session_id="x")', model="haiku"))
+    assert allowed is None, "haiku must now be allowed — it came from the tmp copy"
+
+
+def test_check_trust_root_write_blocks_specialists_json():
+    """The production path stays guarded even though the loader above is
+    honest data, not code: a seat cannot Write/Edit its own pin table
+    (sealed rule c9ca1a09) — neither the bundle copy nor a top-level
+    config/ shadow."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "src/willow_mcp/bundle/config/specialists.json",
+    })
+    assert reason is not None
+    assert "c9ca1a09" in reason
+
+    reason2 = pre_tool_use.check_trust_root_write({
+        "file_path": "/repo/config/specialists.json",
+    })
+    assert reason2 is not None
+
+
+def test_check_trust_root_write_blocks_spawn_models_json_if_reintroduced():
+    """The removed split-brain file stays guarded too, in case anything ever
+    reintroduces it — the guard matches the filename, not just the field."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "src/willow_mcp/bundle/config/spawn_models.json",
+    })
+    assert reason is not None
+    assert "c9ca1a09" in reason
+
+
+# ── check_agent_spawn: detector rework (Loki audit 2026-09-21) ────────────
+# Every bypass input from the audit handoff, turned into a test that now
+# blocks; every false-positive input turned into a test that now allows.
+
+def test_agent_spawn_detects_bare_json_app_id():
+    result = pre_tool_use.check_agent_spawn(_spawn_input('{"app_id": "hanuman"}'))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_colon_app_id_no_quotes():
+    result = pre_tool_use.check_agent_spawn(_spawn_input("app_id: hanuman"))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_app_id_mixed_case_value():
+    result = pre_tool_use.check_agent_spawn(_spawn_input('app_id="Hanuman"'))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_uppercase_APP_ID_key():
+    result = pre_tool_use.check_agent_spawn(_spawn_input('APP_ID="hanuman"'))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_lowercase_you_are():
+    result = pre_tool_use.check_agent_spawn(_spawn_input("you are hanuman, go build it"))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_markdown_bold_you_are():
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are **Hanuman**, the builder."))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_youre_contraction():
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You're Hanuman for this one."))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_curly_quoted_app_id():
+    curly_prompt = "app_id=“hanuman”"
+    result = pre_tool_use.check_agent_spawn(_spawn_input(curly_prompt))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_persona_path_reference():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Read personas/hanuman.md and adopt it before you start."))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_comma_start_framing():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Hanuman, build the thing. Enter as the builder seat first."))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_fork_detects_seat_in_description_only():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "continue the build", subagent_type="fork") | {"description": "hanuman builds"})
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+
+
+def test_agent_spawn_fork_detects_enter_as_in_prompt():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Enter as hanuman and continue.", subagent_type="fork"))
+    assert result is not None
+    assert "fork" in result[1]
+
+
+def test_agent_spawn_fork_subagent_type_case_insensitive():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="loki", session_id="x")',
+        subagent_type="Fork", model="opus"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+
+
+def test_agent_spawn_allows_app_id_inside_handoff_read_lookup():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'Look at handoff_read(app_id="hanuman") for background before searching.',
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_allows_willow_app_id_inside_session_read_lookup():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'Check session_read(app_id="willow") for the current session state.',
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_allows_you_are_question_negation():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Loki? no — ask claude-code-guide instead."))
+    assert result is None
+
+
+def test_agent_spawn_prefers_session_enter_seat_over_earlier_mention():
+    """Order-bug fix: a correctly pinned auditor spawn that cites the
+    builder's packet by app_id ahead of its own session_enter must not be
+    pinned to the wrong seat's model."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'dispatch_read(app_id="hanuman", limit=1) then '
+        'session_enter(app_id="loki", session_id="x")',
+        model="opus"))
+    assert result is None
+
+
+def test_agent_spawn_allows_bare_willow_mention_with_no_framing():
+    """A bare app_id=willow mention with no session_enter/"You are" framing
+    at all is not an attempt to become the orchestrator seat."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input('{"app_id": "willow"}'))
+    assert result is None
+
+
+def test_fallback_specialists_track_the_registry():
+    """Drift guard: the hook's literal _FALLBACK_SPECIALISTS must stay in
+    step with the shipped config/specialists.json, or an unreadable-registry
+    fallback silently protects fewer (or differently-roled) seats than the
+    real one does."""
+    registry_path = (
+        Path(__file__).resolve().parent.parent
+        / "src" / "willow_mcp" / "bundle" / "config" / "specialists.json"
+    )
+    data = json.loads(registry_path.read_text())
+    real_roles = {row["agent_id"]: row.get("role") for row in data.get("specialists", [])}
+    orch = data["orchestrator_seat"]
+    real_roles[orch["agent_id"]] = orch.get("role")
+    real_human_only = {row["agent_id"]: bool(row.get("human_only")) for row in data.get("specialists", [])}
+    real_human_only[orch["agent_id"]] = bool(orch.get("human_only"))
+
+    fallback_roles = {row["agent_id"]: row.get("role") for row in pre_tool_use._FALLBACK_SPECIALISTS}
+    fallback_human_only = {
+        row["agent_id"]: bool(row.get("human_only")) for row in pre_tool_use._FALLBACK_SPECIALISTS
+    }
+    assert real_roles == fallback_roles
+    assert real_human_only == fallback_human_only
+
+
+# ── check_agent_spawn: round-3 rework, four regex-boundary defects ────────
+# (Loki re-audit 2026-09-21, handoff session_handoff-2026-09-21-99388882).
+
+def test_agent_spawn_session_enter_seat_survives_nested_paren_before_app_id():
+    """(1) A nested paren in the canonical `session_id=str(uuid4())` shape,
+    ahead of app_id in the same session_enter(...) call, used to truncate
+    the `[^)]*` capture before app_id was reached — falling through to the
+    bare tier and letting the willow refusal be bypassed entirely."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(session_id=str(uuid4()), app_id="willow")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+    assert "human-orchestrator" in reason
+
+
+def test_agent_spawn_session_enter_seat_survives_nested_paren_multiline():
+    """(1) Multi-line form of the same shape."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(\n'
+        '    session_id=str(uuid4()),\n'
+        '    app_id="willow",\n'
+        ')'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+
+
+def test_agent_spawn_session_enter_seat_nested_paren_still_pins_hanuman():
+    """(1) The non-willow variant of the same shape must still resolve to
+    the session_enter tier and pin the builder's model, not merely avoid
+    crashing."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(session_id=str(uuid4()), app_id="hanuman")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(session_id=str(uuid4()), app_id="hanuman")', model="sonnet"))
+    assert allowed is None
+
+
+def test_agent_spawn_you_are_seat_prefers_earliest_text_match():
+    """(2) The row-order bug: iterating rows and returning the first ROW
+    that matches anywhere (rather than the earliest TEXT match) pinned a
+    correctly-framed Loki spawn to Hanuman's model because the fleet table
+    happened to list hanuman before loki. Loki's own "You are Loki" framing
+    comes first in the text and must win."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'You are Loki. Audit the packet whose prompt said "You are Hanuman".',
+        model="opus"))
+    assert result is None
+
+
+def test_agent_spawn_you_are_allows_willows_possessive():
+    """(3) "Willow's" is not "Willow" — no trailing boundary let the human
+    -orchestrator refusal fire on a mere possessive."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are Willow's auditor."))
+    assert result is None
+
+
+def test_agent_spawn_you_are_allows_willows_grove_reference():
+    """(3) "Willow's Grove" is the sibling repo's name, not the seat."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Willow's Grove resident watcher for this shift."))
+    assert result is None
+
+
+def test_agent_spawn_you_are_allows_willowbrook():
+    """(3) "Willowbrook" merely starts with "Willow" — a compound word, not
+    the seat name."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are Willowbrook support."))
+    assert result is None
+
+
+def test_agent_spawn_comma_start_allows_hyphenated_compound():
+    """(5, cheap fix) "Hanuman-style" is a compound word describing a style
+    of notes, not the comma-start address form entering the seat."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("Hanuman-style build notes"))
+    assert result is None
+
+
+def test_agent_spawn_allows_paren_less_prose_lookup():
+    """(5, cheap fix) A read-only lookup call named in prose without
+    parentheses ("Run ... with app_id=hanuman") is a lookup argument, not an
+    entry — the masking that already covers the parenthesised form is
+    extended to this shape too."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Run mcp__willow-mcp__handoff_read with app_id=hanuman for background.",
+        subagent_type="Explore"))
+    assert result is None
+
+
+# ── check_agent_spawn: round-4 rework, three regex-boundary defects ───────
+# (Loki third audit 2026-09-21, handoff session_handoff-2026-09-21-498edf37).
+
+def test_agent_spawn_you_are_seat_blocks_single_quoted_hanuman_no_model():
+    """(1) REGRESSION: `(?![\\w'?])` treated a closing single quote as a
+    boundary, so a single-quoted "You are Hanuman" no longer matched at
+    all and the builder's sonnet pin was never enforced."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "'You are Hanuman'. Build the thing."))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+
+def test_agent_spawn_you_are_seat_blocks_quoted_enter_as_fork():
+    """(1) REGRESSION: the same closing-quote boundary let a quoted "Enter
+    as 'Hanuman'" framing dodge the fork refusal."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Enter as 'Hanuman' now", subagent_type="fork"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+
+
+def test_agent_spawn_you_are_seat_blocks_willow_trailing_quote():
+    """(1) REGRESSION: "You are Willow'" bypassed the orchestrator refusal."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are Willow'"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason and "human-orchestrator" in reason
+
+
+def test_agent_spawn_you_are_seat_blocks_quoted_enter_as_willow():
+    """(1) REGRESSION: "Enter as 'Willow'" bypassed the orchestrator
+    refusal the same way."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("Enter as 'Willow'"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason and "human-orchestrator" in reason
+
+
+def test_agent_spawn_you_are_seat_still_allows_willows_possessive_apostrophe():
+    """(1) The fix must not regress the ORIGINAL apostrophe case: "You are
+    Willow's auditor" still is not "Willow"."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Willow's auditor"))
+    assert result is None
+
+
+def test_agent_spawn_session_enter_unclosed_note_paren_blocks_willow():
+    """(2) An unclosed session_enter( call — a nested paren inside an
+    argument value — used to `continue` past the call entirely, falling to
+    the bare tier where the willow refusal never fires."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="willow", note="a ( b")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason and "human-orchestrator" in reason
+
+
+def test_agent_spawn_session_enter_unclosed_project_paren_blocks_willow():
+    """(2) Same shape via an unbalanced paren in a `project=` value."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="willow", project="Grove (WIP")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+
+
+def test_agent_spawn_session_enter_truncated_call_blocks_willow():
+    """(2) A truncated session_enter( call with no closing paren at all
+    still names willow and must still refuse."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="willow"'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+
+
+def test_agent_spawn_session_enter_multiline_unclosed_blocks_willow():
+    """(2) Multi-line unclosed form of the same defect."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(\n'
+        '    app_id="willow",\n'
+        '    note="see (a"\n'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason
+
+
+def test_agent_spawn_session_enter_unclosed_note_paren_pins_hanuman():
+    """(2) The hanuman equivalent of the unclosed-paren shape must still
+    resolve to the session_enter tier and pin the builder's model."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", note="a ( b")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="hanuman", note="a ( b")', model="sonnet"))
+    assert allowed is None
+
+
+def test_agent_spawn_allows_mcp_qualified_handoff_read_lookup():
+    """(3) FALSE POSITIVE: the paren-pass names_pattern lacked the
+    `(?:(?<=__)|\\b)` prefix the prose pass already carries, so the
+    MCP-qualified spelling of a lookup call was never masked and tripped
+    the bare-app_id tier."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'mcp__willow-mcp__handoff_read(app_id="hanuman", handoff_id="x")',
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_allows_mcp_qualified_serve_variant_lookup():
+    """(3) Same defect on the `-serve` suffixed server-qualified spelling."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'mcp__willow-mcp-serve__store_get(app_id="hanuman", key="k")',
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_allows_mcp_qualified_whoami_lookup():
+    """(3) Same defect on `whoami`, called out separately in the audit."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'mcp__willow-mcp__whoami(app_id="hanuman")', subagent_type="Explore"))
+    assert result is None
+
+
+def test_check_trust_root_write_blocks_doubled_slash_specialists_path():
+    """(4) `config//specialists.json` must not slip the guard just because
+    the anchored `$` pattern never saw the doubled separator."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "src/willow_mcp/bundle/config//specialists.json",
+    })
+    assert reason is not None
+    assert "c9ca1a09" in reason
+
+
+def test_check_trust_root_write_blocks_dot_segment_specialists_path():
+    """(4) `config/./specialists.json` is the same guarded file with an
+    inert `.` path segment."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "src/willow_mcp/bundle/config/./specialists.json",
+    })
+    assert reason is not None
+    assert "c9ca1a09" in reason
+
+
+def test_check_trust_root_write_blocks_doubled_slash_manifest_path():
+    """(4) Same normalisation defect, same class, for _MANIFEST_RE."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "/home/x/.willow/mcp_apps//willow/manifest.json",
+        "content": '{"permissions": ["task_net"]}',
+    })
+    assert reason is not None
+
+
+def test_check_trust_root_write_blocks_dot_segment_manifest_path():
+    """(4) Same normalisation defect, same class, for _MANIFEST_RE."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "/home/x/.willow/mcp_apps/./willow/manifest.json",
+        "content": '{"permissions": ["task_net"]}',
+    })
+    assert reason is not None
+
+
+# ── check_agent_spawn: round-4 rework, six items from Loki's fourth audit ──
+# (handoff session_handoff-2026-09-21-78b89408, dispatch 84973DD7).
+
+def test_agent_spawn_comma_start_single_quoted_opening_blocks_fork():
+    """(1) MANDATORY: the comma-start tier's docstring claimed a quoted
+    opening ("'Hanuman', go") was detected, but `^\\**%s` had no leading
+    -quote option and only the trailing-quote form actually matched. An
+    optional leading quote is now consumed right at the `^` anchor."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "'Hanuman', go build it", subagent_type="fork"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+
+
+def test_agent_spawn_comma_start_double_quoted_opening_blocks_fork():
+    """(1) Same fix, double-quoted form."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        '"Hanuman", go build', subagent_type="fork"))
+    assert result is not None
+    assert "fork" in result[1]
+
+
+def test_agent_spawn_comma_start_curly_quoted_opening_blocks_fork():
+    """(1) Same fix, curly-quoted form."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "‘Hanuman’, go build", subagent_type="fork"))
+    assert result is not None
+    assert "fork" in result[1]
+
+
+def test_agent_spawn_session_enter_stray_close_paren_before_app_id_blocks_willow():
+    """(2) A `)` inside a string argument BEFORE app_id used to close the
+    paren-depth walk early, falling to the bare tier where the willow
+    refusal never fires."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(note="a ) b", app_id="willow")'))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason and "human-orchestrator" in reason
+
+
+def test_agent_spawn_app_id_f_string_prefix_pins_hanuman():
+    """(3) `app_id=f"hanuman"` used to let _APP_ID_RE capture the `f` prefix
+    itself as the id, naming no seat at any tier — a specialist spawn with
+    no pin at all. The prefix is now consumed and discarded."""
+    blocked = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id=f"hanuman", session_id="x")'))
+    assert blocked is not None
+    decision, reason = blocked
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id=f"hanuman", session_id="x")', model="sonnet"))
+    assert allowed is None
+
+
+def test_agent_spawn_app_id_r_string_prefix_pins_hanuman():
+    """(3) Same fix, raw-string prefix."""
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id=r"hanuman", session_id="x")', model="sonnet"))
+    assert allowed is None
+    blocked = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id=r"hanuman", session_id="x")'))
+    assert blocked is not None and blocked[0] == "block"
+
+
+def test_agent_spawn_app_id_b_string_prefix_pins_hanuman():
+    """(3) Same fix, bytes-string prefix."""
+    blocked = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id=b"hanuman", session_id="x")'))
+    assert blocked is not None and blocked[0] == "block"
+
+
+def test_agent_spawn_underscore_bold_you_are_willow_refused():
+    """(4) `__Willow__` (underscore emphasis) used to pass through
+    undetected — only asterisk-only bolding was matched."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are __Willow__"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "willow" in reason and "human-orchestrator" in reason
+
+
+def test_agent_spawn_bold_quoted_you_are_willow_refused():
+    """(4) `**'Willow'**` — bold wrapped around a quoted name — used to pass
+    through undetected."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are **'Willow'**"))
+    assert result is not None
+    assert result[0] == "block" and "willow" in result[1]
+
+
+def test_agent_spawn_underscore_you_are_hanuman_pins_sonnet():
+    """(4) Same underscore-emphasis fix, non-orchestrator variant, proving
+    the builder pin is still enforced (not just a hard refusal)."""
+    blocked = pre_tool_use.check_agent_spawn(_spawn_input("You are _Hanuman_"))
+    assert blocked is not None
+    decision, reason = blocked
+    assert decision == "block"
+    assert "hanuman" in reason and "sonnet" in reason
+
+    allowed = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are _Hanuman_", model="sonnet"))
+    assert allowed is None
+
+
+def test_agent_spawn_allows_curly_possessive_willows_auditor():
+    """(5) `You are Willow's auditor` (U+2019 curly apostrophe) hard
+    -refused as the orchestrator seat — the trailing-apostrophe exclusion
+    was ASCII `'` only while the leading-quote class on the same line
+    already listed the curly forms."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Willow’s auditor"))
+    assert result is None
+
+
+def test_agent_spawn_allows_mixed_case_handoff_read_lookup():
+    """(6) `Handoff_Read(...)` on Explore used to pin sonnet because
+    `names_pattern` lacked `re.IGNORECASE` — a capitalised lookup call was
+    never masked out before the bare-app_id tier ran."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'Handoff_Read(app_id="hanuman", handoff_id="x")',
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_allows_willow_adjacent_hyphen_compound():
+    """(6) `You are Willow-adjacent support` hard-refused — the "You are"
+    tier's trailing-boundary exclusion did not exclude a hyphen, unlike the
+    comma-start tier's equivalent exclusion."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Willow-adjacent support"))
+    assert result is None

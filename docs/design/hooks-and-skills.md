@@ -152,6 +152,61 @@ actually needs them:
   doesn't regress to a bare-substring match), plus an end-to-end `main()`
   case in each direction.
 
+**Addendum (2026-09-20):** sealed rule `c9ca1a09` (pair `72f528ab`, record
+`b4a8cbe7`, gap `20e6d23971dc`) closed the "the fleet does not self-assign
+models" guarantee in `specialists.json`'s `model_hint_session` field: nothing
+enforced it at the point a specialist is actually spawned via the harness
+`Agent` tool, so a caller could open `hanuman` under a heavier or lighter
+model than its role is pinned to and nothing would say so. Added
+`check_agent_spawn()`, wired to a new `Agent` `PreToolUse` matcher across all
+three wiring configs (`plugin.json`, `deploy/claude-settings.json`,
+`.claude/settings.json` — kept in step by `test_hook_wiring_sync.py`'s
+existing matcher-parity pin). Cursor is explicitly **out of scope** for this
+one guard: Cursor's equivalent-tool payload shape for a specialist spawn
+(tool name and argument keys) is not established, so it is wired to Claude
+Code's `Agent` `tool_name` only; the other nine guards in this module are
+unaffected.
+
+Detection scans BOTH `prompt` and `description`, and reads a fleet seat as
+ENTERED — not merely mentioned — through five framings, strongest first: a
+`session_enter(app_id="<seat>"` call (the seat named inside its own
+arguments wins over any other mention in the same text); a "You are
+`<Display name>`" / "You're `<Display name>`" / "Enter as `<Display name>`"
+sentence (markdown-bolded or not, case-insensitive, a trailing `?` excluded
+so a question isn't read as framing); `<Display name>,` opening the text; a
+`personas/<seat>.md` reference; or, weakest, a bare `app_id=<seat>` /
+`APP_ID=<seat>` / JSON `"app_id": "<seat>"` shape (straight or curly quotes,
+case-insensitive) with no other framing at all. A bare `app_id=<seat>` that
+appears only as an ARGUMENT to a read-only lookup call (`handoff_read`,
+`dispatch_read`, `session_read`, `store_get`, …) is masked out first and
+never counted — that is a mention, not an entry. The orchestrator seat
+(`willow`) is refused as a spawn target only under the two strongest
+framings; a bare mention never hard-refuses a non-seat spawn.
+
+The pinned role → model table is read from the SAME `specialists.json` rows
+`_load_specialist_rows` already loads — `model_hint_session` doubles as the
+pin when its value is one of the harness's short session-model aliases
+(`sonnet`/`opus`/`haiku`); a full Anthropic model id or `null` is an
+ordinary session hint, not a pin. This closes a split-brain the original cut
+of this guard introduced: a separate `config/spawn_models.json` duplicated
+`model_hint_session` with no parity check between them. That file is gone;
+`hanuman` and `loki` (the two pinned roles today, `builder`→`sonnet` and
+`auditor`→`opus`) carry their pin directly in `model_hint_session`, and
+`check_trust_root_write` refuses a Write/Edit to `specialists.json` (either
+the bundle copy or a top-level `config/` shadow, and the removed
+`spawn_models.json` filename too, in case anything reintroduces it) so a
+seat cannot repin itself even though the loader is honest data, not code.
+
+Three refusals, always a block: the orchestrator seat (`willow`) as above;
+`subagent_type="fork"` (matched case-insensitively) naming any specialist
+seat under any framing tier, because a fork inherits the caller's model and
+cannot carry a pin; and a pinned-role seat spawned with no `model` or the
+wrong one. Both loaders (`_load_specialist_rows`, `_load_spawn_models`) are
+stdlib-only `open()`/`json.load()` reads at call time, same fail-safe shape
+as `_load_remote_posture` above — no new imports, and a missing/malformed
+config degrades to a literal fallback set rather than silently disabling the
+guard for every seat (the reason text says so when that happens).
+
 @phase 5-schema-confirm-md-skill
 ## 5. `schema-confirm.md` skill
 

@@ -47,6 +47,15 @@
             "command": "python3 -m willow_mcp.hook_runner --format claude pre_tool"
           }
         ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -m willow_mcp.hook_runner --format claude pre_tool"
+          }
+        ]
       }
     ],
     "Stop": [
