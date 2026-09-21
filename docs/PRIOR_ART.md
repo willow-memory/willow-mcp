@@ -222,19 +222,38 @@ to a server in-process. For willow-mcp's 170 tools, the combination of
 SDK in-process transport (unit tests) + mcp-assert (conformance) +
 agent-security-harness (security gate) covers the full test surface.
 
-### Repos not yet surveyed
+### Fork audit outcome
 
-Seven MCP forks under `rudi193-cmd/` represent hands-on evaluation of external
-prior art that the survey discusses generically: codebase-memory-mcp,
-multimodels-mcp, mcp-memory-service, basic-memory, ctxvault, hermes-agent,
-claudeclaw. All pushed July–August 2026. Linking which forks were examined to
-which survey conclusions would strengthen provenance.
+The seven MCP forks under `rudi193-cmd/` this survey previously discussed
+generically — codebase-memory-mcp, multimodels-mcp, mcp-memory-service,
+basic-memory, ctxvault, hermes-agent, claudeclaw — were surveyed in a first-pass
+audit (2026-08-18/2026-09-21) alongside ~17 other domain-adjacent forks. All
+seven are **drop**: each is a vanilla or near-vanilla fork of an external project
+carrying no owner work willow-mcp needs. Per-fork notes:
 
-`Nestor` is now a standalone repo under active work (pushed same day as this
-survey) — the survey names it as one of eight unique shapes but never examines
-the implementation. `willow-gate`, `willow-config`, and `willow-compose` form an
-uncovered infrastructure cluster: deployment, gating, and orchestration that the
-MCP tools operate within.
+- **basic-memory** — AGPL-3.0, so licence-excluded regardless of shape, and the
+  fork is unmodified.
+- **mcp-memory-service** — the only one of the seven with substantive owner
+  additions (memory_observe / auto_extract harvest, ranked search, mistake_notes
+  CRUD), but off-domain for willow. Its RRF multi-signal search ranking is the
+  single liftable pattern for KB atom search; mistake_notes is plain correction
+  CRUD, not Mem-ratify's quorum-gated tier promotion.
+- **codebase-memory-mcp** (AST / call-graph), **multimodels-mcp** (model
+  task-router), **ctxvault** (vector-vault typed memory), **hermes-agent** (Nous
+  self-improving agent), **claudeclaw** (Claude Code daemon) — clean forks in
+  orthogonal domains, nothing to salvage.
+
+The wider audit surfaced two things worth keeping, recorded outside this section:
+three external memory systems (ogham-mcp, stash, statewave) in §16, and ShibaClaw
+(Apache-2.0, the claw family) whose owner-built safety machinery — SSRF / DNS-
+rebind guard, Muzzle tool-output framing, install CVE gate — is specced for
+adoption in `docs/design/shibaclaw-safety-adoption-2026-09-21.md`.
+
+`Nestor` is now a standalone repo under active work — the survey names it as one
+of eight unique shapes but never examines the implementation. `willow-gate`,
+`willow-config`, and `willow-compose` form an uncovered infrastructure cluster:
+deployment, gating, and orchestration that the MCP tools operate within. These
+willow-owned repos were outside the fork audit's scope and remain unsurveyed.
 
 ## 2. MCP protocol features beyond tools
 
