@@ -417,6 +417,77 @@ def test_a_refused_followup_does_not_unopen_the_pr(home, tmp_path, monkeypatch):
     assert out["operator"]["assigned"] is True
 
 
+# ── the seat that asked is on the record the steward reads (pair 11ccb0f7) ──
+
+def test_a_granted_open_names_who_asked_and_writes_the_watch_row(home, tmp_path, monkeypatch):
+    from willow_mcp import pr_watch
+
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    out = _open(_FakeGovernancePg(), _FakeApi(), session="sess-371aa2fc")
+    assert out["ok"] and out["opened"]
+    assert out["opened_by"] == {"app_id": "willow", "session_id": "sess-371aa2fc",
+                               "grove_channel": "#willow"}
+    assert out["watch"]["state"] == "populated"
+    assert out["watch"]["key"] == "forge-play/Forge#31"
+    table = pr_watch.load()
+    row = table["forge-play/Forge#31"]
+    assert row["app_id"] == "willow" and row["session_id"] == "sess-371aa2fc"
+    assert row["channel"] == "#willow" and row["head"] == "feat/x"
+    assert row["opened_at"].endswith("Z")
+    # The steward's own state root, not the seat's.
+    assert pr_watch.watch_path().parent.name == "willow-bot"
+
+
+def test_the_watch_row_is_exactly_the_seat_and_nothing_else(home, tmp_path, monkeypatch):
+    """The row names the seat by app_id/session/channel/head/opened_at — a
+    fixed key set, so a credential cannot ride along unnoticed."""
+    from willow_mcp import pr_watch
+
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    _open(_FakeGovernancePg(), _FakeApi(), session="s")
+    row = pr_watch.load()["forge-play/Forge#31"]
+    assert set(row) == {"app_id", "session_id", "channel", "opened_at", "head"}
+    assert row["session_id"] == "s" and row["app_id"] == "willow"
+
+
+def test_a_second_open_adds_a_row_and_keeps_the_first(home, tmp_path, monkeypatch):
+    from willow_mcp import pr_watch
+
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    _open(_FakeGovernancePg(), _FakeApi(), session="s1")
+    pr_watch.record(repo="forge-play/Forge", number=7, app_id="hanuman", session_id="s2", head="feat/y")
+    table = pr_watch.load()
+    assert set(table) == {"forge-play/Forge#31", "forge-play/Forge#7"}
+    assert table["forge-play/Forge#7"]["channel"] == "#hanuman"
+
+
+def test_an_unwritable_watch_root_is_reported_not_raised(home, tmp_path, monkeypatch):
+    from willow_mcp import pr_watch
+
+    _charter(tmp_path, monkeypatch)
+    _app_token(monkeypatch)
+    # A file where the directory must be: mkdir fails, the PR is still open.
+    (pr_watch.watch_path().parent).write_text("not a directory")
+    out = _open(_FakeGovernancePg(), _FakeApi(), session="s")
+    assert out["ok"] and out["opened"] and out["number"] == 31
+    assert out["watch"]["state"] == "unreachable" and out["watch"]["reason"]
+    assert pr_watch.load() == {}
+
+
+def test_a_malformed_watch_file_reads_as_empty(home, tmp_path):
+    from willow_mcp import pr_watch
+
+    p = pr_watch.watch_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("{not json")
+    assert pr_watch.load() == {}
+    p.write_text("[1, 2]")
+    assert pr_watch.load() == {}
+
+
 # ── the tool is wired the way git_push_execute is ────────────────────────────
 
 def test_pr_open_execute_is_gated_as_envelope_apply_by_name():
