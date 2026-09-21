@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **external_guard:** Muzzle — fence tool output in a per-result nonce boundary ([c51d310](https://github.com/willow-memory/willow-mcp/commit/c51d310fb503e1798fd5832e410b5d5a9a2af863))
 * **external_guard:** Muzzle — fence tool output in a per-result nonce boundary ([33907f1](https://github.com/willow-memory/willow-mcp/commit/33907f11b5c4ee859643674541a9dd9ea61e5713))
 
 ## [2.70.0](https://github.com/willow-memory/willow-mcp/compare/v2.69.1...v2.70.0) (2026-09-21)
