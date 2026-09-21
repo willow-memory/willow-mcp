@@ -410,6 +410,91 @@ def dispatch_read(dispatch_id: str) -> dict:
     }
 
 
+# ── cited-packet read (gaps fe3ae204a964 / e40691d86df6) ─────────────────────
+#
+# An audit packet cites the builder's dispatch_id in its context_refs; a
+# rework packet cites the audit's. Under B-54 (#242) the auditor was
+# `not_party_to_dispatch` on the very packet it was assigned to audit and read
+# handoff.json off disk instead — the disclosure rule held and the audit
+# trail lost the read. A citation is a relationship the orchestrator wrote
+# into the citing packet's signed meta, so it is grounds for a READ of the
+# cited packet: `dispatch_read` / `handoff_read` succeed for caller C when C
+# is the to_app of a packet P that cites X and P is working or complete.
+# Read only — never accept, handoff, or clear through a citation. Depth one —
+# a citation of a citation grants nothing. Anything a citation allows is
+# receipted with `via: P` so the trail says how the read was allowed.
+
+_CITATION_ID_RE = re.compile(r"^(?:dispatch:)?([0-9A-Fa-f]{8})$")
+# Prose refs like "dispatch 67E344A9 (Hanuman handoff, verified)" cite too —
+# the id is the 8-hex token following the word dispatch.
+_CITATION_PROSE_RE = re.compile(r"\bdispatch(?:_id)?\s*[:=]?\s*([0-9A-Fa-f]{8})\b")
+CITATION_READ_STATUSES = frozenset({"working", "complete", "verified"})
+
+
+def citation_set(meta: dict) -> set[str]:
+    """The dispatch ids a packet's ``context_refs`` name — bare (``67E344A9``),
+    prefixed (``dispatch:67E344A9``), or inside prose (``dispatch 67E344A9
+    (...)``). Refs that carry no id contribute nothing."""
+    out: set[str] = set()
+    for ref in meta.get("context_refs") or []:
+        if not isinstance(ref, str):
+            continue
+        text = ref.strip()
+        m = _CITATION_ID_RE.match(text)
+        if m:
+            out.add(m.group(1).upper())
+            continue
+        for m in _CITATION_PROSE_RE.finditer(text):
+            out.add(m.group(1).upper())
+    return out
+
+
+def citation_read_access(app_id: str, target_dispatch_id: str) -> dict | None:
+    """Return ``{"via": <citing packet id>, "via_status": ...}`` when
+    ``app_id`` may read the packet ``target_dispatch_id`` through a citation,
+    else ``None``.
+
+    Grounds: a packet P with ``to_app == app_id``, status in
+    :data:`CITATION_READ_STATUSES`, and ``target_dispatch_id`` in P's
+    citation set. P must itself verify (signature, no symlink) — a forged
+    citing packet grants nothing. Only P's own context_refs are consulted:
+    what P cites is readable, what P's citations cite is not.
+    """
+    who = (app_id or "").strip().lower()
+    target = (target_dispatch_id or "").strip().upper()
+    if not who or not target:
+        return None
+    disp_root = dispatch_root()
+    if disp_root.is_symlink() or not disp_root.is_dir():
+        return None
+    for child in sorted(disp_root.iterdir(), key=lambda p: p.name):
+        if child.is_symlink() or not child.is_dir() or packet_symlink_refused(child):
+            continue
+        if child.name.upper() == target:
+            continue
+        meta = _read_json(child / "meta.json")
+        if not meta or not _meta_is_well_formed(meta):
+            continue
+        if (meta.get("to_app") or "").strip().lower() != who:
+            continue
+        if target not in citation_set(meta):
+            continue
+        if dispatch_signing.signature_status(meta) != dispatch_signing.SIG_VALID:
+            continue
+        st = _read_json(child / "status.json") or {}
+        cur = st.get("status") or meta.get("status") or "pending"
+        if cur not in CITATION_READ_STATUSES:
+            continue
+        return {"via": str(meta.get("dispatch_id") or child.name).upper(), "via_status": cur}
+    return None
+
+
+NOT_PARTY_HINT = (
+    "not a party to this packet; cite this id in your packet's context_refs "
+    "to read it (a working or complete packet that cites it grants read only)"
+)
+
+
 def is_dispatch_party(app_id: str, meta: dict) -> bool:
     """Whether app_id is from_app, to_app, or reply_to on this packet's own
     meta.json -- the three identities a dispatch names as involved (B-54,

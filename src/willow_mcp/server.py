@@ -4346,15 +4346,45 @@ def dispatch_read(app_id: str, dispatch_id: str) -> dict:
     {error: not_found} for an unknown dispatch_id, or {error:
     not_party_to_dispatch} if app_id is neither from_app, to_app, reply_to,
     nor the orchestrator (B-54, issue #242 -- dispatch_read permission alone
-    used to let any holder read any dispatch_id's full content)."""
+    used to let any holder read any dispatch_id's full content) -- unless a
+    working/complete packet addressed to app_id CITES this dispatch_id in its
+    context_refs (an auditor reading the builder's packet it was assigned to
+    audit; a reworker reading the audit): then the read is allowed, the
+    result carries `via: <citing packet>`, and the receipt says so."""
     pkt = dispatch_stack.dispatch_read(dispatch_id)
     if pkt.get("error"):
         return pkt
+    grant = _packet_read_grant(app_id, dispatch_id, pkt["meta"], "dispatch_read")
+    if grant.get("error"):
+        return grant
+    if grant.get("via"):
+        pkt = {**pkt, "via": grant["via"], "via_status": grant.get("via_status")}
+    return pkt
+
+
+def _packet_read_grant(app_id: str, dispatch_id: str, meta: dict, tool: str) -> dict:
+    """B-54 read check shared by dispatch_read / handoff_read: party or
+    orchestrator -> {}; cited by a working/complete packet addressed to
+    app_id -> {via, via_status} (receipted so the trail says how the read
+    was allowed); otherwise the not_party refusal naming the citation
+    option. Read grants only -- the write verbs never consult this."""
     from .human_session import is_orchestrator_app
 
-    if not is_orchestrator_app(app_id) and not dispatch_stack.is_dispatch_party(app_id, pkt["meta"]):
-        return {"error": "not_party_to_dispatch", "dispatch_id": dispatch_id}
-    return pkt
+    if is_orchestrator_app(app_id) or dispatch_stack.is_dispatch_party(app_id, meta):
+        return {}
+    grant = dispatch_stack.citation_read_access(app_id, dispatch_id)
+    if grant:
+        _receipt_log.record(
+            app_id, tool, "ok",
+            json.dumps({"citation_read": dispatch_id.upper(), "via": grant["via"]},
+                       separators=(",", ":")),
+        )
+        return grant
+    return {
+        "error": "not_party_to_dispatch",
+        "dispatch_id": dispatch_id,
+        "message": dispatch_stack.NOT_PARTY_HINT,
+    }
 
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -4433,15 +4463,19 @@ def handoff_read(app_id: str, dispatch_id: str) -> dict:
     before verify_handoff, and what a successor agent reads to pick up the
     thread. Read-only. Returns {error: not_party_to_dispatch} if app_id is
     neither from_app, to_app, reply_to, nor the orchestrator (B-54, issue
-    #242 -- same packet-party check as dispatch_read)."""
+    #242 -- same packet-party check as dispatch_read, same citation grant:
+    a working/complete packet addressed to app_id that cites this id in its
+    context_refs allows the read, carried as `via`)."""
     pkt = dispatch_stack.dispatch_read(dispatch_id)
     if pkt.get("error"):
         return pkt
-    from .human_session import is_orchestrator_app
-
-    if not is_orchestrator_app(app_id) and not dispatch_stack.is_dispatch_party(app_id, pkt["meta"]):
-        return {"error": "not_party_to_dispatch", "dispatch_id": dispatch_id}
-    return handoff_stack.handoff_read(dispatch_id)
+    grant = _packet_read_grant(app_id, dispatch_id, pkt["meta"], "handoff_read")
+    if grant.get("error"):
+        return grant
+    out = handoff_stack.handoff_read(dispatch_id)
+    if grant.get("via") and not out.get("error"):
+        out = {**out, "via": grant["via"], "via_status": grant.get("via_status")}
+    return out
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
