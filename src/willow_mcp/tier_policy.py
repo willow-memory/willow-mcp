@@ -99,6 +99,9 @@ TOOL_CLASS: dict[str, str] = {
     # seal_drain mirrors a human's Nestor seal onto the SOIL governance record
     # and advances a local offset file — a write, never a seal (decision 72292afd).
     "seal_drain": WRITE,
+    # net_authority_drain attaches a signer-minted envelope to a held task row
+    # and flips it to pending — a write, never a seal (decision c8572a92).
+    "net_authority_drain": WRITE,
     "context_save": WRITE, "context_expire": WRITE,
     "frank_append": WRITE,
     # nest_scan writes a local SQLite Nest DB; nest_promote writes structure-only

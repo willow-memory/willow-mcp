@@ -1,9 +1,11 @@
 # systemd SYSTEM unit template for the willow-mcp net signer (decision c8572a92).
-# Runs as the egress key's owner so the seat (uid 1000) never reads private.pem
-# and this process never reads the seat's task text — it receives a sealed line
-# and a hash over a local socket, verifies the operator's seal against a
-# public-only ring, and signs. Rendered by `python -m willow_mcp.net_signer
-# install`; installed by the ONE root line that command prints.
+# Runs as the egress key's owner so the seat (uid 1000) never reads private.pem.
+# It receives the SEALED bytes over a local socket — the bound line, a rule,
+# and the task text the operator read (amending pair 6b305258) — verifies the
+# operator's seal against a public-only ring, derives the task hash from the
+# sealed body itself, and signs. Nothing outside the seal is a fact to it.
+# Rendered by `python -m willow_mcp.net_signer install`; installed by the ONE
+# root line that command prints once the ring is staged.
 [Unit]
 Description=willow-mcp net signer — seal to task envelope, as the egress key owner
 After=local-fs.target

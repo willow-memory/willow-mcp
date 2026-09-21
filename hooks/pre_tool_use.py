@@ -914,6 +914,7 @@ _SEAT_WRITE_TOOLS = frozenset({
     "nest_correct_classification",
     "nest_intake_file", "nest_intake_scan", "nest_intake_skip", "nest_promote", "nest_scan",
     "nestor_tool_route", "nestor_tool_seal",
+    "net_authority_drain",
     "schema_confirm_mapping", "seal_drain",
     "session_bind", "session_handoff_write", "session_reconcile",
     "store_delete", "store_purge_collection", "store_put", "store_update",

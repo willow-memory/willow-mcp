@@ -167,12 +167,14 @@ def sign_envelope(
     """Create a signed envelope. This function is never registered as an MCP tool.
 
     ``task`` is hashed here (the operator's terminal path, ``sign-net-task``).
-    ``task_hash`` is the seal-driven path (decision ``c8572a92``): the signer
-    that holds the key never receives the task text — only the hash the
-    operator sealed — so it binds the hash it was handed. Exactly one of the
-    two must be given. ``seal_pair_id`` names the sealing Nestor pair and
-    rides INSIDE the signed payload, so an executor can tell a seal-minted
-    envelope from a terminal-minted one without trusting anything unsigned.
+    ``task_hash`` is the seal-driven path (decision ``c8572a92`` as amended
+    by ``6b305258``): the signer that holds the key DERIVES the hash from the
+    task text inside the sealed bytes the operator signed — never from a
+    hash a caller handed it — and passes what it derived here. Exactly one
+    of the two must be given. ``seal_pair_id`` is the signer's digest of the
+    verified seal bytes and rides INSIDE the signed payload, so an executor
+    can tell a seal-minted envelope from a terminal-minted one without
+    trusting anything unsigned.
     """
     if os.environ.get("WILLOW_IN_KART", "").strip():
         raise PermissionError("network authorization cannot be signed inside Kart")
