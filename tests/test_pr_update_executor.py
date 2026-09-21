@@ -412,6 +412,33 @@ def test_bot_type_but_wrong_login_is_eauthor(home, tmp_path, monkeypatch):
     assert not out["ok"] and out["error"] == "EAUTHOR"
 
 
+def test_missing_pull_requests_write_is_eperm_and_files_one_ask(home, tmp_path, monkeypatch):
+    """Gap 4464a63db1a9 (Loki 8A23D1AE low): pr_update_execute checks the
+    App's `pull_requests` permission on the minted token like pr_open does,
+    refuses EPERM before any GitHub read, and files ONE human_required item."""
+    from willow_mcp import human_loop
+    from willow_mcp.db import Store
+
+    _charter(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "willow_mcp.github_app_credentials.mint_installation_token",
+        lambda repo: {"ok": True, "mode": "app", "token": "ghs_test_token",
+                      "permissions": {"contents": "write", "pull_requests": "read"},
+                      "installation_id": 1, "app_slug": "willows-bot"},
+    )
+    store = Store(str(tmp_path / "store"))
+    pg, api = _FakeGovernancePg(), _FakeApi()
+    out = _update(pg, api, store=store)
+    assert not out["ok"] and out["error"] == "EPERM"
+    assert "Pull requests is 'read'" in out["reason"]
+    assert out["human_required_state"] == "filed" and out["human_required_id"]
+    assert api.calls == []  # refused before any GitHub read
+    titles = [i["title"] for i in human_loop.list_queue(store, status="open", kind="onboarding")]
+    assert titles == ["GitHub App: grant pull_requests:write to willows-bot"]
+    again = _update(pg, _FakeApi(), store=store)
+    assert again["human_required_state"] == "already"
+
+
 # ── PR template enforcement on a new body (gap 378c2e57c3d0) ─────────────────
 
 def test_a_body_missing_a_required_section_is_ebody_before_citation(home, tmp_path, monkeypatch):

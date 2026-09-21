@@ -17,6 +17,11 @@ is the operator's (``human_required_resolve``); a resolved item does not block
 a later re-file, because the wall can come back (a new org, a re-install
 that dropped the permission).
 
+The dedupe scan reads the newest 200 OPEN ``onboarding`` items (``list_queue``'s
+bound); past that a duplicate could file. The live queue holds ~30 open items
+in total, so the bound is stated rather than engineered around (Loki
+8A23D1AE).
+
 Never raises: the caller is already refusing, and a queue that cannot be
 written must not turn a legible refusal into a crash. Every exit is a dict
 with ``state``: ``filed`` (new row), ``already`` (open row exists),
