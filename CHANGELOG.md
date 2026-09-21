@@ -36,7 +36,7 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **diagnostic:** per-app security-signal summary over the receipt log ([8ad5740](https://github.com/willow-memory/willow-mcp/commit/8ad5740fe0c1e1c52eebe152cc1d1cf515882792))
+* **diagnostic:** per-app security-signal summary over the receipt log ([c8ebfa5](https://github.com/willow-memory/willow-mcp/commit/c8ebfa52407da6474317186641149839eca33952))
 
 ## [2.72.0](https://github.com/willow-memory/willow-mcp/compare/v2.71.0...v2.72.0) (2026-09-21)
 
