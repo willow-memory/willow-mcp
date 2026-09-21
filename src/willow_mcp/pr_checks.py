@@ -35,7 +35,8 @@ envelope, no citation, no write. It:
    more than one pytest invocation, the LAST complete one — the one CI
    actually judged, and a count-shaped line found inside a ``Captured
    stdout/stderr`` section, or with no FAILURES/ERRORS/summary header
-   preceding it, is never mistaken for that invocation's close); else a
+   preceding it, is never mistaken for that invocation's close — unless the
+   captured output itself contains a pytest banner); else a
    ruff/lint block (lines matching ``path.py:LINE:COL: CODE`` plus the
    ``Found N errors`` summary); else a generic fallback anchored on
    GitHub's own ``##[error]`` annotations (Postgres teardown lines are
@@ -46,8 +47,9 @@ envelope, no citation, no write. It:
    last FAILED/ERROR summary line, or end of log, and Postgres teardown
    noise is filtered from it. A CLOSED pytest block over 300 lines is
    never head-trimmed: it keeps its first 100 lines (the opening
-   tracebacks) and its last 200 lines (the short test summary section and
-   the count line), with a ``… N lines omitted …`` marker between —
+   tracebacks) and its last 200 lines (not necessarily the whole short test
+   summary section — a summary section longer than 200 lines is itself cut
+   to its own tail) plus the count line, with a ``… N lines omitted …`` marker between —
    ``failure["trimmed"]`` becomes ``{"omitted": N, "kept": "head+tail"}``
    in that case; an UNCLOSED block over 300 lines still keeps its head,
    with ``trimmed: true`` (a bare bool) as before.
@@ -68,7 +70,18 @@ when the block was trimmed. ``truncated``/``bytes_dropped`` on the ``red[]``
 entry report whether the log-fetch cap dropped bytes off the HEAD of the
 log to keep the tail (the pytest summary lives at the tail); the blob hop
 asks for that tail directly with a ``Range`` header, falling back to the
-in-memory ring buffer only when the server ignores it.
+in-memory ring buffer only when the server ignores it, or answers the
+ranged request with a 4xx (the blob host's suffix-range support is an
+attempted optimization, not a guarantee — see below); ``red[]`` entries
+gain ``range_fallback: true`` when that retry happened.
+
+Stated limits (Loki, third audit, 2026-09-21):
+
+- a no-summary run with a trailing Captured section reads as unclosed.
+- captured output printing an inner banner+count hides the outer traceback.
+- a matching ``##[endgroup]`` ends an unclosed block.
+- app lines naming a .py path after FAILED/ERROR are counted.
+- doctest .md:: ids are not.
 """
 from __future__ import annotations
 
@@ -220,9 +233,14 @@ def _default_log_fetch(url: str, *, bearer: str, timeout: float = _LOG_FETCH_TIM
     TRANSFER, not just the memory kept, unlike reading the whole stream. A
     206 response's body IS the requested tail; a server that ignores Range
     and answers 200 falls back to ring-buffering the stream in memory,
-    keeping only the last ``max_bytes`` bytes read. Bounded: ``timeout``
-    seconds per hop, ``max_bytes`` read cap. Never raises — every exit is a
-    structured dict."""
+    keeping only the last ``max_bytes`` bytes read. If the ranged blob hop
+    answers with a 4xx instead (a suffix range is not among Azure Blob's
+    documented Range formats — this is an attempted optimization, not a
+    guaranteed one), that hop is refetched ONCE with no Range header at
+    all, falling back to the same in-memory ring buffer; the returned dict
+    then carries ``range_fallback: True``. Bounded: ``timeout`` seconds per
+    hop, ``max_bytes`` read cap. Never raises — every exit is a structured
+    dict."""
     import urllib.error
     import urllib.request
 
@@ -232,15 +250,22 @@ def _default_log_fetch(url: str, *, bearer: str, timeout: float = _LOG_FETCH_TIM
 
     opener = urllib.request.build_opener(_NoAutoRedirect)
     hop_url, hop_bearer, redirected = url, bearer, False
-    for _hop in range(2):  # the original request, plus at most one redirect
+    range_fallback = False
+    for _hop in range(3):  # the original request, one redirect, and at
+        # most one no-Range retry of the blob hop when it 4xx's the range
         headers = {"User-Agent": "willow-mcp-broker", "Accept": "*/*"}
         if hop_bearer:
             headers["Authorization"] = f"Bearer {hop_bearer}"
-        if redirected:
+        if redirected and not range_fallback:
             # Only the blob hop gets Range: it's the unauthenticated,
-            # pre-signed URL GitHub redirects to, and Azure blob storage
-            # honours it. The first (api.github.com) hop never has a body
-            # to range over — it only ever answers with the 302 itself.
+            # pre-signed URL GitHub redirects to. A suffix range
+            # (bytes=-N) is ATTEMPTED here because the pytest summary lives
+            # at the tail, but it is not among Azure Blob's documented
+            # Range formats (bytes=start- / bytes=start-end) — if the host
+            # answers a 4xx to it, the hop below is retried once with no
+            # Range header at all. The first (api.github.com) hop never has
+            # a body to range over — it only ever answers with the 302
+            # itself.
             headers["Range"] = f"bytes=-{max_bytes}"
         req = urllib.request.Request(hop_url, headers=headers, method="GET")
         try:
@@ -252,6 +277,15 @@ def _default_log_fetch(url: str, *, bearer: str, timeout: float = _LOG_FETCH_TIM
                     return {"ok": False, "status": exc.code,
                              "reason": "redirect without a usable Location, or a second redirect"}
                 hop_url, hop_bearer, redirected = location, "", True
+                continue
+            if redirected and not range_fallback and 400 <= exc.code < 500:
+                # The suffix range was refused outright (e.g. 400
+                # InvalidHeaderValue, 416 InvalidRange) — retry this SAME
+                # hop once with no Range header, taking the ring-buffer
+                # path below instead of ever reporting the job unreachable
+                # over an unverified premise about this host's Range
+                # support.
+                range_fallback = True
                 continue
             detail = exc.read(400).decode(errors="replace")
             return {"ok": False, "status": exc.code, "reason": detail or str(exc.reason)}
@@ -279,12 +313,15 @@ def _default_log_fetch(url: str, *, bearer: str, timeout: float = _LOG_FETCH_TIM
                 "redirected": redirected,
                 "truncated": bool(total_size is not None and total_size > len(data)),
                 "bytes_dropped": bytes_dropped,
+                "range_fallback": range_fallback,
             }
-        # The server ignored Range (a plain 200): fall back to ring-buffering
-        # the stream in chunks, keeping only the LAST max_bytes bytes — the
-        # pytest FAILURES/summary section lives at the TAIL of a CI log, so a
-        # cap that keeps the head (a plain `read(max_bytes)`) silently drops
-        # exactly the block this feature exists to find.
+        # The server ignored Range (a plain 200), or the ranged hop was
+        # refused and this is the no-Range retry: fall back to
+        # ring-buffering the stream in chunks, keeping only the LAST
+        # max_bytes bytes — the pytest FAILURES/summary section lives at
+        # the TAIL of a CI log, so a cap that keeps the head (a plain
+        # `read(max_bytes)`) silently drops exactly the block this feature
+        # exists to find.
         buf = bytearray()
         total_read = 0
         chunk_size = 65536
@@ -303,6 +340,7 @@ def _default_log_fetch(url: str, *, bearer: str, timeout: float = _LOG_FETCH_TIM
             "text": bytes(buf).decode("utf-8", errors="replace"),
             "redirected": redirected, "truncated": truncated,
             "bytes_dropped": max(0, total_read - max_bytes),
+            "range_fallback": range_fallback,
         }
     return {"ok": False, "status": 0, "reason": "too many redirects"}
 
@@ -741,6 +779,7 @@ def read_pr_checks(
         failure: Optional[dict[str, Any]] = None
         log_truncated = False
         log_bytes_dropped = 0
+        log_range_fallback = False
         if conclusion in _FAILING_CONCLUSIONS:
             if not actions_ok:
                 summary["log_tail"] = {
@@ -773,6 +812,7 @@ def read_pr_checks(
                         full_text = log_resp.get("text") or ""
                         log_truncated = bool(log_resp.get("truncated"))
                         log_bytes_dropped = int(log_resp.get("bytes_dropped") or 0)
+                        log_range_fallback = bool(log_resp.get("range_fallback"))
                         tail_lines, total_lines = _log_tail_lines(full_text, cap)
                         summary["log_tail"] = {
                             "state": "populated" if tail_lines else "empty",
@@ -801,6 +841,7 @@ def read_pr_checks(
                 "failure": failure,
                 "truncated": log_truncated,
                 "bytes_dropped": log_bytes_dropped,
+                "range_fallback": log_range_fallback,
             })
         out_runs.append(summary)
 

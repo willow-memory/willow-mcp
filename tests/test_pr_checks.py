@@ -253,6 +253,7 @@ def test_populated_with_one_red_tail_annotations_and_first_error_line(home, monk
         },
         "truncated": False,
         "bytes_dropped": 0,
+        "range_fallback": False,
     }]
     # The bearer rides the first (api.github.com) hop; the log fetch is a
     # separate call the fake here answers directly (redirect-following is
@@ -982,7 +983,8 @@ def test_default_log_fetch_follows_one_redirect_without_the_bearer(monkeypatch):
         "https://api.github.com/repos/x/y/actions/jobs/1/logs", bearer="ghs_secret",
     )
     assert out == {"ok": True, "status": 200, "text": "the log text",
-                    "redirected": True, "truncated": False, "bytes_dropped": 0}
+                    "redirected": True, "truncated": False, "bytes_dropped": 0,
+                    "range_fallback": False}
     assert calls[0]["auth"] == "Bearer ghs_secret"
     assert calls[1]["url"] == "https://blob.example/signed"
     assert calls[1]["auth"] is None, "the bearer must not follow to the second host"
@@ -1062,6 +1064,95 @@ def test_default_log_fetch_real_opener_chain_strips_bearer_cross_host(monkeypatc
     assert calls[0]["auth"] == "Bearer ghs_SECRET"
     assert calls[1]["url"] == "https://productionresultssa1.blob.core.windows.net/signed"
     assert calls[1]["auth"] is None, "the bearer must not follow to the cross-host hop"
+
+
+def test_default_log_fetch_range_4xx_falls_back_to_no_range_retry(monkeypatch):
+    """Third audit's condition (Loki, 2026-09-21): a suffix Range
+    (``bytes=-N``) is attempted on the blob hop, but is not among Azure
+    Blob's documented Range formats, so the live host may refuse it. Drives
+    the REAL urllib chain: hop 1 (api.github.com) 302s, hop 2 (the blob
+    host) answers 416 to the ranged request, and the code refetches that
+    SAME hop once with no Range header at all — the second attempt answers
+    200 and extraction proceeds against that body. ``range_fallback: True``
+    records that the retry happened."""
+    import http.client
+    import io
+
+    calls = []
+    blob_hits = {"n": 0}
+
+    _FAILURES_TEXT = (
+        b"=== FAILURES ===\n"
+        b"FAILED tests/t.py::test_x - AssertionError\n"
+        b"===== short test summary info =====\n"
+        b"FAILED tests/t.py::test_x - AssertionError\n"
+        b"===== 1 failed in 0.01s =====\n"
+    )
+
+    class _FakeSocket:
+        def __init__(self, data: bytes):
+            self._data = data
+
+        def makefile(self, mode, *a, **k):
+            return io.BytesIO(self._data)
+
+    class _FakeHTTPSConnection(http.client.HTTPConnection):
+        def __init__(self, host, timeout=None, **kwargs):
+            self.host = host
+            self.sock = None
+
+        def set_debuglevel(self, level):
+            pass
+
+        def request(self, method, url, body=None, headers=None, **kw):
+            calls.append({
+                "url": f"https://{self.host}{url}",
+                "range": (headers or {}).get("Range"),
+                "auth": (headers or {}).get("Authorization"),
+            })
+
+        def getresponse(self):
+            if self.host == "api.github.com":
+                data = (
+                    b"HTTP/1.1 302 Found\r\n"
+                    b"Location: https://blob.example/signed\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+            else:
+                blob_hits["n"] += 1
+                if blob_hits["n"] == 1:
+                    data = b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n"
+                else:
+                    body = _FAILURES_TEXT
+                    data = (
+                        b"HTTP/1.1 200 OK\r\nContent-Length: "
+                        + str(len(body)).encode() + b"\r\n\r\n" + body
+                    )
+            resp = http.client.HTTPResponse(_FakeSocket(data))
+            resp.begin()
+            return resp
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", _FakeHTTPSConnection)
+
+    out = pr_checks._default_log_fetch(
+        "https://api.github.com/repos/x/y/actions/jobs/1/logs", bearer="ghs_SECRET",
+    )
+    assert out["ok"] is True, out
+    assert out["status"] == 200
+    assert out["range_fallback"] is True
+    assert len(calls) == 3
+    assert calls[1]["range"] == f"bytes=-{pr_checks._LOG_FETCH_MAX_BYTES}"
+    assert calls[2]["range"] is None, "the no-Range retry must not send Range again"
+    assert calls[2]["url"] == calls[1]["url"], "the same hop is retried, not a new redirect"
+    assert calls[2]["auth"] is None, "the bearer must not follow to the blob host on retry either"
+
+    failure = pr_checks._extract_failure_block(out["text"])
+    assert failure["kind"] == "pytest"
+    assert "tests/t.py::test_x" in failure["tests_failed"]
+    assert failure["count_line"] == "===== 1 failed in 0.01s ====="
 
 
 # ── gate visibility ────────────────────────────────────────────────────────────
