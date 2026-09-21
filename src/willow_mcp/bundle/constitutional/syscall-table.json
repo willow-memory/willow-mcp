@@ -282,9 +282,22 @@
       "enforced_by": null,
       "min_ring": "ENGINEER",
       "note": "Gap 8d1bcb2b7c02: no broker verb edited a PR title; a pr-title.yml failure after a commit retype was a click the seat could not make. Sealed under governance decision (seal 783bab4e; Nestor pair 783bab4e-90e2-4735-b83b-a52108d411c3), operator, 2026-09-16. Excludes merge, approve, close, request-review, and assignee \u2014 those are verb 5 or ENOSYS; a near-miss is a fault (EAMBIG), never stretched onto verb 4 or verb 5."
+    },
+    {
+      "id": 17,
+      "verb": "unit.install",
+      "summary": "Write, enable and start a systemd --user unit from a template tracked in a named repo at HEAD.",
+      "bounds": {
+        "units": "list[unit-name] \u2014 systemd --user units this envelope may write; the broker's own unit (the willow-mcp server / serve unit) is never a grantable member, same clause as row 15",
+        "sources": "list[repo@path] \u2014 `org/name@relative/path.template`: every unit written comes from a template file tracked in that repo at the checkout's current HEAD; never free text, never a path outside the named repos"
+      },
+      "enforcement": "soft",
+      "enforced_by": null,
+      "min_ring": "ENGINEER",
+      "note": "Gap aae735965d2a (carrying cd0787ddc141): installing a fleet unit \u2014 the reloader, the repo-sweep timer, the net signer, the seal watcher \u2014 was `python -m ... install` + `systemctl --user enable --now` at a keyboard, and Kart cannot reach the user bus. Sealed under governance decision (seal 197aafa5; Nestor pair 197aafa5-1904-4ec9-a5a6-f113f07047b4), operator, 2026-09-21. Preflight before citation: the source repo has a verified clone, the path is a tracked file clean at HEAD, the template's declared unit name equals `unit`, and `unit` is not the broker's. The act writes ~/.config/systemd/user/<unit> (and the .timer sibling when the source ships one), daemon-reload, enable --now; the FRANK unit_install receipt carries the source sha and both digests. Not merged into row 15: reload restarts a unit that exists onto pulled code, install creates or replaces the unit definition itself \u2014 what runs under the operator's identity \u2014 a different act, so a different row (a near-miss is a fault). No stop, disable, mask or edit: those stay ENOSYS until asked for."
     }
   ],
   "lineage": {
-    "note": "Drafted 2026-07-06 in session e2b05d0a (Willow, orchestrator-seat design). Operator ratified thirteen verbs (twelve drafted + agent.lifecycle). This draft carries fourteen rows: pr.open (id 4) was added during drafting as the cheap reversible sibling of pr.merge, so that opening a PR against a foreign repo is expressible-and-boundable rather than falling to ENOSYS. Operator ratified fourteen 2026-07-06 ('keep it at 14'), with notice that the schema will change \u2014 that is what draft status is for. Row 15 unit.reload added 2026-09-16 under sealed decision 06075e99 (operator), PR #555. Row 16 pr.update added 2026-09-16 under sealed decision 783bab4e (operator), PR <#>."
+    "note": "Drafted 2026-07-06 in session e2b05d0a (Willow, orchestrator-seat design). Operator ratified thirteen verbs (twelve drafted + agent.lifecycle). This draft carries fourteen rows: pr.open (id 4) was added during drafting as the cheap reversible sibling of pr.merge, so that opening a PR against a foreign repo is expressible-and-boundable rather than falling to ENOSYS. Operator ratified fourteen 2026-07-06 ('keep it at 14'), with notice that the schema will change \u2014 that is what draft status is for. Row 15 unit.reload added 2026-09-16 under sealed decision 06075e99 (operator), PR #555. Row 16 pr.update added 2026-09-16 under sealed decision 783bab4e (operator), PR <#>. Row 17 unit.install added 2026-09-21 under sealed decision 197aafa5 (operator), PR <#>."
   }
 }

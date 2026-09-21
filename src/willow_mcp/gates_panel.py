@@ -826,6 +826,11 @@ def _request_rows(store=None) -> list[GateRow]:
                 # rather than a paste-me line that would be a half-truth.
                 envelope_kind = (
                     "push" if gate_id.startswith("push.")
+                    # `unit.` splits by marker the way `pr.` splits by
+                    # separator: `unit.<name>@install` is `unit.install`
+                    # (verb 17, sealed 197aafa5); bare `unit.<name>` is
+                    # `unit.reload` (verb 15).
+                    else "unit.install" if gate_id.startswith("unit.") and gate_id.endswith("@install")
                     else "unit.reload" if gate_id.startswith("unit.")
                     # `pr.` splits by separator, not prefix: `#<number>` is
                     # `pr.update` (verb 16); `:<base>` is `pr.open` (verb 4).

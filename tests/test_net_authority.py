@@ -756,9 +756,14 @@ def test_install_stages_under_willow_home_and_refuses_the_root_line_without_a_ri
     assert json.loads(Path(out["ring_staged"]).read_text())["public_only"] is True
     # the CLI exit code says whether a root line was printed
     monkeypatch.setenv("WILLOW_KEYRING", str(verifier["full_ring"]))
-    assert ns.main(["install", "--group", "sean-campbell", "--stage-dir", str(tmp_path / "s")]) == 0
-    monkeypatch.delenv("WILLOW_KEYRING")
+    # Verb 17 (unit.install): the keyboard path is behind --keyboard; without
+    # it the CLI refuses and points at unit_install_execute.
     assert ns.main(["install", "--group", "sean-campbell", "--stage-dir", str(tmp_path / "s")]) == 2
+    assert ns.main(["install", "--keyboard", "--group", "sean-campbell",
+                    "--stage-dir", str(tmp_path / "s")]) == 0
+    monkeypatch.delenv("WILLOW_KEYRING")
+    assert ns.main(["install", "--keyboard", "--group", "sean-campbell",
+                    "--stage-dir", str(tmp_path / "s")]) == 2
 
 
 def test_hold_ttl_is_inside_the_lease_ceiling():
