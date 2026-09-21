@@ -154,6 +154,23 @@ cannot impersonate the tool-output boundary.
 
 ## P3 (priority: medium, conditional) - Install CVE gate
 
+> **Status (landed):** the precondition holds — Kart tasks run arbitrary shell
+> through kartikeya's `sandbox.run_shell`, so a task body can carry
+> `pip install <pkg>`. `willow_mcp/install_audit.py` adds the gate at SUBMIT
+> time in `task_submit` (right after `check_kart_task`), which resolves the
+> where-does-the-audit-run question: the broker has the environment to run
+> `pip-audit`; the network-isolated sandbox could not. It detects
+> pip/npm/yarn/pnpm installs, audits pip specs via `pip-audit -r` (an injectable
+> runner seam so tests use a hand-written double), and refuses with an
+> `INSTALL-AUDIT:` error + structured `install_audit` block when a resolved
+> package carries a vuln at/above `WILLOW_INSTALL_AUDIT_SEVERITY` (default
+> `high`). It degrades OPEN — an absent tool, a timeout, or an unparseable
+> package list allows the install with a logged warning, exactly like
+> `check_kart_task`. npm/yarn/pnpm are detected but allowed-with-caution
+> (auditing a bare `npm install <pkg>` needs a lockfile context absent at submit
+> time); gates-panel surfacing and a dedicated install manifest capability are
+> follow-ons.
+
 Adopt **only if willow executes package-install shell commands.** If it does,
 port `install_audit.py` as a pre-exec guard on the shell/exec path: detect
 pip/npm/yarn/pnpm install commands, run `pip-audit --json` / `npm audit --json`,
