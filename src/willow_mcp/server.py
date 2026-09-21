@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 136 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 137 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -5273,9 +5273,13 @@ def manifest_grant_request(
     Signs nothing and needs no gpg-agent — verification only. The request is
     written to disk BEFORE the envelope citation is inked, so a request that
     fails to persist never spends the one-use citation.
-    `manifest_grant_apply` (the trust-owner unit) drains `pending/` and does
-    the actual write+sign+publish; `manifest_grant_status(pair_id)` reads the
-    outcome. Gated as envelope_apply, beside unit.install and unit.reload."""
+    `manifest_grant_apply` (the broker's own `willow-mcp-manifest-grant`
+    systemd --user unit — an audit-trail split from this half, not a
+    privilege boundary on this box; see the executor's module docstring)
+    drains `pending/` and does the actual write+sign+publish;
+    `manifest_grant_status(pair_id)` reads the outcome, and
+    `manifest_grant_retry(pair_id)` requeues a transiently-failed one.
+    Gated as envelope_apply, beside unit.install and unit.reload."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
@@ -5313,6 +5317,38 @@ def manifest_grant_status(
         return manifest_grant_executor.manifest_grant_status(pair_id)
     except Exception as exc:
         return {"state": "unreachable", "pair_id": pair_id, "error": str(exc)}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def manifest_grant_retry(
+    app_id: str,
+    pair_id: str,
+) -> dict:
+    """Orchestrator-only: move `failed/<pair_id>.json` back to `pending/`
+    for the next apply drain — but ONLY when the recorded failure reason is
+    on the narrow transient list (`EUNREACH`, `ecorrupt`, `eunexpected`,
+    `eperm_pending`: a disk hiccup, an unreachable dependency, a race
+    against another request, or a corrupt directory read). Refused `EPERM`
+    naming the original reason for `eforged`, `eseal_mismatch`, an
+    escalation-class group, or `edrift` — those mean the request itself was
+    wrong, and retrying resubmits exactly what was correctly refused; the
+    fix there is a fresh sealed Nestor pair, never a replay of this one
+    (Loki audit 4, MEDIUM — `failed/` used to be terminal even for causes
+    that were never the pair's own fault). Requeues the SAME record
+    unchanged (nothing here re-signs or re-verifies) and appends a
+    `manifest_grant_retried` FRANK event naming the prior error."""
+    pg = get_pg()
+    try:
+        from . import manifest_grant_executor
+        from .governance_ledger import GovernanceLedger
+
+        return manifest_grant_executor.manifest_grant_retry(
+            app_id, pair_id, ledger=GovernanceLedger(pg) if pg else None,
+            project="willow-mcp",
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"manifest_grant_retry_failed: {exc}"}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -8580,18 +8616,21 @@ def _cmd_sign_manifest(args) -> None:
 
 
 def _cmd_manifest_grant(args) -> None:
-    """`willow-mcp manifest-grant {request,apply,status}` — the CLI wrapper
-    around the split `manifest.grant` verb (verb 18; pair `b74019ac`, amending
-    `d5504878`: the broker never publishes). `request` and `status` run the
-    same code path as their MCP tools and are operator-terminal only, same
-    non-forgeable tty-ownership guard `allow-permission`/`deny-permission`
-    use (an env-only Kart check is not enough here either — this wrapper
-    adds no separate authority, it is a keyboard door onto the same broker
-    call, so it needs the same presence proof those sibling permission
-    commands require). `apply` is what `willow-mcp-manifest-grant.timer`
-    runs as the trust owner, not from an operator terminal — it does not
-    call `require_operator_terminal`, the same shape `reloader.py`'s `tick`
-    subcommand takes."""
+    """`willow-mcp manifest-grant {request,apply,status,retry}` — the CLI
+    wrapper around the split `manifest.grant` verb (verb 18; pair
+    `b74019ac`, amending `d5504878`: the broker never publishes;
+    unit-honesty rework pair `6bd11def`). `request`, `status` and `retry`
+    run the same code path as their MCP tools and are operator-terminal
+    only, same non-forgeable tty-ownership guard `allow-permission`/
+    `deny-permission` use (an env-only Kart check is not enough here either
+    — this wrapper adds no separate authority, it is a keyboard door onto
+    the same broker call, so it needs the same presence proof those
+    sibling permission commands require). `apply` is what
+    `willow-mcp-manifest-grant.timer` runs as the BROKER's own uid, in the
+    broker's own `--user` manager (no distinct trust-owner identity on this
+    box, gap `85716b25d9a8`) — not from an operator terminal, so it does
+    not call `require_operator_terminal`, the same shape `reloader.py`'s
+    `tick` subcommand takes."""
     from . import manifest_grant_executor
 
     if args.mg_action == "apply":
@@ -8614,6 +8653,19 @@ def _cmd_manifest_grant(args) -> None:
         result = manifest_grant_executor.manifest_grant_status(args.pair_id)
         print(json.dumps(result, indent=2, default=str))
         if result.get("state") in ("not_found", "unreachable"):
+            raise SystemExit(1)
+        return
+
+    if args.mg_action == "retry":
+        from .governance_ledger import GovernanceLedger
+
+        pg = get_pg()
+        ledger = GovernanceLedger(pg) if pg else None
+        result = manifest_grant_executor.manifest_grant_retry(
+            args.app_id, args.pair_id, ledger=ledger, project="willow-mcp",
+        )
+        print(json.dumps(result, indent=2, default=str))
+        if not result.get("ok"):
             raise SystemExit(1)
         return
 
@@ -10121,7 +10173,8 @@ def _build_parser():
     manifest_grant_p = subparsers.add_parser(
         "manifest-grant",
         help="manifest.grant (verb 18): request (broker, verify+write pending), "
-             "apply (trust-owner unit, sign+publish), status (read pending/done/failed)",
+             "apply (broker's own --user unit, sign+publish), "
+             "status (read pending/done/failed), retry (requeue a transient failure)",
     )
     mg_sub = manifest_grant_p.add_subparsers(dest="mg_action", required=True)
 
@@ -10143,10 +10196,10 @@ def _build_parser():
 
     mg_apply_p = mg_sub.add_parser(
         "apply",
-        help="Trust-owner unit side: drain pending/ (or one pair_id), re-verify "
+        help="Apply side: drain pending/ (or one pair_id), re-verify "
              "the seal and pre-state fresh, sign and publish under signed_pair_lock, "
              "roll back through the same staged path on any failure. What "
-             "willow-mcp-manifest-grant.timer runs; never the broker process.",
+             "willow-mcp-manifest-grant.timer runs, as the broker's own uid.",
     )
     mg_apply_p.add_argument("pair_id", nargs="?", default=None,
                             help="apply only this pending pair_id (default: drain all of pending/)")
@@ -10155,6 +10208,19 @@ def _build_parser():
         "status", help="Read which of pending/ done/ failed/ holds a pair_id's request",
     )
     mg_status_p.add_argument("pair_id")
+
+    mg_retry_p = mg_sub.add_parser(
+        "retry",
+        help="Requeue a failed/<pair_id> request back to pending/, but only when "
+             "the recorded failure reason is transient (EUNREACH/ecorrupt/"
+             "eunexpected/eperm_pending); refuses eforged/eseal_mismatch/"
+             "escalation/edrift by name.",
+    )
+    mg_retry_p.add_argument("pair_id", help="failed pair_id to requeue")
+    mg_retry_p.add_argument(
+        "--app-id", dest="app_id", default=os.environ.get("WILLOW_APP_ID", "willow"),
+        help="orchestrator identity to run as (default $WILLOW_APP_ID or 'willow')",
+    )
 
     attest_session_p = subparsers.add_parser(
         "attest-session",

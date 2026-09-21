@@ -223,21 +223,21 @@ def render_values(unit: str) -> dict[str, str]:
     environment — the same names the fleet's installers use. Anything a
     template asks for beyond these is ``ETEMPLATE``.
 
-    ``TRUST_OWNER`` (added for ``willow-mcp-manifest-grant.service``, Loki
-    audit 3 finding 3): the username that owns ``$WILLOW_HOME/mcp_apps`` —
-    the identity a trust-owner unit's ``User=`` must run as, resolved from
-    the filesystem rather than guessed from this process's own ``$USER``
-    (which, run from the broker's own session, names the broker — the one
-    identity the design says never publishes). Left out of the values
-    entirely (never filled with an empty or wrong guess) when
-    ``mcp_apps`` does not exist yet or the owning uid has no passwd entry;
-    a template asking for ``@TRUST_OWNER@`` then refuses ``ETEMPLATE`` by
-    name instead of silently rendering the broker's own identity in.
+    No ``TRUST_OWNER`` placeholder is filled here (removed, pair
+    ``6bd11def``, amending the Loki audit 3 finding 3 fix): every unit
+    installed through this path lands in the INSTALLING process's own
+    ``~/.config/systemd/user`` (:func:`unit_dir`), and systemd.exec is
+    explicit that a non-root ``--user`` service manager may only run a unit
+    as the identity the manager itself is running as — a ``User=`` line
+    naming anyone else refuses at start (217/USER) regardless of what this
+    function resolves. A template still asking for ``@TRUST_OWNER@`` gets
+    ``ETEMPLATE`` by name; none of the templates in this bundle ask for it
+    any more.
 
     ``WILLOW_KEYRING`` / ``WILLOW_PGP_FINGERPRINT`` are filled from this
-    process's own environment when set — same "resolved values, not
-    guesses" rule; a template needing one that is unset here refuses
-    ``ETEMPLATE`` rather than rendering an empty ``Environment=`` line."""
+    process's own environment when set — "resolved values, not guesses";
+    a template needing one that is unset here refuses ``ETEMPLATE`` rather
+    than rendering an empty ``Environment=`` line."""
     values: dict[str, object] = {
         "PYTHON": Path(sys.executable),
         "UNIT": unit,
@@ -252,13 +252,6 @@ def render_values(unit: str) -> dict[str, str]:
         from .seal_handler import _nestor_db_path
         values["NESTOR_DB"] = _nestor_db_path()
     except Exception:  # noqa: BLE001 — optional; a template that needs it will refuse by name
-        pass
-    apps_root = Path(os.environ.get("WILLOW_MCP_APPS_ROOT", paths.willow_home() / "mcp_apps"))
-    try:
-        import pwd
-        if apps_root.is_dir():
-            values["TRUST_OWNER"] = pwd.getpwuid(apps_root.stat().st_uid).pw_name
-    except (OSError, KeyError):  # noqa: BLE001 — no owner resolvable; leave unfilled, refuse by name
         pass
     for env_key in ("WILLOW_KEYRING", "WILLOW_PGP_FINGERPRINT"):
         val = os.environ.get(env_key, "").strip()

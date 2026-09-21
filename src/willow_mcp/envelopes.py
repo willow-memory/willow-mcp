@@ -261,15 +261,27 @@ class EnvelopeAuthority:
         call_args: dict,
         project: str,
         session: str,
+        pair_id: str | None = None,
     ) -> dict:
         result = self.check(
             envelope_id, actor=actor, verb=verb, call_args=call_args
         )
         outcome = "granted" if result.get("ok") else result.get("errno", "EAMBIG")
+        # `pair_id` is folded into the CITATION's own call_args (not the
+        # `call_args` the bounds check above judges — bounds.signature is
+        # verb-defined and a caller adding a key it does not name would
+        # otherwise be refused "bounds mismatch"). This lets a caller that
+        # cites once per sealed decision (manifest.grant, pair `6bd11def`)
+        # look its own citation back up by (envelope_id, pair_id, outcome)
+        # rather than by "whichever citation is newest for this envelope" —
+        # see `GovernanceLedger.all_events`.
+        content_call_args = dict(call_args) if pair_id is not None else call_args
+        if pair_id is not None:
+            content_call_args["pair_id"] = pair_id
         content = {
             "envelope_id": envelope_id,
             "verb": verb,
-            "call_args": call_args,
+            "call_args": content_call_args,
             "outcome": outcome,
             "session": session,
             "actor": actor,

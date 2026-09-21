@@ -1013,7 +1013,7 @@ def test_apply_refuses_when_pre_state_is_absent(
     }
     rec = ledger.append_citation("willow-mcp", {
         "envelope_id": "env-manifest.grant-test", "verb": mgx.VERB,
-        "call_args": {"apps": ["kart"], "groups": ["store_read"]},
+        "call_args": {"apps": ["kart"], "groups": ["store_read"], "pair_id": "pair-mg-1"},
         "outcome": "granted", "session": "", "actor": "willow",
     }, max_count=None)
     record["citation_id"] = rec[0]
@@ -1139,10 +1139,13 @@ def test_apply_refuses_ewronguser_when_it_does_not_own_apps_root(
     assert out["error"] == "ewronguser"
 
 
-def test_render_manifest_grant_service_template_fills_trust_owner_and_pgp_env(tmp_path, monkeypatch):
-    """Fix 3: the service template must render with User=, WILLOW_KEYRING=
-    and WILLOW_PGP_FINGERPRINT= filled, plus the ExecStartPre that
-    provisions manifest_grants/{pending,done,failed}."""
+def test_render_manifest_grant_service_template_has_no_user_line_or_trust_owner(tmp_path, monkeypatch):
+    """Fix 3 (unit honesty, pair 6bd11def): the service template must NOT
+    carry a User= line or claim a trust-owner identity — a non-root --user
+    manager can only run a unit as itself (systemd.exec). It must render
+    with WILLOW_KEYRING=/WILLOW_PGP_FINGERPRINT= filled, the ExecStartPre
+    that provisions manifest_grants/{pending,done,failed}, and no literal
+    /home/ path leaking in (no per-user identity baked into the unit)."""
     from willow_mcp import unit_install_executor as uix
 
     apps_root = tmp_path / "mcp_apps"
@@ -1150,10 +1153,10 @@ def test_render_manifest_grant_service_template_fills_trust_owner_and_pgp_env(tm
     monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(apps_root))
     monkeypatch.setenv("WILLOW_KEYRING", str(tmp_path / "verifiers.json"))
     monkeypatch.setenv("WILLOW_PGP_FINGERPRINT", "ABCD1234")
-    monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "wh"))
 
     values = uix.render_values("willow-mcp-manifest-grant.service")
-    assert values.get("TRUST_OWNER")
+    assert "TRUST_OWNER" not in values
     assert values.get("WILLOW_KEYRING") == str(tmp_path / "verifiers.json")
     assert values.get("WILLOW_PGP_FINGERPRINT") == "ABCD1234"
 
@@ -1161,7 +1164,13 @@ def test_render_manifest_grant_service_template_fills_trust_owner_and_pgp_env(tm
                      / "deploy" / "willow-mcp-manifest-grant.service.template")
     rendered = uix.render_template(template_path.read_text(encoding="utf-8"),
                                    "willow-mcp-manifest-grant.service", values=values)
-    assert f"User={values['TRUST_OWNER']}" in rendered
+    # The [Service] block, minus ExecStart= (this dev box's own venv
+    # interpreter path, not an identity claim) — the section that would
+    # carry a User= directive or a baked-in per-user identity, if either
+    # existed.
+    service_block = rendered.split("[Service]", 1)[1].split("ExecStart=", 1)[0]
+    assert "User=" not in service_block
+    assert "/home/" not in service_block
     assert "Environment=\"WILLOW_KEYRING=" in rendered
     assert "Environment=\"WILLOW_PGP_FINGERPRINT=ABCD1234\"" in rendered
     assert "ExecStartPre=" in rendered
@@ -1172,6 +1181,272 @@ def test_render_manifest_grant_service_template_fills_trust_owner_and_pgp_env(tm
 
 def _now_iso_helper():
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Loki audit 4 rework (pair 6bd11def): TWO-PAIRS, REPLAY, stale lock,
+#    manifest_grant_retry ───────────────────────────────────────────────────
+
+def test_two_requests_under_one_envelope_both_reach_done(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit 4, HIGH (TWO-PAIRS): two sealed pairs governed by the same
+    envelope, both requested before either is applied. Both must land in
+    done/ — neither citation may be picked by 'latest' and burn the other."""
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart", "hanuman"), groups=("store_read",))
+    _manifest(home, "kart")
+    _manifest(home, "hanuman")
+    _seal(home, store, pair_id="pair-A", seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+    _seal(home, store, pair_id="pair-B", seats=("hanuman",), groups=("store_read",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req_a = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-A",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert req_a["ok"] is True, req_a
+    req_b = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-B",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert req_b["ok"] is True, req_b
+    assert req_a["citation_id"] != req_b["citation_id"]
+
+    applied = mgx.manifest_grant_apply(ledger=ledger, apps_root=home / "mcp_apps",
+                                       grants_root=grants_root)
+    assert applied["ok"] is True, applied
+    by_pair = {r["pair_id"]: r for r in applied["processed"]}
+    assert by_pair["pair-A"]["ok"] is True
+    assert by_pair["pair-B"]["ok"] is True
+    assert mgx.manifest_grant_status("pair-A", grants_root=grants_root)["state"] == "done"
+    assert mgx.manifest_grant_status("pair-B", grants_root=grants_root)["state"] == "done"
+
+
+def test_citation_minted_for_a_different_pair_is_eforged(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit 4, HIGH (REPLAY): a pending file naming a citation_id that
+    is genuinely granted in FRANK, but was minted for a DIFFERENT pair_id
+    (the stolen-key + copied-citation shape) — refused even though the
+    citation itself is real and granted."""
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, pair_id="pair-real", seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+    _seal(home, store, pair_id="pair-mallory", seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    real_req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-real",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert real_req["ok"] is True, real_req
+    real_citation = real_req["citation_id"]
+    # The genuine pending file for pair-real is removed so only the forged
+    # one for pair-mallory is in pending/ when apply drains it.
+    (grants_root / "pending" / "pair-real.json").unlink()
+
+    forged = {
+        "pair_id": "pair-mallory", "envelope_id": real_req["envelope_id"],
+        "citation_id": real_citation, "actor": "willow", "apps": ["kart"],
+        "groups": ["store_read"], "project": "willow-mcp", "session": "",
+        "requested_at": _now_iso_helper(),
+        "pre_state": {"kart": mgx._seat_pre_state("kart", home / "mcp_apps")},
+    }
+    forged["broker_sig"] = mgx._sign_request(forged, grants_root)
+    (grants_root / "pending" / "pair-mallory.json").write_text(json.dumps(forged, default=str))
+
+    applied = mgx.manifest_grant_apply(ledger=ledger, apps_root=home / "mcp_apps",
+                                       grants_root=grants_root)
+    result = applied["processed"][0]
+    assert result["error"] == "eforged"
+    assert "pair_id" in result["reason"]
+    kart_manifest = json.loads((home / "mcp_apps" / "kart" / "manifest.json").read_text())
+    assert kart_manifest["permissions"] == []
+
+
+def test_replaying_a_consumed_done_citation_after_revoke_is_eforged(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit 4, HIGH (REPLAY): a byte-for-byte copy of an already-DONE
+    request, dropped back into pending/ after the operator revoked the
+    grant it produced — everything about it (signature, pair_id, citation)
+    is genuinely correct because it IS the once-genuine request. done/'s
+    own record of consumed citation ids must still refuse it."""
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req, applied = _request_and_apply(home, store, ledger, apps_root=home / "mcp_apps",
+                                      grants_root=grants_root)
+    assert applied["ok"] is True, applied
+
+    done_path = grants_root / "done" / "pair-mg-1.json"
+    done_record = json.loads(done_path.read_text())
+    # The operator revokes the grant by hand, the way manifest_grant_status's
+    # own docstring describes recovering a stuck request.
+    from willow_mcp import manifest_admin
+    manifest_admin.set_permission("kart", "store_read", False)
+    assert json.loads((home / "mcp_apps" / "kart" / "manifest.json").read_text())["permissions"] == []
+
+    replay = {k: v for k, v in done_record.items() if k != "result"}
+    (grants_root / "pending").mkdir(parents=True, exist_ok=True)
+    (grants_root / "pending" / "pair-mg-1.json").write_text(json.dumps(replay, default=str))
+
+    applied2 = mgx.manifest_grant_apply(ledger=ledger, apps_root=home / "mcp_apps",
+                                        grants_root=grants_root)
+    result = applied2["processed"][0]
+    assert result["error"] == "eforged"
+    assert "consumed" in result["reason"]
+    kart_manifest = json.loads((home / "mcp_apps" / "kart" / "manifest.json").read_text())
+    assert kart_manifest["permissions"] == []
+
+
+def test_stale_lock_with_dead_pid_is_reclaimed(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit 4, MEDIUM: a lock file left behind by a hard kill (dead
+    pid, old timestamp) is reclaimed rather than permanently EALREADY-ing
+    the pair."""
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    lock_dir = grants_root / "pending"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    dead_pid = 2**30  # not a real, live pid
+    old = (datetime.now(timezone.utc) - timedelta(seconds=700)).isoformat()
+    (lock_dir / "pair-mg-1.lock").write_text(json.dumps({"pid": dead_pid, "created_at": old}))
+
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["ok"] is True, out
+    assert out.get("reclaimed_stale_lock") is True
+    assert not (lock_dir / "pair-mg-1.lock").exists()
+
+
+def test_young_lock_is_not_reclaimed_even_with_dead_pid(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    lock_dir = grants_root / "pending"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    dead_pid = 2**30
+    fresh = _now_iso_helper()
+    (lock_dir / "pair-mg-1.lock").write_text(json.dumps({"pid": dead_pid, "created_at": fresh}))
+
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["error"] == "EALREADY"
+
+
+def test_lock_with_live_pid_is_never_reclaimed_regardless_of_age(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    lock_dir = grants_root / "pending"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    old = (datetime.now(timezone.utc) - timedelta(seconds=700)).isoformat()
+    (lock_dir / "pair-mg-1.lock").write_text(json.dumps({"pid": os.getpid(), "created_at": old}))
+
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["error"] == "EALREADY"
+
+
+# ── manifest_grant_retry ──────────────────────────────────────────────────
+
+def _fail_into_failed(grants_root, pair_id, record, out):
+    (grants_root / "failed").mkdir(parents=True, exist_ok=True)
+    (grants_root / "failed" / f"{pair_id}.json").write_text(
+        json.dumps({**record, "result": out}, default=str))
+
+
+def test_retry_requeues_a_transient_failure(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-mg-1",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert req["ok"] is True, req
+    record = json.loads((grants_root / "pending" / "pair-mg-1.json").read_text())
+    (grants_root / "pending" / "pair-mg-1.json").unlink()
+    _fail_into_failed(grants_root, "pair-mg-1", record, {"ok": False, "error": "EUNREACH", "reason": "disk hiccup"})
+
+    out = mgx.manifest_grant_retry("willow", "pair-mg-1", ledger=ledger, grants_root=grants_root)
+    assert out["ok"] is True, out
+    assert out["state"] == "requeued"
+    assert out["prior_error"] == "EUNREACH"
+    assert (grants_root / "pending" / "pair-mg-1.json").is_file()
+    assert not (grants_root / "failed" / "pair-mg-1.json").exists()
+    assert any(r["event_type"] == mgx.RETRY_EVENT for r in pg.rows)
+
+    applied = mgx.manifest_grant_apply(ledger=ledger, apps_root=home / "mcp_apps",
+                                       grants_root=grants_root)
+    assert applied["ok"] is True, applied
+
+
+def test_retry_refuses_a_terminal_failure(home, tmp_path, monkeypatch):
+    grants_root = home / "manifest_grants"
+    record = {
+        "pair_id": "pair-x", "envelope_id": "e", "citation_id": "c",
+        "apps": ["kart"], "groups": ["store_read"],
+    }
+    _fail_into_failed(grants_root, "pair-x", record, {"ok": False, "error": "eforged", "reason": "forged"})
+
+    out = mgx.manifest_grant_retry("willow", "pair-x", grants_root=grants_root)
+    assert out["error"] == "EPERM"
+    assert out["prior_error"] == "eforged"
+    assert (grants_root / "failed" / "pair-x.json").is_file()
+    assert not (grants_root / "pending" / "pair-x.json").exists()
+
+
+def test_retry_refuses_when_pending_already_exists(home, tmp_path, monkeypatch):
+    grants_root = home / "manifest_grants"
+    record = {"pair_id": "pair-x", "envelope_id": "e", "citation_id": "c",
+              "apps": ["kart"], "groups": ["store_read"]}
+    _fail_into_failed(grants_root, "pair-x", record, {"ok": False, "error": "EUNREACH", "reason": "disk"})
+    (grants_root / "pending").mkdir(parents=True, exist_ok=True)
+    (grants_root / "pending" / "pair-x.json").write_text(json.dumps(record))
+
+    out = mgx.manifest_grant_retry("willow", "pair-x", grants_root=grants_root)
+    assert out["error"] == "EALREADY"
+
+
+def test_retry_is_orchestrator_only(home, tmp_path, monkeypatch):
+    grants_root = home / "manifest_grants"
+    record = {"pair_id": "pair-x", "envelope_id": "e", "citation_id": "c",
+              "apps": ["kart"], "groups": ["store_read"]}
+    _fail_into_failed(grants_root, "pair-x", record, {"ok": False, "error": "EUNREACH", "reason": "disk"})
+
+    out = mgx.manifest_grant_retry("hanuman", "pair-x", grants_root=grants_root)
+    assert out["error"] == "EPERM"
+    assert (grants_root / "failed" / "pair-x.json").is_file()
+
+
+def test_retry_no_failed_request_is_enoent(home, tmp_path):
+    out = mgx.manifest_grant_retry("willow", "no-such-pair", grants_root=home / "manifest_grants")
+    assert out["error"] == "ENOENT"
 
 
 def test_status_not_found_then_pending_then_done(

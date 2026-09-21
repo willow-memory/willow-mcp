@@ -1,32 +1,44 @@
 # systemd --user template for the willow-mcp manifest-grant apply unit
-# (pair b74019ac, amending d5504878). One act per tick: drain
-# $WILLOW_HOME/manifest_grants/pending/, re-verify each request's seal and
-# pre-state fresh, sign and publish through manifest_admin.set_permission +
-# publish_signed_pair under signed_pair_lock, move to done/ or failed/.
-# Type=oneshot because it drains what is pending and exits — the .timer
-# beside it owns the cadence, same split as willow-mcp-reloader.
+# (pair b74019ac, amending d5504878; unit-honesty rework pair 6bd11def).
+# One act per tick: drain $WILLOW_HOME/manifest_grants/pending/, re-verify
+# each request's seal and pre-state fresh, sign and publish through
+# manifest_admin.set_permission + publish_signed_pair under
+# signed_pair_lock, move to done/ or failed/. Type=oneshot because it
+# drains what is pending and exits — the .timer beside it owns the
+# cadence, same split as willow-mcp-reloader.
 #
-# Runs as the trust owner (this unit's own --user identity), NOT as the
-# broker: manifest_grant_request (the broker side) never signs and never
-# publishes; only this unit does, which is why it needs no sudo bridge to
-# cross — it already owns mcp_apps/.
+# Runs in the BROKER's own --user manager, as the broker's OWN uid — no
+# User= line here, and none is possible: systemd.exec is explicit that a
+# non-root --user service manager may only run a unit as the identity the
+# manager itself is running as ("the only valid setting is the same user
+# the user's service manager is running as"). A prior draft's
+# "User=" line naming a separate trust-owner identity could therefore
+# never start (217/USER) once installed here (unit_install_executor.
+# unit_dir() always installs into
+# the INSTALLING process's own ~/.config/systemd/user — the broker's).
+# The request/apply split (manifest_grant_request never signs or
+# publishes; only manifest_grant_apply does) is real and stays — but on
+# this box it is an AUDIT-TRAIL split, not a privilege boundary, since both
+# halves run as the same uid (manifest_grant_executor module docstring,
+# gap 85716b25d9a8). manifest_grant_apply's own euid-owns-apps_root check
+# still refuses to run as any uid other than the one that owns apps_root —
+# on this box that is the broker itself, so the check passes here and
+# would correctly refuse a mismatched identity after a real uid split.
 #
-# Loki audit 3, finding 3: a prior version of this template carried no
-# User=, no WILLOW_KEYRING, and no WILLOW_PGP_FINGERPRINT — so
-# get_keyring() returned None (every apply EACCES'd, then EALREADY burned
-# the pair on the next request) and a signed seat's manifest could never
-# be re-signed (efingerprint_absent). All three are filled here; the
-# executor's own euid-owns-apps_root check (manifest_grant_apply) is the
-# hard boundary — this file being wrong is a refusal, not a silent wrong
-# identity, but wiring it right means the unit actually runs at all.
+# Loki audit 3, finding 3 (superseded by the above): a prior version of
+# this template carried no WILLOW_KEYRING and no WILLOW_PGP_FINGERPRINT —
+# so get_keyring() returned None (every apply EACCES'd, then EALREADY
+# burned the pair on the next request) and a signed seat's manifest could
+# never be re-signed (efingerprint_absent). Both are filled here.
 # ExecStartPre provisions manifest_grants/{pending,done,failed} so the
-# first tick never depends on manifest_grant_request having run first.
+# first tick never depends on manifest_grant_request having run first —
+# and, running as the broker's own uid in the broker's own $WILLOW_HOME,
+# this provisioning step actually succeeds.
 [Unit]
 Description=willow-mcp manifest-grant — apply sealed permission grants
 
 [Service]
 Type=oneshot
-User=@TRUST_OWNER@
 Environment="WILLOW_HOME=@WILLOW_HOME@"
 Environment="WILLOW_STORE_ROOT=@WILLOW_STORE_ROOT@"
 Environment="WILLOW_PG_DB=@PG_DB@"

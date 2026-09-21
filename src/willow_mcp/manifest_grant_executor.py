@@ -25,19 +25,33 @@ in the same process identity:
   all: :mod:`pgp` signature VERIFICATION (``gpg --verify``) needs no agent,
   and this half never calls :func:`pgp.sign_detached`.
 
-* :func:`manifest_grant_apply` — the unit side. A trust-owner ``--user``
-  systemd unit (``willow-mcp-manifest-grant.timer`` / ``.service``, same
-  shape as :mod:`reloader`'s own installer-never-starts split — see
-  ``src/willow_mcp/bundle/deploy/willow-mcp-manifest-grant.{service,timer}.template``)
-  drains ``pending/``: RE-verifies the seal and every seat's pre-state fresh
-  (a pending request can sit for minutes; nothing about it is trusted twice
-  without a re-check), then for each seat applies its groups one at a time
-  through ``manifest_admin.set_permission`` + ``publish_signed_pair`` under
+* :func:`manifest_grant_apply` — the unit side. Rework (pair ``6bd11def``,
+  amending ``b74019ac``): this runs as a ``willow-mcp-manifest-grant.timer`` /
+  ``.service`` unit installed in the BROKER's own ``--user`` manager, under
+  the broker's OWN uid — no ``User=`` line, no trust-owner claim. systemd's
+  own manual is explicit that a non-root ``--user`` manager may only run a
+  unit as the identity it is already running as (systemd.exec, "the only
+  valid setting is the same user the user's service manager is running
+  as"); a prior draft's ``User=@TRUST_OWNER@`` line could therefore never
+  start at all (217/USER), and "runs as a distinct trust-owner uid" was
+  never true of a broker-installed ``--user`` unit regardless of what the
+  template said. What this split actually buys, restated honestly: the
+  request/apply split is an AUDIT-TRAIL boundary, not a privilege one — see
+  the module-level note below and executor:294-321 / 973-976. The real
+  privilege boundary on this box is Kart's read-only bind on ``config/``,
+  ``nestor.db`` and ``manifest_grants/`` (gap ``85716b25d9a8``) and a uid
+  split, if the operator ever performs one — then, and only then, does
+  ``manifest_grant_apply`` running as a distinct identity from the broker
+  mean anything. ``manifest_grant_apply`` drains ``pending/``: RE-verifies
+  the seal and every seat's pre-state fresh (a pending request can sit for
+  minutes; nothing about it is trusted twice without a re-check), then for
+  each seat applies its groups one at a time through
+  ``manifest_admin.set_permission`` + ``publish_signed_pair`` under
   the exclusive ``signed_pair_lock`` — with NO ``privileged_publisher``: this
-  process already runs AS the trust owner (the unit's own uid), so the sudo
-  bridge that the broker could never clear a controlling tty for
-  (``publish_via_trust_owner`` needs one; a systemd unit has none) is not
-  needed at all. A failure on seat *n*, group *g* rolls back every group
+  process runs as the broker's own uid, the same uid that already owns the
+  trust root on this box, so the sudo bridge that a cross-uid publish would
+  need (``publish_via_trust_owner``, which needs a controlling tty the
+  broker can never clear) is not needed at all. A failure on seat *n*, group *g* rolls back every group
   already granted to that seat and every seat already granted earlier in the
   same request, through the SAME staged ``set_permission`` path — never a
   bare ``Path.write_text``. The request moves to ``done/`` with per-seat
@@ -108,11 +122,16 @@ Kart-guard note (Loki probe P6): a positive ``gpg-agent`` socket check in
 can create a Unix socket file at the expected path (including one running
 inside Kart's own bwrap sandbox) can make the check pass, and a real
 gpg-agent answering does not prove ITS private key belongs to the operator.
-The actual boundary is that :func:`manifest_grant_apply` runs as a distinct
-uid (the trust owner's ``--user`` systemd service), never inside a Kart task
-and never as the broker; the socket check is a diagnostic that turns a
-cryptic gpg failure into a named one, nothing more. The request side
-(:func:`manifest_grant_request`) makes no such check at all — it never signs.
+The actual boundary :func:`manifest_grant_apply` enforces is narrower than a
+prior draft claimed: it refuses to run inside a Kart task at all
+(:func:`_in_kart`), and it refuses to run as any uid other than the one that
+owns ``apps_root`` (the trust root). On THIS box those two things do not add
+up to a distinct-uid guarantee — the broker itself owns ``apps_root``, so
+"the uid that owns apps_root" and "the broker's own uid" are the same
+uid (gap ``85716b25d9a8``: the actual uid split is not built). The socket
+check is a diagnostic that turns a cryptic gpg failure into a named one,
+nothing more. The request side (:func:`manifest_grant_request`) makes no
+such check at all — it never signs.
 """
 from __future__ import annotations
 
@@ -208,6 +227,47 @@ def _in_kart() -> bool:
     )
 
 
+#: A lock older than this with no live holder is reclaimed (Loki audit 4,
+#: MEDIUM). Ten minutes is well past any real request's lock hold time (the
+#: lock spans one `_manifest_grant_request_locked` call — file writes and a
+#: single envelope citation, not network I/O) and well short of "a human
+#: would notice and intervene first."
+_STALE_LOCK_AGE_S = 600.0
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else — never treat as dead
+    except OSError:
+        return True  # unknown — never treat as dead on ambiguous failure
+    return True
+
+
+def _stale_lock(lock_path: Path, *, max_age_s: float = _STALE_LOCK_AGE_S) -> bool:
+    """True only when the lock names a pid that is provably not running AND
+    is at least ``max_age_s`` old. A lock this process cannot parse, whose
+    pid is still alive, or that is simply young, is never reclaimed —
+    ambiguity always resolves to 'leave it alone.'"""
+    try:
+        info = json.loads(lock_path.read_text(encoding="utf-8"))
+        pid = int(info["pid"])
+        created_at = info["created_at"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    try:
+        created = datetime.fromisoformat(created_at)
+    except (TypeError, ValueError):
+        return False
+    age_s = (datetime.now(timezone.utc) - created).total_seconds()
+    if age_s < max_age_s:
+        return False
+    return not _pid_alive(pid)
+
+
 def _gpg_agent_reachable() -> bool:
     """A positive gpg-agent socket check — a diagnostic, NOT a security
     boundary (module docstring, Loki probe P6). Used only by
@@ -300,25 +360,41 @@ def _ring_from_keyring(kr) -> dict[str, dict]:
 # pending/<pair_id>.json and have it applied.
 #
 # The fix is a detached ed25519 signature the BROKER holds and the APPLY
-# UNIT can verify — not net_signer's key (that key belongs to the egress
-# key's owner, uid 994 on a hardened box, a different uid than the broker's
-# 1000 and unreachable to it by design; sharing it here would break that
-# split) and not pgp.sign_detached (the request side deliberately signs
-# nothing with gpg and needs no gpg-agent — module docstring). Instead: a
-# dedicated ed25519 keypair generated on first use under
-# ``<grants_root>/broker_signing_key`` (0600, broker-owned, private half
-# never leaves this process) with its public half exported alongside it at
-# ``<grants_root>/broker_public_key.pub`` (0644 — the apply unit, a
-# different uid, must be able to read it; provisioning ``manifest_grants/``
-# with a mode both uids can traverse is fix 3's job, tracked there). The
-# apply unit never needs the private half at all: it only ever verifies.
+# side can verify — not net_signer's key (that key belongs to the egress
+# key's owner, a different uid than the broker's and unreachable to it by
+# design; sharing it here would break that split) and not pgp.sign_detached
+# (the request side deliberately signs nothing with gpg and needs no
+# gpg-agent — module docstring). Instead: a dedicated ed25519 keypair
+# generated on first use under ``<grants_root>/broker_signing_key`` (0600,
+# broker-owned, private half never leaves this process) with its public half
+# exported alongside it at ``<grants_root>/broker_public_key.pub`` (0644).
 #
-# What is signed (Loki's own spec): the canonical JSON of exactly
-# ``{pair_id, envelope_id, citation_id, apps, groups, pre_state,
-# requested_at}`` — the fields that, taken together, ARE the request. A
-# forged file with no ``broker_sig``, or one whose signature does not
-# verify against this key, is refused ``eforged`` with no grant, before the
-# seal, the escalation set, or anything else is even looked at.
+# Loki audit 4, HIGH ("signing key adds nothing on this box"): this
+# signature is an AUDIT-TRAIL binding, not a privilege boundary, and this
+# comment previously overclaimed it as one ("a file this process did not
+# write and sign is never actioned" — false on a single-uid box). What it
+# actually proves: the pending record was produced by SOME process holding
+# ``broker_signing_key`` — nothing more. On this box (no uid split, gap
+# ``85716b25d9a8``) that key lives at ``$WILLOW_HOME/manifest_grants/``,
+# 0600, owned by uid 1000 — the SAME uid Kart tasks run as, with
+# ``$WILLOW_HOME`` read-write. A Kart task can read the private half
+# directly (POISON: on an empty ``manifest_grants/`` it can even plant its
+# own keypair first, and the broker's next genuine request signs with the
+# planted key) and forge a request the broker itself would then sign as
+# genuine. The signature therefore verifies "a uid-1000 process wrote this,"
+# never "the broker, and only the broker, wrote this" — closing that gap is
+# the uid split's job, not this branch's. What this branch DOES close: the
+# citation binding below (pair_id in ``call_args``, matched by id — not
+# "latest" — never a "latest" lookup, and never a previously-consumed
+# citation) so a signed-but-stolen-key forgery still cannot replay a
+# citation it does not itself hold.
+#
+# What is signed: the canonical JSON of exactly ``{pair_id, envelope_id,
+# citation_id, apps, groups, pre_state, requested_at}`` — the fields that,
+# taken together, ARE the request. A forged file with no ``broker_sig``, or
+# one whose signature does not verify against this key, is refused
+# ``eforged`` with no grant, before the seal, the escalation set, or
+# anything else is even looked at.
 
 def _broker_signing_key_path(grants_root: Path) -> Path:
     return grants_root / "broker_signing_key"
@@ -578,27 +654,52 @@ def _existing_request_state(grants_root: Path, pair_id: str) -> Optional[str]:
     return None
 
 
+def _consumed_citation_ids(grants_root: Path) -> set[str]:
+    """Every ``citation_id`` a ``done/`` entry already recorded — the
+    REPLAY defense (Loki audit 4, HIGH): done/ IS the record of which
+    citations were actually consumed, so a request naming one of these ids
+    again is refused regardless of how well-formed or well-signed it
+    otherwise looks. Read-only, tolerant of a corrupt or unreadable
+    individual file (skipped, never raised) — this is a denylist check, not
+    the only gate."""
+    done_dir = grants_root / "done"
+    ids: set[str] = set()
+    if not done_dir.is_dir():
+        return ids
+    for f in done_dir.glob("*.json"):
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        cid = rec.get("citation_id")
+        if cid:
+            ids.add(cid)
+    return ids
+
+
 def manifest_grant_status(pair_id: str, *, grants_root: Optional[Path] = None) -> dict:
     """Three-state (plus not_found) read of one request: ``pending`` (the
     unit has not drained it yet), ``done`` (granted, receipts attached),
     ``failed`` (refused or rolled back at apply time), or ``not_found`` (no
     request was ever made for this ``pair_id``). Read-only, never blocks.
 
-    ``failed`` is TERMINAL BY DESIGN (Loki audit 3, medium finding —
-    weighed against adding a ``manifest_grant_retry`` orchestrator verb,
-    and deliberately not built): a pair that failed once (bad seal at
-    apply time, drift, escalation, a forged file, a rollback that could
-    not complete) failed for a reason that a bare retry cannot itself
-    fix — the seal is still whatever it was, the drift is still there, the
-    forgery is still forged. Retrying productively means re-sealing a
-    fresh Nestor pair (a NEW pair_id) once the actual cause is addressed,
-    not replaying the same failed request. The one-request-per-pair rule
-    (``EALREADY``) already refuses a second attempt at the SAME pair_id
-    whether it is pending, done, or failed; unsticking a failed one is
-    the operator's `rm $WILLOW_HOME/manifest_grants/failed/<pair_id>.json`
-    — the one keyboard act this verb was not written to remove, since the
-    thing to remove is the FILE, not a re-verification this module could
-    perform any more usefully the second time than the first.
+    ``failed`` is terminal for most causes, but not all of them (Loki audit
+    4, MEDIUM: a disk hiccup, an unreachable dependency, a race against
+    another request, or a corrupt-directory read burned a human-sealed pair
+    for a reason that was never the pair's own fault). A pair that failed
+    for ``eforged``, ``eseal_mismatch``, an escalation-class group, or
+    ``edrift`` failed for a reason a bare retry cannot itself fix — the
+    seal is still whatever it was, the drift is still there, the forgery is
+    still forged; retrying productively there means re-sealing a fresh
+    Nestor pair (a NEW ``pair_id``) once the actual cause is addressed, not
+    replaying the same failed request, and :func:`manifest_grant_retry`
+    refuses those causes by name. For the narrower, audited set of
+    genuinely transient causes (:data:`RETRYABLE_ERRORS`),
+    :func:`manifest_grant_retry` moves the same request back to ``pending/``
+    unchanged. The one-request-per-pair rule (``EALREADY``) still refuses a
+    second attempt at the SAME ``pair_id`` while it is pending or done; a
+    failed one that is not on the retryable list still needs the operator's
+    `rm $WILLOW_HOME/manifest_grants/failed/<pair_id>.json`.
     """
     root = _grants_root(grants_root)
     state = _existing_request_state(root, pair_id)
@@ -632,8 +733,9 @@ def manifest_grant_request(
     docstring), write ONE signed request under
     ``$WILLOW_HOME/manifest_grants/pending/<pair_id>.json``, and only then
     ink the FRANK envelope citation. Never signs, never touches a seat's
-    manifest — that is :func:`manifest_grant_apply`'s job, run by a different
-    process identity (the trust-owner unit).
+    manifest — that is :func:`manifest_grant_apply`'s job, run as a separate
+    call (an audit-trail split, not a privilege boundary on this box — see
+    the module docstring and executor:294-321).
 
     Returns ``{ok: True, state: "requested", pending_path, citation_id,
     envelope_id, pair_id}`` or a refusal dict. ``app_id`` must be the
@@ -662,21 +764,54 @@ def manifest_grant_request(
     lock_dir = grants_root_p / "pending"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{pair_id}.lock"
+    reclaimed_stale_lock = False
+
+    def _acquire() -> int:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, json.dumps({"pid": os.getpid(), "created_at": _now_iso()}).encode("utf-8"))
+        return fd
+
     try:
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        lock_fd = _acquire()
     except FileExistsError:
-        return _refuse(
-            "EALREADY",
-            f"a manifest.grant request for pair_id={pair_id!r} is already being "
-            "written by a concurrent call — one request per sealed pair",
-        )
+        # Loki audit 4, MEDIUM (stale lock): this box is swap-bound and a
+        # hard kill (SIGKILL/OOM) mid-request leaves the lock behind — the
+        # `finally: lock_path.unlink()` below never runs. A lock older than
+        # 10 minutes whose recorded pid is no longer alive is reclaimed; a
+        # live pid, or a lock too young to judge either way, is left alone.
+        if _stale_lock(lock_path):
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            try:
+                lock_fd = _acquire()
+                reclaimed_stale_lock = True
+            except FileExistsError:
+                return _refuse(
+                    "EALREADY",
+                    f"a manifest.grant request for pair_id={pair_id!r} is already being "
+                    "written by a concurrent call — one request per sealed pair",
+                )
+        else:
+            return _refuse(
+                "EALREADY",
+                f"a manifest.grant request for pair_id={pair_id!r} is already being "
+                "written by a concurrent call — one request per sealed pair",
+            )
     os.close(lock_fd)
     try:
-        return _manifest_grant_request_locked(
+        result = _manifest_grant_request_locked(
             app_id, envelope_id=envelope_id, pair_id=pair_id, project=project,
             session=session, task_id=task_id, ledger=ledger, store=store,
             apps_root=apps_root, db_path=db_path, grants_root_p=grants_root_p,
         )
+        if reclaimed_stale_lock:
+            # A receipt line, not a refusal: the request itself proceeded
+            # (or was refused) on its own merits; this only notes that its
+            # lock slot had to be reclaimed from a dead holder first.
+            result["reclaimed_stale_lock"] = True
+        return result
     finally:
         lock_path.unlink(missing_ok=True)
 
@@ -756,6 +891,14 @@ def _manifest_grant_request_locked(
             return {"ok": False, "error": outcome["error"], "reason": outcome["reason"], "app_id": seat}
         pre_state[seat] = {"manifest_sha256": outcome["manifest_sha256"], "sig_sha256": outcome["sig_sha256"]}
 
+    # Loki audit 4, HIGH (TWO-PAIRS / REPLAY): pair_id rides in call_args so
+    # the citation FRANK records carries it too — apply matches its citation
+    # by (envelope_id, pair_id, outcome=granted), never by "whichever is
+    # newest for the envelope." bounds-checking (EnvelopeAuthority.check)
+    # only ever sees the bounds-relevant subset of call_args; pair_id is
+    # folded into the CITATION content separately (authorize_and_cite's
+    # pair_id= kwarg below) so it never has to appear in the envelope's own
+    # bounds signature.
     call_args = {"apps": apps, "groups": groups}
     try:
         rows = governing_envelopes(VERB, app_id)
@@ -793,7 +936,7 @@ def _manifest_grant_request_locked(
 
     result = EnvelopeAuthority(ledger).authorize_and_cite(
         matches[0], actor=app_id, verb=VERB, call_args=call_args,
-        project=project or "willow-mcp", session=session,
+        project=project or "willow-mcp", session=session, pair_id=pair_id,
     )
     if not result.get("ok"):
         pending_path.unlink(missing_ok=True)
@@ -808,8 +951,12 @@ def _manifest_grant_request_locked(
     # Signed AFTER the citation is inked, over the fields that make the
     # request what it is (pair_id, envelope_id, citation_id, apps, groups,
     # pre_state, requested_at) — apply verifies this FIRST, before anything
-    # else, so a file this process did not write is never actioned
-    # (Loki audit 3, finding 2).
+    # else. This proves the file was produced by A process holding
+    # ``broker_signing_key`` (Loki audit 3, finding 2); on a single-uid box
+    # that is not the same as "the broker, uniquely" (Loki audit 4, HIGH —
+    # see the module-level note above the key-loading helpers). The
+    # citation binding that follows (pair_id in call_args, matched by id) is
+    # what actually stops a signed forgery from being actioned.
     pending_record["broker_sig"] = _sign_request(pending_record, grants_root_p)
     _write_json_atomic(pending_path, pending_record)
 
@@ -825,9 +972,11 @@ def _manifest_grant_request_locked(
 def _apply_one_seat(app_id: str, groups: list[str], *, apps_root: Path) -> dict:
     """Add ``groups`` to one seat's manifest via
     ``manifest_admin.set_permission`` — NO ``privileged_publisher``: this
-    process runs AS the trust owner (the apply unit's own uid), so
-    ``publish_signed_pair`` writes the trust root directly under
-    ``signed_pair_lock``; there is no sudo bridge to cross."""
+    process runs as the broker's own uid, the same uid that already owns
+    ``apps_root`` on this box, so ``publish_signed_pair`` writes the trust
+    root directly under ``signed_pair_lock``; there is no sudo bridge to
+    cross. (A uid split, if the operator ever performs one, would need
+    ``privileged_publisher`` here — gap ``85716b25d9a8``.)"""
     from . import manifest_admin, pgp
 
     pre = _seat_pre_state(app_id, apps_root)
@@ -1006,17 +1155,46 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
         return _fail("eforged", "pending record carries no envelope_id/citation_id to confirm in FRANK")
     if ledger is None:
         return _fail("EUNREACH", "no FRANK ledger available to confirm the citation against")
-    latest = ledger.latest_event("envelope_citation", match={"envelope_id": envelope_id, "outcome": "granted"})
-    if (latest is None or latest.get("id") != citation_id
-            or (latest.get("content") or {}).get("verb") != VERB):
+    # Loki audit 4, HIGH (TWO-PAIRS): a citation is looked up by ITS OWN id
+    # among EVERY granted citation for this envelope — never
+    # `latest_event`'s "whichever is newest." Two legitimate requests queued
+    # under one envelope used to burn whichever one `latest_event` did not
+    # happen to return (on real Postgres, ORDER BY created_at DESC — the
+    # OLDER pending request always lost).
+    candidates = ledger.all_events("envelope_citation", match={"envelope_id": envelope_id, "outcome": "granted"})
+    cited = next((c for c in candidates if c.get("id") == citation_id), None)
+    if cited is None or (cited.get("content") or {}).get("verb") != VERB:
         return _fail("eforged",
                       f"FRANK carries no granted {VERB!r} envelope_citation matching "
                       f"citation_id={citation_id!r} for pair_id={pair_id!r}")
-    cited_args = (latest["content"].get("call_args") or {})
+    cited_args = (cited["content"].get("call_args") or {})
+    # Loki audit 4, HIGH (REPLAY): the citation's OWN pair_id (recorded in
+    # call_args at request time) must match THIS record's pair_id. A
+    # citation minted for pair A can never authorize pair B, even copied
+    # verbatim onto a byte-identical, correctly-signed pending file — the
+    # shape of Loki's actual REPLAY probe: a spent citation_id from a done/
+    # entry, glued onto a freshly self-sealed pair.
+    if cited_args.get("pair_id") != pair_id:
+        return _fail("eforged",
+                      "FRANK citation's call_args.pair_id does not match this request's "
+                      f"pair_id={pair_id!r} — a citation minted for a different sealed "
+                      "pair can never authorize this one, even copied verbatim")
     if set(cited_args.get("apps") or []) != set(apps) or set(cited_args.get("groups") or []) != set(groups):
         return _fail("eforged",
                       "FRANK citation's call_args do not match this request's apps/groups — "
                       "the file was edited after the citation was inked")
+    # Loki audit 4, HIGH (REPLAY): a citation already spent by an earlier
+    # done/ grant must never authorize a second one — even a byte-for-byte
+    # copy of a once-valid pending file, dropped back into pending/ after
+    # the operator revoked the grant it produced the first time. done/
+    # already names the citation_id it consumed; refuse before touching a
+    # single seat's manifest.
+    consumed = _consumed_citation_ids(grants_root)
+    if citation_id in consumed:
+        return _fail("eforged",
+                      f"citation_id={citation_id!r} was already consumed by a prior "
+                      "done/ grant — a spent citation is never replayable, regardless "
+                      "of a valid broker_sig or a matching pair_id")
 
     # 5. Pre-state is mandatory, not optional (Loki audit 3, finding 2:
     # drift was skipped whenever pre_state was simply absent). A request
@@ -1125,20 +1303,25 @@ def manifest_grant_apply(
     db_path: Optional[Path] = None,
     grants_root: Optional[Path] = None,
 ) -> dict:
-    """The unit side: drain ``pending/`` (or just ``pair_id``, when named),
+    """The apply side: drain ``pending/`` (or just ``pair_id``, when named),
     re-verifying the seal and every seat's pre-state fresh before acting.
-    Runs as the trust owner — no ``privileged_publisher``, no sudo bridge.
-    Never raises past this call; a per-request exception is reported and the
-    request moved to ``failed/`` rather than left to retry forever silently.
+    Runs as a ``willow-mcp-manifest-grant.timer``/``.service`` unit in the
+    BROKER's own ``--user`` manager, under the broker's own uid — no
+    ``privileged_publisher``, no sudo bridge, no ``User=`` claim (module
+    docstring, pair ``6bd11def``). Never raises past this call; a
+    per-request exception is reported and the request moved to ``failed/``
+    rather than left to retry forever silently.
     """
     if _in_kart():
-        # Advisory, not the boundary (module docstring): the real boundary is
-        # that the apply unit runs as a distinct uid, never inside Kart. This
-        # just turns "ran by accident in the wrong place" into a named
-        # refusal instead of a confusing sudo/gpg failure three steps later.
+        # Advisory, not a privilege boundary (module docstring): the actual
+        # boundary this refuses on is "never inside a Kart task" — it says
+        # nothing about a distinct uid, because on this box there isn't one
+        # (gap 85716b25d9a8). This just turns "ran by accident in the wrong
+        # place" into a named refusal instead of a confusing sudo/gpg
+        # failure three steps later.
         return {"ok": False, "state": "refused", "error": "EUNREACH",
                 "reason": "manifest_grant_apply does not run inside Kart — it runs as the "
-                          "trust-owner systemd --user unit, a distinct uid from any Kart task",
+                          "broker's own systemd --user unit, never a Kart task",
                 "processed": []}
 
     from . import gate
@@ -1146,10 +1329,12 @@ def manifest_grant_apply(
 
     # Loki audit 3, finding 3: the unit template carried no User= and this
     # function made no uid check at all, so enabling it under the operator's
-    # own session ran it as the broker's uid — the one identity the design
-    # says never publishes — and got `eperm` on mcp_apps three layers down
-    # in a confusing place. Refuse by name, up front: this process must run
-    # AS the uid that owns apps_root (the trust owner), never any other.
+    # own session ran it as the broker's uid and got `eperm` on mcp_apps
+    # three layers down in a confusing place. Refuse by name, up front: this
+    # process must run AS the uid that owns apps_root — on this box, the
+    # broker's own uid (no trust-owner separation exists here, pair
+    # 6bd11def); after a real uid split this same check would correctly
+    # refuse a run under the wrong identity.
     if apps_root_p.is_dir():
         try:
             owning_uid = apps_root_p.stat().st_uid
@@ -1161,7 +1346,7 @@ def manifest_grant_apply(
             return {"ok": False, "state": "refused", "error": "ewronguser",
                     "reason": f"manifest_grant_apply is running as uid {os.geteuid()} but "
                               f"apps_root {apps_root_p} is owned by uid {owning_uid} — this "
-                              "process must run AS the trust owner, never any other identity",
+                              "process must run as the uid that owns apps_root, never any other",
                     "apps_root_uid": owning_uid, "running_uid": os.geteuid(),
                     "processed": []}
 
@@ -1202,3 +1387,121 @@ def manifest_grant_apply(
             processed.append(out)
 
     return {"ok": all(r.get("ok") for r in processed), "state": "populated", "processed": processed}
+
+
+# ── retry: failed/ is terminal, but not every failure earned it ────────────
+
+RETRY_EVENT = "manifest_grant_retried"
+
+#: Failure causes a bare retry can plausibly fix without re-sealing anything
+#: — a disk hiccup, an unreachable dependency, a race against another
+#: request, or a `failed`/`done` directory read that came back corrupt.
+#: None of these mean the SEAL, the record, or the request itself was ever
+#: wrong (Loki audit 4, MEDIUM: `failed/` was terminal by design even for
+#: these, and each one burned a human-sealed pair for a cause that was
+#: never the pair's own fault).
+RETRYABLE_ERRORS = frozenset({"EUNREACH", "ecorrupt", "eunexpected", "eperm_pending"})
+
+#: Failure causes that mean the request itself was wrong, forged, or
+#: refused for a standing policy reason — retrying resubmits exactly what
+#: was correctly refused. Never retryable, regardless of age or a
+#: plausible-sounding excuse.
+TERMINAL_ERRORS = frozenset({"eforged", "eseal_mismatch", "EPERM", "edrift"})
+
+
+def manifest_grant_retry(
+    app_id: str,
+    pair_id: str,
+    *,
+    ledger=None,
+    grants_root: Optional[Path] = None,
+    project: str = "",
+) -> dict:
+    """Orchestrator-only: move ``failed/<pair_id>.json`` back to ``pending/``
+    for the apply side to re-drain — but ONLY when the recorded failure
+    reason is on :data:`RETRYABLE_ERRORS`. A cause on :data:`TERMINAL_ERRORS`
+    (forgery, a seal that no longer matches the record, an escalation-class
+    group, or drift) is refused ``EPERM`` naming the original reason:
+    retrying those resubmits exactly what was correctly refused the first
+    time, and the fix is a fresh sealed pair, not a replay of this one
+    (:func:`manifest_grant_status`'s own docstring, before this verb
+    existed, argued exactly this for the general case — this verb is the
+    narrow, audited exception for causes that are provably not the pair's
+    own fault).
+
+    Requeuing strips the prior ``result`` and re-lands the same
+    ``pair_id``/``envelope_id``/``citation_id``/``apps``/``groups``/
+    ``pre_state``/``broker_sig`` unchanged (nothing here re-signs or
+    re-verifies — that is :func:`manifest_grant_apply`'s job on the next
+    drain), appends a ``manifest_grant_retried`` FRANK event naming the
+    prior error, and refuses ``EALREADY`` if a pending or done request for
+    this ``pair_id`` already exists (a fresh request must never race a
+    requeued one).
+    """
+    from .human_session import is_orchestrator_app
+
+    if not is_orchestrator_app(app_id):
+        return _refuse(
+            "EPERM",
+            f"manifest.grant retry is orchestrator-only; {app_id!r} may not call it",
+        )
+
+    root = _grants_root(grants_root)
+    failed_path = root / "failed" / f"{pair_id}.json"
+    if not failed_path.is_file():
+        return _refuse("ENOENT", f"no failed manifest.grant request for pair_id={pair_id!r}")
+    try:
+        record = json.loads(failed_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return _refuse(
+            "EUNREACH",
+            f"failed/{pair_id}.json is unreadable, so its failure reason cannot be "
+            f"judged retryable: {type(exc).__name__}: {exc}",
+        )
+
+    prior_result = record.get("result") or {}
+    prior_error = prior_result.get("error")
+    if prior_error in TERMINAL_ERRORS or prior_result.get("escalating"):
+        return _refuse(
+            "EPERM",
+            f"pair_id={pair_id!r} failed for {prior_error!r}, which is terminal — "
+            "not retryable; re-seal a fresh Nestor pair once the actual cause is "
+            "addressed, rather than replaying a request that was correctly refused",
+            prior_error=prior_error,
+        )
+    if prior_error not in RETRYABLE_ERRORS:
+        return _refuse(
+            "EPERM",
+            f"pair_id={pair_id!r} failed for {prior_error!r}, which is on neither the "
+            "retryable nor the terminal list — refusing rather than guessing it is "
+            "safe to resubmit",
+            prior_error=prior_error,
+        )
+
+    pending_path = _pending_path(root, pair_id)
+    if pending_path.is_file() or (root / "done" / f"{pair_id}.json").is_file():
+        return _refuse(
+            "EALREADY",
+            f"pair_id={pair_id!r} already has a pending or done manifest.grant request",
+        )
+
+    requeued = {k: v for k, v in record.items() if k != "result"}
+    _write_json_atomic(pending_path, requeued)
+    failed_path.unlink(missing_ok=True)
+
+    receipt_id = None
+    if ledger is not None:
+        try:
+            receipt_id = ledger.append(project or "willow-mcp", RETRY_EVENT, {
+                "actor": app_id, "pair_id": pair_id,
+                "envelope_id": requeued.get("envelope_id"),
+                "citation_id": requeued.get("citation_id"),
+                "prior_error": prior_error,
+            })
+        except Exception as exc:  # noqa: BLE001 — the requeue happened; report, never hide
+            receipt_id = f"receipt_error: {type(exc).__name__}: {exc}"
+
+    return {
+        "ok": True, "state": "requeued", "pair_id": pair_id,
+        "prior_error": prior_error, "receipt_id": receipt_id,
+    }
