@@ -796,10 +796,140 @@ def test_direct_timer_without_unit_key_defaults_to_same_stem(home, tmp_path, mon
 
 def test_enable_effects_shape():
     fx = uix.enable_effects("[Install]\nAlias=a.service b.service\nAlso=c.service\n", "x.service")
-    assert fx == {"creates": ["a.service", "b.service", "c.service"], "activates": ""}
+    assert fx == {"creates": ["a.service", "b.service", "c.service"], "activates": "", "starts": []}
     assert uix.enable_effects("[Socket]\nService=s.service\n", "x.socket")["activates"] == "s.service"
     assert uix.enable_effects("[Path]\n", "x.path")["activates"] == "x.service"
     assert uix.enable_effects("[Timer]\nUnit=a.service\nUnit=b.service\n", "x.timer")["activates"] == "b.service"
+
+
+# ── Loki 1AEBF250: [Unit] start-dependencies are started, so they are judged ──
+
+START_KEYS = ("Requires", "Wants", "BindsTo", "Upholds", "OnFailure", "OnSuccess")
+ORDER_KEYS = ("Requisite", "Conflicts", "PartOf", "Before", "After")
+
+
+def _with_unit_key(template, key, value):
+    return template.replace("[Unit]\n", f"[Unit]\n{key}={value}\n", 1)
+
+
+@pytest.mark.parametrize("key", START_KEYS)
+def test_service_start_key_outside_bounds_is_refused_naming_the_unit(
+        home, tmp_path, monkeypatch, github_root, dest, key):
+    """`enable --now` runs `start`; start pulls Requires/Wants/BindsTo/
+    Upholds into the transaction and OnFailure/OnSuccess later — every one
+    rides in call_args.units, and the refusal names the unit that missed."""
+    _charter(tmp_path, monkeypatch)
+    _tmpl_path(github_root).write_text(_with_unit_key(TEMPLATE, key, "other.service"))
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["ok"] is False and out["fields"] == ["units"], out
+    assert "other.service" in out["reason"] and "bounds mismatch" in out["reason"]
+    assert _citations(pg)[0]["content"]["call_args"]["units"] == [UNIT, "other.service"]
+    assert not (dest / UNIT).exists()
+
+
+@pytest.mark.parametrize("key", START_KEYS)
+def test_service_start_key_inside_bounds_installs_and_is_recorded(
+        home, tmp_path, monkeypatch, github_root, dest, key):
+    _charter(tmp_path, monkeypatch, units=(UNIT, "other.service"))
+    _tmpl_path(github_root).write_text(_with_unit_key(TEMPLATE, key, "other.service"))
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["ok"] and out["starts"] == ["other.service"], out
+    assert out["judged_units"] == [UNIT, "other.service"]
+    assert _receipts(pg)[0]["content"]["starts"] == ["other.service"]
+
+
+@pytest.mark.parametrize("key", ORDER_KEYS)
+def test_ordering_and_condition_keys_are_not_judged(home, tmp_path, monkeypatch, github_root, dest, key):
+    """Requisite=/Conflicts=/PartOf=/Before=/After= condition or order; they
+    start nothing, so a name there outside the bounds is not a refusal."""
+    _charter(tmp_path, monkeypatch)
+    _tmpl_path(github_root).write_text(_with_unit_key(TEMPLATE, key, "other.service"))
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["ok"] and out["starts"] == [] and out["judged_units"] == [UNIT], out
+
+
+def test_target_names_in_start_keys_are_exempt(home, tmp_path, monkeypatch, github_root, dest):
+    """Wants=network-online.target is ambient; otherwise every envelope
+    would have to list the system targets."""
+    _charter(tmp_path, monkeypatch)
+    _tmpl_path(github_root).write_text(
+        _with_unit_key(TEMPLATE, "Wants", "network-online.target default.target"))
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["ok"] and out["starts"] == [] and out["judged_units"] == [UNIT], out
+
+
+DIRECT_TARGET = "# unit: fleet.target\n[Unit]\nDescription=fleet hub\n@WANTS@\n[Install]\nWantedBy=default.target\n"
+
+
+def test_direct_target_wants_outside_bounds_is_refused(home, tmp_path, monkeypatch, github_root, dest):
+    """A direct .target install with Wants=other.service starts other.service
+    on `enable --now fleet.target` (Loki J1ZR3JVG) — judged like a service's."""
+    src = _direct(github_root, "fleet.target", DIRECT_TARGET.replace("@WANTS@", "Wants=other.service"))
+    _charter(tmp_path, monkeypatch, units=("fleet.target",), sources=(src,))
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest, unit="fleet.target", source=src,
+                   values={**VALUES, "UNIT": "fleet.target"})
+    assert out["ok"] is False and out["fields"] == ["units"] and "other.service" in out["reason"], out
+    assert _citations(pg)[0]["content"]["call_args"]["units"] == ["fleet.target", "other.service"]
+    assert not (dest / "fleet.target").exists()
+
+
+def test_direct_target_wants_inside_bounds_installs(home, tmp_path, monkeypatch, github_root, dest):
+    src = _direct(github_root, "fleet.target", DIRECT_TARGET.replace("@WANTS@", "Wants=other.service"))
+    _charter(tmp_path, monkeypatch, units=("fleet.target", "other.service"), sources=(src,))
+    fake = _Fake()
+    out = _install(_FakeGovernancePg(), fake, github_root, dest, unit="fleet.target", source=src,
+                   values={**VALUES, "UNIT": "fleet.target"})
+    assert out["ok"] and out["starts"] == ["other.service"] and out["enabled"] == "fleet.target", out
+    assert fake.enables == [["systemctl", "--user", "enable", "--now", "fleet.target"]]
+
+
+def test_timer_sibling_start_keys_ride_too(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(
+        _with_unit_key(TIMER, "Wants", "other.service"))
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest)
+    assert out["ok"] is False and "other.service" in out["reason"], out
+    assert _citations(pg)[0]["content"]["call_args"]["units"] == [UNIT, TIMER_UNIT, "other.service"]
+
+
+def test_start_keys_join_continuations_and_dedup():
+    fx = uix.enable_effects(
+        "[Unit]\nWants=a.service \\\n b.service\nRequires=a.service\nAfter=c.service\n"
+        "OnFailure=d.service default.target\n", "x.service")
+    assert fx["starts"] == ["a.service", "b.service", "d.service"]
+
+
+def test_refusal_names_the_offending_unit_and_the_ask_proposes_the_full_judged_set(
+        home, tmp_path, monkeypatch, github_root, dest):
+    """Also=other.service outside bounds: the reason says WHICH name missed,
+    and the filed ask proposes units=<the judged set>, not units=[unit] —
+    which is already in bounds and would refuse again (Loki 1AEBF250)."""
+    _charter(tmp_path, monkeypatch)
+    _tmpl_path(github_root).write_text(TEMPLATE + "[Install]\nAlso=other.service\n")
+    asked = {}
+
+    def _open(app_id, gate_id, *, task_id, reason, store=None):
+        asked.update(app_id=app_id, gate_id=gate_id, reason=reason)
+        return {"ok": True, "gate_id": gate_id}
+
+    from willow_mcp import gate_request
+    monkeypatch.setattr(gate_request, "open_request", _open)
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["ok"] is False and out["fields"] == ["units"]
+    assert out["reason"] == "bounds mismatch: units not in bounds: ['other.service']"
+    assert asked["gate_id"] == f"unit.{UNIT}@install"
+    assert f"units=['{UNIT}', 'other.service']" in asked["reason"]
+    assert "other.service" in asked["reason"]
+
+
+def test_source_refusal_names_the_source(home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch, sources=(f"{REPO}@deploy/other.service.template",))
+    out = _install(_FakeGovernancePg(), _Fake(), github_root, dest)
+    assert out["fields"] == ["sources"] and f"source not in bounds: '{SRC}'" in out["reason"]
 
 
 def test_replace_then_fail_restores_the_previous_unit_and_inks_a_failure_row(

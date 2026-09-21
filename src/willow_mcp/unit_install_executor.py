@@ -47,6 +47,29 @@ template wins; otherwise the file name with ``.template`` stripped
 (``willow-mcp-reloader.service.template`` declares
 ``willow-mcp-reloader.service``) — the convention every ``deploy/*.template``
 already follows by filename.
+
+What the bounds judge (Loki 0B774ED3 + 1AEBF250, enumerated from what
+``systemctl --user enable --now <unit>`` can create or start): the unit,
+its timer sibling, every ``[Install] Alias=``/``Also=`` name, the
+activation target of a ``.timer``/``.socket``/``.path``, and every
+non-``.target`` name in the ``[Unit]`` start keys ``Requires=``/``Wants=``/
+``BindsTo=``/``Upholds=`` (pulled into the same start transaction) and
+``OnFailure=``/``OnSuccess=`` (started later). Scope — stated, not judged:
+
+* a ``.target`` install is a dependency hub: starting it also starts every
+  *already-installed* unit that elected into it from its own ``[Install]
+  WantedBy=``/``RequiredBy=``/``UpheldBy=`` — outside the template's
+  content, so it cannot be judged from it;
+* the installed unit's own ``WantedBy=``/``RequiredBy=``/``UpheldBy=``
+  symlinks create no new unit — the created NAME is the installed unit's,
+  which is judged; the directory owner is not;
+* ``DefaultInstance=`` is the argument: ``_UNIT_RE`` admits ``foo@.service``
+  and an instance name is what ``unit`` names, so it is judged as ``unit``;
+* ``.target`` names in the start keys are exempt (ambient system targets —
+  otherwise every envelope lists ``default.target``); ``Requisite=``/
+  ``Conflicts=``/``PartOf=``/``Before=``/``After=`` are conditions and
+  ordering, not starts — exempt; ``.d/`` drop-ins are refused by
+  ``_UNIT_RE``.
 """
 from __future__ import annotations
 
@@ -235,24 +258,48 @@ def render_template(text: str, unit: str, *, values: Optional[dict[str, str]] = 
     return rendered
 
 
-def _file_ask(app_id: str, *, unit: str, source: str, errno: str, reason: str,
+def _file_ask(app_id: str, *, units: list[str], source: str, errno: str, reason: str,
               fields, task_id: str, store=None) -> dict:
     """Same surface as :func:`unit_reload_executor._file_ask` — a ``unit.``
     row on ``gates``; ``@install`` on the gate id tells the panel this is
-    verb 17, not verb 15."""
+    verb 17, not verb 15. ``units`` is the full judged set (the unit and
+    every name the enable creates or starts), so the bounds the ask
+    proposes are the bounds that would grant it — an ask naming only the
+    installed unit refused again on the same Also= (Loki 1AEBF250)."""
     from . import gate_request
 
+    unit = units[0]
     detail = f"{errno}: {reason}"
     if fields:
         detail += f" (fields: {', '.join(str(f) for f in fields)})"
     summary = (
         f"{app_id or 'an agent'} asked to install unit {unit!r} from {source!r} "
         f"and was refused: {detail}. Ratify a unit.install envelope with bounds "
-        f"(units=[{unit!r}], sources=[{source!r}]) and the agent can ask again."
+        f"(units={list(units)!r}, sources=[{source!r}]) and the agent can ask again."
     )
     return gate_request.open_request(
         app_id or "", f"unit.{unit}@install", task_id=task_id, reason=summary, store=store,
     )
+
+
+def _outside_bounds(rows: list[dict], envelope_id: str, *, judged: list[str], source: str) -> list[str]:
+    """The judged names the cited envelope's bounds do not list, as
+    ``units=[...]`` / ``sources=[...]`` strings for a refusal reason; empty
+    when the envelope's row is not among ``rows`` or its bounds are not the
+    list shape (the gate already said why)."""
+    bounds = next((r.get("bounds") for r in rows if r.get("id") == envelope_id), None)
+    if not isinstance(bounds, dict):
+        return []
+    out: list[str] = []
+    granted_units = bounds.get("units")
+    if isinstance(granted_units, list):
+        missing = [u for u in judged if u not in granted_units]
+        if missing:
+            out.append(f"units not in bounds: {missing!r}")
+    granted_sources = bounds.get("sources")
+    if isinstance(granted_sources, list) and source not in granted_sources:
+        out.append(f"source not in bounds: {source!r}")
+    return out
 
 
 def _resolve_clone(repo: str, *, root: Optional[Path], runner) -> dict:
@@ -350,9 +397,11 @@ def _timer_sibling_rel(rel: str) -> Optional[str]:
 
 _SECTION_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*$")
 #: Keys whose values name OTHER units. `enable` honours Alias= (creates the
-#: alias name), Also= (enables the named units); the rest bind or order —
-#: naming the broker's unit in any of them is content the argument-level
-#: EPERM was written to forbid (Loki FECF6FED, finding 3).
+#: alias name), Also= (enables the named units); the rest bind, start or
+#: order — naming the broker's unit in any of them is content the
+#: argument-level EPERM was written to forbid (Loki FECF6FED, finding 3).
+#: This is the broker-name sweep; which of these the BOUNDS judge is
+#: :func:`enable_effects`.
 _UNIT_NAMING_KEYS = {
     "Install": ("Alias", "Also", "WantedBy", "RequiredBy", "UpheldBy"),
     "Unit": ("Requires", "Requisite", "Wants", "BindsTo", "PartOf", "Upholds",
@@ -419,18 +468,27 @@ def broker_units_named(rendered: str) -> list[str]:
 
 #: Per unit type, the section+key naming what `enable --now <unit>` starts.
 _ACTIVATION_KEY = {"timer": ("Timer", "Unit"), "socket": ("Socket", "Service"), "path": ("Path", "Unit")}
+#: `[Unit]` keys whose units `start` pulls into the same transaction
+#: (Requires/Wants/BindsTo/Upholds) or starts afterwards (OnFailure/
+#: OnSuccess). Requisite=/Conflicts=/PartOf=/Before=/After= are conditions
+#: and ordering, not starts (Loki 1AEBF250).
+_START_KEYS = ("Requires", "Wants", "BindsTo", "Upholds", "OnFailure", "OnSuccess")
 
 
 def enable_effects(rendered: str, unit_name: str) -> dict:
     """Every unit name ``systemctl enable --now <unit_name>`` will CREATE or
     START from this rendered text, so the envelope's bounds can judge all of
-    it (Loki 0B774ED3 — the last door in the class):
+    it (Loki 0B774ED3, 1AEBF250):
 
     * ``creates``: ``[Install] Alias=`` names (symlinks created) and
       ``Also=`` units (enabled alongside);
     * ``activates``: for a ``.timer``/``.socket``/``.path`` the unit its
       activation key names, last assignment wins as in systemd, or absent
-      the ``.service`` on the same stem; ``""`` for any other type.
+      the ``.service`` on the same stem; ``""`` for any other type;
+    * ``starts``: every non-``.target`` name in the ``[Unit]`` start keys
+      (:data:`_START_KEYS`) — pulled in by ``start``, for a direct
+      ``.target`` install as much as for a service. ``.target`` names are
+      ambient (``default.target``, ``network-online.target``) and exempt.
 
     The service+timer sibling rule of 02195799 is the special case of this.
     """
@@ -448,7 +506,14 @@ def enable_effects(rendered: str, unit_name: str) -> dict:
             activates = values[-1].strip()
         else:
             activates = unit_name[: -len(suffix) - 1] + ".service"
-    return {"creates": creates, "activates": activates}
+    section_unit = unit_keys(rendered, "Unit")
+    starts: list[str] = []
+    for key in _START_KEYS:
+        for value in section_unit.get(key, ()):
+            for name in value.split():
+                if name and not name.endswith(".target") and name not in starts:
+                    starts.append(name)
+    return {"creates": creates, "activates": activates, "starts": starts}
 
 
 def timer_activates(timer_rendered: str, timer_name: str) -> str:
@@ -480,7 +545,7 @@ def execute_unit_install(
     ``destination`` / ``values`` are test seams for the clone root, the
     systemd user directory, and the render values.
     """
-    from .envelopes import EnvelopeAuthority, governing_envelope_ids
+    from .envelopes import EnvelopeAuthority, governing_envelopes
 
     unit = (unit or "").strip()
     source = (source or "").strip()
@@ -584,6 +649,7 @@ def execute_unit_install(
                 declared=activates, activates=activates,
             )
     creates = list(effects["creates"])
+    starts = list(effects["starts"])
     if timer_src is not None:
         timer_effects = enable_effects(timer_rendered, timer_name)
         activates = timer_effects["activates"]
@@ -595,6 +661,7 @@ def execute_unit_install(
                 declared=activates, timer=timer_name, activates=activates,
             )
         creates.extend(timer_effects["creates"])
+        starts.extend(n for n in timer_effects["starts"] if n not in starts)
 
     if ledger is None:
         return _refuse(
@@ -603,33 +670,35 @@ def execute_unit_install(
         )
 
     # The cited call names everything the enable will write, create, enable
-    # or start — the unit, its sibling, every Alias=/Also= name, and the
-    # activation target — so the envelope's bounds judge all of it. An
-    # activation target equal to the installed unit adds nothing; a
-    # direct timer/socket/path's same-stem service does ride along.
+    # or start — the unit, its sibling, every Alias=/Also= name, the
+    # activation target, and every [Unit] start-dependency — so the
+    # envelope's bounds judge all of it. An activation target equal to the
+    # installed unit adds nothing; a direct timer/socket/path's same-stem
+    # service does ride along.
     judged: list[str] = [unit]
-    for name in ([timer_name] if timer_name else []) + creates + ([activates] if activates else []):
+    for name in ([timer_name] if timer_name else []) + creates + ([activates] if activates else []) + starts:
         if name and name not in judged:
             judged.append(name)
     call_args = {"units": judged, "sources": [source]}
     try:
-        matches = governing_envelope_ids(VERB, app_id)
+        rows = governing_envelopes(VERB, app_id)
     except (OSError, ValueError) as exc:
         return _refuse("EAMBIG", f"envelope registry unreadable: {exc}")
+    matches = [row["id"] for row in rows]
     if envelope_id:
         if envelope_id not in matches:
             result = _refuse(
                 "ENOENT", f"envelope {envelope_id!r} does not govern {VERB} "
                           f"for {app_id!r}", envelope_ids=matches,
             )
-            result["ask"] = _file_ask(app_id, unit=unit, source=source, errno="ENOENT",
+            result["ask"] = _file_ask(app_id, units=judged, source=source, errno="ENOENT",
                                       reason=result["reason"], fields=None,
                                       task_id=task_id, store=store)
             return result
         matches = [envelope_id]
     if not matches:
         result = _refuse("ENOENT", f"no active {VERB} envelope governs {app_id!r}")
-        result["ask"] = _file_ask(app_id, unit=unit, source=source, errno="ENOENT",
+        result["ask"] = _file_ask(app_id, units=judged, source=source, errno="ENOENT",
                                   reason=result["reason"], fields=None,
                                   task_id=task_id, store=store)
         return result
@@ -646,11 +715,20 @@ def execute_unit_install(
     )
     if not result.get("ok"):
         errno = result.get("errno", "EAMBIG")
-        out = _refuse(errno, result.get("reason", ""), envelope_id=matches[0],
-                      citation_id=result.get("citation_id"), fields=result.get("fields"))
+        reason = result.get("reason", "")
+        fields = result.get("fields")
+        # A bounds miss names the VALUE, not only the field: the offending
+        # unit is usually an Also=/Wants=/activation extra, not `unit`
+        # itself, and an ask proposing `units=[unit]` would refuse again on
+        # the same name (Loki 1AEBF250).
+        outside = _outside_bounds(rows, matches[0], judged=judged, source=source)
+        if fields and outside:
+            reason = f"{reason}: {'; '.join(outside)}"
+        out = _refuse(errno, reason, envelope_id=matches[0],
+                      citation_id=result.get("citation_id"), fields=fields)
         if errno in _ASKABLE:
-            out["ask"] = _file_ask(app_id, unit=unit, source=source, errno=errno,
-                                   reason=out["reason"], fields=result.get("fields"),
+            out["ask"] = _file_ask(app_id, units=judged, source=source, errno=errno,
+                                   reason=out["reason"], fields=fields,
                                    task_id=task_id, store=store)
         return out
 
@@ -737,7 +815,7 @@ def execute_unit_install(
         "previous_kept": [str(k) for _, k in backups], "pruned": pruned,
         "unrecognised_backups": unrecognised,
         "timer": timer_name, "activates": activates, "creates": creates,
-        "judged_units": judged, "enabled": enable_target,
+        "starts": starts, "judged_units": judged, "enabled": enable_target,
         "written": written,
         "envelope_id": matches[0], "citation_id": result.get("citation_id"),
         "state_before": state_before, "state_after": state_after,
@@ -752,7 +830,7 @@ def execute_unit_install(
             "previous_kept": receipt_out["previous_kept"], "pruned": pruned,
             "unrecognised_backups": unrecognised,
             "timer": timer_name, "activates": activates, "creates": creates,
-            "judged_units": judged, "enabled": enable_target,
+            "starts": starts, "judged_units": judged, "enabled": enable_target,
             "active_state_after": state_after.get("ActiveState"),
             "active_enter_after": state_after.get("ActiveEnterTimestamp"),
             "session": session, "citation_id": result.get("citation_id"),
