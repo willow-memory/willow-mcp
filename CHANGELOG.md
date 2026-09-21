@@ -31,6 +31,26 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.68.0](https://github.com/willow-memory/willow-mcp/compare/v2.67.0...v2.68.0) (2026-09-21)
+
+
+### Added
+
+* **governance:** add manifest.grant broker verb (verb 18) ([d050ab8](https://github.com/willow-memory/willow-mcp/commit/d050ab8c044b88fa88aa489309324d3cd7dfcd2b))
+
+
+### Fixed
+
+* **manifest-grant:** close Loki audit 5 limits (FRANK replay check, stale-lock TOCTOU, wording) ([37b0a3a](https://github.com/willow-memory/willow-mcp/commit/37b0a3a08623e35c93b7ea33fcafef279ba89e42))
+* **manifest-grant:** rework 4 — pair-bound citations, unit honesty, retry ([9302505](https://github.com/willow-memory/willow-mcp/commit/93025054fc49475642e59cd069675ce95c4ddc4c))
+* **manifest-grant:** rework 3 — seal age is not a lease, sign the request, re-verify at apply ([10e9365](https://github.com/willow-memory/willow-mcp/commit/10e9365cf8c08bf19b802cb2d0dbe70dcea16a95))
+* **manifest-grant:** rework write path onto manifest_admin, bind grant to the seal ([3bb2317](https://github.com/willow-memory/willow-mcp/commit/3bb2317ebcb9bb14ba97b4be93ae18b8923fb054))
+
+
+### Changed
+
+* **manifest-grant:** split into request/apply, verify the seal for real ([b4b848e](https://github.com/willow-memory/willow-mcp/commit/b4b848e87714b497fe8abae5dd866cd825090e2b))
+
 ## [2.67.0](https://github.com/willow-memory/willow-mcp/compare/v2.66.0...v2.67.0) (2026-09-21)
 
 
