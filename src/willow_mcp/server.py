@@ -1791,7 +1791,7 @@ def net_authority_drain(app_id: str, max_rows: int = 0) -> dict:
 
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("envelope_retire_sweep")
-def envelope_retire_sweep(app_id: str, dry_run: bool = True) -> dict:
+def envelope_retire_sweep(app_id: str, dry_run: bool = True, max_rows: int = 0) -> dict:
     """One pass over the active envelope register (sealed decision 83faa340;
     gap 4c7512c57a7e): an envelope whose bounds name a branch is retired
     when that branch is merged and deleted on the remote; an envelope with
@@ -1821,13 +1821,27 @@ def envelope_retire_sweep(app_id: str, dry_run: bool = True) -> dict:
     to the registry and no FRANK row is appended. Three-state receipt
     (INVARIANTS §1): `{state: populated|empty|unreachable, examined,
     retired: [{id, verb, reason}], kept_standing, kept_in_force: [{id,
-    verb, why}], unreachable: [{id, why}], dry_run}`."""
+    verb, why}], unreachable: [{id, why}], dry_run, truncated}`.
+
+    `revoked_by` on a live retirement is always the sweep's own fixed name
+    (`envelope_retire_sweep.DEFAULT_ACTOR`), never `app_id` — an unattended
+    tick is not the caller's own act and must not be attributed to
+    whichever seat's `app_id` happened to invoke the tool (rework of
+    Loki's finding on BAA43543/9494D3AF). `max_rows` (0 = unbounded) and
+    a wall-clock budget well inside the steward mcp_client's 90s call
+    timeout together bound one call; `truncated` says whether rows were
+    left for next tick. Refuses `EREGISTRY` before any read if this
+    process does not resolve the same registry `$WILLOW_HOME` names (gap
+    4c7512c57a7e), same guard `envelope_authoring.revoke` applies."""
     from . import envelope_retire_sweep as _sweep
     from .governance_ledger import GovernanceLedger
 
     pg = get_pg()
     ledger = GovernanceLedger(pg) if pg is not None else None
-    return _sweep.sweep(actor=app_id or "willow-mcp-sweep", dry_run=dry_run, ledger=ledger)
+    kwargs = {}
+    if max_rows and max_rows > 0:
+        kwargs["max_rows"] = int(max_rows)
+    return _sweep.sweep(dry_run=dry_run, ledger=ledger, **kwargs)
 
 
 # ── Identity binding (willow-gate seam — check-in / check-out) ───────────────────
