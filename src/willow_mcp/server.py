@@ -5354,16 +5354,21 @@ def pr_checks_read(app_id: str, repo: str, ref: str = "", pr: int = 0,
     head sha) or `ref` (a sha or branch name, used as given) — passing
     neither is `EINVAL`. Mints the willows-bot App install token (App only,
     no host-token fallback), lists that commit's check-runs (paginated past
-    100) with annotations for any non-quiet run, and tails the Actions job
-    log (bounded, redirect-followed without leaking the bearer to the blob
-    host) for any run that actually failed. `state` is `populated` (at
-    least one check-run), `empty` (the head resolved, zero check-runs
-    reported yet), or `unreachable` (`reason` names the cause: `token`,
-    `permission_absent`, `not_found`, `timeout`, `http_<status>`); a
-    per-run `log_tail` carries its OWN state the same way. `red` collects
-    one line per failing leg: `{name, conclusion, job_url,
-    first_error_line}`. Read-only: no writes, no envelope, no FRANK
-    citation."""
+    100) with annotations for any non-quiet run, and fetches the FULL
+    Actions job log (capped at 5 MB, redirect-followed without leaking the
+    bearer to the blob host) for any run that actually failed. `state` is
+    `populated` (at least one check-run), `empty` (the head resolved, zero
+    check-runs reported yet), or `unreachable` (`reason` names the cause:
+    `token`, `permission_absent`, `not_found`, `timeout`, `http_<status>`);
+    a per-run `log_tail` (still a bounded raw-line tail) carries its OWN
+    state the same way. `red` collects one entry per failing leg: `{name,
+    conclusion, job_url, first_error_line, failure}` — `failure` is `{kind:
+    pytest|ruff|generic, text, tests_failed, count_line}` extracted from the
+    FULL log (pytest's FAILURES/summary section, else a ruff block, else a
+    `##[error]`-anchored generic fallback with Postgres service-teardown
+    noise dropped), or `None` when no log was fetched; `first_error_line`
+    is the first `FAILED` line when `failure.kind == "pytest"`. Read-only:
+    no writes, no envelope, no FRANK citation."""
     from . import pr_checks as _pr_checks
 
     try:
