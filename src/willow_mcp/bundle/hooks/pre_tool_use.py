@@ -901,7 +901,7 @@ _SEAT_WRITE_TOOLS = frozenset({
     "fork_create", "fork_delete", "fork_join", "fork_log", "fork_merge",
     "frank_append",
     "friction_scan",
-    "gap_delete", "gap_log", "gap_promote", "gap_purge_topic", "gap_resolve",
+    "gap_delete", "gap_log", "gap_promote", "gap_purge_topic", "gap_resolve", "gap_retopic",
     "grove_ack", "grove_bus_send", "grove_flag", "grove_heartbeat",
     "grove_reply", "grove_send_message", "grove_unflag",
     "handoff_write_v4",
