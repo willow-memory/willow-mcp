@@ -392,6 +392,33 @@ def test_unfillable_placeholder_is_ETEMPLATE(home, tmp_path, monkeypatch, github
     assert _citations(pg) == [] and not (dest / UNIT).exists()
 
 
+def test_real_deploy_template_renders_clean(home, tmp_path, monkeypatch, github_root, dest):
+    """The tracked ``deploy/nestor-ui.service.template`` — not this file's own
+    ``TEMPLATE`` fixture constant — is what row 17 actually installs. Render
+    IT through :func:`execute_unit_install`: the declared name matches, every
+    ``@PLACEHOLDER@`` the real file carries resolves from ``values`` with
+    none left over, the ``EnvironmentFile=`` line survives into the rendered
+    unit, no ``--db``/``--domain`` lands on the command line, and the bounds
+    judge names exactly ``nestor-ui.service`` — no ``Also=``/``Alias=``/
+    start-key extra widening what row 17 sealed."""
+    _charter(tmp_path, monkeypatch)
+    real = Path(__file__).resolve().parent.parent / "deploy" / "nestor-ui.service.template"
+    text = real.read_text(encoding="utf-8")
+    assert uix.declared_unit_name(text, real) == UNIT
+    _tmpl_path(github_root).write_text(text, encoding="utf-8")
+    pg = _FakeGovernancePg()
+    out = _install(pg, _Fake(), github_root, dest,
+                    values={"PYTHON": "/v/bin/python", "WILLOW_HOME": "/home/x/wh", "UNIT": UNIT})
+    assert out["ok"] and out["installed"], out
+    assert out["judged_units"] == [UNIT]
+    rendered = (dest / UNIT).read_text()
+    assert "@" not in rendered, "every placeholder in the real template must resolve from values"
+    assert "EnvironmentFile=/home/x/wh/env" in rendered
+    exec_line = next(line for line in rendered.splitlines() if line.startswith("ExecStart="))
+    assert "--db" not in exec_line and "--domain" not in exec_line
+    assert exec_line.endswith("/nestor-ui")  # the console script, no argv at all
+
+
 def test_unsafe_value_is_ETEMPLATE(home, tmp_path, monkeypatch, github_root, dest):
     _charter(tmp_path, monkeypatch)
     out = _install(_FakeGovernancePg(), _Fake(), github_root, dest,
