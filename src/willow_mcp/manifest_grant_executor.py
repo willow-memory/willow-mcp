@@ -64,13 +64,18 @@ Four preconditions, none of which an agent can satisfy on its own:
    This module parses that text with a strict grammar (:func:`ruling_text` /
    :data:`_RULING_RE`) and refuses (``eseal_mismatch``) when the record
    disagrees with it;
-3. no escalation-class group, ever, regardless of seal or envelope — the
-   PreToolUse manifest guard's own list restated here so a grant can never
-   open the door the guard exists to keep shut. This is EXACTLY the 14-item
-   packet list (:data:`ESCALATION_GROUPS`) — not the much broader gate-derived
-   set a prior draft used, which refused this verb's own first live pair
-   (10ed2707, naming ``grove_read``/``grove_write``, neither of which is
-   escalation-class here);
+3. no escalation-class group, ever, regardless of seal or envelope — a
+   dedicated escalation set for THIS verb (:data:`ESCALATION_GROUPS`,
+   exactly the 14-item packet list), never the PreToolUse manifest guard's
+   OWN list, which is broader still (``hooks/pre_tool_use.py:928-940``
+   names ~37 groups, including ``store_write``/``grove_write``/
+   ``task_queue``) and is enforced separately, unchanged, by the guard
+   itself. A prior draft folded most of the guard's broader set in here
+   too, which refused this verb's own first live pair (10ed2707, naming
+   ``grove_read``/``grove_write``, neither of which is escalation-class
+   for THIS verb — both are for the guard's, which is why the guard still
+   refuses a seat's own self-grant of them regardless of what this verb
+   does);
 4. the caller is the orchestrator seat itself (``is_orchestrator_app``) —
    this is a narrowing REFUSAL layered on top of the manifest gate that
    already authenticated ``app_id`` (the ``@_guarded`` decorator's PGP-backed
@@ -123,14 +128,16 @@ from typing import Optional
 VERB = "manifest.grant"
 EVENT = "manifest_granted"
 
-#: The exact escalation set the PreToolUse manifest guard refuses self-grant
-#: of (`hooks/pre_tool_use.py:928-940`, `gate.PERMISSION_GROUPS`). A sealed
-#: pair naming any of these is refused here too, regardless of seal or
-#: envelope bounds. This is EXACTLY the packet's escalation set — nothing
-#: more. A prior draft folded in most of gate's other write/admin groups
-#: (store_write, grove_write, task_db, ...); that over-broad list refused
-#: the verb's own first live pair (10ed2707, which names grove_write) and
-#: was never exercised by a test.
+#: This verb's OWN escalation set — the packet's list, exactly, no more.
+#: NOT the same list the PreToolUse manifest guard refuses self-grant of
+#: (`hooks/pre_tool_use.py:928-940`, `gate.PERMISSION_GROUPS`), which is
+#: broader (~37 groups, including store_write/grove_write/task_queue) and
+#: enforced separately by the guard regardless of what this verb grants. A
+#: sealed pair naming any of THESE 14 is refused here, regardless of seal
+#: or envelope bounds. A prior draft folded in most of the guard's broader
+#: set instead; that over-broad list refused the verb's own first live
+#: pair (10ed2707, which names grove_write) and was never exercised by a
+#: test.
 ESCALATION_GROUPS = frozenset({
     "task_net", "integration_net", "web_net", "mcp_federation", "grove_relay",
     "orchestrator", "context", "binding", "full_access",
@@ -282,6 +289,118 @@ def _ring_from_keyring(kr) -> dict[str, dict]:
     }
 
 
+# ── the broker's own signature over a pending request ───────────────────────
+#
+# Loki audit 3, finding 2 ("forgeable pending/"): apply used to re-verify only
+# the seal and (optionally) pre-state drift — never the escalation set, never
+# that the citation it names actually exists in FRANK with outcome=granted,
+# never that the file was written by manifest_grant_request at all. Anything
+# with $WILLOW_HOME write access (any Kart task, since WILLOW_HOME and
+# config/verifiers.json are broker-uid-writable there) could hand-write a
+# pending/<pair_id>.json and have it applied.
+#
+# The fix is a detached ed25519 signature the BROKER holds and the APPLY
+# UNIT can verify — not net_signer's key (that key belongs to the egress
+# key's owner, uid 994 on a hardened box, a different uid than the broker's
+# 1000 and unreachable to it by design; sharing it here would break that
+# split) and not pgp.sign_detached (the request side deliberately signs
+# nothing with gpg and needs no gpg-agent — module docstring). Instead: a
+# dedicated ed25519 keypair generated on first use under
+# ``<grants_root>/broker_signing_key`` (0600, broker-owned, private half
+# never leaves this process) with its public half exported alongside it at
+# ``<grants_root>/broker_public_key.pub`` (0644 — the apply unit, a
+# different uid, must be able to read it; provisioning ``manifest_grants/``
+# with a mode both uids can traverse is fix 3's job, tracked there). The
+# apply unit never needs the private half at all: it only ever verifies.
+#
+# What is signed (Loki's own spec): the canonical JSON of exactly
+# ``{pair_id, envelope_id, citation_id, apps, groups, pre_state,
+# requested_at}`` — the fields that, taken together, ARE the request. A
+# forged file with no ``broker_sig``, or one whose signature does not
+# verify against this key, is refused ``eforged`` with no grant, before the
+# seal, the escalation set, or anything else is even looked at.
+
+def _broker_signing_key_path(grants_root: Path) -> Path:
+    return grants_root / "broker_signing_key"
+
+
+def _broker_public_key_path(grants_root: Path) -> Path:
+    return grants_root / "broker_public_key.pub"
+
+
+def _load_or_create_broker_signing_key(grants_root: Path):
+    """The broker's own ed25519 PRIVATE key for signing pending requests —
+    generated once, on first request, and reused after. Never touched by
+    :func:`manifest_grant_apply`, which only ever reads the public half."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, NoEncryption, PrivateFormat, PublicFormat,
+    )
+
+    path = _broker_signing_key_path(grants_root)
+    if path.is_file():
+        raw = bytes.fromhex(path.read_text(encoding="utf-8").strip())
+        return Ed25519PrivateKey.from_private_bytes(raw)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    priv = Ed25519PrivateKey.generate()
+    raw = priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(raw.hex())
+    os.replace(tmp, path)
+
+    pub = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    pub_path = _broker_public_key_path(grants_root)
+    pub_tmp = pub_path.with_suffix(pub_path.suffix + f".tmp-{os.getpid()}")
+    pub_tmp.write_text(pub.hex(), encoding="utf-8")
+    os.chmod(pub_tmp, 0o644)
+    os.replace(pub_tmp, pub_path)
+    return priv
+
+
+def _canonical_request_bytes(record: dict) -> bytes:
+    payload = {
+        "pair_id": record.get("pair_id"),
+        "envelope_id": record.get("envelope_id"),
+        "citation_id": record.get("citation_id"),
+        "apps": record.get("apps"),
+        "groups": record.get("groups"),
+        "pre_state": record.get("pre_state"),
+        "requested_at": record.get("requested_at"),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _sign_request(record: dict, grants_root: Path) -> str:
+    priv = _load_or_create_broker_signing_key(grants_root)
+    return priv.sign(_canonical_request_bytes(record)).hex()
+
+
+def _verify_request_signature(record: dict, grants_root: Path) -> tuple[bool, str]:
+    """``(ok, reason)``. ``False`` for anything the broker did not sign:
+    no ``broker_sig`` field at all (a hand-written file), a signature that
+    does not verify (a forged or corrupted one), or no public key on disk
+    yet to verify against (a file dropped before any real request ever
+    ran)."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    sig_hex = record.get("broker_sig")
+    if not sig_hex or not isinstance(sig_hex, str):
+        return False, "pending record carries no broker_sig — not written by manifest_grant_request"
+    pub_path = _broker_public_key_path(grants_root)
+    if not pub_path.is_file():
+        return False, f"no broker public key at {pub_path} to verify the signature against"
+    try:
+        pub_bytes = bytes.fromhex(pub_path.read_text(encoding="utf-8").strip())
+        sig_bytes = bytes.fromhex(sig_hex)
+        Ed25519PublicKey.from_public_bytes(pub_bytes).verify(sig_bytes, _canonical_request_bytes(record))
+    except (ValueError, InvalidSignature):
+        return False, "broker_sig does not verify against the broker's public key — forged or corrupted"
+    return True, "ok"
+
+
 def _bind_to_seal(pair_id: str, apps: list[str], groups: list[str], *,
                    db_path: Optional[Path] = None) -> Optional[dict]:
     """Refuse unless the sealed pair's ed25519 signature verifies AND its
@@ -323,7 +442,15 @@ def _bind_to_seal(pair_id: str, apps: list[str], groups: list[str], *,
             "no keyring configured (config/verifiers.json via WILLOW_KEYRING) — "
             "a grant cannot verify a seal without a ring to verify it against",
         )
-    ok, reason, field = net_signer.verify_seal(sealed, _ring_from_keyring(ring_kr))
+    # Loki audit 3, finding 1: "a permission grant is not a lease." The
+    # default verify_seal age bound (net_authority.SEAL_MAX_AGE_S, 24h) was
+    # written for a one-shot net-authority request; a manifest.grant sealed
+    # pair is a standing governance decision, and it does not go stale on a
+    # calendar just because nobody happened to apply it within a day. The
+    # actual revocation path is supersession: _load_sealed_ruling already
+    # refuses a pair whose row carries superseded_by (net_authority.
+    # read_sealed_pair), and that check runs before verify_seal is reached.
+    ok, reason, field = net_signer.verify_seal(sealed, _ring_from_keyring(ring_kr), max_age_s=None)
     if not ok:
         return _refuse(
             "EACCES",
@@ -419,11 +546,27 @@ def _pending_path(grants_root: Path, pair_id: str) -> Path:
 
 
 def _write_json_atomic(path: Path, record: dict) -> None:
+    """tmp-write + fsync(file) + rename + fsync(directory). A rename alone
+    is atomic with respect to a crash mid-write, but on most filesystems it
+    is NOT durable until the containing directory's own metadata is
+    fsync'd — a crash between ``os.replace`` and the next `sync` can lose
+    the rename itself, or leave the new name pointing at garbage (Loki
+    audit 3, finding 6). Citing an envelope only after this returns is what
+    makes "durable on disk before a single citation is spent" (module
+    docstring) actually true rather than aspirational."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
     try:
-        tmp.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, indent=2, default=str))
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -439,7 +582,24 @@ def manifest_grant_status(pair_id: str, *, grants_root: Optional[Path] = None) -
     """Three-state (plus not_found) read of one request: ``pending`` (the
     unit has not drained it yet), ``done`` (granted, receipts attached),
     ``failed`` (refused or rolled back at apply time), or ``not_found`` (no
-    request was ever made for this ``pair_id``). Read-only, never blocks."""
+    request was ever made for this ``pair_id``). Read-only, never blocks.
+
+    ``failed`` is TERMINAL BY DESIGN (Loki audit 3, medium finding —
+    weighed against adding a ``manifest_grant_retry`` orchestrator verb,
+    and deliberately not built): a pair that failed once (bad seal at
+    apply time, drift, escalation, a forged file, a rollback that could
+    not complete) failed for a reason that a bare retry cannot itself
+    fix — the seal is still whatever it was, the drift is still there, the
+    forgery is still forged. Retrying productively means re-sealing a
+    fresh Nestor pair (a NEW pair_id) once the actual cause is addressed,
+    not replaying the same failed request. The one-request-per-pair rule
+    (``EALREADY``) already refuses a second attempt at the SAME pair_id
+    whether it is pending, done, or failed; unsticking a failed one is
+    the operator's `rm $WILLOW_HOME/manifest_grants/failed/<pair_id>.json`
+    — the one keyboard act this verb was not written to remove, since the
+    thing to remove is the FILE, not a re-verification this module could
+    perform any more usefully the second time than the first.
+    """
     root = _grants_root(grants_root)
     state = _existing_request_state(root, pair_id)
     if state is None:
@@ -479,8 +639,15 @@ def manifest_grant_request(
     envelope_id, pair_id}`` or a refusal dict. ``app_id`` must be the
     orchestrator seat; ``ledger`` is a :class:`GovernanceLedger`;
     ``store``/``apps_root``/``db_path``/``grants_root`` are test seams.
+
+    An ``O_CREAT|O_EXCL`` lock file (``pending/<pair_id>.lock``) serializes
+    this against a CONCURRENT call for the SAME ``pair_id`` (Loki audit 3,
+    medium finding: ``_existing_request_state`` and the write it guards had
+    no lock between them, so two requests racing the same pair could both
+    pass the EALREADY check and both cite — two citations, last file wins).
+    A pair already being written by another call refuses ``EALREADY``
+    rather than blocking; the lock is released win or lose.
     """
-    from .envelopes import EnvelopeAuthority, governing_envelopes
     from .human_session import is_orchestrator_app
 
     if not is_orchestrator_app(app_id):
@@ -492,6 +659,46 @@ def manifest_grant_request(
         )
 
     grants_root_p = _grants_root(grants_root)
+    lock_dir = grants_root_p / "pending"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{pair_id}.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return _refuse(
+            "EALREADY",
+            f"a manifest.grant request for pair_id={pair_id!r} is already being "
+            "written by a concurrent call — one request per sealed pair",
+        )
+    os.close(lock_fd)
+    try:
+        return _manifest_grant_request_locked(
+            app_id, envelope_id=envelope_id, pair_id=pair_id, project=project,
+            session=session, task_id=task_id, ledger=ledger, store=store,
+            apps_root=apps_root, db_path=db_path, grants_root_p=grants_root_p,
+        )
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def _manifest_grant_request_locked(
+    app_id: str,
+    *,
+    envelope_id: str,
+    pair_id: str,
+    project: str,
+    session: str,
+    task_id: str,
+    ledger,
+    store,
+    apps_root: Optional[Path],
+    db_path: Optional[Path],
+    grants_root_p: Path,
+) -> dict:
+    """The body of :func:`manifest_grant_request`, run under its per-pair
+    lock. Not called directly outside tests that already hold the lock."""
+    from .envelopes import EnvelopeAuthority, governing_envelopes
+
     existing = _existing_request_state(grants_root_p, pair_id)
     if existing is not None:
         return _refuse(
@@ -527,8 +734,9 @@ def manifest_grant_request(
             "EPERM",
             f"pair_id={pair_id!r} names escalation-class group(s) {escalating!r} — "
             "never grantable through manifest.grant, regardless of seal or "
-            "envelope bounds (same list the PreToolUse manifest guard refuses "
-            "self-grant of)",
+            "envelope bounds (the packet's own escalation set, restated in "
+            "ESCALATION_GROUPS — narrower than, and not the same list as, "
+            "the PreToolUse manifest guard's own broader refusal set)",
             escalating=escalating,
         )
 
@@ -597,6 +805,12 @@ def manifest_grant_request(
 
     pending_record["envelope_id"] = matches[0]
     pending_record["citation_id"] = result.get("citation_id")
+    # Signed AFTER the citation is inked, over the fields that make the
+    # request what it is (pair_id, envelope_id, citation_id, apps, groups,
+    # pre_state, requested_at) — apply verifies this FIRST, before anything
+    # else, so a file this process did not write is never actioned
+    # (Loki audit 3, finding 2).
+    pending_record["broker_sig"] = _sign_request(pending_record, grants_root_p)
     _write_json_atomic(pending_path, pending_record)
 
     return {
@@ -636,22 +850,31 @@ def _apply_one_seat(app_id: str, groups: list[str], *, apps_root: Path) -> dict:
             manifest_admin.set_permission(app_id, g, True)
             granted_now.append(g)
     except OSError as exc:
-        _revoke_groups(app_id, granted_now)
+        revoke = _revoke_groups(app_id, granted_now)
         try:
             owning_uid = manifest_path.stat().st_uid
         except OSError:
             owning_uid = None
-        return {"ok": False, "app_id": app_id, "error": "eperm",
-                "reason": f"{type(exc).__name__}: {exc}",
-                "path": str(manifest_path), "owning_uid": owning_uid}
+        out = {"ok": False, "app_id": app_id, "error": "eperm",
+               "reason": f"{type(exc).__name__}: {exc}",
+               "path": str(manifest_path), "owning_uid": owning_uid}
+        if revoke["failed"]:
+            out["rollback_failed"] = revoke["failed"]
+        return out
     except RuntimeError as exc:
-        _revoke_groups(app_id, granted_now)
-        return {"ok": False, "app_id": app_id, "error": _classify_set_permission_error(exc),
-                "reason": str(exc)}
+        revoke = _revoke_groups(app_id, granted_now)
+        out = {"ok": False, "app_id": app_id, "error": _classify_set_permission_error(exc),
+               "reason": str(exc)}
+        if revoke["failed"]:
+            out["rollback_failed"] = revoke["failed"]
+        return out
     except Exception as exc:  # noqa: BLE001 — never let an exception escape a citation already inked
-        _revoke_groups(app_id, granted_now)
-        return {"ok": False, "app_id": app_id, "error": "eunexpected",
-                "reason": f"{type(exc).__name__}: {exc}"}
+        revoke = _revoke_groups(app_id, granted_now)
+        out = {"ok": False, "app_id": app_id, "error": "eunexpected",
+               "reason": f"{type(exc).__name__}: {exc}"}
+        if revoke["failed"]:
+            out["rollback_failed"] = revoke["failed"]
+        return out
 
     after_text = manifest_path.read_text(encoding="utf-8")
     after_digest = _digest(after_text.encode("utf-8"))
@@ -664,24 +887,35 @@ def _apply_one_seat(app_id: str, groups: list[str], *, apps_root: Path) -> dict:
     }
 
 
-def _revoke_groups(app_id: str, groups: list[str]) -> None:
-    """Best-effort compensating undo of groups THIS call already granted,
-    when a LATER group for the SAME seat fails partway through. Never
-    raises: the outer refusal this backs out of is what gets reported."""
+def _revoke_groups(app_id: str, groups: list[str]) -> dict:
+    """Compensating undo of groups THIS call already granted — for the SAME
+    seat (a later group failing) or a LATER seat in the same request
+    failing. Never raises, but never swallows either (Loki audit 3,
+    finding 4: this used to be a bare ``except Exception: pass``, and a
+    rollback that failed was reported as ``rolled_back`` with the seat
+    still holding the group). Returns ``{app_id, reverted, failed}``:
+    ``reverted`` is what actually came off, ``failed`` is
+    ``[{group, reason}, ...]`` for what did not — the caller reports
+    ``rollback_failed`` from ``failed``, never folds it into success."""
     from . import manifest_admin
 
+    reverted: list[str] = []
+    failed: list[dict] = []
     for g in reversed(groups):
         try:
             manifest_admin.set_permission(app_id, g, False)
-        except Exception:  # noqa: BLE001 — best-effort undo only
-            pass
+            reverted.append(g)
+        except Exception as exc:  # noqa: BLE001 — reported via `failed`, never hidden
+            failed.append({"group": g, "reason": f"{type(exc).__name__}: {exc}"})
+    return {"app_id": app_id, "reverted": reverted, "failed": failed}
 
 
-def _rollback_seat(app_id: str, groups: list[str]) -> None:
-    """Best-effort undo of a whole seat this call already granted, when a
-    LATER seat in the same request fails — through the SAME staged
-    ``set_permission`` path a grant used, never a direct byte restore."""
-    _revoke_groups(app_id, groups)
+def _rollback_seat(app_id: str, groups: list[str]) -> dict:
+    """Undo of a whole seat this call already granted, when a LATER seat in
+    the same request fails — through the SAME staged ``set_permission``
+    path a grant used, never a direct byte restore. See :func:`_revoke_groups`
+    for the truthful-reporting contract."""
+    return _revoke_groups(app_id, groups)
 
 
 def _move(path: Path, dest_dir: Path, record: dict) -> Path:
@@ -692,31 +926,116 @@ def _move(path: Path, dest_dir: Path, record: dict) -> Path:
     return dest
 
 
+def _dirs_writable(grants_root: Path) -> tuple[bool, str]:
+    """Whether THIS process (the apply unit's uid) can create, write and
+    unlink inside every one of ``pending/``, ``done/``, ``failed/``. Checked
+    BEFORE granting anything (Loki audit 3, finding 5: a cross-uid box where
+    the apply uid could grant a seat's manifest but not unlink the request
+    from ``pending/`` used to grant, ink a receipt, and then loop forever
+    reporting ``eunexpected`` every tick with the grant already live and the
+    file stuck 'pending'). A directory that cannot be created or is not
+    writable+traversable by this uid refuses ``eperm_pending`` up front,
+    before a single seat's manifest is touched."""
+    for name in ("pending", "done", "failed"):
+        d = grants_root / name
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return False, f"cannot create or access {d}: {type(exc).__name__}: {exc}"
+        if not os.access(d, os.W_OK | os.X_OK):
+            return False, f"{d} is not writable by this process (uid {os.geteuid()})"
+    return True, "ok"
+
+
 def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
                 db_path: Optional[Path], grants_root: Path) -> dict:
     pair_id = record.get("pair_id")
     apps = record.get("apps") or []
     groups = record.get("groups") or []
 
+    # 0. Can this process even move the request OUT of pending/ once it
+    # decides an outcome? Checked before anything is granted — never after
+    # (Loki audit 3, finding 5).
+    dirs_ok, dirs_reason = _dirs_writable(grants_root)
+    if not dirs_ok:
+        out = {"ok": False, "error": "eperm_pending", "reason": dirs_reason}
+        try:
+            _move(path, grants_root / "failed", {**record, "result": out})
+        except OSError:
+            pass  # even failed/ is unreachable; no grant occurred either way
+        return {"pair_id": pair_id, **out}
+
+    def _fail(errno: str, reason: str, **extra) -> dict:
+        out = {"ok": False, "error": errno, "reason": reason, **extra}
+        _move(path, grants_root / "failed", {**record, "result": out})
+        return {"pair_id": pair_id, **out}
+
+    # 1. The broker's own signature over the request, FIRST — before the
+    # seal, before the escalation set, before anything else. A file this
+    # process did not write and sign is never actioned, regardless of how
+    # well-formed it otherwise looks (Loki audit 3, finding 2, FORGE-1/2).
+    sig_ok, sig_reason = _verify_request_signature(record, grants_root)
+    if not sig_ok:
+        return _fail("eforged", sig_reason)
+
+    # 2. The seal — re-verified fresh (a pending request can sit for minutes).
     seal_refusal = _bind_to_seal(pair_id, apps, groups, db_path=db_path)
     if seal_refusal is not None:
-        _move(path, grants_root / "failed", {**record, "result": seal_refusal})
-        return {"pair_id": pair_id, "ok": False, **seal_refusal}
+        return _fail(seal_refusal["error"], seal_refusal["reason"],
+                     **{k: v for k, v in seal_refusal.items() if k not in ("ok", "error", "reason")})
 
+    # 3. The escalation set — re-checked at apply, not just at request. A
+    # prior draft re-verified only the seal here; nothing stopped a
+    # perfectly-signed request naming an escalation group post-request if
+    # request-time enforcement were ever bypassed or the escalation list
+    # widened between request and apply.
+    escalating = sorted(set(groups) & ESCALATION_GROUPS)
+    if escalating:
+        return _fail("EPERM",
+                      f"pair_id={pair_id!r} names escalation-class group(s) {escalating!r} at "
+                      "apply time — refused regardless of what request-time checked",
+                      escalating=escalating)
+
+    # 4. The envelope + citation actually exist in FRANK, granted, for this
+    # exact pair — never re-derived, never assumed from the file's own say-so
+    # (Loki audit 3, finding 2: a hand-written file naming citation_id
+    # 'forged' used to apply cleanly).
+    envelope_id = record.get("envelope_id")
+    citation_id = record.get("citation_id")
+    if not envelope_id or not citation_id:
+        return _fail("eforged", "pending record carries no envelope_id/citation_id to confirm in FRANK")
+    if ledger is None:
+        return _fail("EUNREACH", "no FRANK ledger available to confirm the citation against")
+    latest = ledger.latest_event("envelope_citation", match={"envelope_id": envelope_id, "outcome": "granted"})
+    if (latest is None or latest.get("id") != citation_id
+            or (latest.get("content") or {}).get("verb") != VERB):
+        return _fail("eforged",
+                      f"FRANK carries no granted {VERB!r} envelope_citation matching "
+                      f"citation_id={citation_id!r} for pair_id={pair_id!r}")
+    cited_args = (latest["content"].get("call_args") or {})
+    if set(cited_args.get("apps") or []) != set(apps) or set(cited_args.get("groups") or []) != set(groups):
+        return _fail("eforged",
+                      "FRANK citation's call_args do not match this request's apps/groups — "
+                      "the file was edited after the citation was inked")
+
+    # 5. Pre-state is mandatory, not optional (Loki audit 3, finding 2:
+    # drift was skipped whenever pre_state was simply absent). A request
+    # with no pre-state to check drift against is itself refused, never
+    # treated as "nothing to compare."
     pre_state = record.get("pre_state") or {}
+    if not pre_state:
+        return _fail("eforged", "pre_state is mandatory and absent from this request")
     for seat in apps:
         seat_now = _seat_pre_state(seat, apps_root)
         if not seat_now.get("ok"):
-            out = {"ok": False, "error": seat_now["error"], "reason": seat_now["reason"], "app_id": seat}
-            _move(path, grants_root / "failed", {**record, "result": out})
-            return {"pair_id": pair_id, **out}
+            return _fail(seat_now["error"], seat_now["reason"], app_id=seat)
         recorded = pre_state.get(seat) or {}
-        if recorded.get("manifest_sha256") and recorded["manifest_sha256"] != seat_now["manifest_sha256"]:
-            out = {"ok": False, "error": "edrift", "app_id": seat,
-                   "reason": f"{seat}'s manifest changed since the request was made — "
-                             "refusing to apply against a moved target"}
-            _move(path, grants_root / "failed", {**record, "result": out})
-            return {"pair_id": pair_id, **out}
+        if not recorded.get("manifest_sha256"):
+            return _fail("eforged", f"pre_state for {seat!r} is missing or incomplete", app_id=seat)
+        if recorded["manifest_sha256"] != seat_now["manifest_sha256"]:
+            return _fail("edrift",
+                         f"{seat}'s manifest changed since the request was made — "
+                         "refusing to apply against a moved target", app_id=seat)
 
     from . import pgp as _pgp_precheck
     if _pgp_precheck.pgp_enabled() and not _gpg_agent_reachable():
@@ -735,15 +1054,31 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
         outcome = _apply_one_seat(seat, groups, apps_root=apps_root)
         if not outcome.get("ok"):
             refused.append(outcome)
+            rolled_back: list[str] = []
+            rollback_failed: list[dict] = []
             for undone_app, undone_groups in reversed(rollback_stack):
-                _rollback_seat(undone_app, undone_groups)
+                revoke = _rollback_seat(undone_app, undone_groups)
+                if revoke["failed"]:
+                    rollback_failed.append({"app_id": undone_app, "still_held": [
+                        f["group"] for f in revoke["failed"]], "detail": revoke["failed"]})
+                else:
+                    rolled_back.append(undone_app)
+            reason = (f"seat {seat!r} refused ({outcome.get('reason')}); rolled back "
+                      f"{len(rolled_back)} already-granted seat(s) in this request")
+            if rollback_failed:
+                # Loki audit 3, finding 4 (RBFAIL): a rollback failure is
+                # named explicitly, with which seats still hold what — never
+                # folded into "rolled back N" as if it had succeeded.
+                still = {r["app_id"]: r["still_held"] for r in rollback_failed}
+                reason += f"; ROLLBACK FAILED, still held: {still!r}"
             out = {
                 "ok": False, "error": outcome.get("error", "EAMBIG"),
-                "reason": (f"seat {seat!r} refused ({outcome.get('reason')}); rolled back "
-                           f"{len(rollback_stack)} already-granted seat(s) in this request"),
+                "reason": reason,
                 "granted": [], "refused": refused,
-                "rolled_back": [a for a, _ in rollback_stack],
+                "rolled_back": rolled_back,
             }
+            if rollback_failed:
+                out["rollback_failed"] = rollback_failed
             _move(path, grants_root / "failed", {**record, "result": out})
             return {"pair_id": pair_id, **out}
 
@@ -805,6 +1140,31 @@ def manifest_grant_apply(
                 "reason": "manifest_grant_apply does not run inside Kart — it runs as the "
                           "trust-owner systemd --user unit, a distinct uid from any Kart task",
                 "processed": []}
+
+    from . import gate
+    apps_root_p = apps_root if apps_root is not None else gate._apps_root()
+
+    # Loki audit 3, finding 3: the unit template carried no User= and this
+    # function made no uid check at all, so enabling it under the operator's
+    # own session ran it as the broker's uid — the one identity the design
+    # says never publishes — and got `eperm` on mcp_apps three layers down
+    # in a confusing place. Refuse by name, up front: this process must run
+    # AS the uid that owns apps_root (the trust owner), never any other.
+    if apps_root_p.is_dir():
+        try:
+            owning_uid = apps_root_p.stat().st_uid
+        except OSError as exc:
+            return {"ok": False, "state": "refused", "error": "EUNREACH",
+                    "reason": f"cannot stat apps_root {apps_root_p}: {type(exc).__name__}: {exc}",
+                    "processed": []}
+        if owning_uid != os.geteuid():
+            return {"ok": False, "state": "refused", "error": "ewronguser",
+                    "reason": f"manifest_grant_apply is running as uid {os.geteuid()} but "
+                              f"apps_root {apps_root_p} is owned by uid {owning_uid} — this "
+                              "process must run AS the trust owner, never any other identity",
+                    "apps_root_uid": owning_uid, "running_uid": os.geteuid(),
+                    "processed": []}
+
     root = _grants_root(grants_root)
     pending_dir = root / "pending"
     if not pending_dir.is_dir():
@@ -815,9 +1175,6 @@ def manifest_grant_apply(
         files = sorted(pending_dir.glob("*.json"))
     if not files:
         return {"ok": True, "state": "empty", "processed": []}
-
-    from . import gate
-    apps_root_p = apps_root if apps_root is not None else gate._apps_root()
 
     processed: list[dict] = []
     for f in files:

@@ -221,7 +221,23 @@ def _safe(value: object, field: str) -> str:
 def render_values(unit: str) -> dict[str, str]:
     """The placeholders this process can fill from its own resolved
     environment — the same names the fleet's installers use. Anything a
-    template asks for beyond these is ``ETEMPLATE``."""
+    template asks for beyond these is ``ETEMPLATE``.
+
+    ``TRUST_OWNER`` (added for ``willow-mcp-manifest-grant.service``, Loki
+    audit 3 finding 3): the username that owns ``$WILLOW_HOME/mcp_apps`` —
+    the identity a trust-owner unit's ``User=`` must run as, resolved from
+    the filesystem rather than guessed from this process's own ``$USER``
+    (which, run from the broker's own session, names the broker — the one
+    identity the design says never publishes). Left out of the values
+    entirely (never filled with an empty or wrong guess) when
+    ``mcp_apps`` does not exist yet or the owning uid has no passwd entry;
+    a template asking for ``@TRUST_OWNER@`` then refuses ``ETEMPLATE`` by
+    name instead of silently rendering the broker's own identity in.
+
+    ``WILLOW_KEYRING`` / ``WILLOW_PGP_FINGERPRINT`` are filled from this
+    process's own environment when set — same "resolved values, not
+    guesses" rule; a template needing one that is unset here refuses
+    ``ETEMPLATE`` rather than rendering an empty ``Environment=`` line."""
     values: dict[str, object] = {
         "PYTHON": Path(sys.executable),
         "UNIT": unit,
@@ -237,6 +253,17 @@ def render_values(unit: str) -> dict[str, str]:
         values["NESTOR_DB"] = _nestor_db_path()
     except Exception:  # noqa: BLE001 — optional; a template that needs it will refuse by name
         pass
+    apps_root = Path(os.environ.get("WILLOW_MCP_APPS_ROOT", paths.willow_home() / "mcp_apps"))
+    try:
+        import pwd
+        if apps_root.is_dir():
+            values["TRUST_OWNER"] = pwd.getpwuid(apps_root.stat().st_uid).pw_name
+    except (OSError, KeyError):  # noqa: BLE001 — no owner resolvable; leave unfilled, refuse by name
+        pass
+    for env_key in ("WILLOW_KEYRING", "WILLOW_PGP_FINGERPRINT"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            values[env_key] = val
     return {k: str(v) for k, v in values.items() if str(v)}
 
 

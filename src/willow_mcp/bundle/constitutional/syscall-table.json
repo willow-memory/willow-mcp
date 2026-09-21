@@ -302,7 +302,7 @@
       "summary": "Add a permission group to one or more seats' manifest.json under a sealed decision, signed by the broker.",
       "bounds": {
         "apps": "list[app_id] \u2014 seats this envelope may write a manifest for; the broker's own app_id is never a grantable member",
-        "groups": "list[group-name] \u2014 permission groups or capability flags this envelope may add; an escalation-class group (task_net, integration_net, web_net, mcp_federation, grove_relay, orchestrator, context, binding, full_access, envelope_apply, envelope_write, frank_write, governance_propose, governance_sync \u2014 the PreToolUse manifest guard's own list, exactly, no more) is never grantable regardless of bounds. store_write and grove_write are NOT on this list and are grantable through this verb."
+        "groups": "list[group-name] \u2014 permission groups or capability flags this envelope may add; an escalation-class group (task_net, integration_net, web_net, mcp_federation, grove_relay, orchestrator, context, binding, full_access, envelope_apply, envelope_write, frank_write, governance_propose, governance_sync \u2014 this verb's OWN escalation set, the packet's list exactly, no more; NOT the PreToolUse manifest guard's own broader refusal set, which the guard enforces separately regardless of what this verb grants) is never grantable regardless of bounds. store_write and grove_write are NOT on this list and are grantable through this verb."
       },
       "enforcement": "soft",
       "enforced_by": null,

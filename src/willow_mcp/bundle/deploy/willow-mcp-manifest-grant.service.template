@@ -10,13 +10,28 @@
 # broker: manifest_grant_request (the broker side) never signs and never
 # publishes; only this unit does, which is why it needs no sudo bridge to
 # cross — it already owns mcp_apps/.
+#
+# Loki audit 3, finding 3: a prior version of this template carried no
+# User=, no WILLOW_KEYRING, and no WILLOW_PGP_FINGERPRINT — so
+# get_keyring() returned None (every apply EACCES'd, then EALREADY burned
+# the pair on the next request) and a signed seat's manifest could never
+# be re-signed (efingerprint_absent). All three are filled here; the
+# executor's own euid-owns-apps_root check (manifest_grant_apply) is the
+# hard boundary — this file being wrong is a refusal, not a silent wrong
+# identity, but wiring it right means the unit actually runs at all.
+# ExecStartPre provisions manifest_grants/{pending,done,failed} so the
+# first tick never depends on manifest_grant_request having run first.
 [Unit]
 Description=willow-mcp manifest-grant — apply sealed permission grants
 
 [Service]
 Type=oneshot
+User=@TRUST_OWNER@
 Environment="WILLOW_HOME=@WILLOW_HOME@"
 Environment="WILLOW_STORE_ROOT=@WILLOW_STORE_ROOT@"
 Environment="WILLOW_PG_DB=@PG_DB@"
 Environment="WILLOW_NESTOR_DB=@NESTOR_DB@"
+Environment="WILLOW_KEYRING=@WILLOW_KEYRING@"
+Environment="WILLOW_PGP_FINGERPRINT=@WILLOW_PGP_FINGERPRINT@"
+ExecStartPre=/bin/sh -c 'umask 077; mkdir -p "@WILLOW_HOME@/manifest_grants/pending" "@WILLOW_HOME@/manifest_grants/done" "@WILLOW_HOME@/manifest_grants/failed"'
 ExecStart=@PYTHON@ -m willow_mcp manifest-grant apply

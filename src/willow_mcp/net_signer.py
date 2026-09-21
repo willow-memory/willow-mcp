@@ -207,7 +207,7 @@ def _parse_iso(value) -> Optional[datetime]:
 
 
 def verify_seal(seal: dict, ring: dict[str, dict], *, now: Optional[datetime] = None,
-                max_age_s: int = na.SEAL_MAX_AGE_S) -> tuple[bool, str, str]:
+                max_age_s: Optional[int] = na.SEAL_MAX_AGE_S) -> tuple[bool, str, str]:
     """(ok, reason, field). Only ed25519 verifiers can confirm.
 
     A revoked key refuses even when revoked-not-compromised (Loki
@@ -216,7 +216,20 @@ def verify_seal(seal: dict, ring: dict[str, dict], *, now: Optional[datetime] = 
     cannot tell an old honest seal from one made after the rotation and
     refuses both — stated, not silent. A seal older than ``max_age_s``
     (Nestor's ``created_at``, which the sealer stamps) refuses too: a
-    request nobody minted in a day is not minted a week later.
+    request nobody minted in a day is not minted a week later — for a
+    per-task network authority row, which is what :data:`net_authority.
+    SEAL_MAX_AGE_S` (the default here) was written for.
+
+    ``max_age_s=None`` disables the age bound entirely (Loki audit 3,
+    finding "a permission grant is not a lease"): a sealed GOVERNANCE
+    decision — e.g. ``manifest.grant``'s standing permission grant — does
+    not go stale on a calendar the way a one-shot net-authority request
+    does. It is not unbounded trust: a governance decision that is later
+    superseded is caught by :func:`net_authority.read_sealed_pair`'s own
+    ``superseded_by`` check before this function is ever called, which is
+    the actual revocation path for a sealed pair. Callers that pass
+    nothing keep the prior default (:data:`net_authority.SEAL_MAX_AGE_S`,
+    24h) unchanged.
     """
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -239,7 +252,7 @@ def verify_seal(seal: dict, ring: dict[str, dict], *, now: Optional[datetime] = 
     if sealed_at is None:
         return False, "seal carries no timezone-aware created_at", "created_at"
     current = (now or _now())
-    if (current - sealed_at).total_seconds() > max_age_s:
+    if max_age_s is not None and (current - sealed_at).total_seconds() > max_age_s:
         return False, f"seal from {seal['created_at']} is older than {max_age_s}s", "created_at"
     if sealed_at > current + timedelta(seconds=300):
         return False, "seal is dated in the future", "created_at"
