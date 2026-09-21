@@ -890,13 +890,22 @@ def _require_confirmed(mapping: dict) -> Optional[dict]:
     reads but must be explicitly confirmed (schema_confirm_mapping) before
     any write tool may use them."""
     if not mapping.get("confirmed"):
-        return {
-            "error": (
-                f"unconfirmed_schema: table '{mapping.get('table')}' has not been confirmed "
-                "for this database — call schema_confirm_mapping, or edit the mapping file "
-                "directly, then retry"
-            )
-        }
+        msg = (
+            f"unconfirmed_schema: table '{mapping.get('table')}' has not been confirmed "
+            "for this database — call schema_confirm_mapping, or edit the mapping file "
+            "directly, then retry"
+        )
+        # Gap 24fed2f5c907: a sibling seat's confirmed mapping existed but its
+        # fields differ from this seat's heuristic — say which, so the human
+        # path starts from the disagreement rather than from a blank refusal.
+        refused = mapping.get("extend_refused") or []
+        if refused:
+            parts = [
+                f"{r.get('app_id')}'s confirmed mapping on: {r.get('differs_on') or []}"
+                for r in refused if isinstance(r, dict)
+            ]
+            msg += " — differs from " + "; ".join(parts)
+        return {"error": msg}
     return None
 
 
@@ -5945,6 +5954,12 @@ def _diag_schema(app_id: str) -> dict:
                 "unmapped": [f for f, v in m["fields"].items() if v["column"] is None],
                 "drift": bool(m.get("schema_drift")),
             }
+            # Gap 24fed2f5c907: a mapping inherited from a sibling seat says so
+            # (who it came from); one that could not be inherited says why.
+            if m.get("extended_from"):
+                check["tables"][table]["extended_from"] = m["extended_from"]
+            if m.get("extend_refused"):
+                check["tables"][table]["extend_refused"] = m["extend_refused"]
         check["status"] = "ok"
     except Exception as e:
         check["status"] = "fail"
