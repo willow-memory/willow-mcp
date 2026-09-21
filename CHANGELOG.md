@@ -31,6 +31,23 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.65.0](https://github.com/willow-memory/willow-mcp/compare/v2.64.0...v2.65.0) (2026-09-21)
+
+
+### Added
+
+* **gaps:** gap_retopic moves a gap under a new topic with its history on the record ([5a5f46b](https://github.com/willow-memory/willow-mcp/commit/5a5f46b55fd0d932e89915e0bf5cba06c05285c0))
+* **github-app:** a missing App permission files one named human_required item ([4a54330](https://github.com/willow-memory/willow-mcp/commit/4a54330cfc7bd879d227e873e00106b32b4ca02a))
+* **schema:** a confirmed mapping extends to a new seat on the same (database, table) ([bc57a26](https://github.com/willow-memory/willow-mcp/commit/bc57a26d7a4d2a7c8072e3b62fff5596c690c567))
+* **pr_open:** record who asked — opened_by in the receipt and a watch row for the steward ([5a6a570](https://github.com/willow-memory/willow-mcp/commit/5a6a570245b4361328dbfc6a80681b60d03cfe9a))
+
+
+### Fixed
+
+* **docs:** tool counts in prose follow #588 and #590 ([962e7d3](https://github.com/willow-memory/willow-mcp/commit/962e7d3b25e79760921b78764254a8795b8a5fb6))
+* **schema,github-app:** extend on columns not metadata; a sibling must be a seeded seat; pr_update checks pull_requests ([53a4b85](https://github.com/willow-memory/willow-mcp/commit/53a4b85f55d79aea513648908c3951376da189b2))
+* **hooks:** gap_retopic joins _SEAT_WRITE_TOOLS in both hook copies ([71694f4](https://github.com/willow-memory/willow-mcp/commit/71694f4cce418cc4aaf58aa783d5c1b29a7d60be))
+
 ## [2.64.0](https://github.com/willow-memory/willow-mcp/compare/v2.63.0...v2.64.0) (2026-09-21)
 
 
