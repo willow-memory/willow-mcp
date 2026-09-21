@@ -86,7 +86,8 @@ TOOL_CLASS: dict[str, str] = {
     "kb_promote": WRITE, "knowledge_flag": WRITE, "knowledge_retract": WRITE,
     "gap_log": WRITE, "gap_resolve": WRITE, "gap_delete": WRITE,
     "dispatch_send": WRITE, "dispatch_accept": WRITE, "handoff_write_v4": WRITE,
-    "verify_handoff": WRITE, "agent_clear": WRITE, "session_handoff_write": WRITE,
+    "verify_handoff": WRITE, "agent_clear": WRITE, "dispatch_withdraw": WRITE,
+    "session_handoff_write": WRITE,
     "lineage_record": WRITE, "lineage_link": WRITE,
     "friction_scan": WRITE,
     # nestor_tool_route persists a ledger passage + teach-queue entry; seal writes

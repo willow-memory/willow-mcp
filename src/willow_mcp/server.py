@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 137 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 138 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -4276,7 +4276,14 @@ def dispatch_send(
     is resolved automatically (the common case); pass it only after an
     ``EAMBIG`` names your options in ``envelope_ids``. It can only select
     among envelopes that already govern you — naming one that does not
-    returns ``ENOENT``, so it disambiguates and never widens."""
+    returns ``ENOENT``, so it disambiguates and never widens.
+
+    A packet addressed to its own sender is refused ``EINVAL`` before the
+    envelope gate runs (no quota spent): it is the shape a seat would use to
+    mint its own citation (Loki 40A353F2, A1)."""
+    if (app_id or "").strip().lower() == (to_app or "").strip().lower():
+        return {"error": "EINVAL", "message": "a packet cannot be sent to its sender",
+                "from_app": app_id, "to_app": to_app}
     # #333: cite-before-act. `role` is resolved here with dispatch.py's own
     # fallback (`role or to_app`, lowercased) so the bounds an envelope is
     # checked against name the same task_class dispatch.py will actually
@@ -4346,15 +4353,46 @@ def dispatch_read(app_id: str, dispatch_id: str) -> dict:
     {error: not_found} for an unknown dispatch_id, or {error:
     not_party_to_dispatch} if app_id is neither from_app, to_app, reply_to,
     nor the orchestrator (B-54, issue #242 -- dispatch_read permission alone
-    used to let any holder read any dispatch_id's full content)."""
+    used to let any holder read any dispatch_id's full content) -- unless a
+    working/complete packet addressed to app_id CITES this dispatch_id in its
+    context_refs (an auditor reading the builder's packet it was assigned to
+    audit; a reworker reading the audit): then the read is allowed, the
+    result carries `via: <citing packet>`, and the receipt says so."""
     pkt = dispatch_stack.dispatch_read(dispatch_id)
     if pkt.get("error"):
         return pkt
+    grant = _packet_read_grant(app_id, dispatch_id, pkt["meta"], "dispatch_read")
+    if grant.get("error"):
+        return grant
+    if grant.get("via"):
+        pkt = {**pkt, **grant}
+    return pkt
+
+
+def _packet_read_grant(app_id: str, dispatch_id: str, meta: dict, tool: str) -> dict:
+    """B-54 read check shared by dispatch_read / handoff_read: party or
+    orchestrator -> {}; cited by a working/complete packet addressed to
+    app_id -> {via, via_status} (receipted so the trail says how the read
+    was allowed); otherwise the not_party refusal naming the citation
+    option. Read grants only -- the write verbs never consult this."""
     from .human_session import is_orchestrator_app
 
-    if not is_orchestrator_app(app_id) and not dispatch_stack.is_dispatch_party(app_id, pkt["meta"]):
-        return {"error": "not_party_to_dispatch", "dispatch_id": dispatch_id}
-    return pkt
+    if is_orchestrator_app(app_id) or dispatch_stack.is_dispatch_party(app_id, meta):
+        return {}
+    grant = dispatch_stack.citation_read_access(app_id, dispatch_id)
+    if grant:
+        _receipt_log.record(
+            app_id, tool, "ok",
+            json.dumps({"citation_read": dispatch_id.upper(), "via": grant["via"],
+                        "via_from": grant.get("via_from", "")},
+                       separators=(",", ":")),
+        )
+        return grant
+    return {
+        "error": "not_party_to_dispatch",
+        "dispatch_id": dispatch_id,
+        "message": dispatch_stack.NOT_PARTY_HINT,
+    }
 
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -4433,15 +4471,19 @@ def handoff_read(app_id: str, dispatch_id: str) -> dict:
     before verify_handoff, and what a successor agent reads to pick up the
     thread. Read-only. Returns {error: not_party_to_dispatch} if app_id is
     neither from_app, to_app, reply_to, nor the orchestrator (B-54, issue
-    #242 -- same packet-party check as dispatch_read)."""
+    #242 -- same packet-party check as dispatch_read, same citation grant:
+    a working/complete packet addressed to app_id that cites this id in its
+    context_refs allows the read, carried as `via`)."""
     pkt = dispatch_stack.dispatch_read(dispatch_id)
     if pkt.get("error"):
         return pkt
-    from .human_session import is_orchestrator_app
-
-    if not is_orchestrator_app(app_id) and not dispatch_stack.is_dispatch_party(app_id, pkt["meta"]):
-        return {"error": "not_party_to_dispatch", "dispatch_id": dispatch_id}
-    return handoff_stack.handoff_read(dispatch_id)
+    grant = _packet_read_grant(app_id, dispatch_id, pkt["meta"], "handoff_read")
+    if grant.get("error"):
+        return grant
+    out = handoff_stack.handoff_read(dispatch_id)
+    if grant.get("via") and not out.get("error"):
+        out = {**out, **grant}
+    return out
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -4467,6 +4509,48 @@ def agent_clear(
     ready for the next packet. The final step of the dispatch lifecycle
     (send → accept → handoff → verify → clear); orchestrator-side."""
     return dispatch_stack.agent_clear(target_app, dispatch_id, session_id)
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("dispatch_withdraw")
+def dispatch_withdraw(
+    app_id: str, dispatch_id: str, reason: str, force: bool = False,
+) -> dict:
+    """Retire a dispatch packet the orchestrator no longer wants worked:
+    pending → withdrawn (gap afa515539c0a). Orchestrator-only, same group as
+    verify_handoff / agent_clear. A `working` packet is withdrawn only when
+    no session of the assignee is still bound to it as working — otherwise
+    `EBUSY` naming the session ids and the reconcile path
+    (session_reconcile on each), because liveness beyond the session record
+    cannot be known here. `force=True` withdraws over the bound sessions
+    anyway — for a seat that is gone — and records them on the packet
+    (`forced_over_sessions`) and in the FRANK event. `withdrawn` is
+    terminal: dispatch_accept, session_enter(dispatch_id=...) and
+    handoff_write_v4 refuse invalid_transition, and the packet never
+    appears as pending again. Writes a `dispatch_withdraw` event to the
+    FRANK ledger when one is reachable. Returns {id, previous, status}."""
+    out = dispatch_stack.dispatch_withdraw(
+        dispatch_id, reason, by_app=app_id, force=force,
+    )
+    if out.get("error"):
+        return out
+    pg = get_pg()
+    if pg is not None:
+        try:
+            from .governance_ledger import GovernanceLedger
+            out["frank_id"] = GovernanceLedger(pg).append(
+                "willow", "dispatch_withdraw",
+                {"dispatch_id": out["dispatch_id"], "previous": out["previous"],
+                 "to_app": out.get("to_app"), "reason": out.get("reason"),
+                 "forced": bool(out.get("forced_over_sessions")),
+                 "forced_over_sessions": list(out.get("forced_over_sessions") or []),
+                 "actor": app_id, "session": _current_orchestrator_session() or ""},
+            )
+        except Exception as exc:  # the withdrawal is on disk; the ledger fault is reported, not hidden
+            out["frank_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        out["frank_error"] = "postgres_unavailable"
+    return out
 
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -5601,9 +5685,11 @@ def envelope_ratify(proposal_id: str) -> dict:
         ledger = GovernanceLedger(pg)
     try:
         row = _ea.ratify(proposal_id, verifier=verifier, ledger=ledger)
+    except _ea.RegistryMismatchError as exc:
+        return {**exc.detail, "message": str(exc)}
     except _ea.EnvelopeAuthoringError as exc:
         return {"error": type(exc).__name__, "message": str(exc)}
-    return {"ok": True, "envelope": row}
+    return {"ok": True, "envelope": row, "registry": _ea.registry_identity()}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -5629,9 +5715,11 @@ def envelope_reject(
             proposal_id, reason=reason, verifier=verifier,
             reopen_when=reopen_when, ledger=ledger,
         )
+    except _ea.RegistryMismatchError as exc:
+        return {**exc.detail, "message": str(exc)}
     except _ea.EnvelopeAuthoringError as exc:
         return {"error": type(exc).__name__, "message": str(exc)}
-    return {"ok": True, "rejection": row}
+    return {"ok": True, "rejection": row, "registry": _ea.registry_identity()}
 
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -5677,13 +5765,24 @@ def envelope_pending_read(
     override") rather than a two-hop dance through ``envelope_list``.
     Precedent IDs that no longer resolve to an active envelope are
     silently dropped from the expansion (revoked / hand-edited registry);
-    ``precedent_ids`` itself stays intact as tamper evidence."""
+    ``precedent_ids`` itself stays intact as tamper evidence.
+
+    ``registry`` names the file this queue was read from — ``path`` and a
+    content ``fingerprint`` — so when an operator says "ratified" and the
+    queue has not moved, the desk can say which registry their act would
+    have to be in (gap 4c7512c57a7e). ``registry_mismatch`` is present when
+    that file is not the one ``$WILLOW_HOME`` names: every ratify from
+    this process would refuse ``EREGISTRY``."""
     from . import envelope_authoring as _ea
     rows = _ea.list_pending(
         oldest_first=oldest_first, limit=limit,
         include_precedents=include_precedents,
     )
-    return {"pending": rows, "count": len(rows)}
+    out = {"pending": rows, "count": len(rows), "registry": _ea.registry_identity()}
+    mismatch = _ea.registry_mismatch()
+    if mismatch is not None:
+        out["registry_mismatch"] = mismatch
+    return out
 
 
 @mcp.tool(annotations=_ANNO_READ)

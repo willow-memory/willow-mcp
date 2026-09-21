@@ -10,6 +10,9 @@ from .registry import iter_registry_rows, load_registry
 
 VALID_STATUSES = frozenset({
     "pending", "working", "complete", "verified", "cleared", "closed", "failed",
+    # Terminal: the orchestrator retired the packet (dispatch_withdraw, gap
+    # afa515539c0a). Never accepted, never closed, never listed as pending.
+    "withdrawn",
 })
 
 

@@ -108,6 +108,124 @@ class OperatorVerifierRequired(EnvelopeAuthoringError):
     downgrades on: unknown / compromised → refuse."""
 
 
+class RegistryMismatchError(EnvelopeAuthoringError):
+    """``EREGISTRY`` (gap 4c7512c57a7e): the registry this process resolves
+    is not the one ``$WILLOW_HOME`` names. An operator act that lands in a
+    registry the desk does not read reports "ratified" and changes nothing
+    the desk can see — the proposal stays ``proposed`` on the broker and the
+    seat ratifies again on the operator's word. Refused before any write;
+    ``detail`` names both paths and the env that steered the resolve."""
+
+    def __init__(self, message: str, detail: dict):
+        super().__init__(message)
+        self.detail = detail
+
+
+# ---------------------------------------------------------------------------
+# Registry identity — which file is in effect, and is it the home's own
+# ---------------------------------------------------------------------------
+
+
+def registry_identity(path: Optional[Path] = None) -> dict:
+    """``{path, fingerprint, exists, mtime, active, proposals}`` for the
+    registry in effect (or ``path``). ``fingerprint`` is the sha256 of the
+    file bytes, 16 hex — enough for two readers to agree they are looking
+    at the same file, which is the question the desk asks when an operator
+    says "ratified" and the queue has not moved. Read-only; counts come from
+    a plain ``json.loads`` so a registry the trusted-read gate would refuse
+    still gets a fingerprint (the gate's own refusal is unchanged elsewhere)."""
+    import hashlib
+    p = path if path is not None else _envelopes.registry_path()
+    out: dict[str, Any] = {"path": str(p), "fingerprint": None, "exists": False,
+                           "mtime": None, "active": None, "proposals": None}
+    try:
+        raw = p.read_bytes()
+    except OSError:
+        return out
+    out["exists"] = True
+    out["fingerprint"] = hashlib.sha256(raw).hexdigest()[:16]
+    try:
+        out["mtime"] = (
+            datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+            .replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+    except OSError:
+        pass
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return out
+    if isinstance(doc, dict):
+        out["active"] = len(doc.get("active") or [])
+        out["proposals"] = len(doc.get("proposals") or [])
+    return out
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except OSError:
+        return False
+
+
+def registry_mismatch() -> Optional[dict]:
+    """``None`` when the registry in effect is ``$WILLOW_HOME/constitutional/
+    pre-approved.json``; otherwise the ``EREGISTRY`` detail: ``resolved``,
+    ``expected``, ``steered_by`` (the env var that moved the resolve — or
+    the absence of ``WILLOW_HOME``, which lands the implicit ``~/.willow``
+    default), and a ``message`` that names all three.
+
+    The home's own registry is the one every reader on the box — the desk,
+    the serve broker, ``home_init``'s seed — reads by default. A ratify
+    that goes anywhere else is an act the desk cannot see."""
+    from . import paths as _paths
+    resolved = _envelopes.registry_path()
+    home_env = (os.environ.get("WILLOW_HOME") or "").strip()
+    try:
+        expected: Optional[Path] = _paths.willow_home() / "constitutional" / "pre-approved.json"
+    except _paths.RetiredHomeError as exc:
+        return {
+            "error": "EREGISTRY",
+            "resolved": str(resolved),
+            "expected": None,
+            "steered_by": "WILLOW_HOME unset (implicit ~/.willow default, retired)",
+            "message": (
+                f"EREGISTRY: registry resolved to {resolved} with WILLOW_HOME unset; "
+                f"the implicit home is retired ({exc}). Set WILLOW_HOME to the live "
+                "home before ratifying."
+            ),
+        }
+    if expected is not None and _same_file(resolved, expected):
+        return None
+    if (os.environ.get("WILLOW_ENVELOPE_REGISTRY") or "").strip():
+        steered_by = "WILLOW_ENVELOPE_REGISTRY"
+    elif (os.environ.get("WILLOW_CHARTER_REPO") or "").strip():
+        steered_by = "WILLOW_CHARTER_REPO"
+    elif not home_env:
+        steered_by = "WILLOW_HOME unset (implicit ~/.willow default)"
+    else:
+        steered_by = "unknown"
+    return {
+        "error": "EREGISTRY",
+        "resolved": str(resolved),
+        "expected": str(expected),
+        "steered_by": steered_by,
+        "message": (
+            f"EREGISTRY: this process resolves the envelope registry to {resolved} "
+            f"(steered by {steered_by}), but $WILLOW_HOME names {expected}. An "
+            "operator act written to the former is invisible to every reader of "
+            "the latter — refused before any write. Unset the steering env or "
+            "point WILLOW_HOME at the home whose registry you mean."
+        ),
+    }
+
+
+def _refuse_registry_mismatch(act: str) -> None:
+    detail = registry_mismatch()
+    if detail is not None:
+        raise RegistryMismatchError(f"{act} refused — {detail['message']}", detail)
+
+
 # ---------------------------------------------------------------------------
 # Registry read/write helpers
 # ---------------------------------------------------------------------------
@@ -231,6 +349,13 @@ def propose(
     FRANK ledger when one is available; ledger-write failure is reported in
     the returned dict but does not roll back the sidecar write (mirrors the
     discipline sign-session uses for its ledger append).
+
+    Deliberately NOT guarded by ``EREGISTRY`` (:func:`registry_mismatch`):
+    a proposal has no force wherever it lands, and a specialist's
+    auto-propose on a gate miss must be able to queue into whatever registry
+    its process resolves — a steered resolve costs nothing here. The guard
+    sits on the operator acts (ratify / reject / revoke), where a write to
+    the wrong file is a "ratified" the desk cannot see (gap 4c7512c57a7e).
     """
     if _keyring.enabled():
         # Attribution rail is active. Every gate below is inside the
@@ -373,6 +498,7 @@ def ratify(
             f"ratify requires an operator verifier known to the keyring "
             f"and not compromised; got {verifier!r}."
         )
+    _refuse_registry_mismatch("ratify")
 
     registry = _load_registry()
     proposals = list(registry.get("proposals") or [])
@@ -462,6 +588,7 @@ def reject(
             f"reject requires an operator verifier known to the keyring "
             f"and not compromised; got {verifier!r}."
         )
+    _refuse_registry_mismatch("reject")
 
     registry = _load_registry()
     proposals = list(registry.get("proposals") or [])
@@ -612,6 +739,7 @@ def revoke(
         # cannot act on: they can see the authority is gone and not whether
         # it was redundant, mistaken, or abused.
         raise EnvelopeAuthoringError("revoke requires a reason")
+    _refuse_registry_mismatch("revoke")
 
     registry = _load_registry()
     rows = registry.get("active") or []

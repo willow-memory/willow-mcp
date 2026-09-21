@@ -36,6 +36,12 @@ def handoff_write_v4(
         return pkt
     if pkt["meta"].get("to_app", "").lower() != app_id.lower():
         return {"error": "wrong_recipient", "expected": pkt["meta"].get("to_app")}
+    cur = pkt.get("status", {}).get("status", "pending")
+    if cur == "withdrawn":
+        # Terminal (gap afa515539c0a): the orchestrator retired this packet;
+        # a closeout against it would resurrect work nobody asked for.
+        return {"error": "invalid_transition", "from": cur, "to": "complete",
+                "dispatch_id": dispatch_id}
 
     root = dispatch_dir(dispatch_id)
     handoff = {

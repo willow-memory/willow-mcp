@@ -105,6 +105,10 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     "orchestrator": frozenset({
         "dispatch_send", "dispatch_read", "dispatch_list", "dispatch_accept",
         "handoff_write_v4", "handoff_read", "verify_handoff", "agent_clear",
+        # gap afa515539c0a: retire a pending packet. Orchestrator-only, like
+        # verify_handoff / agent_clear -- a builder must not retire its own
+        # or a peer's assignment.
+        "dispatch_withdraw",
         "session_read", "session_enter", "session_handoff_write", "agent_route", "agent_dispatch_result",
         "fleet_status", "fleet_health", "frank_read", "frank_verify",
         "frank_append", "envelope_apply",
@@ -410,6 +414,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         "agent_route", "agent_dispatch_result",
         "dispatch_send", "dispatch_read", "dispatch_list", "dispatch_accept",
         "handoff_write_v4", "handoff_read", "verify_handoff", "agent_clear",
+        "dispatch_withdraw",
         "session_read", "session_enter", "session_handoff_write",
         "agent_seed_mirror",
         "exposure_config_get", "exposure_slice",
