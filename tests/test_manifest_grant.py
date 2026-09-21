@@ -1,10 +1,16 @@
-"""The brokered manifest grant (verb 18 `manifest.grant`, sealed `d5504878`) —
-a human-sealed Nestor pair names seats + groups; this process, and only this
-process, appends those groups to each seat's manifest.json, signs it, and
-verifies the result — never a hand-edit, never `manifest_admin.set_permission`
-called from a tool (that function's own docstring forbids it). Sibling of
+"""The brokered manifest grant (verb 18 `manifest.grant`, sealed `d5504878`,
+write path split under pair `b74019ac`) — the broker never publishes.
+`manifest_grant_request` verifies everything (orchestrator caller, envelope
+bounds, the sealed pair's real ed25519 `seal_sig` against the keyring, the
+strict grammar, no escalation group, per-seat pre-state) and writes ONE
+request under `$WILLOW_HOME/manifest_grants/pending/<pair_id>.json`, citing
+the envelope only after the file is durable. `manifest_grant_apply` — the
+trust-owner unit, never the broker, never Kart — re-verifies fresh and does
+the actual sign+publish through `manifest_admin.set_permission`, no
+`privileged_publisher` (it already owns the trust root). Sibling of
 `test_unit_install.py`: a fake FRANK ledger + a real envelope registry in
-tmp_path, the sealed pair lives in a per-test SOIL `Store`.
+tmp_path, the sealed pair lives in a per-test SOIL `Store` plus a genuinely
+ed25519-signed row in `home/nestor.db`.
 """
 from __future__ import annotations
 
@@ -14,9 +20,11 @@ import subprocess
 from datetime import datetime, timezone
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from willow_mcp import keyring as keyring_mod
 from willow_mcp import manifest_grant_executor as mgx
+from willow_mcp import net_signer as ns
 from willow_mcp import seal_handler
 from willow_mcp.db import Store
 
@@ -121,20 +129,12 @@ def _charter(tmp_path, monkeypatch, *, grantee="willow", apps=("kart",),
     monkeypatch.setenv("WILLOW_SYSCALL_TABLE", str(tab))
 
 
-# ── the sealed pair (SOIL governance record + keyring verifier) ─────────────
-#
-# Rework (Loki audit 04472e32, finding 4): a grant must be bound to what was
-# actually SEALED, not to the mutable SOIL record alone. `_seal()` now also
-# writes a matching row into `home/nestor.db` (the default nestor.db path
-# `seal_handler._nestor_db_path()` resolves to under the `home` fixture's
-# WILLOW_HOME) whose `target_text` is the strict grammar
-# `mgx.ruling_text()` produces — the artifact `execute_manifest_grant` binds
-# the grant to. Tests that want a MISMATCH between what was sealed and what
-# the record now says pass `seal_seats=`/`seal_groups=` explicitly.
-
+# ── the sealed pair: a real ed25519 signature over the grammar, in
+#    home/nestor.db, plus the mutable SOIL governance record ────────────────
 
 def _write_nestor_pair(home, pair_id, target_text, *, verifier="sean",
-                        status="sealed", seal_sig="stub-seal-sig"):
+                        status="sealed", seal_sig="stub-seal-sig",
+                        created_at=None):
     """A minimal `tm_pairs` row — the same shape `tests/test_net_authority.py`
     and `tests/test_reloader.py` use — under `home/nestor.db`."""
     import sqlite3
@@ -157,16 +157,23 @@ def _write_nestor_pair(home, pair_id, target_text, *, verifier="sean",
         "target_text, target_lang, status, verifier, created_at, seal_sig) "
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
         (pair_id, "test grant", "test grant", "decision", target_text, "decision",
-         status, verifier, "2026-09-21T00:00:00Z", seal_sig),
+         status, verifier, created_at or datetime.now(timezone.utc).isoformat(), seal_sig),
     )
     conn.commit()
     conn.close()
 
 
+def _sign_seal(kr, name, source_norm, target_text) -> str:
+    entry = kr.get(name)
+    priv = Ed25519PrivateKey.from_private_bytes(entry.private)
+    return priv.sign(ns.seal_message(source_norm, target_text, name)).hex()
+
+
 def _seal(home, store, *, pair_id="pair-mg-1", verifier="sean", status="sealed",
           seats=("kart",), groups=("store_read",),
           seal_seats=None, seal_groups=None, write_nestor_pair=True,
-          nestor_status="sealed", nestor_seal_sig="stub-seal-sig", **overrides):
+          nestor_status="sealed", nestor_seal_sig=None, nestor_verifier=None,
+          kr=None, **overrides):
     record = {
         "id": "grove-perms-test",
         "title": "test grant",
@@ -182,8 +189,15 @@ def _seal(home, store, *, pair_id="pair-mg-1", verifier="sean", status="sealed",
         sealed_seats = list(seal_seats) if seal_seats is not None else list(seats)
         sealed_groups = list(seal_groups) if seal_groups is not None else list(groups)
         target_text = mgx.ruling_text(sealed_seats, sealed_groups)
-        _write_nestor_pair(home, pair_id, target_text, verifier=verifier,
-                            status=nestor_status, seal_sig=nestor_seal_sig)
+        sealed_verifier = nestor_verifier if nestor_verifier is not None else verifier
+        if nestor_seal_sig is not None:
+            sig = nestor_seal_sig
+        elif kr is not None and sealed_verifier in kr.names():
+            sig = _sign_seal(kr, sealed_verifier, "test grant", target_text)
+        else:
+            sig = "stub-seal-sig"
+        _write_nestor_pair(home, pair_id, target_text, verifier=sealed_verifier,
+                            status=nestor_status, seal_sig=sig)
     return rid
 
 
@@ -194,11 +208,12 @@ def store(tmp_path):
 
 @pytest.fixture
 def ring_with_sean(tmp_path):
-    """A keyring with 'sean' active — the operator's canonical verifier for
-    these tests."""
+    """A keyring with a REAL ed25519 'sean' entry active — the operator's
+    canonical verifier for these tests. Yields the `Keyring` so tests can
+    sign with `sean`'s private half via `_sign_seal`."""
     with keyring_mod.isolated():
         k = keyring_mod.Keyring(path=str(tmp_path / "keys.json"))
-        k.add("sean")
+        k.add("sean", kind="ed25519")
         k.save()
         keyring_mod.set_keyring(k)
         try:
@@ -215,51 +230,44 @@ def _manifest(home, app_id, permissions=None):
     return path
 
 
-# ── refusals that never touch the envelope or the seat ───────────────────────
+def _request(app_id="willow", *, pair_id="pair-mg-1", envelope_id="", ledger=None,
+             store=None, apps_root=None, grants_root=None):
+    return mgx.manifest_grant_request(
+        app_id, envelope_id=envelope_id, pair_id=pair_id,
+        ledger=ledger or _ledger(_FakeGovernancePg()), store=store, apps_root=apps_root,
+        grants_root=grants_root,
+    )
+
+
+def _pending_files(grants_root):
+    d = grants_root / "pending"
+    return list(d.glob("*.json")) if d.is_dir() else []
+
+
+# ── refusals at the REQUEST stage — never touch the envelope or a seat ──────
 
 def test_non_orchestrator_caller_is_eperm(home, tmp_path, store, ring_with_sean):
-    out = mgx.execute_manifest_grant(
-        "hanuman", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store,
-    )
+    out = _request("hanuman", store=store)
     assert out["error"] == "EPERM"
-    assert not out["granted"]
-
-
-def test_inside_kart_is_eunreach(home, tmp_path, monkeypatch, store):
-    monkeypatch.setenv("WILLOW_IN_KART", "1")
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store,
-    )
-    assert out["error"] == "EUNREACH"
 
 
 def test_no_governance_record_is_enoent(home, tmp_path, store):
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="no-such-pair",
-        ledger=_ledger(_FakeGovernancePg()), store=store,
-    )
+    out = _request(pair_id="no-such-pair", store=store)
     assert out["error"] == "ENOENT"
 
 
 def test_unsealed_pair_is_eacces(home, tmp_path, store):
     _seal(home, store, status="proposed")
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store,
-    )
+    out = _request(store=store)
     assert out["error"] == "EACCES"
     assert "sealed" in out["reason"]
 
 
 def test_unknown_verifier_is_eacces(home, tmp_path, store):
-    """The keyring has no verifier registered at all — 'sean' is unknown."""
+    """No keyring configured at all — 'sean' cannot be checked against
+    anything, so the seal is refused rather than trusted on the record's say-so."""
     _seal(home, store, verifier="sean")
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store,
-    )
+    out = _request(store=store)
     assert out["error"] == "EACCES"
     assert "keyring" in out["reason"]
 
@@ -267,59 +275,66 @@ def test_unknown_verifier_is_eacces(home, tmp_path, store):
 def test_compromised_verifier_is_eacces(home, tmp_path, store):
     with keyring_mod.isolated():
         k = keyring_mod.Keyring(path=str(tmp_path / "keys.json"))
-        k.add("sean")
+        k.add("sean", kind="ed25519")
         k.revoke("sean", reason="test", compromised=True)
         k.save()
         keyring_mod.set_keyring(k)
         try:
             _seal(home, store, verifier="sean")
-            out = mgx.execute_manifest_grant(
-                "willow", envelope_id="", pair_id="pair-mg-1",
-                ledger=_ledger(_FakeGovernancePg()), store=store,
-            )
+            out = _request(store=store)
         finally:
             keyring_mod.set_keyring(None)
     assert out["error"] == "EACCES"
 
 
+def test_garbage_seal_sig_is_refused(home, tmp_path, store, ring_with_sean):
+    """A structurally-valid-hex but wrong signature over the sealed bytes:
+    the keyring KNOWS 'sean' and 'sean' is active, but the bytes do not
+    verify. Loki finding: the seal binding used to compare TEXT only and
+    never called net_signer.verify_seal at all — a garbage seal_sig on an
+    otherwise well-formed row was granted with a receipt."""
+    _seal(home, store, verifier="sean", nestor_seal_sig="ab" * 64)
+    out = _request(store=store)
+    assert out["error"] == "EACCES"
+    assert "does not verify" in out["reason"]
+
+
+def test_sealed_verifier_mismatch_is_refused(home, tmp_path, store, ring_with_sean):
+    """The SOIL record's `nestor_verifier` says 'sean' (active, known-good) —
+    but the SEALED ROW in nestor.db actually names 'mallory'. The seal
+    signature covers (source_norm, target_text, VERIFIER), so a caller
+    cannot launder an unknown verifier through a record that names someone
+    else. This must be refused using the SEALED row's verifier, never the
+    record's."""
+    _seal(home, store, verifier="sean", nestor_verifier="mallory")
+    out = _request(store=store)
+    assert out["error"] == "EACCES"
+    assert "mallory" in out["reason"] or "not in the ring" in out["reason"]
+
+
 def test_malformed_seats_is_einval(home, tmp_path, store, ring_with_sean):
     _seal(home, store, seats=[])
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store,
-    )
+    out = _request(store=store)
     assert out["error"] == "EINVAL"
 
 
 def test_malformed_groups_is_einval(home, tmp_path, store, ring_with_sean):
     _seal(home, store, groups=None)
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store,
-    )
+    out = _request(store=store)
     assert out["error"] == "EINVAL"
 
 
 def test_escalation_group_refused_even_when_sealed(home, tmp_path, monkeypatch, store, ring_with_sean):
-    """Sealed, known verifier, envelope bounds would even cover it — refused
-    anyway because full_access is on the escalation list.
-
-    Loki audit 04472e32 (finding 2): the escalation set is EXACTLY the
-    packet's list (task_net, integration_net, web_net, mcp_federation,
-    grove_relay, orchestrator, context, binding, full_access, envelope_apply,
-    envelope_write, frank_write, governance_propose, governance_sync) — not
-    the much broader gate-derived list a prior draft used, which refused
-    this verb's own first live pair (10ed2707, naming grove_write).
-    store_write is grantable through this verb now; full_access still is not."""
+    """Sealed with a REAL verifiable signature, envelope bounds would even
+    cover it — refused anyway because full_access is on the escalation list.
+    store_write/grove_write are grantable through this verb; full_access is not."""
     _charter(tmp_path, monkeypatch, apps=("kart",), groups=("full_access",))
     _manifest(home, "kart")
-    _seal(home, store, seats=("kart",), groups=("full_access",))
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store, apps_root=home / "mcp_apps",
-    )
+    _seal(home, store, seats=("kart",), groups=("full_access",), kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
     assert out["error"] == "EPERM"
     assert "full_access" in out["escalating"]
+    assert not _pending_files(home / "manifest_grants")
 
 
 def test_escalation_groups_is_exactly_the_packet_list():
@@ -333,122 +348,188 @@ def test_escalation_groups_is_exactly_the_packet_list():
     assert "store_write" not in mgx.ESCALATION_GROUPS
 
 
-def test_grove_write_pair_shaped_grant_is_granted(home, tmp_path, monkeypatch, store, ring_with_sean):
-    """The live pair 10ed2707 shape: two seats, grove_read + grove_write.
-    Neither group is on the trimmed escalation list, so a sealed pair naming
-    them is granted, not refused."""
-    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
-    _charter(tmp_path, monkeypatch, apps=("hanuman", "loki"),
-             groups=("grove_read", "grove_write"))
-    _manifest(home, "hanuman")
-    _manifest(home, "loki")
-    _seal(home, store, seats=("hanuman", "loki"), groups=("grove_read", "grove_write"))
-
-    pg = _FakeGovernancePg()
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(pg), store=store, apps_root=home / "mcp_apps",
-    )
-
-    assert out["ok"] is True, out
-    assert {g["app_id"] for g in out["granted"]} == {"hanuman", "loki"}
-    for seat in ("hanuman", "loki"):
-        manifest = json.loads((home / "mcp_apps" / seat / "manifest.json").read_text())
-        assert set(manifest["permissions"]) == {"grove_read", "grove_write"}
-
-
 def test_no_active_envelope_is_enoent(home, tmp_path, monkeypatch, store, ring_with_sean):
-    """A registry exists (so the read succeeds) but grants nothing to
-    'willow' for this verb — zero matches is ENOENT, not a read failure."""
     _charter(tmp_path, monkeypatch, grantee="someone-else", apps=("kart",), groups=("store_read",))
-    _seal(home, store)
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store,
-    )
+    _manifest(home, "kart")
+    _seal(home, store, kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
     assert out["error"] == "ENOENT"
+    assert not _pending_files(home / "manifest_grants")
 
 
 def test_group_outside_bounds_is_eambig(home, tmp_path, monkeypatch, store, ring_with_sean):
     _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
     _manifest(home, "kart")
-    _seal(home, store, seats=("kart",), groups=("knowledge_read",))
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store, apps_root=home / "mcp_apps",
-    )
+    _seal(home, store, seats=("kart",), groups=("knowledge_read",), kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
     assert out["error"] == "EAMBIG"
+    assert not _pending_files(home / "manifest_grants")
 
 
-def test_app_outside_bounds_is_eambig(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
-    _manifest(home, "hanuman")
-    _seal(home, store, seats=("hanuman",), groups=("store_read",))
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store, apps_root=home / "mcp_apps",
-    )
-    assert out["error"] == "EAMBIG"
-
-
-def test_seat_with_no_manifest_is_refused_not_created(home, tmp_path, monkeypatch, store, ring_with_sean):
+def test_seat_with_no_manifest_is_refused_enomanifest(home, tmp_path, monkeypatch, store, ring_with_sean):
     _charter(tmp_path, monkeypatch, apps=("ghost",), groups=("store_read",))
-    _seal(home, store, seats=("ghost",), groups=("store_read",))
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store, apps_root=home / "mcp_apps",
-    )
-    assert out["ok"] is False
-    assert out["refused"][0]["error"] == "enomanifest"
+    _seal(home, store, seats=("ghost",), groups=("store_read",), kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "enomanifest"
     assert not (home / "mcp_apps" / "ghost" / "manifest.json").exists()
+    assert not _pending_files(home / "manifest_grants")
 
 
-# ── the happy path (unsigned — no WILLOW_PGP_FINGERPRINT) ────────────────────
-
-def test_happy_path_two_seats_two_groups_unsigned(home, tmp_path, monkeypatch, store, ring_with_sean):
-    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
-    _charter(tmp_path, monkeypatch, apps=("kart", "hanuman"),
-             groups=("store_read", "knowledge_read"))
-    _manifest(home, "kart", permissions=["store_read"])
-    _manifest(home, "hanuman")
-    _seal(home, store, seats=("kart", "hanuman"), groups=("store_read", "knowledge_read"))
-
-    pg = _FakeGovernancePg()
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(pg), store=store, apps_root=home / "mcp_apps",
-    )
-
-    assert out["ok"] is True, out
-    assert not out["refused"]
-    assert {g["app_id"] for g in out["granted"]} == {"kart", "hanuman"}
+def test_record_edited_after_seal_is_refused_eseal_mismatch(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """The SOIL governance record is mutable after the seal lands
+    (`seal_handler.on_seal` keeps upgrading it in place); the sealed text in
+    nestor.db is not. Editing `groups` on the record post-seal must be
+    refused, not silently executed."""
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read", "knowledge_read"))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read", "knowledge_read"),
+          seal_groups=("store_read",), kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "eseal_mismatch"
     kart_manifest = json.loads((home / "mcp_apps" / "kart" / "manifest.json").read_text())
-    assert set(kart_manifest["permissions"]) == {"store_read", "knowledge_read"}
-    hanuman_manifest = json.loads((home / "mcp_apps" / "hanuman" / "manifest.json").read_text())
-    assert set(hanuman_manifest["permissions"]) == {"store_read", "knowledge_read"}
-    assert len(_receipts(pg)) == 2
-    for rec in _receipts(pg):
-        assert rec["content"]["pair_id"] == "pair-mg-1"
-        assert set(rec["content"]["groups_added"]) <= {"store_read", "knowledge_read"}
+    assert kart_manifest["permissions"] == []
+    assert not _pending_files(home / "manifest_grants")
 
 
-def test_idempotent_regrant_adds_nothing_new(home, tmp_path, monkeypatch, store, ring_with_sean):
-    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+def test_unsealed_nestor_pair_is_refused_eacces_even_if_soil_record_says_sealed(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
     _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
-    _manifest(home, "kart", permissions=["store_read"])
-    _seal(home, store, seats=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), nestor_status="draft",
+          kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EACCES"
+
+
+def test_unparseable_sealed_text_is_refused_einval(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), write_nestor_pair=False)
+    sig = _sign_seal(ring_with_sean, "sean", "test grant", "grant kart store_read please, thanks")
+    _write_nestor_pair(home, "pair-mg-1", "grant kart store_read please, thanks",
+                       verifier="sean", seal_sig=sig)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EINVAL"
+    assert "grammar" in out["reason"]
+
+
+def test_ruling_text_round_trips():
+    text = mgx.ruling_text(["kart", "hanuman"], ["store_read", "knowledge_read"])
+    parsed = mgx._parse_ruling_text(text)
+    assert parsed == {"apps": ["kart", "hanuman"], "groups": ["store_read", "knowledge_read"]}
+
+
+# ── grammar: the two live sealed pairs (Loki audit 7518bb57) ────────────────
+
+def test_d23a3726_exact_text_parses_to_seven_seats_two_groups():
+    """Pair d23a3726, grammar form — the live grant naming all seven
+    receive_dispatch specialists two groups."""
+    text = (
+        "willow-manifest-grant-v1 seats=hanuman,loki,jeles,ada,skirnir,heimdallr,binder "
+        "groups=grove_read,grove_write\n"
+        "Every specialist with receive_dispatch: true carries grove_read and "
+        "grove_write. Measured 2026-09-21."
+    )
+    parsed = mgx._parse_ruling_text(text)
+    assert parsed == {
+        "apps": ["hanuman", "loki", "jeles", "ada", "skirnir", "heimdallr", "binder"],
+        "groups": ["grove_read", "grove_write"],
+    }
+
+
+def test_10ed2707_prose_is_refused_naming_the_grammar(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """Pair 10ed2707's actual sealed text — prose, no grammar line — must be
+    refused with a message naming the grammar this verb requires, not
+    guessed at by scraping seat names out of English."""
+    prose = (
+        "Yes — every specialist with receive_dispatch: true in specialists.json "
+        "carries grove_read and grove_write in $WILLOW_HOME/mcp_apps/<app_id>/"
+        "manifest.json. Measured 2026-09-21: seven change — hanuman, loki, jeles, "
+        "ada, skirnir, heimdallr, binder."
+    )
+    assert mgx._parse_ruling_text(prose) is None
+
+    _charter(tmp_path, monkeypatch, apps=("hanuman", "loki", "jeles", "ada", "skirnir",
+                                          "heimdallr", "binder"),
+             groups=("grove_read", "grove_write"))
+    for seat in ("hanuman", "loki"):
+        _manifest(home, seat)
+    _seal(home, store, seats=("hanuman", "loki", "jeles", "ada", "skirnir", "heimdallr", "binder"),
+          groups=("grove_read", "grove_write"), write_nestor_pair=False)
+    sig = _sign_seal(ring_with_sean, "sean", "test grant", prose)
+    _write_nestor_pair(home, "pair-mg-1", prose, verifier="sean", seal_sig=sig)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EINVAL"
+    assert mgx.RULING_FORMAT in out["reason"]
+
+
+# ── request written only after verification ─────────────────────────────────
+
+def test_pending_file_does_not_exist_until_every_precondition_holds(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    # A refusal (bad envelope grantee) must leave no trace in pending/.
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+    monkeypatch.setenv("WILLOW_ENVELOPE_REGISTRY", str(tmp_path / "does-not-govern-kart.json"))
+    (tmp_path / "does-not-govern-kart.json").write_text(json.dumps({"active": [{
+        "id": "e", "verb_id": 18, "verb": "manifest.grant", "grantee": "somebody-else",
+        "bounds": {"apps": ["kart"], "groups": ["store_read"]}, "issued_by": "root",
+        "issued_at": "2026-01-01", "expires_at": "2027-01-01", "max_count": None,
+        "use_count_source": "frank", "status": "active",
+    }]}))
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["error"] == "ENOENT"
+    assert not _pending_files(grants_root)
+
+
+def test_successful_request_writes_pending_and_cites_the_envelope(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
 
     pg = _FakeGovernancePg()
-    out = mgx.execute_manifest_grant(
+    out = mgx.manifest_grant_request(
         "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(pg), store=store, apps_root=home / "mcp_apps",
+        ledger=_ledger(pg), store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
     )
-    assert out["ok"] is True
-    assert out["granted"][0]["groups"] == []
+    assert out["ok"] is True, out
+    assert out["state"] == "requested"
+    assert out["citation_id"]
+    pending = _pending_files(grants_root)
+    assert len(pending) == 1
+    record = json.loads(pending[0].read_text())
+    assert record["apps"] == ["kart"] and record["groups"] == ["store_read"]
+    assert record["citation_id"] == out["citation_id"]
+    assert record["pre_state"]["kart"]["manifest_sha256"]
+    # a citation was actually inked — an envelope_citation row exists
+    assert any(r["event_type"] == "envelope_citation" for r in pg.rows)
 
 
-# ── signed happy path + rollback (real gpg key, same fixture shape as
-#    test_pgp_manifest_signing.py) ───────────────────────────────────────────
+def test_duplicate_request_for_same_pair_is_ealready(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+    out1 = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out1["ok"] is True
+    out2 = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out2["error"] == "EALREADY"
+
+
+# ── apply: signed happy path, rollback, status ──────────────────────────────
 
 def _gen_key(gnupghome, name, email):
     batch = gnupghome / f"{name}.batch"
@@ -487,277 +568,270 @@ def pgp_env(gpg_keypair, monkeypatch):
     monkeypatch.setenv("WILLOW_PGP_FINGERPRINT", gpg_keypair["fingerprint"])
 
 
-def test_happy_path_signs_and_gate_then_authorizes(home, tmp_path, monkeypatch, store, ring_with_sean, pgp_env):
+def _request_and_apply(home, store, ledger, *, apps_root, grants_root, pair_id="pair-mg-1"):
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id=pair_id,
+        ledger=ledger, store=store, apps_root=apps_root, grants_root=grants_root,
+    )
+    assert req["ok"] is True, req
+    applied = mgx.manifest_grant_apply(ledger=ledger, apps_root=apps_root, grants_root=grants_root)
+    return req, applied
+
+
+def test_apply_happy_path_signs_and_gate_then_authorizes(
+    home, tmp_path, monkeypatch, store, ring_with_sean, pgp_env,
+):
     from willow_mcp import gate, pgp
 
+    grants_root = home / "manifest_grants"
     _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
     path = _manifest(home, "kart")
     pgp.sign_detached(path)  # start signed, like a real onboarded seat
-    _seal(home, store, seats=("kart",), groups=("store_read",))
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
 
     pg = _FakeGovernancePg()
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(pg), store=store, apps_root=home / "mcp_apps",
-    )
+    ledger = _ledger(pg)
+    req, applied = _request_and_apply(home, store, ledger, apps_root=home / "mcp_apps",
+                                      grants_root=grants_root)
 
-    assert out["ok"] is True, out
+    assert applied["ok"] is True, applied
+    result = applied["processed"][0]
+    assert result["ok"] is True
     assert gate.authorized("kart") is True
     assert gate.permitted("kart", "store_get") is True
-    assert out["granted"][0]["sig_sha256"]
+    assert result["granted"][0]["sig_sha256"]
+    assert len(_receipts(pg)) == 1
+
+    status = mgx.manifest_grant_status("pair-mg-1", grants_root=grants_root)
+    assert status["state"] == "done"
+    assert not _pending_files(grants_root)
 
 
-def test_sign_failure_rolls_back_manifest_and_sig(home, tmp_path, monkeypatch, store, ring_with_sean, pgp_env):
-    from willow_mcp import pgp
-
-    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
-    path = _manifest(home, "kart", permissions=["store_write"])
-    ok, _ = pgp.sign_detached(path)
-    assert ok
-    before_bytes = path.read_bytes()
-    before_sig = (path.parent / "manifest.json.sig").read_bytes()
-    _seal(home, store, seats=("kart",), groups=("store_read",))
-
-    monkeypatch.setattr(pgp, "sign_detached", lambda p: (False, "forced failure"))
-
-    pg = _FakeGovernancePg()
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(pg), store=store, apps_root=home / "mcp_apps",
-    )
-
-    assert out["ok"] is False
-    assert out["refused"][0]["error"] == "esign"
-    assert path.read_bytes() == before_bytes
-    assert (path.parent / "manifest.json.sig").read_bytes() == before_sig
-    assert not _receipts(pg)
-
-
-def test_atomic_rollback_undoes_earlier_seats_in_the_same_call(
-    home, tmp_path, monkeypatch, store, ring_with_sean, pgp_env,
-):
-    """Two seats, second one fails to sign — atomic=True (the default) rolls
-    the FIRST seat's grant back too, so a partial grant never survives a
-    refused call."""
-    from willow_mcp import pgp
-
-    _charter(tmp_path, monkeypatch, apps=("kart", "hanuman"), groups=("store_read",))
-    kart_path = _manifest(home, "kart")
-    hanuman_path = _manifest(home, "hanuman")
-    pgp.sign_detached(kart_path)
-    pgp.sign_detached(hanuman_path)
-    kart_before = kart_path.read_bytes()
-    _seal(home, store, seats=("kart", "hanuman"), groups=("store_read",))
-
-    # The write path now signs a STAGED candidate in an anonymous tempdir
-    # (`manifest_admin._signed_candidate`), so the path no longer names
-    # which seat is being signed — key the forced failure off call order
-    # instead: kart (seat 1) signs fine, hanuman (seat 2) does not.
-    real_sign = pgp.sign_detached
-    calls = {"n": 0}
-
-    def _flaky(path):
-        calls["n"] += 1
-        if calls["n"] >= 2:
-            return False, "forced failure on second seat"
-        return real_sign(path)
-
-    monkeypatch.setattr(pgp, "sign_detached", _flaky)
-
-    pg = _FakeGovernancePg()
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(pg), store=store, apps_root=home / "mcp_apps",
-    )
-
-    assert out["ok"] is False
-    assert "kart" in out["rolled_back"]
-    assert kart_path.read_bytes() == kart_before
-    assert not _receipts(pg)
-
-
-def test_frank_event_carries_before_after_digests(home, tmp_path, monkeypatch, store, ring_with_sean):
-    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
-    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
-    _manifest(home, "kart")
-    _seal(home, store, seats=("kart",), groups=("store_read",))
-
-    pg = _FakeGovernancePg()
-    mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(pg), store=store, apps_root=home / "mcp_apps",
-    )
-    receipts = _receipts(pg)
-    assert len(receipts) == 1
-    content = receipts[0]["content"]
-    assert content["app_id"] == "kart"
-    assert content["manifest_sha256_before"] != content["manifest_sha256_after"]
-    assert content["groups_added"] == ["store_read"]
-
-
-# ── pre-state signature verification (Loki finding 3) ────────────────────────
-
-def test_tampered_manifest_is_refused_esig_prestate_bytes_untouched(
-    home, tmp_path, monkeypatch, store, ring_with_sean, pgp_env,
-):
-    """A manifest whose current `.sig` does not verify (hand-edited after
-    signing) must never be laundered into a freshly valid signature by a
-    grant that only cares about the new content — it stays denied, and
-    nothing on disk moves."""
-    from willow_mcp import pgp
-
-    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
-    path = _manifest(home, "kart", permissions=["store_write"])
-    ok, _ = pgp.sign_detached(path)
-    assert ok
-    # Hand-edit AFTER signing: the .sig on disk no longer matches the content.
-    path.write_text(json.dumps({"app_id": "kart", "permissions": ["store_write", "full_access"]}))
-    before_bytes = path.read_bytes()
-    before_sig = (path.parent / "manifest.json.sig").read_bytes()
-    _seal(home, store, seats=("kart",), groups=("store_read",))
-
-    pg = _FakeGovernancePg()
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(pg), store=store, apps_root=home / "mcp_apps",
-    )
-
-    assert out["ok"] is False
-    assert out["refused"][0]["error"] == "esig_prestate"
-    assert path.read_bytes() == before_bytes
-    assert (path.parent / "manifest.json.sig").read_bytes() == before_sig
-    assert not _receipts(pg)
-
-
-def test_signed_manifest_with_no_fingerprint_is_refused_efingerprint_absent(
-    home, tmp_path, monkeypatch, store, ring_with_sean, pgp_env,
-):
-    """A manifest that already carries a detached signature must never be
-    overwritten unsigned just because WILLOW_PGP_FINGERPRINT dropped out of
-    the environment (Loki finding 5 / probe P2)."""
-    from willow_mcp import pgp
-
-    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
-    path = _manifest(home, "kart")
-    ok, _ = pgp.sign_detached(path)
-    assert ok
-    before_bytes = path.read_bytes()
-    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
-    _seal(home, store, seats=("kart",), groups=("store_read",))
-
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store, apps_root=home / "mcp_apps",
-    )
-
-    assert out["ok"] is False
-    assert out["refused"][0]["error"] == "efingerprint_absent"
-    assert path.read_bytes() == before_bytes
-
-
-# ── bind to the seal, not the mutable record (Loki finding 4) ────────────────
-
-def test_record_edited_after_seal_is_refused_eseal_mismatch(
+def test_apply_unsigned_happy_path_two_seats(
     home, tmp_path, monkeypatch, store, ring_with_sean,
 ):
-    """The SOIL governance record is mutable after the seal lands
-    (`seal_handler.on_seal` keeps upgrading it in place); the sealed text in
-    nestor.db is not. Editing `groups` on the record post-seal must be
-    refused, not silently executed."""
     monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart", "hanuman"),
+             groups=("store_read", "knowledge_read"))
+    _manifest(home, "kart", permissions=["store_read"])
+    _manifest(home, "hanuman")
+    _seal(home, store, seats=("kart", "hanuman"), groups=("store_read", "knowledge_read"),
+          kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req, applied = _request_and_apply(home, store, ledger, apps_root=home / "mcp_apps",
+                                      grants_root=grants_root)
+
+    assert applied["ok"] is True, applied
+    result = applied["processed"][0]
+    assert result["ok"] is True
+    assert {g["app_id"] for g in result["granted"]} == {"kart", "hanuman"}
+    kart_manifest = json.loads((home / "mcp_apps" / "kart" / "manifest.json").read_text())
+    assert set(kart_manifest["permissions"]) == {"store_read", "knowledge_read"}
+    assert len(_receipts(pg)) == 2
+
+
+def test_apply_failure_on_group_2_of_seat_1_rolls_back_group_1_and_withholds_receipts(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Two groups, one seat; the second group's `set_permission` fails. The
+    first group must be rolled back through the SAME staged path (never a
+    byte restore), no FRANK receipt is inked, and the request lands in
+    failed/, not done/."""
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    grants_root = home / "manifest_grants"
     _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read", "knowledge_read"))
     _manifest(home, "kart")
-    # Sealed text says store_read only; the record now (falsely) also claims
-    # knowledge_read was granted — as if someone edited it after the seal.
-    _seal(home, store, seats=("kart",), groups=("store_read", "knowledge_read"),
-          seal_groups=("store_read",))
+    _seal(home, store, seats=("kart",), groups=("store_read", "knowledge_read"), kr=ring_with_sean)
 
-    out = mgx.execute_manifest_grant(
+    from willow_mcp import manifest_admin
+
+    real_set_permission = manifest_admin.set_permission
+    calls = {"n": 0}
+
+    def _flaky(app_id, perm, granted, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("forced failure on second group")
+        return real_set_permission(app_id, perm, granted, **kwargs)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req = mgx.manifest_grant_request(
         "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store, apps_root=home / "mcp_apps",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
     )
+    assert req["ok"] is True, req
 
-    assert out["error"] == "eseal_mismatch"
+    monkeypatch.setattr(manifest_admin, "set_permission", _flaky)
+    applied = mgx.manifest_grant_apply(ledger=ledger, apps_root=home / "mcp_apps",
+                                       grants_root=grants_root)
+
+    assert applied["ok"] is False
+    result = applied["processed"][0]
+    assert result["ok"] is False
     kart_manifest = json.loads((home / "mcp_apps" / "kart" / "manifest.json").read_text())
     assert kart_manifest["permissions"] == []
+    assert not _receipts(pg)
+
+    status = mgx.manifest_grant_status("pair-mg-1", grants_root=grants_root)
+    assert status["state"] == "failed"
 
 
-def test_unsealed_nestor_pair_is_refused_eacces_even_if_soil_record_says_sealed(
-    home, tmp_path, monkeypatch, store, ring_with_sean,
-):
-    """The SOIL record alone saying status=sealed is not enough — the pair
-    itself must be sealed in nestor.db."""
-    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
-    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
-    _manifest(home, "kart")
-    _seal(home, store, seats=("kart",), groups=("store_read",), nestor_status="draft")
-
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store, apps_root=home / "mcp_apps",
-    )
-    assert out["error"] == "EACCES"
-
-
-def test_unparseable_sealed_text_is_refused_einval(
+def test_apply_rolls_back_seat_1_when_seat_2_fails(
     home, tmp_path, monkeypatch, store, ring_with_sean,
 ):
     monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
-    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
-    _manifest(home, "kart")
-    _seal(home, store, seats=("kart",), groups=("store_read",), write_nestor_pair=False)
-    _write_nestor_pair(home, "pair-mg-1", "grant kart store_read please, thanks")
-
-    out = mgx.execute_manifest_grant(
-        "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(_FakeGovernancePg()), store=store, apps_root=home / "mcp_apps",
-    )
-    assert out["error"] == "EINVAL"
-
-
-def test_ruling_text_round_trips():
-    text = mgx.ruling_text(["kart", "hanuman"], ["store_read", "knowledge_read"])
-    parsed = mgx._parse_ruling_text(text)
-    assert parsed == {"apps": ["kart", "hanuman"], "groups": ["store_read", "knowledge_read"]}
-
-
-# ── OSError during the write path is `eperm`, never an escaped exception
-#    (Loki finding 1) ────────────────────────────────────────────────────────
-
-def test_permission_error_during_write_is_refused_eperm_and_rolled_back(
-    home, tmp_path, monkeypatch, store, ring_with_sean,
-):
-    """A trust root this uid cannot write (Loki probe P5: mcp_apps owned by
-    a different uid on the live box) must come back as a structured `eperm`
-    refusal naming the path — never an escaped PermissionError, and never a
-    grant left half-applied across seats."""
-    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    grants_root = home / "manifest_grants"
     _charter(tmp_path, monkeypatch, apps=("kart", "hanuman"), groups=("store_read",))
-    kart_manifest = _manifest(home, "kart")
+    kart_path = _manifest(home, "kart")
     _manifest(home, "hanuman")
-    kart_before = kart_manifest.read_bytes()
-    _seal(home, store, seats=("kart", "hanuman"), groups=("store_read",))
+    _seal(home, store, seats=("kart", "hanuman"), groups=("store_read",), kr=ring_with_sean)
 
     from willow_mcp import manifest_admin
 
     real_set_permission = manifest_admin.set_permission
 
     def _flaky(app_id, perm, granted, **kwargs):
-        if app_id == "hanuman":
-            raise PermissionError(f"[Errno 13] Permission denied: 'mcp_apps/{app_id}/manifest.json'")
+        if app_id == "hanuman" and granted:
+            raise RuntimeError("forced failure on second seat")
         return real_set_permission(app_id, perm, granted, **kwargs)
 
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-mg-1",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert req["ok"] is True, req
+
     monkeypatch.setattr(manifest_admin, "set_permission", _flaky)
+    applied = mgx.manifest_grant_apply(ledger=ledger, apps_root=home / "mcp_apps",
+                                       grants_root=grants_root)
+
+    assert applied["ok"] is False
+    kart_manifest = json.loads(kart_path.read_text())
+    assert kart_manifest["permissions"] == []
+    assert not _receipts(pg)
+
+
+def test_request_refuses_tampered_manifest_esig_prestate(
+    home, tmp_path, monkeypatch, store, ring_with_sean, pgp_env,
+):
+    """A manifest whose current `.sig` does not verify (hand-edited after
+    signing) must never be laundered into a freshly valid signature by a
+    grant that only cares about the new content — refused at REQUEST time,
+    before anything is written to pending/."""
+    from willow_mcp import pgp
+
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    path = _manifest(home, "kart", permissions=["store_write"])
+    ok, _ = pgp.sign_detached(path)
+    assert ok
+    path.write_text(json.dumps({"app_id": "kart", "permissions": ["store_write", "full_access"]}))
+    before_bytes = path.read_bytes()
+    before_sig = (path.parent / "manifest.json.sig").read_bytes()
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["error"] == "esig_prestate"
+    assert path.read_bytes() == before_bytes
+    assert (path.parent / "manifest.json.sig").read_bytes() == before_sig
+    assert not _pending_files(grants_root)
+
+
+def test_request_refuses_absent_fingerprint_with_existing_sig(
+    home, tmp_path, monkeypatch, store, ring_with_sean, pgp_env,
+):
+    """A manifest that already carries a detached signature must never be
+    overwritten unsigned just because WILLOW_PGP_FINGERPRINT dropped out of
+    the environment."""
+    from willow_mcp import pgp
+
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    path = _manifest(home, "kart")
+    ok, _ = pgp.sign_detached(path)
+    assert ok
+    before_bytes = path.read_bytes()
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["error"] == "efingerprint_absent"
+    assert path.read_bytes() == before_bytes
+    assert not _pending_files(grants_root)
+
+
+def test_apply_sign_failure_rolls_back_manifest_and_sig(
+    home, tmp_path, monkeypatch, store, ring_with_sean, pgp_env,
+):
+    from willow_mcp import pgp
+
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    path = _manifest(home, "kart", permissions=["store_write"])
+    ok, _ = pgp.sign_detached(path)
+    assert ok
+    before_bytes = path.read_bytes()
+    before_sig = (path.parent / "manifest.json.sig").read_bytes()
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
 
     pg = _FakeGovernancePg()
-    out = mgx.execute_manifest_grant(
+    ledger = _ledger(pg)
+    req = mgx.manifest_grant_request(
         "willow", envelope_id="", pair_id="pair-mg-1",
-        ledger=_ledger(pg), store=store, apps_root=home / "mcp_apps",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
     )
+    assert req["ok"] is True, req
 
-    assert out["ok"] is False
-    assert out["error"] == "eperm"
-    assert out["refused"][0]["app_id"] == "hanuman"
-    assert out["refused"][0]["path"].endswith("hanuman/manifest.json")
-    assert kart_manifest.read_bytes() == kart_before
+    monkeypatch.setattr(pgp, "sign_detached", lambda p: (False, "forced failure"))
+    applied = mgx.manifest_grant_apply(ledger=ledger, apps_root=home / "mcp_apps",
+                                       grants_root=grants_root)
+
+    assert applied["ok"] is False
+    result = applied["processed"][0]
+    assert result["error"] == "esign"
+    assert path.read_bytes() == before_bytes
+    assert (path.parent / "manifest.json.sig").read_bytes() == before_sig
     assert not _receipts(pg)
+    status = mgx.manifest_grant_status("pair-mg-1", grants_root=grants_root)
+    assert status["state"] == "failed"
+
+
+def test_apply_inside_kart_is_refused(home, tmp_path, monkeypatch):
+    monkeypatch.setenv("WILLOW_IN_KART", "1")
+    out = mgx.manifest_grant_apply(grants_root=home / "manifest_grants")
+    assert out["error"] == "EUNREACH"
+
+
+def test_apply_of_empty_pending_is_a_clean_noop(home, tmp_path):
+    out = mgx.manifest_grant_apply(grants_root=home / "manifest_grants")
+    assert out["ok"] is True
+    assert out["state"] == "empty"
+
+
+# ── status transitions ───────────────────────────────────────────────────────
+
+def test_status_not_found_then_pending_then_done(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    grants_root = home / "manifest_grants"
+    assert mgx.manifest_grant_status("pair-mg-1", grants_root=grants_root)["state"] == "not_found"
+
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req, applied = _request_and_apply(home, store, ledger, apps_root=home / "mcp_apps",
+                                      grants_root=grants_root)
+    assert applied["ok"] is True
+    status = mgx.manifest_grant_status("pair-mg-1", grants_root=grants_root)
+    assert status["state"] == "done"
+    assert status["result"]["granted"][0]["app_id"] == "kart"

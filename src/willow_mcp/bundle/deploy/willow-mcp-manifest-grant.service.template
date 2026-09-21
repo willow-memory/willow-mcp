@@ -1,0 +1,22 @@
+# systemd --user template for the willow-mcp manifest-grant apply unit
+# (pair b74019ac, amending d5504878). One act per tick: drain
+# $WILLOW_HOME/manifest_grants/pending/, re-verify each request's seal and
+# pre-state fresh, sign and publish through manifest_admin.set_permission +
+# publish_signed_pair under signed_pair_lock, move to done/ or failed/.
+# Type=oneshot because it drains what is pending and exits — the .timer
+# beside it owns the cadence, same split as willow-mcp-reloader.
+#
+# Runs as the trust owner (this unit's own --user identity), NOT as the
+# broker: manifest_grant_request (the broker side) never signs and never
+# publishes; only this unit does, which is why it needs no sudo bridge to
+# cross — it already owns mcp_apps/.
+[Unit]
+Description=willow-mcp manifest-grant — apply sealed permission grants
+
+[Service]
+Type=oneshot
+Environment="WILLOW_HOME=@WILLOW_HOME@"
+Environment="WILLOW_STORE_ROOT=@WILLOW_STORE_ROOT@"
+Environment="WILLOW_PG_DB=@PG_DB@"
+Environment="WILLOW_NESTOR_DB=@NESTOR_DB@"
+ExecStart=@PYTHON@ -m willow_mcp manifest-grant apply

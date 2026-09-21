@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 135 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 136 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -5245,32 +5245,37 @@ def unit_install_execute(
 
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("envelope_apply")
-def manifest_grant_execute(
+def manifest_grant_request(
     app_id: str,
     envelope_id: str,
     pair_id: str,
 ) -> dict:
-    """Add the permission group(s) a human-sealed Nestor pair names to one or
-    more seats' `manifest.json`, performed by THIS process under the
-    `manifest.grant` envelope that governs `app_id` (verb 18, sealed
-    `d5504878`) — orchestrator-only. `pair_id` names a sealed decision
+    """Verify a human-sealed Nestor pair against every precondition for
+    `manifest.grant` (verb 18, sealed `d5504878`, reworked under pair
+    `b74019ac` — the broker never publishes) and, if every one holds, write
+    ONE signed request under `$WILLOW_HOME/manifest_grants/pending/<pair_id>.json`
+    — orchestrator-only. `pair_id` names a sealed decision
     (`projects_willow_governance_decisions`, correlated via `nestor_pair_id`)
     whose record carries `seats: [app_id]` and `groups: [group]`; those are
     the call args the envelope's `apps`/`groups` bounds judge, not free
-    arguments to this tool. Refuses before any citation: caller is not the
-    orchestrator seat (`EPERM`), running inside Kart where gpg-agent is
-    unreachable (`EUNREACH`), no governance record for `pair_id` (`ENOENT`),
-    the pair is not `status=sealed` or its verifier is unknown/compromised in
-    the keyring (`EACCES`), the record's `seats`/`groups` are malformed
-    (`EINVAL`), or any named group is on the escalation list (`store_write`,
-    `envelope_apply`, `orchestrator`, `full_access`, `task_net`, ... — the
-    same list the PreToolUse manifest guard refuses self-grant of) (`EPERM`).
-    Then, per seat: append the groups to `permissions` (dedupe, keep order),
-    write atomically, detach-sign under PGP enforcement, and verify with
-    `gate.authorized` — a sign or verify failure restores the manifest's
-    previous bytes and `.sig`. Returns `{ok, granted, refused, receipt_ids}`
-    with a FRANK `manifest_granted` citation per seat. Gated as
-    envelope_apply, beside unit.install and unit.reload."""
+    arguments to this tool. Refuses before any citation, and before writing
+    anything: caller is not the orchestrator seat (`EPERM`), a request for
+    this `pair_id` already exists (`EALREADY`), no governance record for
+    `pair_id` (`ENOENT`), the pair is not `status=sealed` on the SOIL record
+    (`EACCES`), the sealed pair's own ed25519 `seal_sig` does not verify
+    against the keyring (`config/verifiers.json` — the sealed row's own
+    verifier, never the SOIL record's) (`EACCES`), the sealed text does not
+    match the strict grammar or names different seats/groups than the record
+    (`EINVAL` / `eseal_mismatch`), the record's `seats`/`groups` are
+    malformed (`EINVAL`), any named group is on the escalation list
+    (`EPERM`), or a target seat has no manifest or a currently-invalid
+    signature (`enomanifest` / `efingerprint_absent` / `esig_prestate`).
+    Signs nothing and needs no gpg-agent — verification only. The request is
+    written to disk BEFORE the envelope citation is inked, so a request that
+    fails to persist never spends the one-use citation.
+    `manifest_grant_apply` (the trust-owner unit) drains `pending/` and does
+    the actual write+sign+publish; `manifest_grant_status(pair_id)` reads the
+    outcome. Gated as envelope_apply, beside unit.install and unit.reload."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
@@ -5278,7 +5283,7 @@ def manifest_grant_execute(
         from . import manifest_grant_executor
         from .governance_ledger import GovernanceLedger
 
-        return manifest_grant_executor.execute_manifest_grant(
+        return manifest_grant_executor.manifest_grant_request(
             app_id,
             envelope_id=envelope_id,
             pair_id=pair_id,
@@ -5287,8 +5292,27 @@ def manifest_grant_execute(
             ledger=GovernanceLedger(pg),
         )
     except Exception as exc:
-        return {"ok": False, "granted": [], "refused": [],
-                "error": f"manifest_grant_execute_failed: {exc}"}
+        return {"ok": False, "error": f"manifest_grant_request_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("envelope_apply")
+def manifest_grant_status(
+    app_id: str,
+    pair_id: str,
+) -> dict:
+    """Read-only: which of `pending/` / `done/` / `failed/` holds the
+    `manifest.grant` request for `pair_id` — or `not_found` if none was ever
+    made. `done` carries per-seat receipts (`result.granted`); `failed`
+    carries the refusal and any rollback. Never mutates anything; gated
+    alongside the rest of this verb's surface only so a specialist cannot
+    poll another seat's pending grant."""
+    try:
+        from . import manifest_grant_executor
+
+        return manifest_grant_executor.manifest_grant_status(pair_id)
+    except Exception as exc:
+        return {"state": "unreachable", "pair_id": pair_id, "error": str(exc)}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -8556,26 +8580,49 @@ def _cmd_sign_manifest(args) -> None:
 
 
 def _cmd_manifest_grant(args) -> None:
-    """`willow-mcp manifest-grant <pair_id> --envelope <id>` — the CLI wrapper
-    around `manifest_grant_execute` (verb 18, `manifest.grant`), same code
-    path as the MCP tool. `app_id` is resolved the same way every other CLI
-    command resolves it (`--app-id` / `$WILLOW_APP_ID`, default `willow`) —
-    not hardcoded, so a CLI invocation under a non-default orchestrator
-    identity is refused by the executor's own `is_orchestrator_app` check
-    instead of silently running as `willow` regardless of who called it.
-    Operator-terminal only, same non-forgeable tty-ownership guard
-    `allow-permission`/`deny-permission` use (Loki finding 6: an env-only
-    Kart check is not enough here either — this wrapper adds no separate
-    authority, it is a keyboard door onto the same broker call, so it needs
-    the same presence proof those sibling permission commands require)."""
+    """`willow-mcp manifest-grant {request,apply,status}` — the CLI wrapper
+    around the split `manifest.grant` verb (verb 18; pair `b74019ac`, amending
+    `d5504878`: the broker never publishes). `request` and `status` run the
+    same code path as their MCP tools and are operator-terminal only, same
+    non-forgeable tty-ownership guard `allow-permission`/`deny-permission`
+    use (an env-only Kart check is not enough here either — this wrapper
+    adds no separate authority, it is a keyboard door onto the same broker
+    call, so it needs the same presence proof those sibling permission
+    commands require). `apply` is what `willow-mcp-manifest-grant.timer`
+    runs as the trust owner, not from an operator terminal — it does not
+    call `require_operator_terminal`, the same shape `reloader.py`'s `tick`
+    subcommand takes."""
     from . import manifest_grant_executor
-    from .governance_ledger import GovernanceLedger
+
+    if args.mg_action == "apply":
+        from .db import get_pg as _get_pg
+        from .governance_ledger import GovernanceLedger
+
+        pg = _get_pg()
+        ledger = GovernanceLedger(pg) if pg else None
+        result = manifest_grant_executor.manifest_grant_apply(pair_id=args.pair_id, ledger=ledger)
+        print(json.dumps(result, indent=2, default=str))
+        if not result.get("ok"):
+            raise SystemExit(1)
+        return
+
     from .human_session import require_operator_terminal
 
     require_operator_terminal()
+
+    if args.mg_action == "status":
+        result = manifest_grant_executor.manifest_grant_status(args.pair_id)
+        print(json.dumps(result, indent=2, default=str))
+        if result.get("state") in ("not_found", "unreachable"):
+            raise SystemExit(1)
+        return
+
+    # request
+    from .governance_ledger import GovernanceLedger
+
     pg = get_pg()
     ledger = GovernanceLedger(pg) if pg else None
-    result = manifest_grant_executor.execute_manifest_grant(
+    result = manifest_grant_executor.manifest_grant_request(
         args.app_id,
         envelope_id=args.envelope or "",
         pair_id=args.pair_id,
@@ -10073,19 +10120,41 @@ def _build_parser():
 
     manifest_grant_p = subparsers.add_parser(
         "manifest-grant",
-        help="Execute a sealed manifest.grant decision: add the sealed pair's "
-             "groups to its named seats' manifests, signed (verb 18; broker "
-             "process only, never Kart)",
+        help="manifest.grant (verb 18): request (broker, verify+write pending), "
+             "apply (trust-owner unit, sign+publish), status (read pending/done/failed)",
     )
-    manifest_grant_p.add_argument("pair_id", help="sealed Nestor pair id to execute")
-    manifest_grant_p.add_argument(
+    mg_sub = manifest_grant_p.add_subparsers(dest="mg_action", required=True)
+
+    mg_request_p = mg_sub.add_parser(
+        "request",
+        help="Broker side: verify a sealed pair against every precondition and "
+             "write one pending request — signs nothing, cites the envelope only "
+             "after the request is durable on disk",
+    )
+    mg_request_p.add_argument("pair_id", help="sealed Nestor pair id to request")
+    mg_request_p.add_argument(
         "--envelope", dest="envelope", default="",
         help="which active manifest.grant envelope to cite (required if more than one governs 'willow')",
     )
-    manifest_grant_p.add_argument(
+    mg_request_p.add_argument(
         "--app-id", dest="app_id", default=os.environ.get("WILLOW_APP_ID", "willow"),
         help="orchestrator identity to run as (default $WILLOW_APP_ID or 'willow')",
     )
+
+    mg_apply_p = mg_sub.add_parser(
+        "apply",
+        help="Trust-owner unit side: drain pending/ (or one pair_id), re-verify "
+             "the seal and pre-state fresh, sign and publish under signed_pair_lock, "
+             "roll back through the same staged path on any failure. What "
+             "willow-mcp-manifest-grant.timer runs; never the broker process.",
+    )
+    mg_apply_p.add_argument("pair_id", nargs="?", default=None,
+                            help="apply only this pending pair_id (default: drain all of pending/)")
+
+    mg_status_p = mg_sub.add_parser(
+        "status", help="Read which of pending/ done/ failed/ holds a pair_id's request",
+    )
+    mg_status_p.add_argument("pair_id")
 
     attest_session_p = subparsers.add_parser(
         "attest-session",
