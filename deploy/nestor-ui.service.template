@@ -1,0 +1,79 @@
+# unit: nestor-ui.service
+#
+# Nestor seal UI (desk) — 127.0.0.1:8765. The port is sealed (operator,
+# 2026-09-09): Nestor UI holds 127.0.0.1:8765 for the origin-bound browser
+# key; willow-mcp serve does not share it.
+#
+# Installed and reinstalled through unit_install_execute (verb 17,
+# unit.install, #588, sealed governance decision 197aafa5) — never at a
+# keyboard. Before this template existed, every restart after a Nestor merge
+# was typed by hand (gap de53ee56014c, filed under apk/keyboard-act: the APK
+# has no keyboard, operator rule 2026-09-16). After a Nestor merge, the
+# broker verb to run is `unit_reload_execute nestor-ui.service` (row 15,
+# verb unit.reload) — this template only covers the first install or a
+# definition change; reload restarts the unit that is already installed
+# onto pulled code.
+#
+# EnvironmentFile=@WILLOW_HOME@/env resolves NESTOR_DB / NESTOR_KEYRING /
+# NESTOR_SEAL_KEY from the broker's own canonical env, and this unit passes
+# NO --db or --domain on the command line. That is deliberate, not an
+# oversight: a `nestor-ui --db ...` typed once during a hand restart kept
+# pointing at a stale copy of the corpus after the operator moved NESTOR_DB,
+# because a CLI argument always wins over the environment and nobody was
+# re-typing it on every restart — the desk and the served corpus quietly
+# diverged (gap cb6623f63b32, "sticky-CLI-args split-brain"). An
+# EnvironmentFile that the unit re-reads on every start, with nothing on the
+# command line to shadow it, means the UI can only ever open what
+# $WILLOW_HOME/env currently names — never a value frozen at some past
+# install.
+#
+# UnsetEnvironment= (applied by systemd AFTER EnvironmentFile=) strips every
+# key in $WILLOW_HOME/env that nestor-ui has no business holding — an
+# unauthenticated loopback seal surface has no need of the fleet's provider
+# keys or Postgres/store/vault coordinates (Loki audit, session_handoff
+# f4e07d8e). The UI needs only NESTOR_DB, NESTOR_KEYRING, NESTOR_SEAL_KEY,
+# NESTOR_REQUIRE_SEAL_KEY (and, if set, NESTOR_PERSONAL_DB /
+# NESTOR_PERSONAL_LEDGER) — every other KEY= line in the env file is named
+# below. This list is a snapshot of the env file's non-NESTOR_ key NAMES as
+# of this commit, not a value; it must track the env file by hand until the
+# env file itself is split into a NESTOR-only file the UI can read alone
+# (gap logged — no gap id minted yet).
+#
+# ExecStart is a documented absolute path, not another substitution key
+# (spelled out in prose here, at-signs and all, so the renderer's own
+# placeholder scan never mistakes this comment for one it must fill — that
+# scan runs over the WHOLE rendered text, comments included, so a comment
+# must never carry a literal at-sign-wrapped, all-caps token that isn't one
+# of render_values()'s own fillable keys):
+# render_values() (src/willow_mcp/unit_install_executor.py) fills placeholders only from
+# THIS broker's own resolved environment — PYTHON, UNIT, WILLOW_HOME,
+# WILLOW_STORE_ROOT, PG_DB, USER, HOME, XDG_CONFIG_HOME, and (when the seal
+# handler resolves one) NESTOR_DB. HOME names this box's home directory, so
+# @HOME@ (below) fills to it without hardcoding the operator's username.
+# None of the fillable keys name a SIBLING repo's checkout or its
+# virtualenv beyond HOME itself, so anything past @HOME@/... here would be
+# unfillable and this install would refuse ETEMPLATE on every attempt. The
+# path below is the `nestor-ui` console
+# script (pyproject.toml: `nestor-ui = "nestor.ui:main"`) built into the
+# Die-Namic-Systems/nestor checkout's own .venv — reviewable in this PR and
+# covered by the installed unit's own digest in the unit.install receipt,
+# same as every value render_template fills.
+[Unit]
+Description=Nestor seal UI (desk) — 127.0.0.1:8765
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=@WILLOW_HOME@/env
+UnsetEnvironment=ANTHROPIC_API_KEY CEREBRAS_API_KEY GEMINI_API_KEY GROQ_API_KEY HF_API_KEY OPENROUTER_API_KEY WILLOW_EDGE_GROQ_MODEL WILLOW_EDGE_OLLAMA_MODEL WILLOW_GEMINI_MODEL WILLOW_HOME WILLOW_INFERENCE_PROVIDER WILLOW_KEYRING WILLOW_OLLAMA_MODEL WILLOW_PG_DB WILLOW_PG_USER WILLOW_STORE_ROOT WILLOW_VAULT_BOX
+ExecStart=@HOME@/github/Die-Namic-Systems/nestor/.venv/bin/nestor-ui
+WorkingDirectory=@HOME@/github/Die-Namic-Systems/nestor
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
