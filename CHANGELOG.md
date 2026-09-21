@@ -31,6 +31,21 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.67.0](https://github.com/willow-memory/willow-mcp/compare/v2.66.0...v2.67.0) (2026-09-21)
+
+
+### Added
+
+* **pr_checks_read:** extract the CI failure block from the full job log ([194ed57](https://github.com/willow-memory/willow-mcp/commit/194ed578bb1873f40e158e1d2561bb4b99d36e89))
+* **pr_checks_read:** extract the CI failure block from the full job log ([8132f12](https://github.com/willow-memory/willow-mcp/commit/8132f125e6681be4de163ad35d1c5a90a3d9ccf9))
+
+
+### Fixed
+
+* **pr-checks:** blob-hop 4xx on the suffix Range retries once with no Range, docstring records Loki's limits ([b58b8a3](https://github.com/willow-memory/willow-mcp/commit/b58b8a3f8ceb82b201568af1bb9dfbab5117cee3))
+* **pr-checks:** closed-block trim keeps the tail, block-close is banner-anchored, id/marker parsing tightened ([c867cf1](https://github.com/willow-memory/willow-mcp/commit/c867cf1b03340bb02cdd09ab001b752d76707869))
+* **pr-checks:** keep the log tail, close unclosed pytest blocks, fix ERRORS/parametrize/underscore-banner extraction ([56848fe](https://github.com/willow-memory/willow-mcp/commit/56848fe110f855bf47ec0ddd89d397116a08f88c))
+
 ## [2.66.0](https://github.com/willow-memory/willow-mcp/compare/v2.65.0...v2.66.0) (2026-09-21)
 
 
