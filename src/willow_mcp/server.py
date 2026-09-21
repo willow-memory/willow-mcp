@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 131 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 132 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -1720,6 +1720,43 @@ def seal_drain(app_id: str, max_records: int = 0, backfill: bool = False) -> dic
     if max_records and max_records > 0:
         kwargs["max_records"] = int(max_records)
     return _drain.drain(seed_at_eof_if_absent=not backfill, **kwargs)
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("net_authority_drain")
+def net_authority_drain(app_id: str, max_rows: int = 0) -> dict:
+    """One tick of seal-driven network authority (sealed decision c8572a92
+    as amended by 6b305258; gap 6031199ac4e1): for every task row held at
+    `held_net_authorization`, read its sealed pair from the vault's
+    nestor.db, hand the sealed bytes to the net signer (the uid-994 owner of
+    the egress key, over its socket), attach the envelope it minted, and
+    release the row to `pending`; then mint any sealed standing-lease
+    request. seal_drain's sibling — the willow-bot steward calls both every
+    tick, and the desk calls this one by hand to prove a seal end to end.
+
+    No new authority: this mints nothing itself. The signer verifies the
+    operator's seal against a public-only ring and derives every binding
+    from the sealed text; a row with no seal stays held, a row whose seal
+    does not verify is refused and inked, and the envelope is re-verified
+    against the ROW here before it is attached.
+
+    Three-state, never collapsed. `state` is `unreachable` when the queue,
+    the store, or the confirmed `tasks` mapping cannot be reached (nothing
+    consumed); `empty` when no held row and no lease request is waiting;
+    `populated` otherwise, with `tasks` (the drain receipt: per-row
+    waiting / minted / refused / unreachable and `counts`) and `leases`
+    (the lease receipt) side by side — each half keeps its own state, so a
+    signer that is down reads as `unreachable` on the rows it could not
+    serve while the tick itself still reports what it saw.
+
+    `max_rows` bounds the task half of one tick (default 200; the rest is
+    next tick, `truncated: true`)."""
+    from . import net_authority as _na
+
+    kwargs = {}
+    if max_rows and max_rows > 0:
+        kwargs["max_rows"] = int(max_rows)
+    return _na.tick(app_id=app_id, pg=get_pg(), **kwargs)
 
 
 # ── Identity binding (willow-gate seam — check-in / check-out) ───────────────────

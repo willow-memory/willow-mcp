@@ -55,7 +55,9 @@ file itself; if it cannot reach the root it says ``unreachable`` with the
 path, and the tick receipt carries that — it does not pretend.
 
 Install is the one unavoidable root act, printed as one line by
-``install --print``; the unit runs as ``User=willow-operator``.
+``install`` — and only when every file that line names has been staged;
+otherwise it names what is missing instead. The unit runs as
+``User=willow-operator``.
 """
 from __future__ import annotations
 
@@ -449,12 +451,87 @@ def render_unit(*, python: Path, key: Path, ring: Path, user: str, group: str,
 
 def install_lines(*, rendered_path: Path, ring_source: Path, ring_dest: Path) -> str:
     """The ONE operator line. Root is unavoidable exactly here: a system unit
-    under /etc and a file placed in the 994-owned key directory."""
+    under /etc and a file placed in the 994-owned key directory. Every path
+    it names must exist before it is printed — :func:`stage_install` refuses
+    to print it otherwise (gap 6031199ac4e1: the first live install printed
+    a line naming a ring it had not staged, and the operator's ``sudo`` chain
+    failed halfway on ``install: No such file or directory``)."""
+    for must_exist in (rendered_path, ring_source):
+        if not Path(must_exist).is_file():
+            raise FileNotFoundError(f"install line would name a file that does not exist: {must_exist}")
     return (
         f"sudo install -m 644 {rendered_path} /etc/systemd/system/{UNIT} && "
         f"sudo install -o willow-operator -g willow-operator -m 644 {ring_source} {ring_dest} && "
         f"sudo systemctl daemon-reload && sudo systemctl enable --now {UNIT}"
     )
+
+
+def default_stage_dir() -> Path:
+    """Where ``install`` renders to: under the willow home, never the
+    caller's cwd. The first live install wrote its unit and ring beside
+    whatever the operator happened to be standing in — the Grove's tracked
+    tree — which is two stray files in the active checkout and a ring that
+    ``git status`` shows to every reader."""
+    from . import paths
+
+    return paths.willow_home() / "deploy" / "net-signer"
+
+
+def stage_install(*, stage_dir: Optional[Path] = None, group: Optional[str] = None,
+                  keyring: Optional[Path] = None, python: Optional[Path] = None) -> dict:
+    """Render the unit and stage the public ring, then say EXACTLY what the
+    operator can run. Three states, never a half-truth:
+
+    * ``ready`` — unit and ring both staged; ``run_this_once_as_root`` is the
+      one line, and every path in it exists.
+    * ``ring_missing`` — no keyring to export from: ``WILLOW_KEYRING`` was
+      unset in this shell (or ``keyring`` absent). The unit is still staged,
+      but NO root line is printed: ``missing`` names the env var and the
+      command to run instead. A line that names a file this call did not
+      make is the failure this function replaces.
+    * ``error`` — the export itself refused (not a keyring, no ed25519
+      entry): ``error`` carries the reason, still no root line.
+    """
+    import grp
+    import pwd
+
+    from . import egress_setup, paths
+
+    if not group:
+        group = grp.getgrgid(pwd.getpwuid(os.getuid()).pw_gid).gr_name
+    ring = default_ring_path()
+    key = default_key_path()
+    rendered = render_unit(python=python or Path(sys.executable), key=key, ring=ring,
+                           user="willow-operator", group=group,
+                           willow_home=paths.willow_home(),
+                           apps_root=Path(os.environ.get("WILLOW_MCP_APPS_ROOT",
+                                                         paths.willow_home() / "mcp_apps")))
+    stage = Path(stage_dir) if stage_dir is not None else default_stage_dir()
+    stage.mkdir(parents=True, exist_ok=True)
+    unit_path = stage / UNIT
+    unit_path.write_text(rendered, encoding="utf-8")
+    staged_ring = stage / "verifiers.public.json"
+    out: dict = {"unit": str(unit_path), "key": str(key), "ring_dest": str(ring),
+                 "egress_dir": str(egress_setup.config_dir()), "stage_dir": str(stage)}
+
+    source = keyring if keyring is not None else Path(os.environ.get("WILLOW_KEYRING", "")).expanduser()
+    if not str(source) or not source.is_file():
+        out.update(state="ring_missing", ring_staged=None, run_this_once_as_root=None,
+                   missing={"env": "WILLOW_KEYRING",
+                            "detail": "no keyring to export the public ring from in this shell",
+                            "run_instead": (f"WILLOW_KEYRING=<path to config/verifiers.json> "
+                                            f"{python or sys.executable} -m willow_mcp.net_signer install")})
+        return out
+    try:
+        export_public_ring(source, staged_ring)
+    except (ValueError, OSError) as exc:
+        out.update(state="error", ring_staged=None, run_this_once_as_root=None,
+                   error=f"{type(exc).__name__}: {exc}")
+        return out
+    out.update(state="ready", ring_staged=str(staged_ring),
+               run_this_once_as_root=install_lines(rendered_path=unit_path, ring_source=staged_ring,
+                                                   ring_dest=ring))
+    return out
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -470,8 +547,10 @@ def main(argv: Optional[list] = None) -> int:
     e = sub.add_parser("export-ring", help="write the public-only ring the signer verifies with")
     e.add_argument("--source", default=os.environ.get("WILLOW_KEYRING", ""))
     e.add_argument("--out", default=None)
-    i = sub.add_parser("install", help="render the system unit and print the one root line")
-    i.add_argument("--out", default=None, help="where to write the rendered unit (default: cwd)")
+    i = sub.add_parser("install", help="render the system unit, stage the public ring, "
+                                       "and print the one root line — or say what is missing")
+    i.add_argument("--stage-dir", default=None,
+                   help="where to stage the unit and ring (default: $WILLOW_HOME/deploy/net-signer)")
     i.add_argument("--group", default=None, help="the operator's group (socket access)")
     args = parser.parse_args(argv)
 
@@ -484,34 +563,12 @@ def main(argv: Optional[list] = None) -> int:
         return 0
 
     if args.command == "install":
-        import grp
-        import pwd
-
-        from . import egress_setup, paths
-
-        group = args.group
-        if not group:
-            group = grp.getgrgid(pwd.getpwuid(os.getuid()).pw_gid).gr_name
-        ring = default_ring_path()
-        key = default_key_path()
-        rendered = render_unit(python=Path(sys.executable), key=key, ring=ring,
-                               user="willow-operator", group=group,
-                               willow_home=paths.willow_home(),
-                               apps_root=Path(os.environ.get("WILLOW_MCP_APPS_ROOT",
-                                                             paths.willow_home() / "mcp_apps")))
-        out = Path(args.out) if args.out else Path.cwd() / UNIT
-        out.write_text(rendered, encoding="utf-8")
-        ring_source = Path(os.environ.get("WILLOW_KEYRING", "")).expanduser()
-        staged = out.with_name("verifiers.public.json")
-        if ring_source.is_file():
-            export_public_ring(ring_source, staged)
-        print(json.dumps({
-            "unit": str(out), "ring_staged": str(staged) if staged.exists() else None,
-            "key": str(key), "egress_dir": str(egress_setup.config_dir()),
-            "run_this_once_as_root": install_lines(rendered_path=out, ring_source=staged,
-                                                   ring_dest=ring),
-        }, indent=2))
-        return 0
+        out = stage_install(stage_dir=Path(args.stage_dir) if args.stage_dir else None,
+                            group=args.group)
+        print(json.dumps(out, indent=2))
+        # A root line was printed only in the ready state; anything else is
+        # the operator's next move, not a success.
+        return 0 if out["state"] == "ready" else 2
 
     # serve
     import threading

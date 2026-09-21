@@ -792,37 +792,86 @@ def drain_leases(
     return receipt
 
 
-def tick(*, ledger=None, call: Callable[[dict], dict] = signer_call) -> dict:
-    """Both halves against the live queue and store — what the steward tick
-    (or ``python -m willow_mcp.net_authority tick``) runs."""
-    from .db import get_pg
+TICK_FIELDS = ["task_id", "task", "status", "agent", "submitted_by", "lane",
+               "network_authorization"]
 
-    pg = get_pg()
+
+def combined_state(tasks: dict, leases: dict) -> tuple[str, Optional[str]]:
+    """The tick's one state from its two halves. ``populated`` if either
+    half had something to show; else ``unreachable`` if either half could
+    not look (an empty half beside a blind one is not an empty tick — it is
+    a tick that could not tell); else ``empty``. Returns ``(state, reason)``,
+    ``reason`` naming the blind half's cause when there is one."""
+    states = {tasks.get("state"), leases.get("state")}
+    if "populated" in states:
+        return "populated", None
+    if "unreachable" in states:
+        blind = tasks if tasks.get("state") == "unreachable" else leases
+        return "unreachable", blind.get("reason") or blind.get("cause")
+    return "empty", None
+
+
+def tick(*, app_id: str = "", ledger=None, call: Callable[[dict], dict] = signer_call,
+         max_rows: int = 0, pg=None, store=None, db_path: Optional[Path] = None) -> dict:
+    """Both halves against the live queue and store, under one three-state
+    envelope — what the ``net_authority_drain`` verb (the steward's tick
+    step, the desk by hand) and ``python -m willow_mcp.net_authority tick``
+    run. ``app_id`` is whose confirmed ``tasks`` mapping to read (default
+    ``$WILLOW_APP_ID`` / ``willow``). ``pg``/``store``/``db_path`` are
+    injectable for tests.
+
+    Receipt: ``{event, state, reason?, tasks, leases}``. ``tasks`` is
+    :func:`drain`'s receipt, ``leases`` is :func:`drain_leases`'s; each keeps
+    its own state, and ``state`` is :func:`combined_state` of the two. When
+    the queue or the mapping cannot be reached, ``tasks`` and ``leases`` are
+    ``None`` and nothing is consumed.
+    """
+    receipt: dict = {"event": "net_authority_tick", "at": _now().isoformat()}
     if pg is None:
-        return {"state": "unreachable", "reason": "postgres_unavailable"}
-    cols = ea._task_table_columns()
-    if cols is None:
-        return {"state": "unreachable", "reason": "tasks mapping unconfirmed"}
-    # _task_table_columns resolves the gate fields only; the drain also needs
-    # the envelope and lane columns, resolved the same way.
+        from .db import get_pg
+
+        pg = get_pg()
+    if pg is None:
+        receipt.update(state="unreachable", reason="postgres_unavailable", tasks=None, leases=None)
+        return receipt
     from . import schema_profile as sp
 
-    app_id = os.environ.get("WILLOW_APP_ID", "willow").strip() or "willow"
-    mapping = sp.resolve(pg, app_id, "tasks",
-                         ["task_id", "task", "status", "agent", "submitted_by", "lane",
-                          "network_authorization"])
-    if "error" in mapping or not mapping.get("confirmed"):
-        return {"state": "unreachable", "reason": "tasks mapping unconfirmed"}
-    full_cols = {k: v["column"] for k, v in mapping["fields"].items()}
+    who = (app_id or os.environ.get("WILLOW_APP_ID", "willow")).strip() or "willow"
+    mapping = sp.resolve(pg, who, "tasks", TICK_FIELDS)
+    if "error" in mapping:
+        receipt.update(state="unreachable", reason="tasks_mapping_unresolved",
+                       error=mapping["error"], tasks=None, leases=None)
+        return receipt
+    if not mapping.get("confirmed"):
+        receipt.update(state="unreachable", reason="tasks_mapping_unconfirmed", tasks=None, leases=None)
+        return receipt
+    full_cols = {k: v.get("column") for k, v in mapping["fields"].items()}
     if ledger is None:
         try:
             from .governance_ledger import GovernanceLedger
             ledger = GovernanceLedger(pg)
         except Exception:  # noqa: BLE001 — no ledger means receipts are reported, not inked
             ledger = None
-    tasks = drain(pg=pg, cols=full_cols, ledger=ledger, call=call)
-    leases = drain_leases(ledger=ledger, call=call)
-    return {"tasks": tasks, "leases": leases}
+    if store is None:
+        from .db import Store
+
+        try:
+            store = Store()
+        except Exception as exc:  # noqa: BLE001 — a store outage is the receipt's to report
+            receipt.update(state="unreachable", reason="store_unavailable",
+                           error=f"{type(exc).__name__}: {exc}", tasks=None, leases=None)
+            return receipt
+    kwargs = {}
+    if max_rows and max_rows > 0:
+        kwargs["max_rows"] = int(max_rows)
+    tasks = drain(pg=pg, cols=full_cols, ledger=ledger, store=store, db_path=db_path, call=call,
+                  **kwargs)
+    leases = drain_leases(store=store, db_path=db_path, ledger=ledger, call=call)
+    state, reason = combined_state(tasks, leases)
+    receipt.update(state=state, tasks=tasks, leases=leases)
+    if reason:
+        receipt["reason"] = reason
+    return receipt
 
 
 def main(argv: Optional[list] = None) -> int:

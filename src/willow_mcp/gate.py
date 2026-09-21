@@ -235,6 +235,11 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     # fleet_health on the tick.
     "governance_sync": frozenset({
         "seal_drain",
+        # Seal-driven network authority as a tick (decision c8572a92; gap
+        # 6031199ac4e1): hands each held task's SEALED pair to the uid-994
+        # signer and attaches what it minted — same standing as seal_drain,
+        # it reflects a human's seal and mints nothing itself.
+        "net_authority_drain",
     }),
     # Cryptographic identity binding (willow-gate seam, Phase 2). The security is
     # the HMAC signature, not this ACL; the group just lets a manifest opt an app
@@ -413,6 +418,10 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # decision_propose, which stays off this line): the steward and the
         # desk tick it beside fleet_health without a manifest re-sign.
         "seal_drain",
+        # Its sibling for seal-driven network authority (c8572a92): releases
+        # a held row only onto an envelope the uid-994 signer minted from the
+        # operator's own seal — no more authority than seal_drain.
+        "net_authority_drain",
         # Grove — the fleet's shared messaging room (read + write; no egress
         # concern like web_net/integration_net/mcp_federation, so unlike those
         # this rides full_access, same reasoning as knowledge_read/write above)

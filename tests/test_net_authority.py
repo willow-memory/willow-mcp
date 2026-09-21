@@ -705,9 +705,60 @@ def test_unit_renders_as_the_key_owner_and_install_is_one_root_line(tmp_path):
     assert "@" not in text
     assert "User=willow-operator" in text and "Group=sean-campbell" in text
     assert "-m willow_mcp.net_signer serve" in text and "RuntimeDirectory=willow-net-signer" in text
-    line = ns.install_lines(rendered_path=tmp_path / ns.UNIT, ring_source=tmp_path / "r.json",
+    unit, ring = tmp_path / ns.UNIT, tmp_path / "r.json"
+    unit.write_text(text)
+    ring.write_text("{}")
+    line = ns.install_lines(rendered_path=unit, ring_source=ring,
                             ring_dest=Path("/k/verifiers.public.json"))
     assert line.count("sudo") == 4 and "systemctl enable --now" in line
+    # the line may never name a file that is not there (gap 6031199ac4e1)
+    with pytest.raises(FileNotFoundError):
+        ns.install_lines(rendered_path=unit, ring_source=tmp_path / "absent.json",
+                         ring_dest=Path("/k/verifiers.public.json"))
+
+
+def test_install_stages_under_willow_home_and_refuses_the_root_line_without_a_ring(
+        tmp_path, verifier, monkeypatch):
+    """The first live install (2026-09-20) ran in a shell with no
+    WILLOW_KEYRING, staged no ring, printed a sudo line naming the ring
+    anyway, and left the unit beside the operator's cwd — the active tree.
+    Three states now: ready / ring_missing / error; a root line only in the
+    first; nothing ever written to cwd."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+    monkeypatch.setenv("WILLOW_MCP_EGRESS_CONFIG_DIR", str(tmp_path / "egress"))
+    monkeypatch.setenv(ns.KEY_ENV, str(tmp_path / "egress" / "private.pem"))
+    monkeypatch.delenv("WILLOW_KEYRING", raising=False)
+    (tmp_path / "cwd").mkdir()
+    monkeypatch.chdir(tmp_path / "cwd")
+
+    out = ns.stage_install(group="sean-campbell", python=Path("/v/bin/python"))
+    assert out["state"] == "ring_missing" and out["run_this_once_as_root"] is None
+    assert out["missing"]["env"] == "WILLOW_KEYRING" and "WILLOW_KEYRING=" in out["missing"]["run_instead"]
+    assert out["ring_staged"] is None
+    assert Path(out["unit"]).is_file() and Path(out["unit"]).parent == home / "deploy" / "net-signer"
+    assert list((tmp_path / "cwd").iterdir()) == []   # nothing in the caller's cwd
+
+    # a keyring that is not one: error, still no root line
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"verifiers": [{"name": "s", "key": "ab" * 32, "kind": "hmac"}]}))
+    out = ns.stage_install(group="sean-campbell", keyring=bad, python=Path("/v/bin/python"))
+    assert out["state"] == "error" and out["run_this_once_as_root"] is None
+    assert "no ed25519 verifier" in out["error"]
+
+    # the real ring: ready, and every path the line names exists
+    out = ns.stage_install(group="sean-campbell", keyring=verifier["full_ring"],
+                           python=Path("/v/bin/python"))
+    assert out["state"] == "ready"
+    line = out["run_this_once_as_root"]
+    assert out["unit"] in line and out["ring_staged"] in line
+    assert Path(out["ring_staged"]).is_file()
+    assert json.loads(Path(out["ring_staged"]).read_text())["public_only"] is True
+    # the CLI exit code says whether a root line was printed
+    monkeypatch.setenv("WILLOW_KEYRING", str(verifier["full_ring"]))
+    assert ns.main(["install", "--group", "sean-campbell", "--stage-dir", str(tmp_path / "s")]) == 0
+    monkeypatch.delenv("WILLOW_KEYRING")
+    assert ns.main(["install", "--group", "sean-campbell", "--stage-dir", str(tmp_path / "s")]) == 2
 
 
 def test_hold_ttl_is_inside_the_lease_ceiling():
@@ -715,3 +766,116 @@ def test_hold_ttl_is_inside_the_lease_ceiling():
 
     assert 0 < server._HELD_NET_TTL_SECONDS <= lease.MAX_TTL_SECONDS
     assert na.SEAL_MAX_AGE_S == na.HELD_MAX_AGE_S
+
+
+# ── the verb: net_authority_drain / tick ──────────────────────────────────────
+
+def _confirmed_mapping(pg, app_id, table, fields):
+    return {"table": table, "confirmed": True, "fields": _FIELDS}
+
+
+def test_tick_is_one_envelope_over_both_halves_and_mints_end_to_end(egress_keys, verifier, tmp_path,
+                                                                    monkeypatch):
+    """The verb's whole job: the held row from hold_and_propose, sealed by the
+    operator, is minted and released by ONE tick — with the confirmed tasks
+    mapping resolved the way task_submit resolves it, not a hand-built
+    cols dict."""
+    from willow_mcp import schema_profile as sp
+
+    _, pub = egress_keys
+    monkeypatch.setattr(ea, "public_key_path", lambda: pub)
+    monkeypatch.setattr(sp, "resolve", _confirmed_mapping)
+    pg, store, db = _FakePg(), _FakeStore(), _nestor_db(tmp_path)
+    ledger = _Ledger()
+    signer = _signer(egress_keys, verifier, tmp_path)
+
+    r = na.tick(app_id="willow", pg=pg, store=store, db_path=db, ledger=ledger, call=signer.handle)
+    assert r["state"] == "empty" and r["tasks"]["state"] == "empty" and r["leases"]["state"] == "empty"
+    assert r["event"] == "net_authority_tick"
+
+    out = _held(pg, store)
+    tid, rid = out["task_id"], out["record_id"]
+    _stamp(store, rid, "pair-1")
+    _put_pair(db, "pair-1", "q", out["seal_this"])
+    r = na.tick(app_id="willow", pg=pg, store=store, db_path=db, ledger=ledger, call=signer.handle)
+    assert r["state"] == "populated" and r["tasks"]["rows"][0]["state"] == "waiting"
+    assert r["leases"]["state"] == "empty"
+
+    _seal_in_db(db, "pair-1", verifier, _fresh(verifier, "q", out["seal_this"]))
+    r = na.tick(app_id="willow", pg=pg, store=store, db_path=db, ledger=ledger, call=signer.handle)
+    assert r["state"] == "populated" and r["tasks"]["rows"][0]["state"] == "minted"
+    assert pg.tasks[tid]["status"] == "pending"
+    assert ledger.rows[-1][1] == na.EVENT_MINTED
+
+
+def test_tick_three_state_on_queue_mapping_store_and_signer(egress_keys, verifier, tmp_path,
+                                                            monkeypatch):
+    from willow_mcp import schema_profile as sp
+
+    _, pub = egress_keys
+    monkeypatch.setattr(ea, "public_key_path", lambda: pub)
+    # no queue: unreachable, nothing consumed, both halves None
+    monkeypatch.setattr("willow_mcp.db.get_pg", lambda: None)
+    r = na.tick(app_id="willow")
+    assert r["state"] == "unreachable" and r["reason"] == "postgres_unavailable"
+    assert r["tasks"] is None and r["leases"] is None
+
+    pg, store, db = _FakePg(), _FakeStore(), _nestor_db(tmp_path)
+    # unconfirmed mapping: a write may not guess (§3.4)
+    monkeypatch.setattr(sp, "resolve", lambda *a: {"table": "tasks", "confirmed": False, "fields": _FIELDS})
+    r = na.tick(app_id="willow", pg=pg, store=store, db_path=db)
+    assert r["state"] == "unreachable" and r["reason"] == "tasks_mapping_unconfirmed"
+    monkeypatch.setattr(sp, "resolve", lambda *a: {"error": "no such table"})
+    r = na.tick(app_id="willow", pg=pg, store=store, db_path=db)
+    assert r["state"] == "unreachable" and r["reason"] == "tasks_mapping_unresolved"
+
+    # a held row with the signer down: the tick is populated (it saw the
+    # row) and the row itself is unreachable — never collapsed into empty
+    monkeypatch.setattr(sp, "resolve", _confirmed_mapping)
+    out = _held(pg, store)
+    _stamp(store, out["record_id"], "pair-1")
+    _put_pair(db, "pair-1", "q", out["seal_this"])
+    _seal_in_db(db, "pair-1", verifier, _fresh(verifier, "q", out["seal_this"]))
+    r = na.tick(app_id="willow", pg=pg, store=store, db_path=db,
+                call=lambda req: {"state": "unreachable", "cause": "socket down"})
+    assert r["state"] == "populated" and r["tasks"]["rows"][0]["state"] == "unreachable"
+    assert pg.tasks[out["task_id"]]["status"] == na.HELD_STATUS
+
+    # a blind half beside an empty half is a tick that could not tell
+    assert na.combined_state({"state": "empty"}, {"state": "empty"}) == ("empty", None)
+    assert na.combined_state({"state": "unreachable", "reason": "queue_unavailable"},
+                             {"state": "empty"}) == ("unreachable", "queue_unavailable")
+    assert na.combined_state({"state": "empty"}, {"state": "populated"}) == ("populated", None)
+
+
+def test_net_authority_drain_is_gated_classed_hooked_and_delegates(monkeypatch):
+    """seal_drain's sibling, registered the same five ways: the
+    governance_sync and full_access groups, the WRITE tier, the seat hook's
+    write-tool set (both copies), and NOT in DESK_CORE — seal_drain is not
+    advertised there either; both are callable by name."""
+    import importlib.util
+    from pathlib import Path as _P
+
+    from willow_mcp import advertise, gate, server, tier_policy
+
+    assert "net_authority_drain" in gate.PERMISSION_GROUPS["governance_sync"]
+    assert "net_authority_drain" in gate.PERMISSION_GROUPS["full_access"]
+    assert "net_authority_drain" not in gate.PERMISSION_GROUPS["governance_propose"]
+    assert tier_policy.TOOL_CLASS["net_authority_drain"] == tier_policy.WRITE
+    assert "net_authority_drain" not in advertise.DESK_CORE and "seal_drain" not in advertise.DESK_CORE
+    repo = _P(__file__).resolve().parent.parent
+    for hook in ("hooks/pre_tool_use.py", "src/willow_mcp/bundle/hooks/pre_tool_use.py"):
+        spec = importlib.util.spec_from_file_location("hook_mod", repo / hook)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert "net_authority_drain" in mod._SEAT_WRITE_TOOLS, hook
+
+    seen = {}
+    monkeypatch.setattr(na, "tick", lambda **kw: seen.update(kw) or {"state": "empty"})
+    monkeypatch.setattr(server, "get_pg", lambda: "PG")
+    fn = getattr(server.net_authority_drain, "__wrapped__", server.net_authority_drain)
+    assert fn("willow", max_rows=7) == {"state": "empty"}
+    assert seen == {"app_id": "willow", "pg": "PG", "max_rows": 7}
+    seen.clear()
+    assert fn("willow") == {"state": "empty"}
+    assert seen == {"app_id": "willow", "pg": "PG"}
