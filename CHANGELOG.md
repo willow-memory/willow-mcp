@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.69.1](https://github.com/willow-memory/willow-mcp/compare/v2.69.0...v2.69.1) (2026-09-21)
+
+
+### Fixed
+
+* **deploy:** manifest-grant unit strips the Nestor-product keys it never reads, adds process hardening ([1d4b28a](https://github.com/willow-memory/willow-mcp/commit/1d4b28ac0e5e8a7d7d6407a7b04cb765fab35339))
+* **deploy:** manifest-grant unit reads the keyring and fingerprint from the env file, not baked placeholders ([1eec700](https://github.com/willow-memory/willow-mcp/commit/1eec70094759fa8fb51b001ea74ed45fb2ce6e84))
+
 ## [2.69.0](https://github.com/willow-memory/willow-mcp/compare/v2.68.0...v2.69.0) (2026-09-21)
 
 
