@@ -27,7 +27,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from . import paths
 
@@ -760,6 +760,127 @@ def save_mapping(app_id: str, fingerprint: str, table: str, record: dict) -> Non
     _write_json_atomic(mapping_path(app_id, fingerprint, table), record)
 
 
+def _confirmed_siblings(app_id: str, fingerprint: str, table: str) -> list[tuple[str, dict]]:
+    """Every OTHER seat's CONFIRMED mapping for the same (database, table),
+    sorted by app_id so the choice of source is deterministic. Reads only —
+    never creates a sibling's directory (mapping_path would).
+
+    What counts as a sibling is bounded (Loki 8A23D1AE): ``schema_maps/`` is
+    deliberately outside the trust root (B-50) and writable by the runtime
+    uid, so a bare ``confirmed: true`` file under any directory name must not
+    count as evidence a human decided anything. A source must (a) be a seeded
+    seat — ``mcp_apps/<app>/manifest.json`` exists, (b) carry ``confirmed_at``,
+    and (c) not itself be an extension (``confirmed_by != "extended"``): an
+    extension copies a human's decision and never chains from a copy.
+    Anything else is skipped; unreadable files likewise.
+    """
+    try:
+        root = paths.schema_maps_dir(app_id).parent
+    except Exception:  # noqa: BLE001 — an unresolvable home is "no siblings", not a crash
+        return []
+    if not root.is_dir():
+        return []
+    out: list[tuple[str, dict]] = []
+    for sib in sorted(p for p in root.iterdir() if p.is_dir()):
+        if sib.name == app_id:
+            continue
+        path = sib / f"{fingerprint}__{table}.json"
+        if not path.is_file():
+            continue
+        try:
+            record = json.loads(path.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        if not (isinstance(record, dict) and record.get("confirmed")):
+            continue
+        if not record.get("confirmed_at") or record.get("confirmed_by") == "extended":
+            continue
+        try:
+            if not (paths.mcp_app_dir(sib.name) / "manifest.json").is_file():
+                continue
+        except Exception:  # noqa: BLE001 — a dir name that is not a valid app_id is not a seat
+            continue
+        out.append((sib.name, record))
+    return out
+
+
+def _column_of(field: Any) -> Optional[str]:
+    """The real column a canonical field maps to; ``None`` for an unmapped
+    field AND for a canonical field the record does not carry at all (an
+    older sibling that predates the field did not map it — the same fact)."""
+    if not isinstance(field, dict):
+        return None
+    return field.get("column") or None
+
+
+def _extend_from_sibling(app_id: str, fingerprint: str, table: str,
+                         fresh_fields: dict) -> tuple[Optional[dict], list[dict]]:
+    """Gap 24fed2f5c907 (apk/keyboard-act): a seat's FIRST write against a
+    table used to refuse ``unconfirmed_schema`` until a human confirmed the
+    seat's own artifact — and a seat without ``schema_admin`` (loki, 2026-09-21)
+    could not, so the desk edited the file by hand. Mappings are keyed per
+    ``(database fingerprint, table, app_id)``; the fingerprint and the table are
+    the same for every seat on one box, so a mapping a human already confirmed
+    for one seat is evidence for the next — PROVIDED it maps every canonical
+    field to the same COLUMN the fresh heuristic proposes.
+
+    Columns, not metadata (Loki 8A23D1AE): the 2026-08-11 confirmations carry
+    ``task_id`` as ``alias/0.9`` and predate ``db_authorization``, while every
+    placeholder ``resolve()`` writes today says ``rooted/0.95`` — a whole-dict
+    comparison refused every human confirmation on the box and matched only
+    the one file the desk hand-edited, which was the act this seam exists to
+    retire. Tier/confidence differences are recorded on the extended artifact
+    as ``extend_note``; a canonical field the sibling does not carry counts
+    as unmapped there. Only a COLUMN difference refuses.
+
+    Returns ``(record, refusals)``: ``record`` is the extended, confirmed
+    artifact (not yet saved) or None; ``refusals`` lists every confirmed
+    sibling whose columns did NOT match, as ``{app_id, differs_on: [field,
+    ...]}``, so the caller can name them.
+    """
+    refusals: list[dict] = []
+    for sib_app, sib_record in _confirmed_siblings(app_id, fingerprint, table):
+        sib_fields = sib_record.get("fields")
+        if not isinstance(sib_fields, dict):
+            continue
+        differs = sorted(
+            f for f in fresh_fields
+            if _column_of(sib_fields.get(f)) != _column_of(fresh_fields.get(f))
+        )
+        if differs:
+            refusals.append({"app_id": sib_app, "differs_on": differs})
+            continue
+        extended = {
+            "schema_version": SCHEMA_VERSION,
+            "database": fingerprint,
+            "table": table,
+            "discovered_at": datetime.now(timezone.utc).isoformat(),
+            "manifest_sha256": manifest_digest(app_id),
+            "confirmed": True,
+            "confirmed_by": "extended",
+            "extended_from": sib_app,
+            "extended_at": datetime.now(timezone.utc).isoformat(),
+            "source_confirmed_at": sib_record.get("confirmed_at"),
+            "fields": dict(fresh_fields),
+        }
+        meta_diffs = sorted(
+            f for f in fresh_fields
+            if sib_fields.get(f) != fresh_fields.get(f)
+        )
+        if meta_diffs:
+            extended["extend_note"] = (
+                f"columns match {sib_app}; tier/confidence differ on: {meta_diffs}"
+            )
+        # A human-authored override tier or extra keys on the source are a
+        # person's fingerprint (sandbox_confirm._is_pristine_placeholder):
+        # columns matched, so the extension stands, and the note travels.
+        note = sib_record.get("confirmed_note") or sib_record.get("note")
+        if note:
+            extended["source_note"] = note
+        return extended, refusals
+    return None, refusals
+
+
 def resolve(conn, app_id: str, table: str, canonical_fields: list[str]) -> dict:
     """Top-level entry point: discover-or-load a mapping for (db, table).
 
@@ -775,6 +896,13 @@ def resolve(conn, app_id: str, table: str, canonical_fields: list[str]) -> dict:
     confirmed them to mean. An unconfirmed mapping is simply recomputed —
     propose_mapping is pure, so this only changes the result when the real
     columns changed, which is exactly when it should.
+
+    A seat with NO artifact yet (or only a pristine unconfirmed placeholder)
+    inherits a sibling seat's confirmed mapping for the same (database, table)
+    when the fresh heuristic proposes byte-identical fields — see
+    ``_extend_from_sibling``. A sibling that does not match is named on the
+    placeholder as ``extend_refused`` so the ``unconfirmed_schema`` refusal
+    can say which fields differ instead of sending the operator to a file.
     """
     columns = introspect(conn, table)
     if not columns:
@@ -797,6 +925,18 @@ def resolve(conn, app_id: str, table: str, canonical_fields: list[str]) -> dict:
             save_mapping(app_id, fingerprint, table, existing)
         return existing
 
+    # Never extend over a human's own unconfirmed work: an artifact carrying an
+    # override tier or keys beyond the placeholder set is a person's draft in
+    # progress (the same fingerprint test sandbox_confirm's guard 1 uses).
+    pristine = existing is None or _is_pristine_unconfirmed(existing)
+    if pristine:
+        extended, refusals = _extend_from_sibling(app_id, fingerprint, table, fresh_fields)
+        if extended is not None:
+            save_mapping(app_id, fingerprint, table, extended)
+            return extended
+    else:
+        refusals = []
+
     record = {
         "schema_version": SCHEMA_VERSION,
         "database": fingerprint,
@@ -806,8 +946,45 @@ def resolve(conn, app_id: str, table: str, canonical_fields: list[str]) -> dict:
         "confirmed": False,
         "fields": fresh_fields,
     }
+    if not pristine:
+        # A person annotated this draft (extra keys, an override tier): keep
+        # every key of theirs that the fresh discovery does not own, so a
+        # recompute never silently erases an operator note. Previously the
+        # placeholder was rewritten wholesale on every call.
+        for key, value in (existing or {}).items():
+            if key not in record and key not in _RESOLVE_PLACEHOLDER_KEYS:
+                record[key] = value
+    if refusals:
+        record["extend_refused"] = refusals
     save_mapping(app_id, fingerprint, table, record)
     return record
+
+
+# The placeholder key set resolve() writes for a fresh discovery — mirrored by
+# sandbox_confirm._PLACEHOLDER_KEYS (which adds schema_drift). Kept here so the
+# extension test does not import sandbox_confirm (and its server import) into
+# every resolve() call.
+_RESOLVE_PLACEHOLDER_KEYS = frozenset(
+    {"schema_version", "database", "table", "discovered_at", "manifest_sha256",
+     "confirmed", "fields", "schema_drift", "extend_refused"}
+)
+
+
+def _is_pristine_unconfirmed(artifact: dict) -> bool:
+    """True when ``artifact`` is exactly what ``resolve()`` wrote and no human
+    has touched it: unconfirmed, no extra keys, no ``confirmed_override``
+    tier on any field. Anything else is preserved as a person's draft."""
+    if not isinstance(artifact, dict) or artifact.get("confirmed"):
+        return False
+    if set(artifact) - _RESOLVE_PLACEHOLDER_KEYS:
+        return False
+    fields = artifact.get("fields")
+    if not isinstance(fields, dict):
+        return False
+    return all(
+        isinstance(f, dict) and f.get("tier") != "confirmed_override"
+        for f in fields.values()
+    )
 
 
 def _apply_overrides(base_fields: dict, overrides: Optional[dict],

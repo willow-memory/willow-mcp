@@ -232,6 +232,32 @@ def execute_pr_update(
             auth.get("reason") or "could not mint a willows-bot installation token",
             envelope_id=matches[0], citation_id=cite.get("citation_id"),
         )
+    # Editing a PR needs the same `pull_requests: write` that opening one does.
+    # Check it on the minted token before any GitHub read, so a missing grant
+    # is a named refusal (and one human_required item — gap 4464a63db1a9)
+    # rather than a 403 on the PATCH reported as a generic EPR.
+    from .pr_executor import pulls_perm_allows_open
+
+    if not pulls_perm_allows_open(auth.get("permissions")):
+        level = (auth.get("permissions") or {}).get("pull_requests")
+        out = _refuse(
+            "EPERM",
+            f"willows-bot is installed on {repo} but Pull requests is {level!r} "
+            f"(need write). In GitHub App settings → Permissions → Repository → "
+            f"Pull requests → Read and write, then re-install / accept the "
+            f"permission request on each org.",
+            envelope_id=matches[0],
+        )
+        from . import github_app_permissions as gap_
+
+        filed = gap_.file_permission_ask(
+            store, app_id=app_id, verb="pr_update_execute", repo=repo,
+            permission="pull_requests", level="write", current=level,
+        )
+        out["human_required_state"] = filed.get("state")
+        if filed.get("human_required_id"):
+            out["human_required_id"] = filed["human_required_id"]
+        return out
 
     call = api or _default_api
 

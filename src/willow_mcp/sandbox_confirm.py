@@ -105,7 +105,13 @@ def _all_exact(mapping: dict, ddl_cols: set[str] | None = None) -> bool:
 # An artifact carrying any key beyond these bears a human fingerprint.
 _PLACEHOLDER_KEYS = frozenset(
     {"schema_version", "database", "table", "discovered_at", "confirmed",
-     "fields", "schema_drift"}
+     "fields", "schema_drift",
+     # resolve() has stamped manifest_sha256 on every placeholder since the
+     # grant-tracking change; without it here guard 1 read every placeholder
+     # as human-authored and declined forever (the exact strand this guard's
+     # docstring describes). extend_refused is resolve()'s own note that a
+     # sibling did not match — machine-written, not a person's fingerprint.
+     "manifest_sha256", "extend_refused"}
 )
 
 

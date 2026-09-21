@@ -138,6 +138,8 @@ TOOL_CLASS: dict[str, str] = {
     "envelope_apply": EXECUTE,
     # ── admin (never sudo) ────────────────────────────────────────────────────
     "schema_confirm_mapping": ADMIN, "gap_purge_topic": ADMIN, "gap_promote": ADMIN,
+    # gap_retopic curates the fleet-shared backlog (same group as gap_promote).
+    "gap_retopic": ADMIN,
 }
 
 # Tools whose whole purpose is server-process / sandbox egress. Unlocked by the

@@ -890,13 +890,22 @@ def _require_confirmed(mapping: dict) -> Optional[dict]:
     reads but must be explicitly confirmed (schema_confirm_mapping) before
     any write tool may use them."""
     if not mapping.get("confirmed"):
-        return {
-            "error": (
-                f"unconfirmed_schema: table '{mapping.get('table')}' has not been confirmed "
-                "for this database — call schema_confirm_mapping, or edit the mapping file "
-                "directly, then retry"
-            )
-        }
+        msg = (
+            f"unconfirmed_schema: table '{mapping.get('table')}' has not been confirmed "
+            "for this database — call schema_confirm_mapping, or edit the mapping file "
+            "directly, then retry"
+        )
+        # Gap 24fed2f5c907: a sibling seat's confirmed mapping existed but its
+        # fields differ from this seat's heuristic — say which, so the human
+        # path starts from the disagreement rather than from a blank refusal.
+        refused = mapping.get("extend_refused") or []
+        if refused:
+            parts = [
+                f"{r.get('app_id')}'s confirmed mapping on: {r.get('differs_on') or []}"
+                for r in refused if isinstance(r, dict)
+            ]
+            msg += " — differs from " + "; ".join(parts)
+        return {"error": msg}
     return None
 
 
@@ -2383,6 +2392,37 @@ def gap_delete(app_id: str, gap_id: str) -> dict:
     retained (deleted=1) and just stops appearing in gap_list. Returns
     {deleted, id}, or {error: not_found}."""
     return gap_backlog.delete(gap_id)
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("gap_retopic")
+def gap_retopic(app_id: str, gap_id: str, topic: str, note: str = "") -> dict:
+    """Move a gap under a new topic (gap 42ec50583126). The id is unchanged;
+    `topic_history` on the record keeps every move as {from, to, at, by,
+    note}; a FRANK `gap_retopic` event is written when the ledger is reachable
+    (the move stands even when it is not — the record says so). Refuses an
+    unknown id, an empty topic, and a topic equal to the current one
+    (`already`). Gated with gap_promote: renaming a backlog entry is
+    curating the fleet-shared backlog, not logging to it. Returns {id, topic,
+    previous, frank}."""
+    out = gap_backlog.retopic(gap_id, topic, by=app_id, note=note)
+    if "error" in out:
+        return out
+    pg = get_pg()
+    if not pg:
+        out["frank"] = {"state": "unreachable", "reason": "postgres_unavailable"}
+        return out
+    try:
+        from .governance_ledger import GovernanceLedger
+
+        rec = GovernanceLedger(pg).append("willow", "gap_retopic", {
+            "gap_id": gap_id, "from": out["previous"], "to": out["topic"],
+            "by": app_id, "note": note,
+        })
+        out["frank"] = {"state": "populated", "id": rec}
+    except Exception as exc:  # noqa: BLE001 — the retopic happened; a ledger miss is reported, not hidden
+        out["frank"] = {"state": "unreachable", "reason": f"{type(exc).__name__}: {exc}"}
+    return out
 
 
 @mcp.tool(annotations=_ANNO_DESTRUCTIVE)
@@ -5329,6 +5369,7 @@ def pr_checks_read(app_id: str, repo: str, ref: str = "", pr: int = 0,
     try:
         return _pr_checks.read_pr_checks(
             app_id, repo=repo, ref=ref, pr=pr, log_tail=log_tail, project=project,
+            store=_store,
         )
     except Exception as exc:
         return {"state": "unreachable", "reason": f"pr_checks_read_failed: {exc}"}
@@ -5994,6 +6035,12 @@ def _diag_schema(app_id: str) -> dict:
                 "unmapped": [f for f, v in m["fields"].items() if v["column"] is None],
                 "drift": bool(m.get("schema_drift")),
             }
+            # Gap 24fed2f5c907: a mapping inherited from a sibling seat says so
+            # (who it came from); one that could not be inherited says why.
+            if m.get("extended_from"):
+                check["tables"][table]["extended_from"] = m["extended_from"]
+            if m.get("extend_refused"):
+                check["tables"][table]["extend_refused"] = m["extend_refused"]
         check["status"] = "ok"
     except Exception as e:
         check["status"] = "fail"

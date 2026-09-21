@@ -61,6 +61,22 @@ def _refuse(errno: str, reason: str, **extra) -> dict:
     return {"ok": False, "error": errno, "reason": reason, "pushed": False, **extra}
 
 
+def _file_permission_ask(out: dict, *, store, app_id: str, repo: str, permission: str,
+                         level: str, current) -> None:
+    """Gap 4464a63db1a9: a missing App permission is told to the operator once,
+    as a named human_required item, beside the refusal — which is unchanged.
+    Mutates ``out``; never raises."""
+    from . import github_app_permissions as gap_
+
+    filed = gap_.file_permission_ask(
+        store, app_id=app_id, verb="git_push_execute", repo=repo,
+        permission=permission, level=level, current=current,
+    )
+    out["human_required_state"] = filed.get("state")
+    if filed.get("human_required_id"):
+        out["human_required_id"] = filed["human_required_id"]
+
+
 def _git(checkout: Path, *args: str, runner: Optional[Callable] = None) -> subprocess.CompletedProcess:
     run = runner or subprocess.run
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
@@ -356,11 +372,16 @@ def execute_push(
         head_ref=branch, repo=repo, runner=runner,
     )
     if not workflow_check.get("ok"):
-        return _refuse(
+        out = _refuse(
             workflow_check.get("errno", "EWORKFLOW"),
             workflow_check.get("reason", "workflow-path preflight refused"),
             preflight=preflight, workflow=workflow_check,
         )
+        if workflow_check.get("state") == "denied":
+            _file_permission_ask(out, store=store, app_id=app_id, repo=repo,
+                                 permission="workflows", level="write",
+                                 current=workflow_check.get("permission"))
+        return out
 
     call_args = {"repo": repo, "branches": [branch], "remote": remote, "force": force}
 
@@ -422,7 +443,7 @@ def execute_push(
     if auth.get("ok") and auth_mode == "app":
         if not gac.contents_perm_allows_push(auth.get("permissions")):
             level = (auth.get("permissions") or {}).get("contents")
-            return _refuse(
+            out = _refuse(
                 "EPERM",
                 f"willows-bot is installed on {repo} but Contents is {level!r} "
                 f"(need write). In GitHub App settings → Permissions → "
@@ -431,6 +452,9 @@ def execute_push(
                 envelope_id=matches[0], citation_id=result.get("citation_id"),
                 sha=sha, auth_mode="app",
             )
+            _file_permission_ask(out, store=store, app_id=app_id, repo=repo,
+                                 permission="contents", level="write", current=level)
+            return out
         args = _push_argv_for_app_token(
             repo=repo, branch=branch, remote=remote,
             remote_url=facts["remote_url"], token=auth["token"], force=force,
