@@ -37,14 +37,13 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 ### Added
 
 * **governance:** add manifest.grant broker verb (verb 18) ([d050ab8](https://github.com/willow-memory/willow-mcp/commit/d050ab8c044b88fa88aa489309324d3cd7dfcd2b))
-* **governance:** manifest.grant — a sealed permission grant lands through a broker verb, never a hand-edit ([6e3d4b8](https://github.com/willow-memory/willow-mcp/commit/6e3d4b8e66d1a7a49f7a11b5f6d920aee7d2f17d))
 
 
 ### Fixed
 
 * **manifest-grant:** close Loki audit 5 limits (FRANK replay check, stale-lock TOCTOU, wording) ([37b0a3a](https://github.com/willow-memory/willow-mcp/commit/37b0a3a08623e35c93b7ea33fcafef279ba89e42))
-* **manifest-grant:** rework 3 — seal age is not a lease, sign the request, re-verify at apply ([10e9365](https://github.com/willow-memory/willow-mcp/commit/10e9365cf8c08bf19b802cb2d0dbe70dcea16a95))
 * **manifest-grant:** rework 4 — pair-bound citations, unit honesty, retry ([9302505](https://github.com/willow-memory/willow-mcp/commit/93025054fc49475642e59cd069675ce95c4ddc4c))
+* **manifest-grant:** rework 3 — seal age is not a lease, sign the request, re-verify at apply ([10e9365](https://github.com/willow-memory/willow-mcp/commit/10e9365cf8c08bf19b802cb2d0dbe70dcea16a95))
 * **manifest-grant:** rework write path onto manifest_admin, bind grant to the seal ([3bb2317](https://github.com/willow-memory/willow-mcp/commit/3bb2317ebcb9bb14ba97b4be93ae18b8923fb054))
 
 
