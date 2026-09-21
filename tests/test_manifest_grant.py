@@ -1195,8 +1195,19 @@ def test_render_manifest_grant_service_template_has_no_user_line_or_trust_owner(
     assert f'Environment="WILLOW_HOME={tmp_path / "wh"}"' in rendered
     unset_line = next(line for line in rendered.splitlines() if line.startswith("UnsetEnvironment="))
     unset_keys = set(unset_line[len("UnsetEnvironment="):].split())
-    assert {"WILLOW_STORE_ROOT", "WILLOW_PG_DB", "WILLOW_PG_USER"} <= unset_keys
-    assert not ({"WILLOW_HOME", "WILLOW_KEYRING", "WILLOW_PGP_FINGERPRINT", "WILLOW_NESTOR_DB"} & unset_keys)
+    assert {
+        "WILLOW_STORE_ROOT", "WILLOW_PG_DB", "WILLOW_PG_USER",
+        "NESTOR_SEAL_KEY", "NESTOR_REQUIRE_SEAL_KEY", "NESTOR_KEYRING",
+        "NESTOR_DB", "NESTOR_PERSONAL_DB", "NESTOR_PERSONAL_LEDGER",
+        "RATATOSK_GROVE_CHANNEL",
+    } <= unset_keys
+    assert not ({
+        "WILLOW_HOME", "WILLOW_KEYRING", "WILLOW_PGP_FINGERPRINT", "WILLOW_NESTOR_DB",
+        "WILLOW_MCP_APPS_ROOT", "WILLOW_MCP_PYTHON", "WILLOW_APP_ID", "WILLOW_IN_KART",
+    } & unset_keys)
+    service_keys = uix.unit_keys(rendered, "Service")
+    assert service_keys.get("NoNewPrivileges") == ["true"]
+    assert service_keys.get("PrivateTmp") == ["true"]
     assert "ExecStartPre=" in rendered
     assert "manifest_grants/pending" in rendered
     assert "manifest_grants/done" in rendered
