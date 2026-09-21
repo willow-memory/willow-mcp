@@ -265,11 +265,39 @@ subject consent but are bound to the credential-bundle domain and would need
 rework to reuse. `production-readiness-checklist`'s evidence and risk-exception
 control model is a distant design reference for `frank_*`, nothing more.
 
-`Nestor` is now a standalone repo under active work — the survey names it as one
-of eight unique shapes but never examines the implementation. `willow-gate`,
-`willow-config`, and `willow-compose` form an uncovered infrastructure cluster:
-deployment, gating, and orchestration that the MCP tools operate within. These
-willow-owned repos were outside the fork audit's scope and remain unsurveyed.
+A willow-infrastructure pass (2026-09-21) surveyed the standalone `willow-memory`
+repos, all Apache-2.0 and all real code (not stubs):
+
+- **kartikeya** — the Kart task queue plus bubblewrap-sandboxed worker
+  (queue / worker / lanes / scheduler); willow-mcp consumes it via `task_submit`.
+- **willow-gate** — trust-gated access control that *complements* (does not
+  duplicate) willow-mcp's egress gating: a Tier 1–4 hash-chained custody ledger
+  reconciling declared-vs-observed capabilities at session check-out (file
+  check-out kept distinct from egress), a five-rung trust ladder, and Ed25519
+  inter-agent bus signing (`message_integrity.py`). Not yet wired into
+  willow-mcp's pre-tool hook.
+- **ratatosk** — the platform session runtime (prompt→tools loop, tiered
+  provider ladder). It *calls* Nestor tools; it is not Nestor. Nestor's
+  tool-routing verbs (`nestor_tool_route` / `_seal` / `_pending`) are
+  implemented in willow-mcp itself, so "Nestor is a standalone repo" was
+  inaccurate.
+- **willows-grove** — the loopback operator-seat UI (127.0.0.1:8766) plus its
+  own MCP server; the Grove *messaging* seam lives in willow-mcp, the served
+  dashboard here. (Distinct from the archived `willow-grove` repo.)
+- **willow-bot** — the propose-only GitHub App steward (webhook receiver, no
+  merge/approve authority) with a hash-chained deposits ledger.
+- **willow-data-vault** — the schema / bootstrap *blueprint* (SQL for secrets,
+  SOIL, receipts, Kart, KB, intake); willow-mcp instantiates the box from it. It
+  is not a second Vault.
+- **corpus-lens** — a standalone session-log analysis tool with a privacy
+  "Guard" wall (quarantines absolute dates / times / filenames, permits only
+  process-shape analysis).
+- **willow-reconciler** — the deterministic `Idea-Id` reconciler (classifies
+  each idea-pile item LANDED / PARTIAL / NOT_STARTED from git evidence) behind
+  the commit-trailer CI gate.
+
+Still unsurveyed: `willow-config` and `willow-compose` (both private) — the
+deployment / orchestration corner of the cluster.
 
 ## 2. MCP protocol features beyond tools
 
