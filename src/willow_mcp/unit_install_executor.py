@@ -221,7 +221,23 @@ def _safe(value: object, field: str) -> str:
 def render_values(unit: str) -> dict[str, str]:
     """The placeholders this process can fill from its own resolved
     environment — the same names the fleet's installers use. Anything a
-    template asks for beyond these is ``ETEMPLATE``."""
+    template asks for beyond these is ``ETEMPLATE``.
+
+    No ``TRUST_OWNER`` placeholder is filled here (removed, pair
+    ``6bd11def``, amending the Loki audit 3 finding 3 fix): every unit
+    installed through this path lands in the INSTALLING process's own
+    ``~/.config/systemd/user`` (:func:`unit_dir`), and systemd.exec is
+    explicit that a non-root ``--user`` service manager may only run a unit
+    as the identity the manager itself is running as — a ``User=`` line
+    naming anyone else refuses at start (217/USER) regardless of what this
+    function resolves. A template still asking for ``@TRUST_OWNER@`` gets
+    ``ETEMPLATE`` by name; none of the templates in this bundle ask for it
+    any more.
+
+    ``WILLOW_KEYRING`` / ``WILLOW_PGP_FINGERPRINT`` are filled from this
+    process's own environment when set — "resolved values, not guesses";
+    a template needing one that is unset here refuses ``ETEMPLATE`` rather
+    than rendering an empty ``Environment=`` line."""
     values: dict[str, object] = {
         "PYTHON": Path(sys.executable),
         "UNIT": unit,
@@ -237,6 +253,10 @@ def render_values(unit: str) -> dict[str, str]:
         values["NESTOR_DB"] = _nestor_db_path()
     except Exception:  # noqa: BLE001 — optional; a template that needs it will refuse by name
         pass
+    for env_key in ("WILLOW_KEYRING", "WILLOW_PGP_FINGERPRINT"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            values[env_key] = val
     return {k: str(v) for k, v in values.items() if str(v)}
 
 

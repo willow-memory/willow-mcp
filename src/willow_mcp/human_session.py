@@ -49,6 +49,16 @@ ORCHESTRATOR_WRITE_TOOLS = frozenset({
     "envelope_propose",
     "envelope_ratify",
     "envelope_reject",
+    # manifest_grant_request (verb 18, #DE196AA9; pair b74019ac amending
+    # d5504878 — the broker never publishes, so this half only writes a
+    # pending request under $WILLOW_HOME/manifest_grants/, never a seat's
+    # manifest.json directly) is gated `envelope_apply` and is
+    # orchestrator-only inside the executor (`is_orchestrator_app`), but that
+    # inner check is a narrowing refusal, not the sole boundary — the same
+    # willow-seat-forgery argument above applies here unchanged. The other
+    # half, manifest_grant_apply, runs as the trust-owner systemd --user
+    # unit, never as app_id=willow, so it is not in this set.
+    "manifest_grant_request",
 })
 
 # PR3: sidecar format tokens. v1 = original attest-session payload (PGP

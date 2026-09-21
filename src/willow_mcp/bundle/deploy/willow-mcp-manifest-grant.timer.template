@@ -1,0 +1,13 @@
+# Polls on a short cadence: a manifest.grant request is minutes old before
+# there is anything for this unit to drain, and a tick that finds pending/
+# empty exits quietly — that is the resting state, not a failure.
+[Unit]
+Description=willow-mcp manifest-grant — poll for pending sealed grants
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+Unit=@SERVICE_UNIT@
+
+[Install]
+WantedBy=timers.target

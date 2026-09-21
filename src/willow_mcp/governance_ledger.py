@@ -370,6 +370,37 @@ class GovernanceLedger:
         cur.close()
         return rows
 
+    def all_events(self, event_type: str, *, match: dict) -> list[dict]:
+        """Every row of ``event_type`` whose content carries every key/value
+        in ``match``, newest first — the multi-match sibling of
+        :meth:`latest_event` (manifest.grant rework, pair ``6bd11def``,
+        Loki audit 4 HIGH "TWO-PAIRS"): a caller that must find its OWN
+        citation among several granted for the same envelope can never
+        settle for "whichever one happens to be newest" — two legitimate
+        citations queued under one envelope means ``latest_event`` returns
+        only one of them, and whichever caller it was not written for was
+        refused as forged. Same match semantics and SQL shape as
+        :meth:`latest_event`; this collects every match instead of
+        returning at the first one."""
+        cur = self.pg.cursor()
+        try:
+            cur.execute(
+                f"SELECT id, content, created_at FROM {TABLE} "  # nosec B608 - TABLE is the module-level constant "frank_ledger"; event_type is a bound param
+                "WHERE event_type = %s ORDER BY created_at DESC",
+                (event_type,),
+            )
+            out: list[dict] = []
+            for record_id, content, created_at in cur.fetchall():
+                if isinstance(content, str):
+                    content = json.loads(content)
+                if isinstance(content, dict) and all(
+                    content.get(k) == v for k, v in match.items()
+                ):
+                    out.append({"id": record_id, "content": content, "created_at": created_at})
+            return out
+        finally:
+            cur.close()
+
     def latest_event(self, event_type: str, *, match: dict) -> dict | None:
         """The most recent row of `event_type` whose content carries every
         key/value in `match`, or ``None`` if none matches.
