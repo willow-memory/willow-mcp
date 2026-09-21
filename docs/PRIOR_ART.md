@@ -794,6 +794,39 @@ equivalent.
 
 ---
 
+## 16. Agent memory systems (forks surveyed)
+
+Three memory systems collected as forks under `rudi193-cmd/` during the fork
+audit. All are close in domain to willow-mcp's KB atoms + `lineage_*` +
+Mem-ratify stack, all carry dependable licences, and none was modified in the
+fork — they are external prior art, not owner work. Licences verified against
+the repo LICENSE file.
+
+| Project | Licence | What it is | Nearest willow shape |
+| --- | --- | --- | --- |
+| [ogham-mcp](https://ogham-mcp.dev) | MIT (verified) | Persistent, searchable shared memory for AI coding agents across MCP clients. Postgres + pgvector hybrid search, recall/consolidation, profiles/schema. Reports 85.8% on the AMB memory benchmark | KB atoms + Grove cross-session memory |
+| [stash](https://github.com/alash3al/stash) | Apache-2.0 (verified) | Go. Persistent agent memory that "remembers, recalls, consolidates, and learns." Eight-stage consolidation pipeline (facts → patterns → wisdom), goal/failure tracking, namespaced, Postgres + pgvector | Mem-ratify tier promotion + knowledge refinement |
+| [statewave](https://github.com/smaramwbc/statewave) | Apache-2.0 (verified) | Python. Compile-then-retrieve memory runtime: episodes compiled into typed memories with confidence scores, provenance-tagged, to avoid query-time retrieval noise | `lineage_*` reasoning provenance + Mem-ratify confidence |
+
+**What's borrowable, not adoptable.** None replaces a willow shape; each is a
+whole memory runtime with its own store. Two ideas are worth lifting as design
+references:
+
+- **stash's staged consolidation** (facts → patterns → wisdom) is a concrete
+  shape for how Mem-ratify tiers could *earn* promotion through processing
+  stages rather than quorum alone. Back the pipeline with the `frank_*` ledger
+  for an audit trail of each promotion.
+- **statewave's compile-at-write** model is the inverse of willow's
+  verify-at-read (`knowledge_verify`): it pays the provenance-tagging cost when
+  the episode lands, not when it is recalled. Worth weighing if retrieve-time
+  verification ever becomes a latency floor.
+
+**Verdict: Keep** willow's own KB/lineage/Mem-ratify. ogham is the closest
+cross-client reference; stash and statewave are consolidation/provenance design
+references. The three forks carry no owner work these rows do not capture.
+
+---
+
 ## Summary
 
 Verdicts across all 22 surveyed systems:
