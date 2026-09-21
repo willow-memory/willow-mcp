@@ -7,6 +7,7 @@ moves land in a throwaway tree.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -221,6 +222,10 @@ def test_oversized_file_is_held_not_filed_uninspected(env, store):
 def test_unreadable_file_holds_rather_than_clears(env, store):
     """A read failure (permission denied, etc.) must be reported as 'could
     not clear', not misread as 'clean' — fail closed, never fail open."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip(
+            "chmod 0o000 does not deny root, so the read succeeds and the file "
+            "is inspected instead of held — this test needs a non-root uid")
     _tmp, drop = env
     unreadable = drop / "invoice_locked.txt"
     unreadable.write_text("aws_key=AKIAABCDEFGHIJKLMNOP\n")
