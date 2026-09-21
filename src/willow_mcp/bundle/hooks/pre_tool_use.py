@@ -51,18 +51,31 @@ Ten guards:
   `web_net` / `mcp_federation`), the Grove relay capability (`grove_relay`), or
   any write-capable permission group (blocks).
 - Spawn guard (sealed rule c9ca1a09, pair 72f528ab / record b4a8cbe7, gap
-  20e6d23971dc): the harness `Agent` tool, when the spawn prompt names a
-  fleet seat (`session_enter(app_id="<seat>"`, a bare `app_id=<seat>`, or
-  "You are <Display name>"). The orchestrator seat (`willow`) is never a
-  spawn target at all. Any other named seat whose role appears in
-  `config/spawn_models.json` must be spawned with `model=` set to that
-  role's pinned value — missing or mismatched blocks. `subagent_type="fork"`
-  is refused for ANY named seat regardless of the table, since a fork
-  inherits the caller's model and cannot carry a pin. A prompt naming no
-  known seat (Explore, Plan, a plain general-purpose spawn) is untouched
-  (blocks; see check_agent_spawn).
+  20e6d23971dc): the harness `Agent` tool, when the spawn prompt OR
+  description names a fleet seat by ENTERING it — `session_enter(app_id=
+  "<seat>"`, a case-insensitive `app_id`/`APP_ID`/JSON `"app_id": "<seat>"`
+  shape (straight or curly quotes), "You are <Display name>" / "You're
+  <Display name>" / "Enter as <Display name>" framing (markdown-bolded or
+  not), `<Display name>,` opening the text, or a `personas/<seat>.md`
+  reference. A bare `app_id=<seat>` that appears only as an argument to a
+  read-only lookup call (`handoff_read`, `dispatch_read`, `session_read`,
+  `store_get`, …) is a MENTION, not an entry, and is not matched. The
+  orchestrator seat (`willow`) is a spawn target only under the two
+  strongest framings (`session_enter(` or a "You are"/"You're"/"Enter as"
+  sentence) — a bare `app_id=willow` mention inside a lookup never refuses a
+  non-seat spawn. Any other named seat whose role appears in
+  `specialists.json`'s `model_hint_session` field (the same field the
+  fleet's "no self-assigned models" guarantee already names — one source,
+  not a second table) must be spawned with `model=` set to that role's
+  pinned value — missing or mismatched blocks. `subagent_type="fork"`
+  (matched case-insensitively) is refused for ANY named seat regardless of
+  the table, since a fork inherits the caller's model and cannot carry a
+  pin. A prompt/description naming no known seat (Explore, Plan, a plain
+  general-purpose spawn) is untouched. Cursor dialect is explicitly out of
+  scope for this one guard (see check_agent_spawn's docstring) — the other
+  nine guards above are unaffected (blocks; see check_agent_spawn).
 
-That third guard is the sudo invariant (FRANK `90e52ab7`) enforced where the
+That egress-keys guard above (bullet 9) is the sudo invariant (FRANK `90e52ab7`) enforced where the
 agent actually acts: *a model may REQUEST egress, never CONFIRM it.* It is a
 guardrail, not a control — a hook lives in the agent's own harness and an agent
 that bypasses it faces no OS-level obstacle on a single-uid host. The control is
@@ -857,6 +870,21 @@ _KEYSTORE_REASON = (
     "standing, never CONFIRM it (sudo invariant, D2). Reading is fine; writing is not."
 )
 
+# Sealed rule c9ca1a09: the file that decides the Agent-spawn model pin —
+# specialists.json's own model_hint_session field, either the bundle copy or
+# a top-level config/ shadow — is not fleet-writable. Matches both filenames
+# so a reintroduced spawn_models.json (the split-brain the rework removed)
+# stays guarded too, not just the file that replaced it.
+_SPAWN_CONFIG_RE = re.compile(r"(?:^|/)(?:bundle/)?config/(?:spawn_models|specialists)\.json$")
+_SPAWN_CONFIG_REASON = (
+    "willow-mcp: this writes specialists.json — the file whose model_hint_session "
+    "field the Agent-spawn guard reads to decide a seat's pinned model (sealed "
+    "rule c9ca1a09, pair 72f528ab). A seat editing its own pin table to raise or "
+    "drop a pin is the same self-grant class the manifest guard above refuses: an "
+    "agent may REQUEST a repin, never CONFIRM it itself (sudo invariant, FRANK "
+    "90e52ab7). Ask the operator to ratify the change; do not write the file."
+)
+
 
 # "Retaking the seat": adding a WRITE-capable permission group (or widening
 # store_scope to everything) to a manifest re-grants the very authority the
@@ -1259,8 +1287,8 @@ def check_owned_db_file_write(tool_input: dict) -> Optional[str]:
 
 
 def check_trust_root_write(tool_input: dict) -> Optional[str]:
-    """Block a Write/Edit that mints a lease, writes an identity secret, or slips
-    `task_net` into a manifest."""
+    """Block a Write/Edit that mints a lease, writes an identity secret, slips
+    `task_net` into a manifest, or edits the spawn guard's own pin table."""
     tool_input = tool_input or {}
     path = str(tool_input.get("file_path", "") or "")
     if not path:
@@ -1269,6 +1297,8 @@ def check_trust_root_write(tool_input: dict) -> Optional[str]:
         return _SELF_GRANT_REASON
     if _KEYSTORE_RE.search(path):
         return _KEYSTORE_REASON
+    if _SPAWN_CONFIG_RE.search(path):
+        return _SPAWN_CONFIG_REASON
     if _MANIFEST_RE.search(path):
         # Only the permissions that carry escalation. Editing a manifest for any
         # other reason is ordinary work and must not be blocked.
@@ -1307,25 +1337,40 @@ _FALLBACK_SPECIALISTS = [
 ]
 
 # Role -> required Agent-spawn session model, sealed pair c9ca1a09. Mirrors
-# config/spawn_models.json; used only if that file can't be read.
+# specialists.json's own model_hint_session field; used only if that file
+# can't be read at all (see _load_spawn_models).
 _FALLBACK_SPAWN_MODELS = {"builder": "sonnet", "auditor": "opus"}
+
+# The harness's short session-model aliases. specialists.json's
+# model_hint_session field is overloaded: for most rows it's a literal
+# Anthropic model id (e.g. "claude-haiku-4-5-20251001") or null, meaning
+# "inherit the caller's default" — neither is a spawn-guard pin. Only a row
+# whose value is one of these short aliases is read as a pin, which is how
+# a single field serves both purposes without a second table (finding:
+# split-brain between specialists.json and a duplicate spawn_models.json).
+_SHORT_MODEL_ALIASES = frozenset({"sonnet", "opus", "haiku"})
 
 
 def _bundle_config_candidates(filename: str) -> list[str]:
-    """Where a bundle config JSON might live relative to THIS file. Two
-    candidates because this module ships at two paths that must stay
-    byte-identical (src/willow_mcp/bundle/hooks/pre_tool_use.py and the
-    top-level hooks/pre_tool_use.py mirror tested against it): from the
-    bundle copy, config/ is a sibling of hooks/ (candidate 1). The top-level
-    mirror has no sibling config/ at all — it's a test-only copy, not an
-    install shape — so it reaches the bundle's own config by walking up to
-    the repo root instead (candidate 2). Tests may monkeypatch this to point
-    at a fixture directory instead of either real path."""
+    """Where a bundle config JSON lives relative to THIS file. This module
+    ships at two paths that must stay byte-identical
+    (src/willow_mcp/bundle/hooks/pre_tool_use.py and the top-level
+    hooks/pre_tool_use.py mirror tested against it), and each copy reaches
+    the SAME real bundle config by a different relative path — never both.
+    The bundle copy has config/ as a direct sibling of hooks/; that is the
+    only candidate that exists in a real install, so if it's there, it's the
+    one path returned. The top-level mirror has no sibling config/ at all —
+    it's a test-only copy, not an install shape — so it walks up to the repo
+    root and back down to the bundle's own config/ instead. Picking one
+    shape rather than trying both (one of which is always a dead path in any
+    given install) keeps production reading exactly the one real file.
+    Tests may monkeypatch this whole function to point at a fixture
+    directory instead of either real path."""
     hook_dir = os.path.dirname(os.path.abspath(__file__))
-    return [
-        os.path.join(hook_dir, "..", "config", filename),
-        os.path.join(hook_dir, "..", "src", "willow_mcp", "bundle", "config", filename),
-    ]
+    sibling_config = os.path.join(hook_dir, "..", "config")
+    if os.path.isdir(sibling_config):
+        return [os.path.join(sibling_config, filename)]
+    return [os.path.join(hook_dir, "..", "src", "willow_mcp", "bundle", "config", filename)]
 
 
 def _load_json_config(filename: str) -> Optional[dict]:
@@ -1359,44 +1404,210 @@ def _load_specialist_rows() -> "tuple[list[dict], bool]":
 
 
 def _load_spawn_models() -> dict:
-    """Load the role->model pin table from config/spawn_models.json, falling
-    back to _FALLBACK_SPAWN_MODELS. Config, not code (sealed pair c9ca1a09):
-    editing the shipped JSON changes the guard's behaviour with no code
-    edit — see test_pre_tool_use_hook.py's table-is-config test."""
-    data = _load_json_config("spawn_models.json")
-    if isinstance(data, dict):
-        table = {
-            k: v for k, v in data.items()
-            if isinstance(k, str) and isinstance(v, str) and not k.startswith("_")
-        }
-        if table:
-            return table
-    return dict(_FALLBACK_SPAWN_MODELS)
+    """Role -> required Agent-spawn model, derived from the SAME
+    specialists.json rows _load_specialist_rows reads — one source, not a
+    duplicated spawn_models.json (the split-brain the rework closed). A
+    row's model_hint_session pins its role only when the value is one of
+    _SHORT_MODEL_ALIASES; a full Anthropic model id or null is a session
+    hint for something else, not a spawn-guard pin. Config, not code
+    (sealed pair c9ca1a09): editing specialists.json changes the guard's
+    behaviour with no code edit — see
+    test_pre_tool_use_hook.py::test_agent_spawn_table_reads_specialists_json_not_code.
+    Falls back to _FALLBACK_SPAWN_MODELS only when specialists.json can't be
+    read at all."""
+    rows, used_fallback = _load_specialist_rows()
+    if used_fallback:
+        return dict(_FALLBACK_SPAWN_MODELS)
+    table: dict = {}
+    for row in rows:
+        role = row.get("role")
+        hint = row.get("model_hint_session")
+        if role and isinstance(hint, str) and hint in _SHORT_MODEL_ALIASES:
+            table[role] = hint
+    return table or dict(_FALLBACK_SPAWN_MODELS)
 
 
-# Matches session_enter(app_id="<seat>" / a bare app_id=<seat> (quoted or
-# not) — the shape a specialist's own boot call, or a dispatching caller's
-# prompt, names the seat in. Anchored on the keyword so this can't match an
-# unrelated word that merely contains "app_id".
-_APP_ID_RE = re.compile(r'app_id\s*=\s*["\']?([A-Za-z][A-Za-z0-9_-]*)')
+# Matches an app_id shape naming a seat: `app_id="<seat>"`, `app_id: <seat>`,
+# `APP_ID="<seat>"`, JSON `"app_id": "<seat>"`, straight or curly quotes.
+# Case-insensitive on the keyword AND the seat id — `_detect_specialist_seat`
+# looks the captured text up in a lower-cased id table. Anchored on the
+# keyword so this can't match an unrelated word that merely contains
+# "app_id".
+_APP_ID_RE = re.compile(
+    r'app_id["\']?\s*[=:]\s*["\'‘’“”]?([A-Za-z][A-Za-z0-9_-]*)',
+    re.IGNORECASE,
+)
+
+# The read-only lookup calls a prompt or description can legitimately quote
+# an app_id into as an ARGUMENT, not an entry — handoff_read(app_id="hanuman")
+# names hanuman as the packet to read, not a seat to become. Masked out
+# before the bare-app_id detection tier runs (see _mask_read_only_calls) so
+# these never trip it; session_enter is deliberately absent from this set —
+# it is the entry call, scanned first, at full priority, never masked.
+_READ_ONLY_LOOKUP_CALLS = frozenset({
+    "handoff_read", "dispatch_read", "session_read", "store_get",
+    "store_list", "store_search", "store_search_all", "dispatch_list",
+    "task_status", "task_list", "whoami", "verify_handoff",
+    "kb_journal_read", "specialist_get", "specialist_list",
+    "diagnostic_summary", "fleet_status", "fleet_health",
+})
 
 
-def _detect_specialist_seat(prompt: str, rows: list) -> Optional[dict]:
-    """Find the fleet seat a spawn prompt names, by app_id= reference or by
-    "You are <Display name>" framing. None when the prompt names no known
-    seat — an ordinary Explore/Plan/general-purpose spawn with no seat
-    framing is not this guard's business."""
-    if not prompt:
-        return None
-    by_id = {row["agent_id"]: row for row in rows if row.get("agent_id")}
-    for match in _APP_ID_RE.finditer(prompt):
-        seat = by_id.get(match.group(1))
+def _mask_read_only_calls(text: str) -> str:
+    """Blank the parenthesised argument text of any _READ_ONLY_LOOKUP_CALLS
+    invocation in `text`, so a bare app_id=<seat> that appears only as an
+    argument to a lookup cannot trip the bare-app_id detection tier. Uses a
+    simple paren-depth counter, not a full parser — good enough for the
+    single-call-per-mention shapes this guard sees in a prompt/description."""
+    if not text:
+        return text
+    names_pattern = re.compile(
+        r'\b(?:' + '|'.join(re.escape(t) for t in _READ_ONLY_LOOKUP_CALLS) + r')\s*\('
+    )
+    out: list = []
+    pos = 0
+    n = len(text)
+    for m in names_pattern.finditer(text):
+        if m.start() < pos:
+            continue
+        out.append(text[pos:m.end()])
+        depth = 1
+        j = m.end()
+        while j < n and depth:
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+            j += 1
+        out.append(" " * (j - m.end()))
+        pos = j
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _find_session_enter_seat(text: str, by_id: dict) -> Optional[dict]:
+    """Highest-priority tier: the seat named INSIDE a session_enter(...)
+    call's own arguments — the entry call itself, not a mention of the seat
+    elsewhere in the same text. Fixes the order bug where a caller citing
+    another seat's packet by app_id (`dispatch_read(app_id="hanuman", ...)`)
+    ahead of its own `session_enter(app_id="loki")` got pinned to the wrong
+    seat's model."""
+    for m in re.finditer(r"session_enter\s*\(([^)]*)\)", text, re.IGNORECASE):
+        am = _APP_ID_RE.search(m.group(1))
+        if am is None:
+            continue
+        seat = by_id.get(am.group(1).lower())
         if seat is not None:
             return seat
+    return None
+
+
+def _find_you_are_seat(text: str, rows: list) -> Optional[dict]:
+    """"You are <Display name>" / "You're <Display name>" / "Enter as
+    <Display name>" framing, case-insensitive, tolerant of markdown bolding
+    around the name. A trailing "?" is excluded (`(?!\\?)`) so a question
+    like "You are Loki? no — ask claude-code-guide" is not read as entry
+    framing."""
     for row in rows:
-        name = row.get("display_name")
-        if name and re.search(r"\bYou are %s\b" % re.escape(name), prompt):
-            return row
+        for name in filter(None, (row.get("display_name"), row.get("agent_id"))):
+            pat = re.compile(
+                r"\b(?:you are|you're|enter as)\s+\**%s\**(?!\?)" % re.escape(name),
+                re.IGNORECASE,
+            )
+            if pat.search(text):
+                return row
+    return None
+
+
+def _find_comma_start_seat(text: str, rows: list) -> Optional[dict]:
+    """`<Display name>,` (or bare `<agent_id>`) opening the text — "Hanuman,
+    build the thing. Enter as the builder seat first." — checked against
+    each of `prompt` and `description` separately, since either can open
+    this way."""
+    if not text:
+        return None
+    stripped = text.lstrip()
+    for row in rows:
+        for name in filter(None, (row.get("display_name"), row.get("agent_id"))):
+            pat = re.compile(r"^\**%s\**\b[,:]?" % re.escape(name), re.IGNORECASE)
+            if pat.match(stripped):
+                return row
+    return None
+
+
+def _find_persona_path_seat(text: str, by_id: dict) -> Optional[dict]:
+    """A `personas/<seat>.md` reference — "Read personas/hanuman.md and
+    adopt it" is entry framing even with no app_id= or "You are" in sight."""
+    m = re.search(r"personas/([A-Za-z0-9_-]+)\.md", text, re.IGNORECASE)
+    if m is None:
+        return None
+    return by_id.get(m.group(1).lower())
+
+
+def _find_bare_app_id_seat(text: str, by_id: dict) -> Optional[dict]:
+    """Weakest tier: a bare app_id=<seat> with no other framing at all
+    (`{"app_id": "hanuman"}`, `app_id: hanuman` alone). Callers must mask
+    read-only lookup calls out of `text` first (see _mask_read_only_calls).
+    A mention on a line that also says "grep" ("grep app_id=loki in tests")
+    is a search reference, not an entry, and is skipped."""
+    for m in _APP_ID_RE.finditer(text):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line_end = text.find("\n", m.end())
+        line = text[line_start: line_end if line_end != -1 else len(text)]
+        if re.search(r"\bgrep\b", line, re.IGNORECASE):
+            continue
+        seat = by_id.get(m.group(1).lower())
+        if seat is not None:
+            return seat
+    return None
+
+
+# Tier names, strongest first — see _detect_specialist_seat. Only the two
+# strongest are enough to refuse the human_only orchestrator seat; a bare
+# mention (app_id=, persona path, comma-start) of `willow` in a lookup
+# prompt must not hard-refuse a non-seat spawn.
+_TIER_SESSION_ENTER = "session_enter"
+_TIER_YOU_ARE = "you_are"
+_TIER_COMMA_START = "comma_start"
+_TIER_PERSONA_PATH = "persona_path"
+_TIER_BARE_APP_ID = "bare_app_id"
+_HUMAN_ONLY_TIERS = frozenset({_TIER_SESSION_ENTER, _TIER_YOU_ARE})
+
+
+def _detect_specialist_seat(prompt: str, description: str, rows: list) -> Optional["tuple[dict, str]"]:
+    """Find the fleet seat a spawn's prompt OR description names by
+    ENTERING it, and which tier matched (see the _TIER_* constants). Scans
+    both fields — a fork's description ("hanuman builds") can carry the same
+    framing its prompt does. Returns None when neither field names a known
+    seat by entry — an ordinary Explore/Plan/general-purpose spawn, or a
+    prompt that only MENTIONS a seat inside a read-only lookup call, is not
+    this guard's business."""
+    by_id = {row["agent_id"].lower(): row for row in rows if row.get("agent_id")}
+    combined = "\n".join(t for t in (prompt, description) if t)
+    if not combined:
+        return None
+
+    seat = _find_session_enter_seat(combined, by_id)
+    if seat is not None:
+        return seat, _TIER_SESSION_ENTER
+
+    seat = _find_you_are_seat(combined, rows)
+    if seat is not None:
+        return seat, _TIER_YOU_ARE
+
+    for text in (prompt, description):
+        seat = _find_comma_start_seat(text, rows)
+        if seat is not None:
+            return seat, _TIER_COMMA_START
+
+    seat = _find_persona_path_seat(combined, by_id)
+    if seat is not None:
+        return seat, _TIER_PERSONA_PATH
+
+    seat = _find_bare_app_id_seat(_mask_read_only_calls(combined), by_id)
+    if seat is not None:
+        return seat, _TIER_BARE_APP_ID
+
     return None
 
 
@@ -1407,29 +1618,52 @@ def check_agent_spawn(tool_input: dict) -> Optional["tuple[str, str]"]:
     decision with no cheap do-over once the wrong model is loaded, so this
     always blocks rather than warns. Refuses:
 
-    - the orchestrator seat (willow) as a spawn target at all (human_only);
-    - subagent_type="fork" naming any other specialist seat — a fork
-      inherits the parent's model and cannot be pinned;
-    - a pinned-role seat (role present in spawn_models.json) spawned with no
-      model, or a model that isn't the table's value for that role.
+    - the orchestrator seat (willow) as a spawn target, but ONLY when named
+      by the two strongest framings (session_enter(...) or a "You are" /
+      "You're" / "Enter as" sentence) — a bare app_id=willow mention (a
+      lookup argument, a persona-path reference, or text that merely opens
+      with the word "Willow") is not an attempt to become the seat and is
+      not refused this way;
+    - subagent_type="fork" (case-insensitive) naming any other specialist
+      seat by any framing tier — a fork inherits the parent's model and
+      cannot be pinned;
+    - a pinned-role seat (role present in specialists.json's
+      model_hint_session, via _load_spawn_models) spawned with no model, or
+      a model that isn't the table's value for that role.
 
-    Detection is prompt-text only — see _detect_specialist_seat. A prompt
-    naming no known seat (Explore, Plan, an unpinned general-purpose spawn)
-    passes through untouched."""
+    Detection scans prompt AND description — see _detect_specialist_seat —
+    and prefers the seat named inside a session_enter(...) call over any
+    other mention in the same text. A prompt/description naming no known
+    seat by entry (Explore, Plan, an unpinned general-purpose spawn, or a
+    prompt that only mentions a seat inside a read-only lookup call) passes
+    through untouched.
+
+    Cursor dialect is explicitly OUT of scope for this one guard: Cursor's
+    equivalent-tool payload shape for a specialist spawn (tool name and
+    argument keys) is not established, so main() only wires this to the
+    Claude Code `Agent` tool_name. The other nine guards in this module are
+    unaffected and still route through cursor_permission_for_guard as
+    before."""
     tool_input = tool_input or {}
     prompt = str(tool_input.get("prompt", "") or "")
-    subagent_type = str(tool_input.get("subagent_type", "") or "")
+    description = str(tool_input.get("description", "") or "")
+    subagent_type = str(tool_input.get("subagent_type", "") or "").strip().lower()
     model = str(tool_input.get("model", "") or "")
     rows, used_fallback = _load_specialist_rows()
-    seat = _detect_specialist_seat(prompt, rows)
-    if seat is None:
+    detected = _detect_specialist_seat(prompt, description, rows)
+    if detected is None:
         return None
+    seat, tier = detected
     agent_id = seat.get("agent_id", "")
     note = (
         " (specialists.json unreadable — literal fallback registry used)"
         if used_fallback else ""
     )
     if seat.get("human_only"):
+        if tier not in _HUMAN_ONLY_TIERS:
+            # A bare mention of the orchestrator seat (lookup argument,
+            # persona path, comma-start) is not an attempt to enter it.
+            return None
         return "block", (
             f"willow-mcp: sealed rule {_SPAWN_GUARD_RULE} — the '{agent_id}' "
             "seat is the human-orchestrator seat and is never an Agent spawn "
@@ -1440,8 +1674,8 @@ def check_agent_spawn(tool_input: dict) -> Optional["tuple[str, str]"]:
     if subagent_type == "fork":
         hint = f', model="{required}"' if required else ""
         return "block", (
-            f"willow-mcp: sealed rule {_SPAWN_GUARD_RULE} — this prompt names "
-            f"the '{agent_id}' seat with subagent_type=\"fork\"{note}, and a "
+            f"willow-mcp: sealed rule {_SPAWN_GUARD_RULE} — this prompt/description "
+            f"names the '{agent_id}' seat with subagent_type=\"fork\"{note}, and a "
             "fork cannot carry a model pin. Retry with "
             f'subagent_type="general-purpose"{hint}.'
         )

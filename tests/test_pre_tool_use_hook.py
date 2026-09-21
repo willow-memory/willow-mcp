@@ -1861,16 +1861,28 @@ def test_agent_spawn_registry_unreadable_fallback_still_refuses_fork(monkeypatch
     assert "fallback" in reason
 
 
-def test_agent_spawn_table_pins_config_not_code(tmp_path, monkeypatch):
-    """The role->model table is read from JSON at call time, not hardcoded —
-    editing the shipped file changes the guard's decision with no code
-    edit."""
-    custom = tmp_path / "spawn_models.json"
-    custom.write_text(json.dumps({"builder": "haiku"}))
+def test_agent_spawn_table_reads_specialists_json_not_code(tmp_path, monkeypatch):
+    """The role->model pin is read from specialists.json's own
+    model_hint_session field at call time, not hardcoded — one source, not a
+    duplicated spawn_models.json — proven by pointing the loader at a tmp
+    copy with a different pin. This is a loader-level fact, not permission
+    to self-assign: the PRODUCTION path stays refused regardless (see
+    test_check_trust_root_write_blocks_specialists_json below)."""
+    custom = tmp_path / "specialists.json"
+    custom.write_text(json.dumps({
+        "specialists": [
+            {"agent_id": "hanuman", "display_name": "Hanuman", "role": "builder",
+             "model_hint_session": "haiku", "human_only": False},
+        ],
+        "orchestrator_seat": {
+            "agent_id": "willow", "display_name": "Willow", "role": "orchestrator",
+            "human_only": True,
+        },
+    }))
     real_candidates = pre_tool_use._bundle_config_candidates
 
     def _patched(filename):
-        if filename == "spawn_models.json":
+        if filename == "specialists.json":
             return [str(custom)]
         return real_candidates(filename)
 
@@ -1878,11 +1890,159 @@ def test_agent_spawn_table_pins_config_not_code(tmp_path, monkeypatch):
 
     refused = pre_tool_use.check_agent_spawn(_spawn_input(
         'session_enter(app_id="hanuman", session_id="x")', model="sonnet"))
-    assert refused is not None, "sonnet must now be refused — the table says haiku"
+    assert refused is not None, "sonnet must now be refused — the tmp copy pins haiku"
 
     allowed = pre_tool_use.check_agent_spawn(_spawn_input(
         'session_enter(app_id="hanuman", session_id="x")', model="haiku"))
-    assert allowed is None, "haiku must now be allowed — it came from the edited file"
+    assert allowed is None, "haiku must now be allowed — it came from the tmp copy"
+
+
+def test_check_trust_root_write_blocks_specialists_json():
+    """The production path stays guarded even though the loader above is
+    honest data, not code: a seat cannot Write/Edit its own pin table
+    (sealed rule c9ca1a09) — neither the bundle copy nor a top-level
+    config/ shadow."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "src/willow_mcp/bundle/config/specialists.json",
+    })
+    assert reason is not None
+    assert "c9ca1a09" in reason
+
+    reason2 = pre_tool_use.check_trust_root_write({
+        "file_path": "/repo/config/specialists.json",
+    })
+    assert reason2 is not None
+
+
+def test_check_trust_root_write_blocks_spawn_models_json_if_reintroduced():
+    """The removed split-brain file stays guarded too, in case anything ever
+    reintroduces it — the guard matches the filename, not just the field."""
+    reason = pre_tool_use.check_trust_root_write({
+        "file_path": "src/willow_mcp/bundle/config/spawn_models.json",
+    })
+    assert reason is not None
+    assert "c9ca1a09" in reason
+
+
+# ── check_agent_spawn: detector rework (Loki audit 2026-09-21) ────────────
+# Every bypass input from the audit handoff, turned into a test that now
+# blocks; every false-positive input turned into a test that now allows.
+
+def test_agent_spawn_detects_bare_json_app_id():
+    result = pre_tool_use.check_agent_spawn(_spawn_input('{"app_id": "hanuman"}'))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_colon_app_id_no_quotes():
+    result = pre_tool_use.check_agent_spawn(_spawn_input("app_id: hanuman"))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_app_id_mixed_case_value():
+    result = pre_tool_use.check_agent_spawn(_spawn_input('app_id="Hanuman"'))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_uppercase_APP_ID_key():
+    result = pre_tool_use.check_agent_spawn(_spawn_input('APP_ID="hanuman"'))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_lowercase_you_are():
+    result = pre_tool_use.check_agent_spawn(_spawn_input("you are hanuman, go build it"))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_markdown_bold_you_are():
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You are **Hanuman**, the builder."))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_youre_contraction():
+    result = pre_tool_use.check_agent_spawn(_spawn_input("You're Hanuman for this one."))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_curly_quoted_app_id():
+    curly_prompt = "app_id=“hanuman”"
+    result = pre_tool_use.check_agent_spawn(_spawn_input(curly_prompt))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_persona_path_reference():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Read personas/hanuman.md and adopt it before you start."))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_detects_comma_start_framing():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Hanuman, build the thing. Enter as the builder seat first."))
+    assert result is not None and result[0] == "block"
+
+
+def test_agent_spawn_fork_detects_seat_in_description_only():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "continue the build", subagent_type="fork") | {"description": "hanuman builds"})
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+
+
+def test_agent_spawn_fork_detects_enter_as_in_prompt():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "Enter as hanuman and continue.", subagent_type="fork"))
+    assert result is not None
+    assert "fork" in result[1]
+
+
+def test_agent_spawn_fork_subagent_type_case_insensitive():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'session_enter(app_id="loki", session_id="x")',
+        subagent_type="Fork", model="opus"))
+    assert result is not None
+    decision, reason = result
+    assert decision == "block"
+    assert "fork" in reason
+
+
+def test_agent_spawn_allows_app_id_inside_handoff_read_lookup():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'Look at handoff_read(app_id="hanuman") for background before searching.',
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_allows_willow_app_id_inside_session_read_lookup():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'Check session_read(app_id="willow") for the current session state.',
+        subagent_type="Explore"))
+    assert result is None
+
+
+def test_agent_spawn_allows_you_are_question_negation():
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        "You are Loki? no — ask claude-code-guide instead."))
+    assert result is None
+
+
+def test_agent_spawn_prefers_session_enter_seat_over_earlier_mention():
+    """Order-bug fix: a correctly pinned auditor spawn that cites the
+    builder's packet by app_id ahead of its own session_enter must not be
+    pinned to the wrong seat's model."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input(
+        'dispatch_read(app_id="hanuman", limit=1) then '
+        'session_enter(app_id="loki", session_id="x")',
+        model="opus"))
+    assert result is None
+
+
+def test_agent_spawn_allows_bare_willow_mention_with_no_framing():
+    """A bare app_id=willow mention with no session_enter/"You are" framing
+    at all is not an attempt to become the orchestrator seat."""
+    result = pre_tool_use.check_agent_spawn(_spawn_input('{"app_id": "willow"}'))
+    assert result is None
 
 
 def test_fallback_specialists_track_the_registry():
