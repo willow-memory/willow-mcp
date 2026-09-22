@@ -141,6 +141,12 @@ TOOL_CLASS: dict[str, str] = {
     "fork_create": WRITE, "fork_join": WRITE, "fork_log": WRITE,
     "fork_merge": WRITE, "fork_delete": WRITE,
     "envelope_apply": EXECUTE,
+    # gitsync_sweep / git_pull_execute used to inherit EXECUTE by riding the
+    # shared "envelope_apply" gate name; pair 163b9a70 split them onto their
+    # own tool names (gate.py's steward_sweep group) so classification must
+    # follow explicitly — same class as before the split, unchanged for the
+    # human orchestrator seat.
+    "gitsync_sweep": EXECUTE, "git_pull_execute": EXECUTE,
     # ── admin (never sudo) ────────────────────────────────────────────────────
     "schema_confirm_mapping": ADMIN, "gap_purge_topic": ADMIN, "gap_promote": ADMIN,
     # gap_retopic curates the fleet-shared backlog (same group as gap_promote).

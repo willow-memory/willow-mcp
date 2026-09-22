@@ -431,9 +431,16 @@ def test_sweep_triggers_reports_unreachable_for_a_retired_home(tmp_path, monkeyp
     assert out["swept"] == []
 
 
-# ── the tools are wired like the push and the PR ────────────────────────────
+# ── the tools are gated on their OWN names, not the push/PR's shared name ───
 
-def test_the_pull_tools_are_gated_as_envelope_apply_by_name():
+def test_the_pull_tools_are_gated_on_their_own_names():
+    """Pair 163b9a70 (the steward as its own principal): gitsync_sweep and
+    git_pull_execute no longer ride the shared `envelope_apply` gate name —
+    a manifest granting gate.py's new `steward_sweep` group must never also
+    unlock envelope_apply/unit.install/unit.reload/PR open/update the way
+    granting the old shared `envelope_apply` group would have. Both names
+    were added to the `orchestrator` and `full_access` permission groups so
+    the human seat is unaffected by the split."""
     catalogue = server._gate_tool_catalogue()
-    assert catalogue["git_pull_execute"] == "envelope_apply"
-    assert catalogue["gitsync_sweep"] == "envelope_apply"
+    assert catalogue["git_pull_execute"] == "git_pull_execute"
+    assert catalogue["gitsync_sweep"] == "gitsync_sweep"

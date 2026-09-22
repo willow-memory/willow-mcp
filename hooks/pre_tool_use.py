@@ -942,6 +942,7 @@ _SEAT_WRITE_TOOLS = frozenset({
     "frank_append",
     "friction_scan",
     "gap_delete", "gap_log", "gap_promote", "gap_purge_topic", "gap_resolve", "gap_retopic",
+    "git_pull_execute", "gitsync_sweep",
     "grove_ack", "grove_bus_send", "grove_flag", "grove_heartbeat",
     "grove_reply", "grove_send_message", "grove_unflag",
     "handoff_write_v4",
@@ -972,7 +973,8 @@ _SEAT_ESCALATION_REASON = (
     "task_queue / dispatch_write / human_loop_write / frank_write / envelope_apply / envelope_write / "
     "fork_write / commitment_write / code_graph_write / agent_dispatch / grove_write / grove_all / "
     "integration_call / federation_call / markdownai_write / markdownai_directives / orchestrator / "
-    "context / binding / tool_oracle_route / tool_oracle_seal / governance_propose / governance_sync / full_access) or widen store_scope to "
+    "context / binding / tool_oracle_route / tool_oracle_seal / governance_propose / governance_sync / "
+    "steward_sweep / steward_enqueue / full_access) or widen store_scope to "
     '"*" — "retaking the seat". The SessionStart bootstrap restores every seat to '
     "read-only by default; re-granting write authority is an operator act, not a "
     "self-grant. An agent may REQUEST the seat, never CONFIRM it itself (sudo "
