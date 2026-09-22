@@ -160,7 +160,8 @@ def test_handoff_write_v4_success(tmp_path):
          patch("willow_mcp.handoff.dispatch_set_status"):
         result = handoff_write_v4(
             app_id, dispatch_id,
-            findings=[{"id": "F1", "text": "Found bug", "severity": "high"}],
+            findings=[{"id": "F1", "text": "Found bug", "severity": "high",
+                       "evidence": ["12 passed"]}],
             narrative="Fixed the issue.",
         )
     assert result["status"] == "complete"
@@ -611,3 +612,175 @@ def test_verify_honest_blocker_report_not_penalized_for_missing_evidence():
     })
     assert result["verified"] is False
     assert result["reason"] == "checklist not resolved"
+
+
+# ── handoff_write_v4 refuses instead of dropping (gap 21f80b2b348a; sealed
+# cdcd948c stage 2; gap 34c8e60f4260) ────────────────────────────────────────
+
+def _write(tmp_path, dispatch_id="d-refuse", **kwargs):
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    dispatch_root.mkdir(parents=True, exist_ok=True)
+    pkt = {
+        "meta": {"to_app": "hanuman", "reply_to": "willow", "role": "builder"},
+        "status": {"status": "active"},
+    }
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root), \
+         patch("willow_mcp.handoff.dispatch_set_status"):
+        return handoff_write_v4("hanuman", dispatch_id, **kwargs)
+
+
+def test_write_refuses_unknown_top_level_key(tmp_path):
+    """The exact BFF5284B shape: summary/details are not accepted fields --
+    refused by name, never silently dropped into findings=[]/narrative=''."""
+    result = _write(
+        tmp_path, summary="Build task", details="did the thing",
+    )
+    assert result["error"] == "EINVAL"
+    assert set(result["unknown_fields"]) == {"summary", "details"}
+    assert "summary" in result["message"]
+    assert "details" in result["message"]
+
+
+def test_write_refuses_single_unknown_key_by_name(tmp_path):
+    result = _write(
+        tmp_path,
+        findings=[{"id": "F1", "text": "x"}],
+        narrative="done",
+        notas="typo of narrative",
+    )
+    assert result["error"] == "EINVAL"
+    assert result["unknown_fields"] == ["notas"]
+    assert "accepted_fields" in result
+
+
+def test_write_refuses_empty_findings_without_reason(tmp_path):
+    result = _write(tmp_path, narrative="done")
+    assert result["error"] == "EINVAL"
+    assert "no_findings_reason" in result["message"]
+    # Loki EB30E84F F3: this is the ONE refusal a real MCP client ever sees
+    # for the BFF5284B (summary/details) shape, since the SDK drops the
+    # unrecognized keys before this check runs -- it must name the
+    # accepted fields, not just say "empty findings".
+    assert "accepted_fields" in result
+    assert "findings" in result["accepted_fields"]
+    assert "narrative" in result["accepted_fields"]
+    assert "field names" in result["message"] or "summary" in result["message"]
+
+
+def test_write_accepts_empty_findings_with_reason_and_records_it(tmp_path):
+    dispatch_id = "d-no-findings"
+    result = _write(
+        tmp_path, dispatch_id=dispatch_id,
+        narrative="Investigated; 0 violations, nothing to report.",
+        no_findings_reason="pure read-only audit, no issues found",
+    )
+    assert result["status"] == "complete"
+    handoff_json = json.loads(
+        (tmp_path / "dispatch" / dispatch_id / "handoff.json").read_text()
+    )
+    assert handoff_json["no_findings_reason"] == "pure read-only audit, no issues found"
+    closeout = (tmp_path / "dispatch" / dispatch_id / "closeout.md").read_text()
+    assert "pure read-only audit, no issues found" in closeout
+
+
+def test_write_refuses_finding_with_no_statement(tmp_path):
+    result = _write(
+        tmp_path,
+        narrative="done",
+        findings=[{"id": "F1", "severity": "high"}],
+    )
+    assert result["error"] == "EINVAL"
+    assert result["invalid_findings"] == [{"index": 0, "keys": ["id", "severity"]}]
+
+
+def test_valid_write_then_passes_verify_handoff(tmp_path):
+    """A valid write (through the new validator) is also accepted by
+    verify_handoff — the writer refuses what the verifier would refuse, and
+    accepts what the verifier accepts."""
+    dispatch_id = "d-roundtrip"
+    written = _write(
+        tmp_path, dispatch_id=dispatch_id,
+        findings=[{"id": "F1", "text": "Found it", "evidence": ["a.py:1"]}],
+        narrative="Full suite: 12 passed, 0 failed.",
+    )
+    assert written["status"] == "complete"
+
+    pkt = {"meta": {"to_app": "hanuman"}, "status": {"status": "complete"}}
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root), \
+         patch("willow_mcp.handoff.dispatch_set_status"):
+        verified = verify_handoff(dispatch_id)
+    assert verified["verified"] is True
+
+
+# ── the writer pre-flights the verifier's own completion-evidence and lint
+# checks (rework of Loki's F3, 23CAD2B4; gap 34c8e60f4260 fully closed) ──────
+
+def test_write_refuses_checklist_resolved_with_no_completion_evidence(tmp_path):
+    """The exact split Loki measured: a finding with a statement but no
+    evidence, and a narrative with no counted result, used to write fine
+    and only fail later at verify_handoff. Now refused at write time with
+    verify_handoff's own reason string."""
+    result = _write(
+        tmp_path,
+        findings=[{"id": "F1", "text": "Found it"}],
+        narrative="done",
+    )
+    assert result["error"] == "EINVAL"
+    assert "no evidence backs it" in result["message"]
+
+
+def test_write_and_verify_no_evidence_reason_strings_are_byte_identical(tmp_path):
+    """Loki EB30E84F F5: the check FUNCTIONS were already shared, but the
+    reason STRINGS were two independently-typed literals -- a drifted-copy
+    risk of exactly the kind repair 1 exists to end. Both now come from one
+    constant; prove it by comparing the writer's refusal message against
+    the verifier's reason for the identical bad shape."""
+    from willow_mcp.handoff import _NO_COMPLETION_EVIDENCE_REASON
+
+    write_result = _write(
+        tmp_path,
+        findings=[{"id": "F1", "text": "Found it"}],
+        narrative="done",
+    )
+    assert write_result["message"] == _NO_COMPLETION_EVIDENCE_REASON
+
+    pkt = {"meta": {}, "status": {"status": "complete"}}
+    handoff_data = {
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": [{"id": "F1", "text": "Found it"}],
+        "narrative": "done",
+    }
+    hr = {"dispatch_id": "d-verify-same", "handoff": handoff_data, "closeout_md": ""}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.handoff_read", return_value=hr):
+        verified = verify_handoff("d-verify-same")
+    assert _NO_COMPLETION_EVIDENCE_REASON in verified["reason"]
+    assert write_result["message"] == _NO_COMPLETION_EVIDENCE_REASON
+
+
+def test_write_accepts_checklist_resolved_false_without_evidence(tmp_path):
+    """An honest blocker/partial report is not a completion claim -- the
+    evidence gate must not fire when checklist_resolved=False (same
+    exemption verify_handoff itself grants)."""
+    result = _write(
+        tmp_path,
+        findings=[{"id": "F1", "text": "Blocked: missing credentials"}],
+        narrative="Could not proceed past the auth step.",
+        checklist_resolved=False,
+    )
+    assert result["status"] == "complete"
+
+
+def test_write_accepts_checklist_resolved_with_narrative_count_and_no_finding_evidence(tmp_path):
+    """The narrative-count path alone is enough -- matches
+    _has_completion_evidence's OR, not an AND."""
+    result = _write(
+        tmp_path,
+        findings=[{"id": "F1", "text": "Docs updated"}],
+        narrative="Ran the suite: 17/17 tests passing.",
+    )
+    assert result["status"] == "complete"

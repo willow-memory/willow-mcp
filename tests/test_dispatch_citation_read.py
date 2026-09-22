@@ -219,7 +219,10 @@ def test_citing_packet_still_pending_grants_nothing(seats):
 def test_citing_packet_complete_still_grants(seats):
     builder = _builder_packet()
     audit = _audit_packet(builder)
-    ho.handoff_write_v4("loki", audit, narrative="Audited.", findings=[])
+    ho.handoff_write_v4(
+        "loki", audit, narrative="Audited.", findings=[],
+        no_findings_reason="test fixture: citation-read access test",
+    )
     assert server.dispatch_read("loki", builder)["via"] == audit
 
 

@@ -47,7 +47,7 @@ TOOL_CLASS: dict[str, str] = {
     "store_search_all": READ, "store_collections": READ, "store_stats": READ,
     "knowledge_search": READ, "kb_at": READ, "kb_startup_continuity": READ,
     "knowledge_verify": READ, "knowledge_check": READ,
-    "gap_list": READ,
+    "gap_list": READ, "gap_get": READ,
     "dispatch_read": READ, "dispatch_list": READ, "handoff_read": READ,
     "session_read": READ, "session_enter": READ,
     "sessions_read_unverifiable": READ,

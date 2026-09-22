@@ -182,8 +182,13 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     "audit": frozenset({
         "receipts_tail",
     }),
+    # gap_get (gap 1477ebb2bc35, dispatch FEEEE98B): the id-lookup door the
+    # backlog was missing — store_get refuses `gaps` (outside every seat's
+    # store_scope) and gap_list has no id lookup — rides the SAME read
+    # group as gap_list rather than a new one; a specialist that can list
+    # the backlog should be able to look up one entry from it by id.
     "gap_read": frozenset({
-        "gap_list",
+        "gap_list", "gap_get",
     }),
     "gap_write": frozenset({
         "gap_log", "gap_resolve", "gap_delete",
@@ -567,8 +572,8 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # Self-audit
         "receipts_tail",
         # Gap backlog
-        "gap_log", "gap_list", "gap_resolve", "gap_delete", "gap_purge_topic",
-        "gap_promote", "gap_retopic",
+        "gap_log", "gap_list", "gap_get", "gap_resolve", "gap_delete",
+        "gap_purge_topic", "gap_promote", "gap_retopic",
         # Lineage / provenance ("story of this willow")
         "lineage_why", "lineage_list", "lineage_record", "lineage_link",
         # Friction floor (relationship smoke detector)
