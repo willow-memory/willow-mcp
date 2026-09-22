@@ -6921,7 +6921,16 @@ def _diag_env_stale() -> dict:
     nothing here). `receipt_id`/`sealed` are best-effort: no Postgres, no
     `env_changed` receipt yet, or the seal lookup failing all leave them
     at their empty defaults rather than raising — this is a diagnostic,
-    not a gate."""
+    not a gate.
+
+    Gap `ce9c914985d9` (logged, not built here — Loki BE590C53 Q6/F7,
+    acceptable to merge with the gap named, not to call it closed): a
+    broker whose `record_startup` write fails reads `state='empty'`
+    forever after — indistinguishable from "predates this module" — and
+    the env trigger is silently OFF on that one broker (ESTATEEMPTY every
+    tick, exit 0, never "open") while the pull trigger keeps working. A
+    fix needs a distinct persisted "unrecordable" sentinel so `empty` and
+    "the write failed" stop sharing one word; out of scope for this pass."""
     from . import env_fingerprint as _envfp
     from . import reloader as _reloader
 

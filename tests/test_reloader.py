@@ -288,6 +288,21 @@ def test_seal_lookup_no_keyring_configured_is_unreachable_not_empty(tmp_path):
     assert out["state"] == "unreachable"
 
 
+def test_seal_lookup_unloadable_keyring_is_unreachable_not_a_traceback(tmp_path, monkeypatch):
+    """T2 (Loki BE590C53, high): WILLOW_KEYRING naming a path with nothing
+    readable at it makes get_keyring() RAISE KeyringError, not return None
+    — left uncaught, that traceback propagated out of main() on the first
+    tick with a pending receipt. Both "unset" and "set but unusable" are
+    the SAME verdict to a caller: unreachable, fix the path."""
+    priv = Ed25519PrivateKey.generate()
+    target_text = "yes — restart onto pull receipt receipt-7"
+    sig = priv.sign(ns.seal_message(SOURCE_NORM, target_text, "sean campbell")).hex()
+    db = _nestor_db(tmp_path, ("pair-1", target_text, "sealed", sig, "", "decision", "sean campbell"))
+    monkeypatch.setenv("WILLOW_KEYRING", str(tmp_path / "no-such-keyring.json"))
+    out = reloader.find_sealing_decision("receipt-7", db)  # must not raise
+    assert out["state"] == "unreachable" and "cause" in out
+
+
 # ── the check ─────────────────────────────────────────────────────────────────
 
 def test_only_the_broker_unit_is_this_units_business(tmp_path, checkout):
@@ -413,11 +428,31 @@ def test_systemctl_runs_in_utc_so_the_parse_matches_the_print(tmp_path, checkout
 
 # ── the units ─────────────────────────────────────────────────────────────────
 
+def _write_ring(tmp_path, name="verifiers.public.json") -> Path:
+    """A real (structurally valid enough to be a FILE) public-ring stand-in
+    — render_units only checks existence at render time; content is never
+    read here. A distinct name per call site avoids cross-test collisions
+    under a shared tmp_path."""
+    p = tmp_path / name
+    p.write_text('{"version": 1, "verifiers": [], "public_only": true}', encoding="utf-8")
+    return p
+
+
+def _no_net_signer_unit(*args, **kw):
+    """A fake systemctl that always reports the net-signer unit unknown —
+    forces _resolve_keyring_path's fallback path (net_signer.default_ring_path(),
+    which itself reads WILLOW_NET_SIGNER_RING when a test sets it)."""
+    return subprocess.CompletedProcess(args, 1, "", "Unit willow-mcp-net-signer.service could not be found.")
+
+
 def test_render_units_fills_every_placeholder(tmp_path, checkout, monkeypatch):
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "home" / "store"))
+    ring = _write_ring(tmp_path)
+    monkeypatch.setenv("WILLOW_NET_SIGNER_RING", str(ring))
     db = _nestor_db(tmp_path)
-    units = reloader.render_units(_config(checkout, db), python=Path("/venv/bin/python"), interval="90s")
+    units = reloader.render_units(_config(checkout, db), python=Path("/venv/bin/python"), interval="90s",
+                                  runner=_no_net_signer_unit)
     svc, tmr = units[reloader.SERVICE_UNIT], units[reloader.TIMER_UNIT]
     assert "@" not in svc and "@" not in tmr
     assert "Type=oneshot" in svc
@@ -425,29 +460,55 @@ def test_render_units_fills_every_placeholder(tmp_path, checkout, monkeypatch):
     assert "WILLOW_RELOADER_UNIT=willow-mcp-serve.service" in svc
     assert f"WILLOW_RELOADER_CHECKOUT={checkout}" in svc
     assert f"WILLOW_NESTOR_DB={db}" in svc
+    assert f'WILLOW_KEYRING={ring}' in svc
     assert "OnUnitActiveSec=90s" in tmr and f"Unit={reloader.SERVICE_UNIT}" in tmr
 
 
-def test_render_units_names_the_public_keyring_not_the_private_one(tmp_path, checkout, monkeypatch):
-    """R1 (Loki 747B0C04, blocking): the deployed unit carried no
-    WILLOW_KEYRING at all, so every seal read ESEALS forever. The rendered
-    template must name a ring — and it must be the PUBLIC one
-    (net_signer.default_ring_path(), normally
-    $WILLOW_HOME/config/verifiers.public.json), never the private
-    config/verifiers.json this oneshot has no business holding (it only
-    ever verifies, never signs)."""
-    from willow_mcp import net_signer as ns
-
+def test_render_units_resolves_keyring_from_the_net_signer_units_own_environment(tmp_path, checkout, monkeypatch):
+    """T1 (Loki BE590C53, blocking): net_signer.default_ring_path() reads
+    WILLOW_NET_SIGNER_RING from THIS process's own environment — on a real
+    box that variable is set only inside the net-signer's installed system
+    unit, never the desk/broker's, so calling it directly named a file
+    that was never staged there. render_units must instead read the
+    net-signer unit's OWN Environment= line — the same fact its installer
+    already baked in, not a second guess."""
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "home" / "store"))
-    monkeypatch.delenv("WILLOW_NET_RING", raising=False)
+    monkeypatch.delenv("WILLOW_NET_SIGNER_RING", raising=False)
+    real_ring = _write_ring(tmp_path, "real-signer-ring.json")
+
+    def fake_show(argv, **kw):
+        assert argv[:3] == ["systemctl", "show", "willow-mcp-net-signer.service"]
+        return subprocess.CompletedProcess(
+            argv, 0, f'Environment=WILLOW_HOME=/x WILLOW_NET_SIGNER_RING={real_ring}\n', "")
+
     db = _nestor_db(tmp_path)
-    units = reloader.render_units(_config(checkout, db), python=Path("/venv/bin/python"))
-    svc = units[reloader.SERVICE_UNIT]
-    expected = str(ns.default_ring_path())
-    assert f'Environment="WILLOW_KEYRING={expected}"' in svc
-    assert "verifiers.public.json" in expected
-    assert "verifiers.json" not in expected.replace("verifiers.public.json", "")
+    units = reloader.render_units(_config(checkout, db), python=Path("/venv/bin/python"), runner=fake_show)
+    assert f'WILLOW_KEYRING={real_ring}' in units[reloader.SERVICE_UNIT]
+
+
+def test_render_units_falls_back_to_default_when_net_signer_unit_unreadable(tmp_path, checkout, monkeypatch):
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "home" / "store"))
+    ring = _write_ring(tmp_path)
+    monkeypatch.setenv("WILLOW_NET_SIGNER_RING", str(ring))
+    db = _nestor_db(tmp_path)
+    units = reloader.render_units(_config(checkout, db), python=Path("/venv/bin/python"),
+                                  runner=_no_net_signer_unit)
+    assert f'WILLOW_KEYRING={ring}' in units[reloader.SERVICE_UNIT]
+
+
+def test_render_units_refuses_when_the_resolved_ring_is_not_a_file(tmp_path, checkout, monkeypatch):
+    """T1/T8: a unit rendered against a ring that is not actually staged
+    can never verify a real seal — refuse at render time, naming the path
+    and how it was resolved, rather than shipping a unit doomed to ESEALS/
+    KeyringError on its first real tick."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "home" / "store"))
+    monkeypatch.setenv("WILLOW_NET_SIGNER_RING", str(tmp_path / "does-not-exist.json"))
+    db = _nestor_db(tmp_path)
+    with pytest.raises(ValueError, match="not a file"):
+        reloader.render_units(_config(checkout, db), runner=_no_net_signer_unit)
 
 
 def test_render_refuses_without_a_checkout(tmp_path):
@@ -459,6 +520,9 @@ def test_render_refuses_without_a_checkout(tmp_path):
 
 def test_install_writes_units_and_never_starts_them(tmp_path, checkout, monkeypatch):
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "home"))
+    ring = _write_ring(tmp_path)
+    monkeypatch.setenv("WILLOW_NET_SIGNER_RING", str(ring))
+    monkeypatch.setattr(reloader.subprocess, "run", _no_net_signer_unit)
     db = _nestor_db(tmp_path)
     dest = tmp_path / "units"
     out = reloader.install_services(_config(checkout, db), destination=dest, reload=False)
@@ -469,6 +533,9 @@ def test_install_writes_units_and_never_starts_them(tmp_path, checkout, monkeypa
 
 def test_uninstall_refuses_an_active_unit(tmp_path, checkout, monkeypatch):
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "home"))
+    ring = _write_ring(tmp_path)
+    monkeypatch.setenv("WILLOW_NET_SIGNER_RING", str(ring))
+    monkeypatch.setattr(reloader.subprocess, "run", _no_net_signer_unit)
     db = _nestor_db(tmp_path)
     dest = tmp_path / "units"
     reloader.install_services(_config(checkout, db), destination=dest, reload=False)

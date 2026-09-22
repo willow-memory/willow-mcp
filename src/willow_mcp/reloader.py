@@ -106,9 +106,25 @@ populated to absent — is now its own refusal, ``EMISSING``, never filed as a
 diff naming ``'<empty>'`` as the target); F7 (partial: :func:`server._diag_env_stale`
 now names ``unit``/``describes`` so the desk can tell whose baseline it is
 reading; ``record_startup`` failure is still indistinguishable from an older
-broker — left open, see the rework 2 handoff); R5 (``EPARTIAL`` now reports
-``act=False`` — a waiting state, not a failure — so ``tick`` exits 0 while
-waiting on the second seal instead of reddening the journal every poll).
+broker — left open, gap ``ce9c914985d9``, see :func:`server._diag_env_stale`);
+R5 (``EPARTIAL`` now reports ``act=False`` — a waiting state, not a failure —
+so ``tick`` exits 0 while waiting on the second seal instead of reddening the
+journal every poll).
+
+Rework 3 (Loki audit BE590C53, 2026-09-22, narrow): T1 (blocking — rework 2's
+own fix was unreachable in practice: :func:`net_signer.default_ring_path`
+reads ``WILLOW_NET_SIGNER_RING`` from the RENDERER's own environment, which on
+a real box is set only inside the net-signer's installed system unit, never
+the desk/broker's — a row-17 render from the desk baked in a
+``WILLOW_KEYRING`` naming a file that was never staged. :func:`_resolve_keyring_path`
+now reads the net-signer unit's OWN ``Environment=`` line — the same fact its
+installer already baked in, not a second guess — falling back to
+``default_ring_path()`` only when that unit cannot be read at all; either way,
+:func:`render_units` now refuses to render when the resolved path is not an
+existing file, naming the path and how it was resolved); T2 (``get_keyring()``
+raising ``KeyringError`` for a configured-but-unusable ring was uncaught —
+:func:`find_sealing_decision` now catches it and maps it to ``unreachable``,
+the same three-state discipline an unset ring already got).
 """
 from __future__ import annotations
 
@@ -262,7 +278,22 @@ def find_sealing_decision(receipt_id: str, db_path: Path) -> dict:
     from . import keyring as _keyring
     from . import net_signer
 
-    ring_kr = _keyring.get_keyring()
+    # T2 (Loki BE590C53): get_keyring() RAISES KeyringError for a
+    # WILLOW_KEYRING that names a path with nothing readable at it (a
+    # missing file, malformed JSON, ...) — it does not return None the way
+    # "unset" does. Left uncaught, that traceback propagated out of
+    # main() on the first tick with a pending receipt: exactly the
+    # three-state collapse this function exists to prevent. Both "no ring
+    # configured" and "a ring is configured but unusable" are the SAME
+    # verdict from a caller's point of view — unreachable, fix the path —
+    # so both land here.
+    try:
+        ring_kr = _keyring.get_keyring()
+    except _keyring.KeyringError as exc:
+        return {"state": "unreachable",
+                "cause": f"WILLOW_KEYRING={_keyring.keyring_path()!r} is configured but could not "
+                         f"be loaded: {exc}",
+                "path": str(db_path)}
     if ring_kr is None:
         return {"state": "unreachable",
                 "cause": "no keyring configured (WILLOW_KEYRING) — a seal cannot be verified "
@@ -753,13 +784,71 @@ def _safe(value: object, field: str) -> str:
     return text
 
 
+#: The net-signer's own SYSTEM unit — the one process on this box whose
+#: ``WILLOW_NET_SIGNER_RING`` is ever actually set, because it is the one
+#: that carries the public ring's real, installed location baked into its
+#: own ``Environment=`` line at render time (net_signer.render_unit).
+_NET_SIGNER_UNIT = "willow-mcp-net-signer.service"
+
+
+def _resolve_keyring_path(*, runner: Optional[Callable] = None) -> tuple[Path, str]:
+    """Where the reloader's rendered unit should point ``WILLOW_KEYRING`` —
+    resolved from the SAME place the net-signer's own installed unit
+    already resolved it, rather than a second, independent guess (Loki
+    BE590C53, T1). ``net_signer.default_ring_path()`` reads
+    ``WILLOW_NET_SIGNER_RING`` from THIS process's environment — which on
+    a real box is set inside the net-signer's system unit and nowhere
+    else, so calling it here (in the desk/broker's own environment) named
+    a file that was never staged there. Read the net-signer unit's own
+    ``Environment=`` line instead — ``systemctl show
+    willow-mcp-net-signer.service --property=Environment`` — a read of
+    the SAME fact the signer's own installer baked in, not an invented
+    third source.
+
+    Returns ``(path, source)`` — ``source`` is ``"net-signer-unit"`` when
+    read from there, ``"default"`` when that unit could not be read at
+    all (not installed, no system bus reachable) and
+    :func:`net_signer.default_ring_path` was used as a last resort.
+    """
+    from . import net_signer
+
+    run = runner or subprocess.run
+    try:
+        proc = run(["systemctl", "show", _NET_SIGNER_UNIT, "--property=Environment"],
+                   capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT_S, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("Environment="):
+                for name, value in envfp._parse_environment_pairs(line[len("Environment="):]):
+                    if name == net_signer.RING_ENV and value:
+                        return Path(value), "net-signer-unit"
+    return net_signer.default_ring_path(), "default"
+
+
 def render_units(config: ReloaderConfig, *, python: Optional[Path] = None,
-                 interval: str = DEFAULT_INTERVAL) -> dict[str, str]:
+                 interval: str = DEFAULT_INTERVAL, runner: Optional[Callable] = None) -> dict[str, str]:
     """The .service and .timer bodies, rendered together so the timer's
-    ``Unit=`` can never drift from the service it schedules."""
+    ``Unit=`` can never drift from the service it schedules.
+
+    Refuses (``ValueError``, the same ``ETEMPLATE``-shaped refusal an
+    unresolved ``@KEY@`` already gets) when the resolved keyring path is
+    not an existing file — Loki BE590C53 T1/T8: a unit rendered against a
+    ring that is not actually staged can never verify a real seal, and
+    that must fail at render time, loudly, naming the path and how it was
+    resolved, not at the first tick with a pending receipt.
+    """
     if config.checkout is None:
         raise ValueError(f"no broker checkout to render: set {_ENV_CHECKOUT}")
-    from . import net_signer
+
+    keyring_path, keyring_source = _resolve_keyring_path(runner=runner)
+    if not keyring_path.is_file():
+        raise ValueError(
+            f"WILLOW_KEYRING would render to {keyring_path} (resolved via {keyring_source}), "
+            f"which is not a file — refusing to render a reloader unit whose seal confirm can "
+            f"never succeed; stage the public ring first (`willow-mcp-net-signer export-ring` "
+            f"or `install`) or re-render from where {_NET_SIGNER_UNIT} is actually installed")
 
     values = {
         "PYTHON": python or Path(sys.executable),
@@ -774,8 +863,9 @@ def render_units(config: ReloaderConfig, *, python: Optional[Path] = None,
         "SERVICE_UNIT": SERVICE_UNIT,
         # The PUBLIC-only ring (never config/verifiers.json — see the
         # template's own header comment, Loki 747B0C04 R1): this oneshot
-        # only ever verifies a seal, never signs one.
-        "KEYRING": net_signer.default_ring_path(),
+        # only ever verifies a seal, never signs one. Resolved above from
+        # the net-signer unit's own environment, not guessed (T1).
+        "KEYRING": keyring_path,
     }
     out: dict[str, str] = {}
     for unit, tmpl in ((SERVICE_UNIT, f"{UNIT_PREFIX}.service.template"),
