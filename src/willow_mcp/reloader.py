@@ -562,6 +562,108 @@ def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = No
             "request_state": request_state}
 
 
+#: A safety valve against a pathological ledger, not a curated window.
+#: Rework (Loki 797924DB V1): this used to cap the CANDIDATE scan at the
+#: newest 20 rows at HEAD — on the ledger the fix exists to rescue, the
+#: sealed receipt is the OLDEST row at that sha (every no-op sweep row
+#: since landed in front of it), so the old cap re-created the exact
+#: silent non-fire the fix was written to end. `all_events` already fetches
+#: every matching row; the scan now exhausts that set. The bound only
+#: guards against an unbounded ledger read on a truly pathological history
+#: (the same sha pulled thousands of times, never consumed) — ordinary
+#: operation never gets remotely close, and if it ever is reached the
+#: overflow count is named in the refusal rather than silently dropped.
+_PULL_SCAN_LIMIT = 10_000
+
+
+def _pull_receipts_at(ledger, *, repo: str, checkout: str, after: str,
+                       limit: int = _PULL_SCAN_LIMIT) -> tuple[list[dict], int]:
+    """Every ``git_pull`` receipt for ``repo``+``checkout`` whose ``after``
+    equals ``after`` (the checkout's CURRENT HEAD), newest first — the full
+    set, not a slice of it — plus the count (if any) beyond ``limit`` that
+    were excluded as a pathological-ledger safety valve.
+
+    Gap ``3df997ffe92b``: the seal names a receipt id — the operator's
+    confirmation of THAT sha. Matching against "whichever git_pull row
+    happens to be newest right now" instead of "a receipt describing the
+    sha the seal actually confirmed" meant a later, unrelated row (even one
+    at the SAME sha, from a second pull that also landed there) could
+    silently take over the match. This collects every receipt at the
+    confirmed sha instead of picking one by row order.
+    """
+    rows = ledger.all_events(urx.PULL_EVENT, match={"repo": repo, "checkout": checkout, "after": after})
+    overflow = max(0, len(rows) - limit)
+    return rows[:limit], overflow
+
+
+def _is_consumed(ledger, receipt_id: str, *, repo: str, checkout: str) -> bool:
+    """A ``unit_reload`` receipt already cites ``receipt_id`` — via the
+    singular ``pull_receipt_id`` (one trigger fired the restart) or inside
+    ``pull_receipt_ids`` (Loki 797924DB V3: every sealed receipt found at
+    the acted-on sha is cited together, so a second sealed receipt at that
+    sha is not left live to fire again on a later revert-and-reapply).
+    Matched by repo+checkout rather than unit: that is what ``run_once``
+    always stamps on the ``unit_reload`` content, and it is what a courtesy
+    caller outside the reloader (:mod:`pull_executor`'s no-op branch) can
+    supply too, without knowing which systemd unit the reloader targets."""
+    if not receipt_id:
+        return False
+    for row in ledger.all_events(urx.EVENT, match={"repo": repo, "checkout": checkout}):
+        content = row.get("content") or {}
+        if content.get("pull_receipt_id") == receipt_id:
+            return True
+        if receipt_id in (content.get("pull_receipt_ids") or ()):
+            return True
+    return False
+
+
+def _stale_sealed_receipts(ledger, nestor_db, *, repo: str, checkout: str, current_head: str,
+                           limit: int = _PULL_SCAN_LIMIT) -> list[str]:
+    """Sealed ``git_pull`` receipts for ``repo``+``checkout`` whose
+    ``after`` is NOT the checkout's current HEAD — a seal that named a sha
+    the tree has since moved past. Rework (Loki 797924DB V2): these used to
+    vanish from the journal the moment a new receipt existed at the new
+    HEAD (sealed or not); the refusal named only the new receipt, and the
+    desk had no way to see that its earlier seal was now spent on nothing.
+    Read-only, called only on a refusal path (never during an act), so the
+    extra :func:`find_sealing_decision` calls this costs never touch the
+    hot path."""
+    out = []
+    for row in ledger.all_events(urx.PULL_EVENT, match={"repo": repo, "checkout": checkout})[:limit]:
+        content = row.get("content") or {}
+        if content.get("after") == current_head:
+            continue
+        rid = row.get("id")
+        if not rid:
+            continue
+        seal = find_sealing_decision(rid, nestor_db)
+        if seal.get("state") == "populated":
+            out.append(rid)
+    return out
+
+
+def _no_match_refusal(ledger, nestor_db, *, repo: str, checkout: str, head: str) -> dict:
+    """No unconsumed ``git_pull`` receipt names the checkout's current HEAD.
+    ``ENORECEIPT`` when nothing has ever been pulled here at all;
+    ``EDRIFT`` naming the newest receipt otherwise — the tree moved past
+    every receipt on file, so the seal (if any) names a sha that is no
+    longer HEAD. Names any sealed-but-stale receipt too (V2)."""
+    latest = ledger.latest_event(urx.PULL_EVENT, match={"repo": repo, "checkout": checkout})
+    if latest is None:
+        return _refuse("ENORECEIPT", f"no git_pull receipt for repo={repo!r} checkout={checkout!r}")
+    latest_id = latest.get("id")
+    latest_content = latest.get("content") or {}
+    latest_after = latest_content.get("after")
+    stale_sealed = _stale_sealed_receipts(ledger, nestor_db, repo=repo, checkout=checkout, current_head=head)
+    reason = (f"{checkout} HEAD is {head!r} but the newest git_pull receipt {latest_id}'s "
+             f"after-sha is {latest_after!r} — the tree moved again since the pull; the seal "
+             f"names the receipt, not the tree")
+    if stale_sealed:
+        reason += f"; sealed receipt(s) naming an earlier sha are now moot: {stale_sealed}"
+    return _refuse("EDRIFT", reason, receipt_id=latest_id, receipt=latest_content, head=head,
+                   stale_sealed=stale_sealed)
+
+
 def check(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None) -> dict:
     """Decide whether the restart is due. Never restarts anything.
 
@@ -571,6 +673,23 @@ def check(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None) 
     ``EALREADY``, ``EDRIFT``) plus the reloader's own ``ENOSEAL`` (receipt
     present, no sealed decision names it — the waiting state) and
     ``ESEALS`` (the seal store cannot be read).
+
+    Fix (gap ``3df997ffe92b``, 2026-09-22): matches by WHAT was confirmed,
+    not by row. Every ``git_pull`` receipt whose ``after`` equals the
+    checkout's current HEAD is collected; EALREADY is decided against the
+    newest of them (consumed or not — a restart already on that sha stays
+    quiet regardless of a stray later row at the same sha). If not yet
+    applied, every receipt at that sha NOT already cited by a prior
+    ``unit_reload`` is a live candidate, ALL tried against
+    :func:`find_sealing_decision` (the set is exhausted, not sliced to a
+    curated window — Loki 797924DB V1). A no-op pull no longer mints a
+    receipt at all (see :mod:`pull_executor`), but even so a later real
+    pull that lands back at the SAME sha (a revert and reapply) still must
+    not displace an already-sealed receipt at that sha — scanning the whole
+    unconsumed set rather than trusting "newest" is what survives that.
+    Every candidate that verifies is cited together by the ONE restart this
+    tick performs (V3), and a sealed-but-now-stale receipt at a DIFFERENT
+    sha is named in a refusal rather than silently dropped (V2).
     """
     unit = (config.unit or "").strip()
     if not urx.is_broker_unit(unit):
@@ -586,51 +705,108 @@ def check(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None) 
     if ledger is None:
         return _refuse("EAMBIG", "no governance ledger: a restart that cannot be matched to a pull receipt is not performed")
 
-    receipt = ledger.latest_event(urx.PULL_EVENT, match={"repo": config.repo, "checkout": str(path)})
-    if receipt is None:
+    # Cheap, ledger-only existence/id checks first — no runner call yet, so
+    # ENORECEIPT and "the receipt can't be named" still return before
+    # touching git or systemctl, same as every caller of this function has
+    # relied on since the original build.
+    any_receipt = ledger.latest_event(urx.PULL_EVENT, match={"repo": config.repo, "checkout": str(path)})
+    if any_receipt is None:
         return _refuse("ENORECEIPT", f"no git_pull receipt for repo={config.repo!r} checkout={str(path)!r}")
-    receipt_id = receipt.get("id")
-    if not receipt_id:
+    if not any_receipt.get("id"):
         return _refuse("EAMBIG", "the pull receipt carries no row id; a seal cannot name it")
-    content = receipt["content"]
+
+    head = urx._git(path, "rev-parse", "HEAD", runner=runner)
+    if head.returncode != 0:
+        return _refuse("EINVAL", f"could not read HEAD of {path}")
+    current_head = (head.stdout or "").strip()
+
+    at_head, overflow = _pull_receipts_at(ledger, repo=config.repo, checkout=str(path), after=current_head)
+    if not at_head:
+        return _no_match_refusal(ledger, config.nestor_db, repo=config.repo, checkout=str(path), head=current_head)
 
     state = urx.show_unit(unit, runner=runner)
     if not state.get("ok"):
         return _refuse("EUNREACH", f"unit state unreachable: {state.get('cause')}",
-                       cause=state.get("cause"), detail=state.get("detail"), receipt_id=receipt_id)
+                       cause=state.get("cause"), detail=state.get("detail"),
+                       receipt_id=at_head[0].get("id"), head=current_head)
 
     active_enter = urx._parse_systemd_timestamp(state.get("ActiveEnterTimestamp"))
-    receipt_at = urx._as_utc(receipt.get("created_at"))
-    if active_enter is not None and receipt_at is not None and active_enter >= receipt_at:
+
+    # EALREADY is decided against the NEWEST receipt at this sha, consumed
+    # or not: if the unit has been active since no older than that pull, the
+    # tree's current sha is already served — a stray unsealed OR
+    # already-consumed row at the same sha changes nothing about that fact.
+    newest = at_head[0]
+    newest_at = urx._as_utc(newest.get("created_at"))
+    if active_enter is not None and newest_at is not None and active_enter >= newest_at:
         return _refuse("EALREADY",
                        f"{unit} has been active since {state.get('ActiveEnterTimestamp')!r}, "
-                       f"which is no older than pull receipt {receipt_id} — already on that code",
-                       receipt_id=receipt_id, receipt=content)
+                       f"which is no older than pull receipt {newest.get('id')} — already on that code",
+                       receipt_id=newest.get("id"), receipt=newest.get("content"), head=current_head)
 
-    head = urx._git(path, "rev-parse", "HEAD", runner=runner)
-    if head.returncode != 0:
-        return _refuse("EINVAL", f"could not read HEAD of {path}", receipt_id=receipt_id)
-    current_head = (head.stdout or "").strip()
-    after = content.get("after")
-    if after and current_head != after:
-        return _refuse("EDRIFT",
-                       f"{path} HEAD is {current_head!r} but receipt {receipt_id}'s after-sha is "
-                       f"{after!r} — the tree moved again since the pull; the seal names the receipt, not the tree",
-                       receipt_id=receipt_id, receipt=content, head=current_head)
+    # Not yet applied. Only receipts no restart has already consumed are
+    # live candidates for a NEW seal to act on — try EVERY one (not just
+    # until the first hit: V3 wants every sealed candidate at this sha
+    # collected, so a single restart can cite and consume all of them, not
+    # just the newest). Journal honesty (Loki-shaped ask): name every
+    # candidate examined, and how many rows beyond the scan bound were not
+    # (V1), so the desk can see the shape without reading raw ledger rows.
+    candidates = [r for r in at_head if not _is_consumed(ledger, r.get("id"), repo=config.repo, checkout=str(path))]
+    overflow_note = f" ({overflow} more row(s) at this sha were beyond the scan bound)" if overflow else ""
+    if not candidates:
+        # Every receipt at this sha has already been consumed by an earlier
+        # restart, yet the unit's own timestamp does not (yet) reflect it —
+        # a fake/observation lag, not a new fact to wait on.
+        return _refuse("EALREADY",
+                       f"every pull receipt at HEAD {current_head!r} for repo={config.repo!r} has "
+                       f"already been consumed by a prior restart ({[r.get('id') for r in at_head]})"
+                       f"{overflow_note}",
+                       receipt_id=newest.get("id"), head=current_head)
 
-    seal = find_sealing_decision(receipt_id, config.nestor_db)
-    if seal["state"] == "unreachable":
-        return _refuse("ESEALS", f"seal store unreachable: {seal.get('cause')}",
-                       receipt_id=receipt_id, path=seal.get("path"))
-    if seal["state"] == "empty":
-        return _refuse("ENOSEAL",
-                       f"pull receipt {receipt_id} ({(content.get('before') or '')[:7]} -> {(after or '?')[:7]}) "
-                       f"is waiting for a sealed decision that names it — the desk proposes, the operator seals",
-                       receipt_id=receipt_id, receipt=content, head=current_head)
+    sealed_hits: list[tuple[str, dict, dict]] = []
+    enoseal_ids = []
+    for receipt in candidates:
+        receipt_id = receipt.get("id")
+        if not receipt_id:
+            continue
+        seal = find_sealing_decision(receipt_id, config.nestor_db)
+        if seal["state"] == "unreachable":
+            return _refuse("ESEALS", f"seal store unreachable: {seal.get('cause')}",
+                           receipt_id=receipt_id, path=seal.get("path"), head=current_head)
+        if seal["state"] == "empty":
+            enoseal_ids.append(receipt_id)
+            continue
+        sealed_hits.append((receipt_id, receipt["content"], seal))
 
-    return {"ok": True, "act": True, "unit": unit, "repo": config.repo, "checkout": str(path),
-            "receipt_id": receipt_id, "receipt": content, "head": current_head,
-            "seal": seal, "state_before": state}
+    if sealed_hits:
+        # Rework (Loki 797924DB V3): every sealed candidate at this sha —
+        # not just the one that happens to be newest — is cited by the ONE
+        # restart this tick performs, via `receipt_ids`/`seals` alongside
+        # the singular `receipt_id`/`seal` kept for the pre-rework shape.
+        # `run_once` stamps all of them onto the `unit_reload` receipt, so
+        # `_is_consumed` marks every one spent together — none is left live
+        # to authorize a second restart on a later revert-and-reapply.
+        primary_id, primary_content, primary_seal = sealed_hits[0]
+        return {"ok": True, "act": True, "unit": unit, "repo": config.repo, "checkout": str(path),
+                "receipt_id": primary_id, "receipt_ids": [h[0] for h in sealed_hits],
+                "receipt": primary_content, "head": current_head,
+                "seal": primary_seal, "seals": [h[2] for h in sealed_hits], "state_before": state}
+
+    # Every unconsumed candidate at this sha was examined (exhausted, not
+    # sliced — V1) — none carries a sealed decision. Name any sealed-but-
+    # stale receipt found at a DIFFERENT sha too (V2), so the desk can see
+    # its earlier seal is spent on nothing rather than silently absent.
+    stale_sealed = _stale_sealed_receipts(ledger, config.nestor_db, repo=config.repo, checkout=str(path),
+                                          current_head=current_head)
+    reason = (f"{len(candidates)} unconsumed git_pull receipt(s) at HEAD {current_head!r} for "
+             f"repo={config.repo!r} — waiting for a sealed decision that names one of "
+             f"{enoseal_ids} — the desk proposes, the operator seals{overflow_note}")
+    if stale_sealed:
+        reason += f"; sealed receipt(s) at another sha are now moot: {stale_sealed}"
+    return _refuse("ENOSEAL", reason,
+                   receipt_id=enoseal_ids[0] if enoseal_ids else candidates[0].get("id"),
+                   candidates=[c.get("id") for c in candidates], head=current_head,
+                   stale_sealed=stale_sealed)
 
 
 # ── the act ───────────────────────────────────────────────────────────────────
@@ -735,6 +911,10 @@ def run_once(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = Non
         content.update({
             "repo": config.repo, "checkout": str(pull_verdict["checkout"]),
             "head": pull_verdict["head"], "pull_receipt_id": pull_verdict["receipt_id"],
+            # V3: every sealed receipt check() found at this sha, not just
+            # the primary one — _is_consumed treats all of them as spent by
+            # this one restart, so none is left live to fire again later.
+            "pull_receipt_ids": pull_verdict.get("receipt_ids") or [pull_verdict["receipt_id"]],
         })
     if due_env:
         triggers.append("env_changed")

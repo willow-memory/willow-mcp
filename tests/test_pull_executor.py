@@ -22,8 +22,18 @@ class _Ledger:
         self.rows = []
 
     def append(self, project, event_type, content):
-        self.rows.append({"project": project, "event_type": event_type, "content": content})
-        return f"rec-{len(self.rows)}"
+        rid = f"rec-{len(self.rows) + 1}"
+        self.rows.append({"id": rid, "project": project, "event_type": event_type, "content": content})
+        return rid
+
+    def all_events(self, event_type, *, match):
+        """Newest first, matched by dict-subset equality on content — the
+        same contract the real GovernanceLedger promises (used by V4's
+        _unconsumed_pull_receipt_id_at, which pull_executor calls
+        directly)."""
+        out = [r for r in self.rows if r["event_type"] == event_type]
+        out = [r for r in out if all(r["content"].get(k) == v for k, v in match.items())]
+        return list(reversed(out))
 
 
 # ── a fake git ──────────────────────────────────────────────────────────────
@@ -153,6 +163,52 @@ def test_already_up_to_date_is_ok_but_not_pulled(checkout):
     out = _pull(checkout, git)
     assert out["ok"] and out["pulled"] is False and out["before"] == out["after"]
     assert ["checkout", "-q", "master"] not in git.mutations()
+
+
+def test_no_op_pull_mints_no_receipt(checkout):
+    """Gap 3df997ffe92b: a no-op pull (before == after) must not append a
+    git_pull receipt at all — a fresh receipt identical in shape to a real
+    one, minted every tick by the steward's sweep even when nothing moved,
+    used to displace an already-sealed reloader receipt from "newest"
+    before the reloader's next tick could ever see it sealed."""
+    git = _FakeGit(local_sha="bbb222", remote_sha="bbb222", ahead=0, behind=0, current="master")
+    ledger = _Ledger()
+    out = _pull(checkout, git, ledger)
+    assert out["ok"] and out["pulled"] is False and out["changed"] is False
+    assert out["before"] == out["after"] == "bbb222"
+    assert out["receipt_id"] is None
+    assert ledger.rows == []
+    assert "no-op" in out["reason"] and "bbb222" in out["reason"]
+
+
+def test_no_op_pull_returns_unconsumed_receipt_id_to_confirm(checkout):
+    """V4 (Loki 797924DB): the desk's own confirm-pull is a no-op, but an
+    earlier real pull (the steward's, or an earlier desk pull) already
+    minted a receipt at this sha — return ITS id so the desk knows which
+    receipt to name in a seal proposal, instead of a dead end."""
+    git = _FakeGit(local_sha="bbb222", remote_sha="bbb222", ahead=0, behind=0, current="master")
+    ledger = _Ledger()
+    ledger.append("forge-play", "git_pull", {"repo": "forge-play/Forge", "checkout": str(checkout),
+                                             "before": "aaa111", "after": "bbb222"})
+    out = _pull(checkout, git, ledger)
+    assert out["ok"] and out["pulled"] is False
+    assert out["receipt_id"] is None  # still no NEW receipt for the no-op itself
+    assert out["confirm_receipt_id"] == "rec-1"
+    assert "confirm receipt rec-1" in out["reason"]
+
+
+def test_no_op_pull_skips_an_already_consumed_receipt_when_confirming(checkout):
+    """V4: a receipt a prior restart already cited is not offered back as
+    something to confirm — nothing left waiting on a seal."""
+    git = _FakeGit(local_sha="bbb222", remote_sha="bbb222", ahead=0, behind=0, current="master")
+    ledger = _Ledger()
+    ledger.append("forge-play", "git_pull", {"repo": "forge-play/Forge", "checkout": str(checkout),
+                                             "before": "aaa111", "after": "bbb222"})
+    ledger.append("forge-play", "unit_reload", {"repo": "forge-play/Forge", "checkout": str(checkout),
+                                                "pull_receipt_id": "rec-1"})
+    out = _pull(checkout, git, ledger)
+    assert out["confirm_receipt_id"] is None
+    assert out["reason"] == "no-op: already at bbb222"
 
 
 def test_branch_defaults_to_the_remote_head(checkout):
