@@ -37,20 +37,17 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 ### Added
 
 * **envelope:** add envelope.ratify trust-owner verb (gap d3f79320ccb5) ([0ee7ef1](https://github.com/willow-memory/willow-mcp/commit/0ee7ef1654d801bf1ad9aaf1c97216694d31ae15))
-* **trust-owner:** envelope.ratify — the operator's seal carries a digest of the grant, and the apply half writes the register ([e5eafd0](https://github.com/willow-memory/willow-mcp/commit/e5eafd043734f296993f4ee6ba513ebacc4749ac))
 
 
 ### Fixed
 
-* **envelope:** bind the seal to the grant's content, not just its name (Loki BDC2B0F2) ([0098b41](https://github.com/willow-memory/willow-mcp/commit/0098b418e2825d1edf96c3b0fa78ddaf72ae7662))
 * **envelope:** convert envelope.ratify to the carried sealed row; bind pair_id (Loki 229BE2C1 R2+R3) ([0dbcacd](https://github.com/willow-memory/willow-mcp/commit/0dbcacdce16a500596353bd5d9250864ba84f25b))
+* **server:** apply half stops reading nestor.db; fix pending/ listing swallow ([1f2747e](https://github.com/willow-memory/willow-mcp/commit/1f2747e66dba44247e2e9318de7cb4d9897411c2))
+* **envelope:** bind the seal to the grant's content, not just its name (Loki BDC2B0F2) ([0098b41](https://github.com/willow-memory/willow-mcp/commit/0098b418e2825d1edf96c3b0fa78ddaf72ae7662))
+* **server:** the apply half must not inherit the broker's uid assumptions at import ([4d35055](https://github.com/willow-memory/willow-mcp/commit/4d3505537cc59b04b41f6cfab9a8590c8f4cc9a9))
 * **envelope:** update tool-count prose and row-density test for row 24 ([ee27385](https://github.com/willow-memory/willow-mcp/commit/ee273853fb521cd9c12055bc493c6735dcc74194))
-* **reloader:** a sealed restart confirm survives a no-op pull — match the receipt at HEAD, not the newest row ([a3b5825](https://github.com/willow-memory/willow-mcp/commit/a3b5825d2d9ab0794b5a346b798b040dec783f4f))
 * **reloader:** exhaust the at-HEAD scan, name stale seals, consume all sealed candidates at a sha ([6c6a5ec](https://github.com/willow-memory/willow-mcp/commit/6c6a5ec3c5c9ae374d04baa619eca07c7d35a99f))
 * **reloader:** match a seal to what was confirmed, not the newest row ([3013146](https://github.com/willow-memory/willow-mcp/commit/3013146786028455e32d85c046174f49b0488b9e))
-* **server:** apply half stops reading nestor.db; fix pending/ listing swallow ([1f2747e](https://github.com/willow-memory/willow-mcp/commit/1f2747e66dba44247e2e9318de7cb4d9897411c2))
-* **server:** the apply half must not inherit the broker's uid assumptions at import ([4d35055](https://github.com/willow-memory/willow-mcp/commit/4d3505537cc59b04b41f6cfab9a8590c8f4cc9a9))
-* **trust-owner:** the apply half stops inheriting the broker's uid — lazy singletons, its own CLI entry, and the sealed row travels in the signed request ([b38b2c5](https://github.com/willow-memory/willow-mcp/commit/b38b2c542d401e7e1fd5aedc9aea05e5917345c5))
 
 ## [2.78.0](https://github.com/willow-memory/willow-mcp/compare/v2.77.0...v2.78.0) (2026-09-22)
 
