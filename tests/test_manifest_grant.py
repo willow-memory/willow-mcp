@@ -664,6 +664,44 @@ def test_apply_unsigned_happy_path_two_seats(
     assert len(_receipts(pg)) == 2
 
 
+def test_apply_succeeds_when_nestor_db_is_gone_after_request(
+    home, tmp_path, monkeypatch, store, ring_with_sean, pgp_env,
+):
+    """Gap `035d287206e1`, F1 (Loki audit B00BD43E, rework 1 on 6743E7AD):
+    apply must never open nestor.db — it is a WAL database a read-only
+    opener cannot open under the real unit's `ProtectHome=read-only`, and
+    every permission shape Loki measured on the box either refused outright
+    or silently hid rows still sitting in the WAL. Proven the direct way
+    here: delete nestor.db ENTIRELY between request and apply. If apply
+    still opened it, this would refuse `EUNREACH`; instead it must grant
+    cleanly, using only the sealed row's bytes the request half already
+    embedded (and signed) in the pending record."""
+    from willow_mcp import gate, pgp
+
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("store_read",))
+    path = _manifest(home, "kart")
+    pgp.sign_detached(path)
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-mg-1",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert req["ok"] is True, req
+
+    (home / "nestor.db").unlink()
+
+    applied = mgx.manifest_grant_apply(ledger=ledger, apps_root=home / "mcp_apps",
+                                        grants_root=grants_root)
+    assert applied["ok"] is True, applied
+    result = applied["processed"][0]
+    assert result["ok"] is True
+    assert gate.permitted("kart", "store_get") is True
+
+
 def test_apply_failure_on_group_2_of_seat_1_rolls_back_group_1_and_withholds_receipts(
     home, tmp_path, monkeypatch, store, ring_with_sean,
 ):

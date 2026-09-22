@@ -190,6 +190,11 @@ def envelope_revoke_request(
             "actor": app_id, "target": target,
             "project": project or "willow-mcp", "session": session,
             "requested_at": mgx._now_iso(), "pre_state": {"envelope": {"revoked": False}},
+            # Gap 035d287206e1, F1: embed the sealed row's own bytes so the
+            # apply half re-verifies the signature without opening
+            # nestor.db (a WAL database — see manifest_grant_executor's
+            # note above _SEALED_ROW_FIELDS).
+            "sealed_row": mgx._sealed_row_fields(sealed),
         }
         return mgx._cite_and_persist(
             pending_path, pending_record, ledger=ledger, envelope_id=envelope_id,
@@ -227,7 +232,9 @@ def _apply_envelope_revoke(record: dict, path: Path, *, ledger, apps_root: Path,
     if citation_refusal is not None:
         return _fail(citation_refusal["error"], citation_refusal["reason"])
 
-    seal_refusal, sealed = mgx._verify_seal_only(pair_id, db_path=db_path)
+    # Gap 035d287206e1, F1: never opens nestor.db at apply — verifies the
+    # sealed row's bytes the request half already embedded (and signed).
+    seal_refusal, sealed = mgx._verify_seal_only(pair_id, sealed_row=record.get("sealed_row"))
     if seal_refusal is not None:
         return _fail(seal_refusal["error"], seal_refusal["reason"])
     parsed = _parse_envelope_revoke_text(sealed.get("target_text", ""))
@@ -413,6 +420,8 @@ def manifest_retire_request(
             "project": project or "willow-mcp", "session": session,
             "requested_at": mgx._now_iso(),
             "pre_state": {target_app_id: {"manifest_sha256": pre["manifest_sha256"]}},
+            # Gap 035d287206e1, F1 — see note above mgx._SEALED_ROW_FIELDS.
+            "sealed_row": mgx._sealed_row_fields(sealed),
         }
         return mgx._cite_and_persist(
             pending_path, pending_record, ledger=ledger, envelope_id=envelope_id,
@@ -449,7 +458,8 @@ def _apply_manifest_retire(record: dict, path: Path, *, ledger, apps_root: Path,
     if citation_refusal is not None:
         return _fail(citation_refusal["error"], citation_refusal["reason"])
 
-    seal_refusal, sealed = mgx._verify_seal_only(pair_id, db_path=db_path)
+    # Gap 035d287206e1, F1: never opens nestor.db at apply.
+    seal_refusal, sealed = mgx._verify_seal_only(pair_id, sealed_row=record.get("sealed_row"))
     if seal_refusal is not None:
         return _fail(seal_refusal["error"], seal_refusal["reason"])
     parsed = _parse_manifest_retire_text(sealed.get("target_text", ""))
@@ -693,6 +703,8 @@ def manifest_create_request(
             "actor": app_id, "target": target,
             "project": project or "willow-mcp", "session": session,
             "requested_at": mgx._now_iso(), "pre_state": {seat_id: {"exists": False}},
+            # Gap 035d287206e1, F1 — see note above mgx._SEALED_ROW_FIELDS.
+            "sealed_row": mgx._sealed_row_fields(sealed),
         }
         return mgx._cite_and_persist(
             pending_path, pending_record, ledger=ledger, envelope_id=envelope_id,
@@ -729,7 +741,8 @@ def _apply_manifest_create(record: dict, path: Path, *, ledger, apps_root: Path,
     if citation_refusal is not None:
         return _fail(citation_refusal["error"], citation_refusal["reason"])
 
-    seal_refusal, sealed = mgx._verify_seal_only(pair_id, db_path=db_path)
+    # Gap 035d287206e1, F1: never opens nestor.db at apply.
+    seal_refusal, sealed = mgx._verify_seal_only(pair_id, sealed_row=record.get("sealed_row"))
     if seal_refusal is not None:
         return _fail(seal_refusal["error"], seal_refusal["reason"])
     parsed = _parse_manifest_create_text(sealed.get("target_text", ""))
@@ -901,6 +914,8 @@ def federation_ratify_request(
             "actor": app_id, "target": target,
             "project": project or "willow-mcp", "session": session,
             "requested_at": mgx._now_iso(), "pre_state": {"command": {"exists": True}},
+            # Gap 035d287206e1, F1 — see note above mgx._SEALED_ROW_FIELDS.
+            "sealed_row": mgx._sealed_row_fields(sealed),
         }
         return mgx._cite_and_persist(
             pending_path, pending_record, ledger=ledger, envelope_id=envelope_id,
@@ -935,7 +950,8 @@ def _apply_federation_ratify(record: dict, path: Path, *, ledger, apps_root: Pat
     if citation_refusal is not None:
         return _fail(citation_refusal["error"], citation_refusal["reason"])
 
-    seal_refusal, sealed = mgx._verify_seal_only(pair_id, db_path=db_path)
+    # Gap 035d287206e1, F1: never opens nestor.db at apply.
+    seal_refusal, sealed = mgx._verify_seal_only(pair_id, sealed_row=record.get("sealed_row"))
     if seal_refusal is not None:
         return _fail(seal_refusal["error"], seal_refusal["reason"])
     parsed = _parse_federation_ratify_text(sealed.get("target_text", ""))

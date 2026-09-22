@@ -503,7 +503,19 @@ def _canonical_request_bytes(record: dict) -> bytes:
     ``manifest.grant`` record (whether or not it explicitly carries
     ``"verb": "manifest.grant"``) signs the EXACT SAME bytes as before this
     change: a pending file signed before this rework still verifies against
-    a broker key generated after it, and vice versa."""
+    a broker key generated after it, and vice versa.
+
+    ``sealed_row`` (gap ``035d287206e1``, F1) is covered UNCONDITIONALLY,
+    for every verb: it is now the one artifact the apply half trusts in
+    place of a fresh nestor.db read, so it must be exactly as tamper-evident
+    as ``target``/``apps``/``groups`` already are — an attacker who could
+    edit the embedded sealed bytes without invalidating ``broker_sig`` could
+    splice in a different, genuinely-signed sealed row (from an unrelated
+    pair) that happens to parse to whatever grammar the tampered record's
+    own ``target``/``apps``/``groups`` names. A request written before this
+    field existed carries no ``sealed_row`` key; ``record.get(...)`` folds
+    that in as ``None``, so old and new requests still sign distinguishable,
+    self-consistent bytes rather than colliding."""
     payload = {
         "pair_id": record.get("pair_id"),
         "envelope_id": record.get("envelope_id"),
@@ -512,6 +524,7 @@ def _canonical_request_bytes(record: dict) -> bytes:
         "groups": record.get("groups"),
         "pre_state": record.get("pre_state"),
         "requested_at": record.get("requested_at"),
+        "sealed_row": record.get("sealed_row"),
     }
     verb = record.get("verb") or VERB
     if verb != VERB:
@@ -550,7 +563,41 @@ def _verify_request_signature(record: dict, grants_root: Path) -> tuple[bool, st
     return True, "ok"
 
 
-def _verify_seal_only(pair_id: str, *, db_path: Optional[Path] = None) -> tuple[Optional[dict], Optional[dict]]:
+#: The fields a sealed row's signature actually covers, and the exact set
+#: the REQUEST half now embeds in the pending record so the APPLY half never
+#: has to open nestor.db to re-verify (gap `035d287206e1`, F1 — Loki audit
+#: B00BD43E, desk decision on 6864961F): nestor.db is a WAL database,
+#: and a read-only opener under `ProtectHome=read-only` cannot create the
+#: `-shm` sidecar a WAL reader needs. Measured under every permission shape
+#: the trust-owner uid can be given (sidecars present-but-unreadable,
+#: sidecars absent with a read-only directory, `immutable=1`, a bare ACL on
+#: the db file alone) — all four either fail outright or silently hide rows
+#: still sitting in the WAL. The remedy Loki names as option (iii): the
+#: broker (which CAN read nestor.db) copies the sealed row's own bytes into
+#: the signed, broker-``broker_sig``-covered request; the apply half re-runs
+#: :func:`net_signer.verify_seal` against those embedded bytes and the
+#: public ring — the ed25519 signature is the anchor, not the file it came
+#: from. Trade-off named honestly: a pair superseded AFTER request but
+#: BEFORE apply is no longer caught at apply time (supersession is checked
+#: only by :func:`net_authority.read_sealed_pair`, a nestor.db read, which
+#: the request half still performs) — a pending request can sit for
+#: minutes, and this narrows (does not remove) that window; the desk chose
+#: this over widening ProtectHome or granting the trust owner nestor.db's
+#: WAL sidecars.
+_SEALED_ROW_FIELDS = ("source_norm", "target_text", "verifier", "seal_sig", "created_at")
+
+
+def _sealed_row_fields(sealed: dict) -> dict:
+    """The exact subset of a ``state: populated`` sealed dict
+    (:func:`net_authority.read_sealed_pair`'s own shape) that
+    :func:`net_signer.verify_seal` needs and nothing else — stashed onto a
+    pending record at request time so the apply half never has to read
+    nestor.db to re-derive it."""
+    return {k: sealed.get(k) for k in _SEALED_ROW_FIELDS}
+
+
+def _verify_seal_only(pair_id: str, *, db_path: Optional[Path] = None,
+                       sealed_row: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
     """Refuse unless the sealed pair's ed25519 signature verifies — no
     grammar, no target binding. ``(refusal, sealed)``: exactly one is
     ``None``. Factored out of :func:`_bind_to_seal` (pair ``1bd6fd29``
@@ -566,11 +613,31 @@ def _verify_seal_only(pair_id: str, *, db_path: Optional[Path] = None) -> tuple[
     ``config/verifiers.json``, using the SEALED ROW's own ``verifier`` field
     — never the SOIL record's ``nestor_verifier``, which is mutable after
     the seal lands and is not what the signature covers.
+
+    ``sealed_row`` (gap ``035d287206e1``, F1): when given, this is the
+    apply-side call — the sealed bytes the REQUEST half already read from
+    nestor.db and embedded (signed) in the pending record, never a fresh
+    nestor.db read. ``db_path``/``sealed_row`` are mutually exclusive in
+    practice: request-time callers pass ``db_path`` (they CAN read
+    nestor.db, and must, to bind the grant to what was actually sealed);
+    apply-time callers pass ``sealed_row`` (they never open nestor.db at
+    all — see the module-level note above :data:`_SEALED_ROW_FIELDS`).
     """
     from . import keyring as _keyring
     from . import net_signer
 
-    sealed = _load_sealed_ruling(pair_id, db_path=db_path)
+    if sealed_row is not None:
+        missing = [k for k in _SEALED_ROW_FIELDS if not sealed_row.get(k)]
+        if missing:
+            return _refuse(
+                "eforged",
+                f"pending record's embedded sealed_row is missing {missing!r} — not "
+                "written by a request half that stashes the sealed bytes (gap "
+                "035d287206e1), or corrupted after the fact",
+            ), None
+        sealed = {"state": "populated", **{k: sealed_row.get(k) for k in _SEALED_ROW_FIELDS}}
+    else:
+        sealed = _load_sealed_ruling(pair_id, db_path=db_path)
     state = sealed.get("state")
     if state == "unreachable":
         return _refuse(
@@ -614,15 +681,19 @@ def _verify_seal_only(pair_id: str, *, db_path: Optional[Path] = None) -> tuple[
 
 
 def _bind_to_seal(pair_id: str, apps: list[str], groups: list[str], *,
-                   db_path: Optional[Path] = None) -> Optional[dict]:
+                   db_path: Optional[Path] = None,
+                   sealed_row: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
     """Refuse unless the sealed pair's ed25519 signature verifies AND its
     own text names exactly ``apps``/``groups`` (read off the mutable SOIL
-    record). Returns a refusal dict, or ``None`` when the grant is bound
-    cleanly and the seal is genuine. ``manifest.grant``'s own grammar
-    binder, built on :func:`_verify_seal_only`."""
-    refusal, sealed = _verify_seal_only(pair_id, db_path=db_path)
+    record). ``(refusal, sealed)``: exactly one is ``None`` — the request
+    side needs ``sealed`` back to stash :func:`_sealed_row_fields` of it
+    onto the pending record (gap ``035d287206e1``); the apply side passes
+    ``sealed_row`` instead of ``db_path`` and never touches nestor.db.
+    ``manifest.grant``'s own grammar binder, built on
+    :func:`_verify_seal_only`."""
+    refusal, sealed = _verify_seal_only(pair_id, db_path=db_path, sealed_row=sealed_row)
     if refusal is not None:
-        return refusal
+        return refusal, None
 
     parsed = _parse_ruling_text(sealed.get("target_text", ""))
     if parsed is None:
@@ -632,7 +703,7 @@ def _bind_to_seal(pair_id: str, apps: list[str], groups: list[str], *,
             f"grammar ({RULING_FORMAT!r} seats=<a,b> groups=<c,d>, one line, prose "
             "below it) — refusing to guess what was actually sealed",
             sealed_text=sealed.get("target_text"),
-        )
+        ), None
     if set(parsed["apps"]) != set(apps) or set(parsed["groups"]) != set(groups):
         return _refuse(
             "eseal_mismatch",
@@ -641,8 +712,8 @@ def _bind_to_seal(pair_id: str, apps: list[str], groups: list[str], *,
             "seal; refusing rather than trusting the mutable record over the seal",
             sealed_apps=parsed["apps"], sealed_groups=parsed["groups"],
             record_apps=apps, record_groups=groups,
-        )
-    return None
+        ), None
+    return None, sealed
 
 
 # ── substrings from set_permission's own RuntimeError messages ─────────────
@@ -1164,7 +1235,7 @@ def _manifest_grant_request_locked(
         return parsed
     apps, groups = parsed["apps"], parsed["groups"]
 
-    seal_refusal = _bind_to_seal(pair_id, apps, groups, db_path=db_path)
+    seal_refusal, sealed = _bind_to_seal(pair_id, apps, groups, db_path=db_path)
     if seal_refusal is not None:
         return seal_refusal
 
@@ -1236,6 +1307,10 @@ def _manifest_grant_request_locked(
         "actor": app_id, "apps": apps, "groups": groups,
         "project": project or "willow-mcp", "session": session,
         "requested_at": _now_iso(), "pre_state": pre_state,
+        # Gap 035d287206e1, F1: the sealed row's own bytes, embedded here
+        # (and covered by broker_sig below) so the apply half never opens
+        # nestor.db — see the note above _SEALED_ROW_FIELDS.
+        "sealed_row": _sealed_row_fields(sealed),
     }
     _write_json_atomic(pending_path, pending_record)
 
@@ -1432,8 +1507,18 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
     if not sig_ok:
         return _fail("eforged", sig_reason)
 
-    # 2. The seal — re-verified fresh (a pending request can sit for minutes).
-    seal_refusal = _bind_to_seal(pair_id, apps, groups, db_path=db_path)
+    # 2. The seal — re-verified fresh (a pending request can sit for
+    # minutes), but NEVER by opening nestor.db here (gap 035d287206e1, F1):
+    # it is a WAL database and a read-only opener under this unit's
+    # ProtectHome=read-only cannot create the -shm sidecar a WAL reader
+    # needs — measured EUNREACH/edrift-shaped failures under every
+    # permission grant tried. The sealed row's own bytes were embedded
+    # (and broker-signed) in the pending record at request time; re-verify
+    # THOSE against the public ring instead — see the note above
+    # _SEALED_ROW_FIELDS. `db_path` is still accepted by this function for
+    # the request-side callers that share it; passed nowhere below.
+    seal_refusal, _sealed_at_apply = _bind_to_seal(
+        pair_id, apps, groups, sealed_row=record.get("sealed_row"))
     if seal_refusal is not None:
         return _fail(seal_refusal["error"], seal_refusal["reason"],
                      **{k: v for k, v in seal_refusal.items() if k not in ("ok", "error", "reason")})
@@ -1656,6 +1741,26 @@ def manifest_grant_apply(
     from . import gate
     apps_root_p = apps_root if apps_root is not None else gate._apps_root()
 
+    # Gap 035d287206e1 (2026-09-22): `Path.is_dir()`/`.exists()` swallow
+    # EVERY `OSError` — including `PermissionError` — and return `False`,
+    # by design (pathlib's own documented behaviour). That means a genuinely
+    # UNREADABLE apps_root/grants_root (the trust-owner uid cannot traverse
+    # $WILLOW_HOME) used to read EXACTLY like "nothing pending, all done":
+    # `{"ok": true, "state": "empty"}`, every tick, forever — the silent
+    # false-positive is worse than a crash, because nothing ever surfaces
+    # it. Distinguish "genuinely absent" (a real, expected empty-install
+    # state) from "present but this uid cannot even stat it" up front, and
+    # refuse the second case by name, listing exactly which path failed.
+    for candidate in (apps_root_p.parent, apps_root_p):
+        try:
+            candidate.stat()
+        except FileNotFoundError:
+            break  # absent, not blocked — the normal "not installed yet" case
+        except OSError as exc:
+            return {"ok": False, "state": "refused", "error": "EACCES",
+                    "reason": f"cannot reach {candidate}: {type(exc).__name__}: {exc}",
+                    "unreadable_path": str(candidate), "processed": []}
+
     # Loki audit 3, finding 3: the unit template carried no User= and this
     # function made no uid check at all, so enabling it under the operator's
     # own session ran it as the broker's uid and got `eperm` on mcp_apps
@@ -1681,12 +1786,34 @@ def manifest_grant_apply(
 
     root = _grants_root(grants_root)
     pending_dir = root / "pending"
+    for candidate in (root.parent, root, pending_dir):
+        try:
+            candidate.stat()
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            return {"ok": False, "state": "refused", "error": "EACCES",
+                    "reason": f"cannot reach {candidate}: {type(exc).__name__}: {exc}",
+                    "unreadable_path": str(candidate), "processed": []}
     if not pending_dir.is_dir():
         return {"ok": True, "state": "empty", "processed": []}
     if pair_id:
         files = [p for p in [pending_dir / f"{pair_id}.json"] if p.is_file()]
     else:
-        files = sorted(pending_dir.glob("*.json"))
+        # Gap 035d287206e1, F2 (Loki audit B00BD43E): the stat() probes
+        # above catch "cannot TRAVERSE" (needs only x on the parent) but
+        # Path.glob() swallows "cannot LIST" (needs r on pending_dir
+        # itself) exactly the way is_dir()/exists() do — a traversable but
+        # unreadable pending/ (mode 111) used to read as {ok: true, state:
+        # "empty"}, exit 0, silently, forever. os.listdir raises on that;
+        # glob does not.
+        try:
+            names = os.listdir(pending_dir)
+        except OSError as exc:
+            return {"ok": False, "state": "refused", "error": "EACCES",
+                    "reason": f"cannot list {pending_dir}: {type(exc).__name__}: {exc}",
+                    "unreadable_path": str(pending_dir), "processed": []}
+        files = sorted(pending_dir / n for n in names if n.endswith(".json"))
     if not files:
         return {"ok": True, "state": "empty", "processed": []}
 

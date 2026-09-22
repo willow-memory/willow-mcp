@@ -640,6 +640,22 @@ def test_revoke_second_request_is_ealready(home, tmp_path, monkeypatch, store, r
 
 
 def test_revoke_apply_time_eseal_mismatch(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """Gap `035d287206e1`, F1 rework: apply no longer opens nestor.db at
+    all (a WAL database a read-only opener cannot open under this unit's
+    ProtectHome=read-only — see manifest_grant_executor's note above
+    `_SEALED_ROW_FIELDS`), so re-sealing the SAME pair_id with different
+    text after the request no longer changes what apply sees — apply only
+    ever re-verifies the sealed bytes the request half already embedded
+    (and signed) in the pending record. Since `sealed_row` is now covered
+    by `broker_sig` too (the same rework, `_canonical_request_bytes`), a
+    tamper of `target` alone no longer reaches the grammar check at all —
+    it is caught earlier, as `eforged` (covered by
+    `test_revoke_apply_time_eforged_on_tampered_signature`). What THIS
+    test proves instead: apply's grammar check is real defense-in-depth
+    even when both `target` and `sealed_row` carry a valid `broker_sig` —
+    simulated here by re-signing a deliberately inconsistent record with
+    the SAME broker key this process already holds (standing in for "the
+    broker itself signed something inconsistent," never a real forgery)."""
     active_extra = [{
         "id": "env-x", "verb_id": 99, "verb": "some.other", "grantee": "jeles",
         "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
@@ -656,12 +672,15 @@ def test_revoke_apply_time_eseal_mismatch(home, tmp_path, monkeypatch, store, ri
     out = _revoke_env(store=store, ledger=ledger, pair_id="pair-rev-mismatch", grants_root=grants_root)
     assert out["ok"] is True
 
-    # The sealed pair's own text changes after the request was recorded —
-    # re-sealed (same pair_id, INSERT OR REPLACE) with a different reason.
-    # Apply re-parses the CURRENT sealed text fresh and must refuse rather
-    # than trust the pending record's stale recorded target.
-    _seal(home, store, pair_id="pair-rev-mismatch",
-          target_text="revoke envelope env-x: a DIFFERENT reason", kr=ring_with_sean)
+    # `target` is edited and the record RE-SIGNED (this test's own access
+    # to the broker key, not a forgery) so `broker_sig` still verifies —
+    # the embedded `sealed_row` is left untouched and still parses to
+    # "original reason"; apply must refuse the mismatch between the two.
+    pending_path = grants_root / "pending" / "pair-rev-mismatch.json"
+    record = json.loads(pending_path.read_text())
+    record["target"]["reason"] = "a DIFFERENT reason"
+    record["broker_sig"] = mgx._sign_request(record, grants_root)
+    pending_path.write_text(json.dumps(record, indent=2))
 
     apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
     processed = apply_out["processed"][0]
@@ -805,6 +824,11 @@ def test_ratify_second_request_is_ealready(home, tmp_path, monkeypatch, store, r
 
 
 def test_ratify_apply_time_eseal_mismatch(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """See `test_revoke_apply_time_eseal_mismatch`'s docstring: gap
+    `035d287206e1`, F1 rework — apply never opens nestor.db, and
+    `sealed_row` is now covered by `broker_sig` too, so this simulates a
+    signed-but-internally-inconsistent record (re-signed with this test's
+    own access to the broker key) rather than a post-request re-seal."""
     server = _fake_server(tmp_path)
     _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=23, bounds={"servers": ["jeles-corpus"]})
     _seal(home, store, pair_id="pair-fed-mismatch",
@@ -816,10 +840,11 @@ def test_ratify_apply_time_eseal_mismatch(home, tmp_path, monkeypatch, store, ri
     out = _ratify(store=store, ledger=ledger, pair_id="pair-fed-mismatch", grants_root=grants_root)
     assert out["ok"] is True
 
-    _seal(home, store, pair_id="pair-fed-mismatch",
-          target_text=f"ratify federation server jeles-corpus command {server} cwd {tmp_path} "
-                      "env_keys [WILLOW_HOME, WILLOW_STORE_ROOT]",
-          kr=ring_with_sean)
+    pending_path = grants_root / "pending" / "pair-fed-mismatch.json"
+    record = json.loads(pending_path.read_text())
+    record["target"]["env_keys"] = ["WILLOW_HOME", "WILLOW_STORE_ROOT"]
+    record["broker_sig"] = mgx._sign_request(record, grants_root)
+    pending_path.write_text(json.dumps(record, indent=2))
 
     apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
     processed = apply_out["processed"][0]
