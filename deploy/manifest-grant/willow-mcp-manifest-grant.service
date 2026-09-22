@@ -1,0 +1,69 @@
+# /etc/systemd/system/willow-mcp-manifest-grant.service
+#
+# manifest.grant apply as a SYSTEM unit under the trust owner — sealed pair
+# 1fdfbdf3 (2026-09-21, amending a7a98534 / 6bd11def), install collapsed to
+# one root act under sealed pair 1bd6fd29 (2026-09-22): "Setup is the
+# installer's (root, once, detects rather than asks). Operations are
+# Willow's, executed by the trust-owner apply half under a sealed pair. The
+# operator's only keyboard act is the seal." The --user unit failed every
+# tick with `ewronguser`: mcp_apps is not owned by the broker's uid and a
+# --user manager cannot switch identity. This unit runs as the uid that owns
+# $WILLOW_HOME/mcp_apps (trust_root_setup.DEFAULT_TRUST_OWNER = willow-operator,
+# the same uid willow-mcp-net-signer runs as), signs with a key that uid owns,
+# and never reads the broker's env file: the four values it needs live in
+# /etc/willow-mcp/manifest-grant.env, root-owned, group-readable by the
+# trust owner only. Since pair 1bd6fd29 this same apply drains four more
+# verbs on the same queue (envelope.revoke, manifest.retire, manifest.create,
+# federation.ratify — syscall-table rows 19-22), dispatched by the pending
+# record's own `verb` field; nothing here changes per verb.
+#
+# Preconditions (INSTALL.md beside this file, each an operator act; install.sh
+# performs them in one root act):
+#   * $WILLOW_HOME/mcp_apps owned by willow-operator (it reads uid 65534 today —
+#     find out why before chowning; if the vault mount squashes ownership no
+#     chown will stick and the pair needs a different home for mcp_apps).
+#   * a dedicated passphrase-less PGP signing key in GNUPGHOME below, its
+#     public half imported into the broker's keyring, WILLOW_PGP_FINGERPRINT in
+#     /etc/willow-mcp/manifest-grant.env AND in the broker's env set to it, and
+#     every seat manifest re-signed once by hand under it (pre-state check).
+#   * manifest_grants/{pending,done,failed}: pending/ writable by 1000 (the
+#     request half) and rwx for willow-operator (it unlinks after apply);
+#     done/ and failed/ writable by willow-operator; the request signing key's
+#     PUBLIC half readable by willow-operator. ACLs, not chown — the broker
+#     still writes pending/.
+#   * $WILLOW_HOME/constitutional (envelope registry) rwx for willow-operator —
+#     envelope.revoke (row 19) writes there directly, outside mcp_apps/.
+#   * a Postgres role for willow-operator (peer auth on the local socket) with
+#     the broker role's read grants on the FRANK tables plus INSERT — the
+#     apply confirms its citation in FRANK and inks the per-verb `<verb>_applied`
+#     event there; with no ledger every apply refuses EUNREACH.
+[Unit]
+Description=willow-mcp manifest-grant — apply sealed permission grants (trust owner)
+After=network.target postgresql.service
+RequiresMountsFor=/home/sean-campbell/sean-data-vault/willow-operator-box
+
+[Service]
+Type=oneshot
+User=willow-operator
+Group=willow-operator
+UMask=0027
+EnvironmentFile=/etc/willow-mcp/manifest-grant.env
+Environment="WILLOW_HOME=/home/sean-campbell/sean-data-vault/willow-operator-box"
+Environment="WILLOW_NESTOR_DB=/home/sean-campbell/sean-data-vault/willow-operator-box/nestor.db"
+Environment="GNUPGHOME=/var/lib/willow-mcp/manifest-grant/gnupg"
+ExecStart=/home/sean-campbell/sean-data-vault/willow-operator-box/venvs/willow-mcp/bin/python -m willow_mcp manifest-grant apply
+# The gpg-agent for GNUPGHOME above is started on demand by gpg itself; the key
+# has no passphrase, so nothing prompts (the template's own warning about a
+# prompt with nowhere to go is what this precondition removes).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/sean-campbell/sean-data-vault/willow-operator-box/manifest_grants
+ReadWritePaths=/home/sean-campbell/sean-data-vault/willow-operator-box/mcp_apps
+ReadWritePaths=/home/sean-campbell/sean-data-vault/willow-operator-box/constitutional
+ReadWritePaths=/var/lib/willow-mcp/manifest-grant
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

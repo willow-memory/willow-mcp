@@ -1,0 +1,15 @@
+# /etc/systemd/system/willow-mcp-manifest-grant.timer
+# Sealed pairs 1fdfbdf3 (system unit under the trust owner) and 1bd6fd29
+# (setup is the installer's; operations are Willow's).
+# Same cadence as the retired --user timer: a request is minutes old before
+# there is anything to drain, and an empty pending/ exits quietly.
+[Unit]
+Description=willow-mcp manifest-grant — poll for pending sealed grants (trust owner)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+Unit=willow-mcp-manifest-grant.service
+
+[Install]
+WantedBy=timers.target
