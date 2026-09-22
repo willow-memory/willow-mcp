@@ -421,6 +421,56 @@ def test_unparseable_sealed_text_is_refused_einval(
     assert "grammar" in out["reason"]
 
 
+# ── R2 (Loki audit 229BE2C1): pair_id folded into the sealed-row binding ───
+
+def test_sealed_row_pair_id_mismatch_is_refused():
+    """Loki audit 229BE2C1, R2: `seal_message` (net_signer.py) covers only
+    `(source_norm, target_text, verifier)` — never `pair_id` — so before
+    this fix a genuinely-signed sealed row presented under a DIFFERENT
+    `pair_id` passed `_verify_seal_only`; the pair<->row binding rested
+    entirely on `broker_sig`, one signature where there used to be two
+    (before gap `035d287206e1`, the row was read from nestor.db BY
+    `pair_id`, so it structurally could not be another pair's). A row
+    genuinely sealed for pair A, presented at apply under pair B, must now
+    refuse before the seal signature is ever checked."""
+    sealed_row = mgx._sealed_row_fields({
+        "pair_id": "pair-A", "source_norm": "grant kart store_read",
+        "target_text": "willow-manifest-grant-v1 seats=kart groups=store_read",
+        "verifier": "sean", "seal_sig": "deadbeef", "created_at": "2026-01-01T00:00:00Z",
+    })
+    refusal, sealed = mgx._verify_seal_only("pair-B", sealed_row=sealed_row)
+    assert refusal is not None
+    assert refusal["error"] == "eseal_mismatch"
+    assert sealed is None
+
+
+def test_sealed_row_pair_id_match_clears_the_binding_check():
+    """The positive leg: the SAME `pair_id` on both sides clears the new
+    check — this row then fails downstream on its fabricated `seal_sig`
+    instead (no real ed25519 signature here), proving the pair_id gate
+    itself did not swallow a legitimate row; it is a earlier, narrower
+    refusal than the signature check, not a replacement for it."""
+    sealed_row = mgx._sealed_row_fields({
+        "pair_id": "pair-A", "source_norm": "grant kart store_read",
+        "target_text": "willow-manifest-grant-v1 seats=kart groups=store_read",
+        "verifier": "sean", "seal_sig": "deadbeef", "created_at": "2026-01-01T00:00:00Z",
+    })
+    refusal, sealed = mgx._verify_seal_only("pair-A", sealed_row=sealed_row)
+    assert refusal is not None
+    assert refusal["error"] != "eseal_mismatch"
+
+
+def test_load_sealed_ruling_injects_pair_id(home, tmp_path, store, ring_with_sean):
+    """`net_authority.read_sealed_pair` never returns `pair_id` (it is the
+    query's own input, not a selected column) — `_load_sealed_ruling`
+    folds it in so every downstream reader (`_sealed_row_fields` included)
+    sees it as an ordinary field of the `sealed` dict."""
+    _seal(home, store, seats=("kart",), groups=("store_read",), kr=ring_with_sean)
+    sealed = mgx._load_sealed_ruling("pair-mg-1", db_path=home / "nestor.db")
+    assert sealed["state"] == "populated"
+    assert sealed["pair_id"] == "pair-mg-1"
+
+
 def test_ruling_text_round_trips():
     text = mgx.ruling_text(["kart", "hanuman"], ["store_read", "knowledge_read"])
     parsed = mgx._parse_ruling_text(text)

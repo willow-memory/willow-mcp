@@ -1478,3 +1478,154 @@ def test_envelope_ratify_apply_refuses_edrift_when_already_ratified(
 
     status = mgx.manifest_grant_status("pair-envrat-1", grants_root=grants_root)
     assert status["state"] == "failed"
+
+
+# ── R3 (Loki audit 229BE2C1): no verb's apply path opens nestor.db ─────────
+#
+# fix/apply-half-receipt-log converted the first four trust-owner verbs to
+# the carried sealed row (gap 035d287206e1, F1): the request half embeds
+# `sealed_row` (covered by `broker_sig`), the apply half re-verifies with
+# `sealed_row=` and never opens nestor.db. envelope.ratify was added to
+# this branch AFTER that conversion and was left on the old `db_path=`
+# path — `git merge-tree` reported no conflict, so nothing would have
+# warned anyone; converted in the same commit as this test. Parametrised
+# over all five verbs so a SIXTH verb added later without this conversion
+# fails this test instead of going dark (EUNREACH every tick) on the box.
+# Proven the direct way test_manifest_grant.py's own
+# test_apply_succeeds_when_nestor_db_is_gone_after_request already uses
+# for manifest.grant: delete nestor.db ENTIRELY between request and apply.
+
+def _nestor_gone_setup_revoke(home, tmp_path, monkeypatch, store, ring_with_sean):
+    # envelope_authoring.revoke() refuses EREGISTRY unless the register
+    # resolves to $WILLOW_HOME/constitutional/pre-approved.json — same
+    # reasoning as test_revoke_end_to_end: never set WILLOW_ENVELOPE_REGISTRY
+    # (what _charter does) for this verb.
+    default_reg = home / "constitutional" / "pre-approved.json"
+    default_reg.parent.mkdir(parents=True, exist_ok=True)
+    active = [
+        {
+            "id": "env-envelope.revoke-nestor-gone", "verb_id": 20, "verb": "envelope.revoke",
+            "grantee": "willow", "bounds": {"envelope_ids": ["env-nestor-gone"]},
+            "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+            "max_count": None, "use_count_source": "frank", "status": "active",
+        },
+        {
+            "id": "env-nestor-gone", "verb_id": 99, "verb": "some.other", "grantee": "jeles",
+            "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
+            "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+            "status": "active",
+        },
+    ]
+    default_reg.write_text(json.dumps({"active": active}))
+    tab = home / "constitutional" / "syscall-table.json"
+    tab.write_text(json.dumps({"verbs": [{"id": 20, "verb": "envelope.revoke",
+                                           "bounds": {"envelope_ids": "l"}}]}))
+    monkeypatch.setenv("WILLOW_SYSCALL_TABLE", str(tab))
+    _seal(home, store, pair_id="pair-nestor-gone",
+          target_text="revoke envelope env-nestor-gone: t", kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _revoke_env(store=store, ledger=ledger, pair_id="pair-nestor-gone", grants_root=grants_root)
+    assert out["ok"] is True, out
+    return ledger, grants_root
+
+
+def _nestor_gone_setup_retire(home, tmp_path, monkeypatch, store, ring_with_sean):
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=21, bounds={"apps": ["jeles"]})
+    _manifest(home, "jeles")
+    _seal(home, store, pair_id="pair-nestor-gone", target_text="retire seat jeles: t", kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _retire_seat(store=store, ledger=ledger, pair_id="pair-nestor-gone",
+                        apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["ok"] is True, out
+    return ledger, grants_root
+
+
+def _nestor_gone_setup_create(home, tmp_path, monkeypatch, store, ring_with_sean):
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
+             bounds={"apps": ["jeles-corpus"], "groups": []})
+    _seal(home, store, pair_id="pair-nestor-gone",
+          target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
+          kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _create_seat(store=store, ledger=ledger, pair_id="pair-nestor-gone",
+                        apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["ok"] is True, out
+    return ledger, grants_root
+
+
+def _nestor_gone_setup_federation_ratify(home, tmp_path, monkeypatch, store, ring_with_sean):
+    server = _fake_server(tmp_path)
+    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=23, bounds={"servers": ["jeles-corpus"]})
+    _seal(home, store, pair_id="pair-nestor-gone",
+          target_text=f"ratify federation server jeles-corpus command {server} cwd {tmp_path} env_keys [WILLOW_HOME]",
+          kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _ratify(store=store, ledger=ledger, pair_id="pair-nestor-gone", grants_root=grants_root)
+    assert out["ok"] is True, out
+    return ledger, grants_root
+
+
+def _nestor_gone_setup_envelope_ratify(home, tmp_path, monkeypatch, store, ring_with_sean):
+    # ratify_proposal_row() also refuses EREGISTRY off the default
+    # resolution — same reasoning as test_envelope_ratify_end_to_end.
+    default_reg = home / "constitutional" / "pre-approved.json"
+    default_reg.parent.mkdir(parents=True, exist_ok=True)
+    governing = {
+        "id": "env-envelope.ratify-nestor-gone", "verb_id": 24, "verb": "envelope.ratify",
+        "grantee": "willow", "bounds": {"proposal_ids": ["env-jeles-dispatch"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }
+    default_reg.write_text(json.dumps({"active": [governing]}))
+    tab = home / "constitutional" / "syscall-table.json"
+    tab.write_text(json.dumps({"verbs": [{"id": 24, "verb": "envelope.ratify",
+                                           "bounds": {"proposal_ids": "l"}}]}))
+    monkeypatch.setenv("WILLOW_SYSCALL_TABLE", str(tab))
+    proposal = _proposal_row(bounds={"channel": "ops"})
+    _write_sidecar(home, proposals=[proposal])
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    _ink_proposed(ledger, proposal)
+    _seal(home, store, pair_id="pair-nestor-gone",
+          target_text=_ratify_text(proposal, words="ratify all three"), kr=ring_with_sean)
+    grants_root = home / "manifest_grants"
+    out = _envelope_ratify(store=store, ledger=ledger, pair_id="pair-nestor-gone", grants_root=grants_root)
+    assert out["ok"] is True, out
+    return ledger, grants_root
+
+
+_NESTOR_GONE_SETUPS = {
+    "envelope.revoke": _nestor_gone_setup_revoke,
+    "manifest.retire": _nestor_gone_setup_retire,
+    "manifest.create": _nestor_gone_setup_create,
+    "federation.ratify": _nestor_gone_setup_federation_ratify,
+    "envelope.ratify": _nestor_gone_setup_envelope_ratify,
+}
+
+
+@pytest.mark.parametrize("verb", sorted(_NESTOR_GONE_SETUPS))
+def test_apply_never_opens_nestor_db(verb, home, tmp_path, monkeypatch, store, ring_with_sean):
+    """Parametrised over all five trust-owner verbs on this queue (gap
+    035d287206e1, F1 + Loki audit 229BE2C1, R3): after a successful
+    request, nestor.db is deleted ENTIRELY before apply runs. If apply
+    still opened it, every one of these would refuse EUNREACH; instead
+    each must grant cleanly using only the `sealed_row` bytes the request
+    half already embedded (and signed) in the pending record. A verb
+    missing from `_NESTOR_GONE_SETUPS` above is a verb this test cannot
+    cover — the assignment (add a sixth verb here too) is on whoever adds
+    one, not a silent pass."""
+    ledger, grants_root = _NESTOR_GONE_SETUPS[verb](home, tmp_path, monkeypatch, store, ring_with_sean)
+
+    (home / "nestor.db").unlink()
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["ok"] is True, processed
