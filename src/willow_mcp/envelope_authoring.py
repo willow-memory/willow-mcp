@@ -169,7 +169,7 @@ def registry_identity(path: Optional[Path] = None) -> dict:
         # Legacy pre-split file (never migrated) may still carry proposals
         # inline — read it if present, else fall through to the sidecar.
         out["proposals"] = len(doc.get("proposals") or [])
-    prop_path = p.with_name("proposals.json")
+    prop_path = _proposals_path()
     try:
         prop_raw = prop_path.read_bytes()
         prop_doc = json.loads(prop_raw.decode("utf-8"))
@@ -260,14 +260,28 @@ def _now_iso() -> str:
 
 
 def _proposals_path() -> Path:
-    """Sealed pair 31f5d3af (2026-09-22): the active register
-    (``pre-approved.json``) and the proposal queue are two different trust
-    boundaries, not one file with two views. ``proposals[]``/``archived[]``
-    live in this sibling file instead — broker-owned (0600, the same uid
-    that has always run the broker), never signed, never requiring
-    trust-owner ownership. The broker writes it directly, exactly as it
-    always wrote the combined file before this split."""
-    return _envelopes.registry_path().with_name("proposals.json")
+    """Rework (Loki audit 54E3DFC0, R1/R2 — the desk's reading of sealed
+    ``31f5d3af``): the active register (``pre-approved.json``) and the
+    proposal queue are two different trust boundaries, not one file with
+    two views, and not even siblings in the SAME directory — a directory
+    is one trust root, and ``constitutional/`` (the register's own
+    directory) is the TRUST OWNER's, 0755, no ACLs. A broker-owned FILE
+    inside a trust-owner-owned DIRECTORY cannot be created, rewritten, or
+    unlinked by the broker at all (directory write permission is the
+    directory owner's to grant, not the file's). ``proposals[]``/
+    ``archived[]`` therefore live in a directory of their OWN
+    (:func:`paths.envelope_proposals_path`, a sibling of ``constitutional/``
+    — never a file inside it), broker-owned end to end, never signed,
+    never requiring trust-owner ownership. The broker writes it directly,
+    exactly as it always wrote the combined file before this split."""
+    # Anchored to $WILLOW_HOME (paths.envelope_proposals_path), not derived
+    # from envelopes.registry_path(): that path can be steered to an
+    # ARBITRARY file via WILLOW_ENVELOPE_REGISTRY, with no reliable
+    # directory depth to climb back out of -- tried, reverted after it
+    # escaped a test's own tmp_path into a directory shared session-wide.
+    from . import paths
+
+    return paths.envelope_proposals_path()
 
 
 def _load_registry() -> dict:
@@ -276,8 +290,9 @@ def _load_registry() -> dict:
     (:func:`envelopes.registry_path`); ``proposals``/``archived`` from the
     broker-owned sidecar (:func:`_proposals_path`, pair 31f5d3af). Every
     reader below (propose/ratify/reject/list_*) keeps operating on the one
-    shape it always has; only this function and :func:`_save_registry`
-    know the file is actually split in two. Both routed through
+    shape it always has; only this function and its write counterparts
+    (:func:`_save_proposals`, :func:`_save_active`) know the file is
+    actually split in two. Both read paths routed through
     :func:`envelopes._load`, which itself routes through
     ``paths.trusted_read`` — a writable/symlinked/unsigned-when-required
     source is a forged-envelope vector and the read refuses it."""
@@ -297,15 +312,22 @@ def _maybe_sign(path: Path) -> None:
     ``trusted_read``'s trust-owner branch refuses a trust-owner-owned file
     whose detached signature does not verify, so a write that lands
     unsigned (or signed under the wrong key) is unreadable to every OTHER
-    process on the box even though it wrote successfully here. Never
-    called for the broker-owned proposals sidecar, which stays on the
-    euid-ownership trust rail exactly as the whole registry did before
-    this split."""
+    process on the box even though it wrote successfully here.
+
+    Rework (Loki audit 54E3DFC0, R2): signs with ``--local-user
+    WILLOW_PGP_FINGERPRINT`` explicitly — never gpg's ambient default
+    signing key, which the prior draft used unqualified and which may
+    belong to a different identity than the fingerprint every reader
+    verifies against (measured: the broker's default key, not the trust
+    owner's). Never called for the broker-owned proposals sidecar, which
+    stays on the euid-ownership trust rail exactly as the whole registry
+    did before this split."""
     from . import pgp
 
     if not pgp.pgp_enabled():
         return
-    ok, detail = pgp.sign_detached(path)
+    fingerprint = pgp.expected_fingerprint()
+    ok, detail = pgp.sign_detached(path, local_user=fingerprint)
     if not ok:
         raise EnvelopeAuthoringError(
             f"{path} was written but could not be re-signed under "
@@ -314,22 +336,38 @@ def _maybe_sign(path: Path) -> None:
         )
 
 
-def _save_registry(registry: dict) -> None:
-    """Split write, the counterpart to :func:`_load_registry`'s merged
-    read: ``active`` to the (signed) active register, ``proposals``/
-    ``archived`` to the broker-owned sidecar. Two atomic writes, not one —
-    a crash between them is a legitimate half-state under the sealed
-    shape, the same way a crash between two independently-owned files
-    always is; there is no single-file transaction to preserve here
-    anymore. Every call site that used to hand the whole merged dict to
-    ``_atomic_write(envelopes.registry_path(), registry)`` now calls this
-    instead."""
-    _atomic_write(_envelopes.registry_path(), {"active": registry.get("active") or []})
-    _maybe_sign(_envelopes.registry_path())
+def _save_proposals(registry: dict) -> None:
+    """Write ONLY ``proposals[]``/``archived[]`` to the broker-owned
+    sidecar (:func:`_proposals_path`) — NEVER touches the active register
+    at all. Rework (Loki audit 54E3DFC0, R2): the prior draft's
+    ``_save_registry`` rewrote BOTH files on every call, so ``propose()``
+    and ``reject()`` — which only ever change the proposal queue —
+    silently rewrote the trust-owner-owned active register too; as the
+    broker's own uid, that ``os.replace`` succeeded and FLIPPED the
+    register's ownership back to the broker, voiding the sealed shape from
+    that call on. ``propose``/``reject`` call this and only this."""
     _atomic_write(_proposals_path(), {
         "proposals": registry.get("proposals") or [],
         "archived": registry.get("archived") or [],
     })
+
+
+def _save_active(registry: dict) -> None:
+    """Write ONLY ``active[]`` to the (signed) active register — NEVER
+    touches the proposals sidecar. The one write path that mutates the
+    trust-owner-owned register: :func:`ratify` (the one broker-side act
+    the sealed text names as touching it — signs with ``--local-user
+    WILLOW_PGP_FINGERPRINT`` via :func:`_maybe_sign`, refusing when unset
+    rather than falling back to an unsigned or wrong-key write) and
+    :func:`revoke` (reached only through the trust-owner apply half in
+    this codebase, :mod:`trust_owner_verbs`, which already runs as the
+    trust-owner uid). A write attempted by a process that does not own
+    ``constitutional/`` raises a plain ``OSError`` here — REFUSED, not
+    silently rescued by directory ownership the way the prior draft was;
+    there is no special-casing, the write simply fails the way any
+    other-uid write into a 0755 directory fails."""
+    _atomic_write(_envelopes.registry_path(), {"active": registry.get("active") or []})
+    _maybe_sign(_envelopes.registry_path())
 
 
 def _load_syscall_table() -> dict[int, dict]:
@@ -528,7 +566,7 @@ def propose(
     }
     proposals.append(row)
     registry["proposals"] = proposals
-    _save_registry(registry)
+    _save_proposals(registry)
 
     ledger_record_id = None
     ledger_error = None
@@ -631,7 +669,27 @@ def ratify(
     active.append(ratified)
     registry["proposals"] = proposals
     registry["active"] = active
-    _save_registry(registry)
+    # Rework (Loki audit 54E3DFC0, R2): ratify is the ONE broker-side act
+    # the sealed text names as touching the trust-owner-owned active
+    # register at all. It writes BOTH files (the proposal leaves the
+    # sidecar, the envelope lands in the register); the register write
+    # signs under WILLOW_PGP_FINGERPRINT via --local-user when PGP is
+    # enforced (_save_active -> _maybe_sign — same pgp_enabled() gate every
+    # other write in this codebase uses, e.g. manifest_admin.create_manifest's
+    # "unsigned atomic write when PGP is not enforced"; a box that has not
+    # opted into PGP enforcement is unaffected, exactly as before). What R2
+    # actually measured and this closes: the signature, when one IS made,
+    # is now minted under the fingerprint by name, never gpg's ambient
+    # default key. On an installed box where constitutional/ is
+    # trust-owner-owned, this call also now needs to run AS the trust
+    # owner (sudo -u willow-operator) for the register write itself to
+    # succeed at the OS level — this function raises whatever OSError that
+    # produces rather than rescuing it; ratify from the desk (the MCP
+    # tool, running as the broker) is refused there, documented in
+    # INSTALL.md's closing section as a follow-on (a trust-owner
+    # envelope.ratify apply-half verb) not built in this packet.
+    _save_proposals(registry)
+    _save_active(registry)
 
     result = dict(ratified)
     result["_ledger_record_id"] = ledger_record_id
@@ -701,7 +759,7 @@ def reject(
     })
     registry["proposals"] = proposals
     registry["archived"] = archived
-    _save_registry(registry)
+    _save_proposals(registry)
 
     ledger_record_id = None
     ledger_error = None
@@ -843,7 +901,14 @@ def revoke(
     row["revoked_at"] = revoked_at
     row["revoked_by"] = verifier
     row["revoked_reason"] = reason
-    _save_registry(registry)
+    # revoke only ever changes active[] -- writes only the register, never
+    # the proposals sidecar (Loki audit 54E3DFC0, R2). Reached in this
+    # codebase only through the trust-owner apply half
+    # (trust_owner_verbs._apply_envelope_revoke), which already runs as
+    # the trust-owner uid; a direct CLI call to this function from any
+    # other identity fails the same way any other-uid write into a
+    # trust-owner-owned directory fails.
+    _save_active(registry)
 
     ledger_record_id = None
     ledger_error = None

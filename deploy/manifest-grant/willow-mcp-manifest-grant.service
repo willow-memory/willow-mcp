@@ -14,8 +14,9 @@
 # /etc/willow-mcp/manifest-grant.env, root-owned, group-readable by the
 # trust owner only. Since pair 1bd6fd29 this same apply drains four more
 # verbs on the same queue (envelope.revoke, manifest.retire, manifest.create,
-# federation.ratify — syscall-table rows 19-22), dispatched by the pending
-# record's own `verb` field; nothing here changes per verb.
+# federation.ratify — syscall-table rows 20-23, row 19 reserved for the
+# sealed net.egress verb, pair c9ddd197), dispatched by the pending record's
+# own `verb` field; nothing here changes per verb.
 #
 # Preconditions (INSTALL.md beside this file, each an operator act; install.sh
 # performs them in one root act):
@@ -31,8 +32,13 @@
 #     done/ and failed/ writable by willow-operator; the request signing key's
 #     PUBLIC half readable by willow-operator. ACLs, not chown — the broker
 #     still writes pending/.
-#   * $WILLOW_HOME/constitutional (envelope registry) rwx for willow-operator —
-#     envelope.revoke (row 19) writes there directly, outside mcp_apps/.
+#   * $WILLOW_HOME/constitutional (envelope registry) DIRECTORY AND FILE
+#     owned by willow-operator, 0755/0644, no ACL — envelope.revoke (row 20)
+#     writes there directly, outside mcp_apps/. The broker's own proposals
+#     queue lives in a directory of its own, $WILLOW_HOME/proposals/, never
+#     inside constitutional/ (a broker-owned file inside a trust-owner-owned
+#     directory cannot be created, rewritten, or unlinked by the broker at
+#     all — pair 31f5d3af via Loki audit 54E3DFC0, R1/R2).
 #   * a Postgres role for willow-operator (peer auth on the local socket) with
 #     the broker role's read grants on the FRANK tables plus INSERT — the
 #     apply confirms its citation in FRANK and inks the per-verb `<verb>_applied`

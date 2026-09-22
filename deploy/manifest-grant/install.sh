@@ -69,6 +69,27 @@
 #     per-session subprocess it does not own) — the desk must reconnect by
 #     hand, named honestly in INSTALL.md rather than implied by the restart
 #     step succeeding.
+#
+# Rework 2 (Loki audit 54E3DFC0, findings R1/R2 — BLOCKING): rework 1's step
+# 1 chowned the register FILE to the trust owner but left its DIRECTORY
+# ($H/constitutional) operator-owned. paths.trusted_read checks the PARENT
+# directory first, so the trust-owner unit was refused before it ever read
+# the file (R1) — and because the broker still owned the directory, its own
+# writes (propose/reject/ratify, envelope_authoring._save_registry as it
+# then was) could still `os.replace` over the "trust-owner-owned" file and
+# silently flip it back to broker ownership (R2). "owned by the trust owner
+# ... the broker never writes either file" (sealed 31f5d3af) cannot hold
+# while the broker owns the directory the file lives in. Fixed: the
+# constitutional/ DIRECTORY itself now chowns to the trust owner (0755, no
+# ACL) alongside the file; the broker's proposals sidecar moves OUT of that
+# directory entirely, into its own broker-owned $H/proposals/ (a sibling,
+# never a file inside constitutional/ that the broker could not create,
+# rewrite, or unlink in the first place). envelope_authoring.py's write path
+# split accordingly: propose()/reject() touch ONLY the sidecar; ratify() is
+# the one broker-side act that still touches the register (writes both,
+# signs under WILLOW_PGP_FINGERPRINT via --local-user, never gpg's ambient
+# default key — R2's other measured defect); revoke() (trust-owner apply
+# half only) touches only the register.
 
 set -euo pipefail
 
@@ -137,17 +158,25 @@ for req in "$H"/manifest_grants/pending/*.json; do
   [ -e "$req" ] && setfacl -m "u:$TRUST_OWNER:r" "$req"
 done
 
-# ---- F1/F2 (sealed 31f5d3af): the active envelope register moves to
-# trust-owner ownership, mode 0644, NO ACLs — the same trust shape a seat
-# manifest already has (paths.trusted_read's new signature branch). Split
-# proposals[]/archived[] out to a broker-owned proposals.json FIRST, while
-# the register is still operator-owned and this script (root) can write
-# both files freely — envelope_propose/list_pending/list_archived keep
-# reading/writing that sidecar as the broker, unaffected by the register's
-# ownership change.
-install -d -o "$OPERATOR" -g "$OPERATOR" -m 755 "$H/constitutional"
+# ---- F1/F2 (sealed 31f5d3af, rework 2 per Loki audit 54E3DFC0 R1/R2): the
+# active envelope register's OWN DIRECTORY moves to trust-owner ownership,
+# not just the file inside it — paths.trusted_read checks the PARENT
+# directory first, and an operator-owned parent refuses the trust-owner
+# unit before it reads a single byte (measured: R1). "owned by the trust
+# owner ... the broker never writes either file" cannot hold while the
+# broker owns the DIRECTORY the file lives in: os.replace by the directory
+# owner rewrites the file and flips its ownership back, which is exactly
+# what R2 measured. So: constitutional/ (dir AND file) -> trust owner,
+# 0755/0644, no ACL; the broker's proposals sidecar moves OUT to a
+# directory of its own ($H/proposals/, paths.envelope_proposals_path) that
+# the broker actually owns end to end — never a file inside the trust
+# owner's directory, which the broker could not create, rewrite, or
+# unlink in the first place. Split FIRST, while constitutional/ is still
+# operator-owned and this script (root) can write both destinations
+# freely; chown constitutional/ itself only after the split lands.
+install -d -o "$OPERATOR" -g "$OPERATOR" -m 755 "$H/proposals"
 REG="$H/constitutional/pre-approved.json"
-PROPOSALS="$H/constitutional/proposals.json"
+PROPOSALS="$H/proposals/proposals.json"
 if [ -f "$REG" ]; then
   SPLIT_TMP=$(mktemp)
   "$PY" - "$REG" "$PROPOSALS" > "$SPLIT_TMP" <<'PYEOF'
@@ -171,10 +200,21 @@ PYEOF
   rm -f "$SPLIT_TMP"
   chown "$OPERATOR:$OPERATOR" "$PROPOSALS"
   chmod 600 "$PROPOSALS"
-  chown "$TRUST_OWNER:$TRUST_OWNER" "$REG"
-  chmod 644 "$REG"
 else
   say "  no existing register at $REG — nothing to migrate; the trust-owner apply half creates one on first envelope.revoke or manifest.retire write"
+fi
+# Now the DIRECTORY itself, not just the file — R1's exact fix. Not -R: a
+# syscall-table.json living alongside the register can stay BROKER-owned
+# (paths.trusted_read's file-level check is euid-based, unaffected by its
+# parent's ownership — only the PARENT needs to resolve to euid-or-trust-
+# owner, which chowning the directory alone already gives it) and is
+# deliberately left untouched here.
+install -d -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 755 "$H/constitutional"
+chown "$TRUST_OWNER:$TRUST_OWNER" "$H/constitutional"
+chmod 755 "$H/constitutional"
+if [ -f "$REG" ]; then
+  chown "$TRUST_OWNER:$TRUST_OWNER" "$REG"
+  chmod 644 "$REG"
 fi
 # federation.ratify (row 23) writes mcp_apps/_federation/servers.json —
 # already under mcp_apps/, already trust-owner-owned by the recursive chown

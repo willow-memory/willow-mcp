@@ -142,19 +142,23 @@ def test_ratify_refuses_eregistry_and_writes_nothing(ring_with_rita, steered_awa
     assert exc.value.detail["error"] == "EREGISTRY"
     assert "ratify refused" in str(exc.value)
     assert (elsewhere.read_bytes(), home_reg.read_bytes()) == before
-    # proposals live in the broker-owned sidecar (pair 31f5d3af), not the
-    # active register itself.
-    assert json.loads(elsewhere.with_name("proposals.json").read_text())["proposals"][0]["id"] == pid  # still proposed
+    # proposals live in the broker-owned sidecar, anchored to $WILLOW_HOME
+    # (pair 31f5d3af / Loki 54E3DFC0 R1/R2) -- home_reg is home/constitutional/
+    # pre-approved.json, so its grandparent is $WILLOW_HOME regardless of
+    # where the registry itself was steered to.
+    proposals_path = home_reg.parent.parent / "proposals" / "proposals.json"
+    assert json.loads(proposals_path.read_text())["proposals"][0]["id"] == pid  # still proposed
 
 
 def test_reject_and_revoke_refuse_eregistry(ring_with_rita, steered_away):
-    _, elsewhere = steered_away
+    home_reg, _elsewhere = steered_away
     pid = _propose()["id"]
     with pytest.raises(ea.RegistryMismatchError):
         ea.reject(pid, reason="no", verifier="rita")
     with pytest.raises(ea.RegistryMismatchError):
         ea.revoke("anything", reason="no", verifier="rita")
-    assert json.loads(elsewhere.with_name("proposals.json").read_text())["proposals"][0]["id"] == pid
+    proposals_path = home_reg.parent.parent / "proposals" / "proposals.json"
+    assert json.loads(proposals_path.read_text())["proposals"][0]["id"] == pid
 
 
 def test_ratify_refuses_eregistry_before_looking_up_the_proposal(ring_with_rita, steered_away):

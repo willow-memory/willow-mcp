@@ -63,25 +63,42 @@ own name). A pending request already on disk was written `0600` by uid
 1000; the default ACL above does not reach an existing file, so `install.sh`
 grants read on every file already in `pending/` too.
 
-**Sealed `31f5d3af`, unblocked by the desk after Loki audit BFCC5C79's F1/F2:
-the active envelope register moves to trust-owner ownership — mode `0644`,
-NO ACLs, detach-signed — the same trust shape a seat manifest already has**
+**Sealed `31f5d3af`, unblocked by the desk after Loki audits BFCC5C79/
+54E3DFC0's F1/F2/R1/R2: the active envelope register's DIRECTORY (not just
+the file) moves to trust-owner ownership — `0755`/`0644`, NO ACLs,
+detach-signed — the same trust shape a seat manifest already has**
 (`paths.trusted_read` gained a trust-owner-plus-signature branch: a file not
 owned by this process's own euid is trusted when it is owned by the trust
 owner, carries no group/other write bit, and its own `<file>.sig` verifies
-under `WILLOW_PGP_FINGERPRINT`). Before the register is chowned, `install.sh`
-splits `proposals[]`/`archived[]` out into a NEW sibling file,
-`constitutional/proposals.json`, owned by the OPERATOR (broker) uid, mode
-`0600` — `envelope_propose` / the pending-proposal reads keep writing and
-reading that sidecar exactly as before, unaffected by the register's
-ownership change:
+under `WILLOW_PGP_FINGERPRINT`). Rework 1 chowned only the FILE and left
+`constitutional/` itself operator-owned — `trusted_read` checks the PARENT
+directory first, so the trust-owner unit was refused before it read a byte
+(R1), and because the broker still owned the directory its own writes could
+still `os.replace` over the "trust-owner-owned" file and flip it back (R2).
+Fixed: the directory chowns too, and the broker's proposals sidecar moves
+OUT of `constitutional/` entirely — a broker-owned FILE inside a
+trust-owner-owned DIRECTORY is one the broker could never create, rewrite,
+or unlink at all, so the sidecar needs a directory of its own:
 
     REG=$H/constitutional/pre-approved.json
-    PROPOSALS=$H/constitutional/proposals.json
+    PROPOSALS=$H/proposals/proposals.json
     # (install.sh runs this split as root via the trust owner's own python,
-    # then:)
+    # BEFORE constitutional/ is chowned, then:)
     chown $OPERATOR:$OPERATOR $PROPOSALS && chmod 600 $PROPOSALS
+    chown willow-operator:willow-operator $H/constitutional && chmod 755 $H/constitutional
     chown willow-operator:willow-operator $REG && chmod 644 $REG
+
+`envelope_authoring.propose()`/`reject()` write ONLY `$H/proposals/
+proposals.json` now — never the register, at all, ever, regardless of which
+uid calls them. `ratify()` is the one broker-side act the sealed text names
+as touching the register; it writes both files and signs the register under
+`WILLOW_PGP_FINGERPRINT` via `--local-user` (never gpg's ambient default
+key — the other defect R2 measured). `syscall-table.json`, if it lives
+alongside the register, is deliberately left broker-owned: `trusted_read`'s
+file-level check is euid-based and does not care who owns the PARENT, so a
+broker-owned file in a trust-owner-owned directory still reads fine for the
+broker; only the register file itself needs to be trust-owner-owned and
+signed.
 
 `federation.ratify` (row 23) writes `mcp_apps/_federation/servers.json` —
 already under `mcp_apps/`, already trust-owner-owned by the recursive chown
@@ -208,12 +225,17 @@ queue is `manifest_grant_retry`-able, `estale_presigned` is not.
 
 ## What is still an operator act after this install
 
-`envelope_authoring.ratify` (the CLI move of a proposal from
-`proposals.json` into the signed active register) still runs as the
-OPERATOR at the terminal, not through the trust-owner apply half — it signs
-the register with the trust owner's key via the same `as_to gpg` shape this
-script uses, which needs the operator's own sudo authority for
-`willow-operator`, exactly as today. A trust-owner `envelope.ratify` verb
-(mirroring `manifest.grant`'s own request/apply split) does not exist yet;
-until it does, ratifying a proposal is still a keyboard act, named honestly
+`envelope_authoring.ratify` (moving a proposal from `$H/proposals/
+proposals.json` into the signed active register — reachable from the CLI
+and from the `envelope_ratify` MCP tool) still runs as whoever calls it,
+not through the trust-owner apply half. Once `constitutional/` is
+trust-owner-owned, a plain broker-uid call to `ratify()` fails at the OS
+level the same way any other-uid write into a `0755` directory it does not
+own fails — `ratify()` raises that `OSError` rather than rescuing it. Until
+a trust-owner `envelope.ratify` verb exists (mirroring `manifest.grant`'s
+own request/apply split), ratifying a proposal for real needs `sudo -u
+willow-operator` from the operator's own terminal, exactly like the signing
+key operations this script itself performs (`as_to gpg ...`). `propose()`
+and `reject()` are unaffected — they only ever touch the broker-owned
+`$H/proposals/` sidecar, never the register, from any uid. Named honestly
 here rather than implied solved by the register's ownership change alone.

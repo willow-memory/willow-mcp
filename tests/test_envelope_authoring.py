@@ -187,7 +187,8 @@ def test_propose_writes_a_proposal_row(ring_with_rita, fresh_registry):
 
     # And it landed in the file — proposals live in the broker-owned sidecar
     # (pair 31f5d3af), not the active register itself.
-    on_disk = json.loads(registry_path.with_name("proposals.json").read_text(encoding="utf-8"))
+    proposals_path = registry_path.parent.parent / "proposals" / "proposals.json"
+    on_disk = json.loads(proposals_path.read_text(encoding="utf-8"))
     assert len(on_disk["proposals"]) == 1
     assert on_disk["proposals"][0]["id"] == row["id"]
 
@@ -263,7 +264,8 @@ def test_ratify_moves_proposal_to_active_with_issued_by_root(
     assert "keyring verifier rita" in ratified["ratified_via"]
 
     on_disk = json.loads(registry_path.read_text(encoding="utf-8"))
-    proposals_on_disk = json.loads(registry_path.with_name("proposals.json").read_text(encoding="utf-8"))
+    proposals_path = registry_path.parent.parent / "proposals" / "proposals.json"
+    proposals_on_disk = json.loads(proposals_path.read_text(encoding="utf-8"))
     assert len(proposals_on_disk["proposals"]) == 0, "proposal removed from queue"
     assert len(on_disk["active"]) == 1, "envelope landed in active"
     assert on_disk["active"][0]["id"] == proposal["id"]
@@ -316,7 +318,8 @@ def test_reject_removes_proposal_from_queue(ring_with_rita, fresh_registry):
     )
     ea.reject(proposal["id"], reason="test", verifier="rita")
     on_disk = json.loads(registry_path.read_text(encoding="utf-8"))
-    proposals_on_disk = json.loads(registry_path.with_name("proposals.json").read_text(encoding="utf-8"))
+    proposals_path = registry_path.parent.parent / "proposals" / "proposals.json"
+    proposals_on_disk = json.loads(proposals_path.read_text(encoding="utf-8"))
     assert proposals_on_disk["proposals"] == []
     assert on_disk["active"] == []
 
@@ -341,7 +344,8 @@ def test_reject_moves_to_archived_with_bounds_and_reopen_when(
         reopen_when="hanuman gets audited by loki",
         verifier="rita",
     )
-    on_disk = json.loads(registry_path.with_name("proposals.json").read_text(encoding="utf-8"))
+    proposals_path = registry_path.parent.parent / "proposals" / "proposals.json"
+    on_disk = json.loads(proposals_path.read_text(encoding="utf-8"))
     assert len(on_disk["archived"]) == 1
     arch = on_disk["archived"][0]
     assert arch["id"] == proposal["id"]
@@ -462,7 +466,7 @@ def test_list_pending_returns_oldest_first(ring_with_rita, fresh_registry):
     # proposals live in the broker-owned sidecar (pair 31f5d3af), not the
     # active register itself.
     registry_path, _ = fresh_registry
-    proposals_path = registry_path.with_name("proposals.json")
+    proposals_path = registry_path.parent.parent / "proposals" / "proposals.json"
     doc = json.loads(proposals_path.read_text(encoding="utf-8"))
     doc["proposals"][0]["proposed_at"] = "2026-08-25T10:00:00Z"
     doc["proposals"][1]["proposed_at"] = "2026-08-25T10:00:01Z"

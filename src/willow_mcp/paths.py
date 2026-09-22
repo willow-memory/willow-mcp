@@ -112,7 +112,18 @@ _APP_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 #: this tree: `mcp_apps/schema_maps/` (2026-08-10, pre-B-50) and
 #: `schema_maps/schema_maps/` (2026-08-18, after the relocation). Neither is an
 #: app; both were discovered only by reading the directory.
-_CONTAINER_DIR_NAMES = frozenset({"mcp_apps", "schema_maps", "handoffs", "sessions"})
+#:
+#: `_retired` and `_federation` (Loki audit 54E3DFC0, F9) are the same shape
+#: one level down, inside `mcp_apps/` itself: manifest.retire moves a retired
+#: seat to `mcp_apps/_retired/<app_id>-<pair_id>/`, and federation.ratify
+#: writes `mcp_apps/_federation/servers.json` — neither is an app_id, and
+#: without a reserved-name guard `manifest.create` would happily create a
+#: seat literally named `_retired` or `_federation`, colliding with those
+#: directories the same way the container names above collide with
+#: themselves.
+_CONTAINER_DIR_NAMES = frozenset({
+    "mcp_apps", "schema_maps", "handoffs", "sessions", "_retired", "_federation",
+})
 
 
 def _validate_app_id(app_id: str) -> str:
@@ -567,6 +578,22 @@ def envelope_registry_path() -> Path:
     ``WILLOW_ENVELOPE_REGISTRY`` first.
     """
     return constitutional_dir() / "pre-approved.json"
+
+
+def envelope_proposals_dir() -> Path:
+    """Broker-owned sidecar directory for envelope ``proposals[]``/
+    ``archived[]`` (Loki audit 54E3DFC0, R1/R2 — the desk's reading of
+    sealed ``31f5d3af``): ``constitutional/`` (and the active register
+    inside it) is the TRUST OWNER's, 0755/0644, no ACLs; the broker's own
+    proposal queue cannot live inside a directory it cannot create files
+    in, so it gets a directory of its own, a sibling of ``constitutional/``
+    rather than a file inside it. Never touched by the trust-owner apply
+    half; ``envelope_authoring.propose``/``reject`` write ONLY here."""
+    return willow_home() / "proposals"
+
+
+def envelope_proposals_path() -> Path:
+    return envelope_proposals_dir() / "proposals.json"
 
 
 def dispatch_signing_key_path() -> Path:
