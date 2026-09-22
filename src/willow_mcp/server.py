@@ -4099,33 +4099,45 @@ def _enveloped_verb_gate(
     (mirrors `envelope_apply`'s own `_postgres_unavailable()` — a citation
     that cannot be written must not be treated as though it were).
 
-    Backward-compat note: an UNREADABLE registry (missing file, wrong
-    ownership/permissions, malformed JSON — `governing_envelope_ids` raises
-    for all three, same as `EnvelopeAuthority.check()` does for an
-    explicitly-named envelope_id) is treated here as "not governed", NOT as
-    a fail-closed refusal. This is deliberately narrower than `check()`'s own
-    fail-closed stance: `check()` is reached only when a caller already
-    asserts a specific `envelope_id` ought to apply (`envelope_apply`, or
-    this same gate once a match IS found), so refusing on an unreadable
-    registry there is refusing a claim that cannot be verified. This
-    resolution step runs on EVERY call to an enforced verb, for every actor,
-    whether or not they hold — or believe they hold — any envelope at all;
-    treating "the registry itself is missing" as a hard failure here would
-    turn every install that has not configured envelope governance (which is
-    most installs — the shipped default is an empty starter, see
-    envelopes.py's `registry_path` docstring) into one where dispatch_send
-    cannot run at all. An actor that genuinely holds an active "dispatch"
-    grant in a registry that then becomes unreadable degrades to unmetered,
-    exactly the pre-#333 behavior for that actor — not a new hole, since
-    #333 closes the "held a grant, cited nothing" bypass, not "the
-    environment is broken in a way that predates this fix" cases."""
+    Backward-compat note, reworked under sealed pair 31f5d3af (Loki audit
+    BFCC5C79, finding F1): a MISSING registry (no file at all — the shipped
+    default, an empty starter, see envelopes.py's `registry_path`
+    docstring) is still treated as "not governed", NOT a fail-closed
+    refusal — this resolution step runs on EVERY call to an enforced verb,
+    for every actor, whether or not they hold any envelope at all, and
+    turning "no registry was ever configured" into a hard failure here
+    would make dispatch_send (and every other enforced verb) unusable on
+    most installs, which have not opted into envelope governance.
+
+    A registry that EXISTS but cannot be trusted or parsed — wrong
+    ownership, a group/other-writable mode, a trust-owner-owned register
+    whose detached signature no longer verifies (pair 31f5d3af: the active
+    register can now be trust-owner-owned rather than broker-owned, and a
+    stale or missing signature on it is exactly the tampered-registry case
+    this ambient gate must never wave through), or malformed JSON — is now
+    FAIL-CLOSED: every verb this gate would otherwise resolve for every
+    actor refuses, rather than silently degrading the whole fleet to
+    unmetered the moment the register's trust root goes bad. This mirrors
+    `EnvelopeAuthority.check()`'s own fail-closed stance for an
+    explicitly-named `envelope_id`, extended here to the ambient path: an
+    unreadable register is fail-closed, never open."""
     try:
-        from .envelopes import governing_envelopes
+        from .envelopes import governing_envelopes, registry_path
 
         governing_rows = governing_envelopes(verb, app_id)
         matches = [row["id"] for row in governing_rows]
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        if not registry_path().is_file():
+            return None
+        return {
+            "error": "EUNREACH",
+            "reason": (
+                f"envelope registry at {registry_path()} exists but is unreadable "
+                f"or untrusted ({type(exc).__name__}: {exc}) — refusing every verb "
+                "this gate governs rather than treating a tampered, unsigned, or "
+                "corrupt registry as ungoverned"
+            ),
+        }
     if not matches:
         # PR6 (envelope-accrual): ENOGRANTS. Currently the gate is
         # permissive here (returns None → call proceeds unmetered) —

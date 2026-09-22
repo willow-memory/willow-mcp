@@ -129,11 +129,20 @@ class RegistryMismatchError(EnvelopeAuthoringError):
 def registry_identity(path: Optional[Path] = None) -> dict:
     """``{path, fingerprint, exists, mtime, active, proposals}`` for the
     registry in effect (or ``path``). ``fingerprint`` is the sha256 of the
-    file bytes, 16 hex — enough for two readers to agree they are looking
-    at the same file, which is the question the desk asks when an operator
-    says "ratified" and the queue has not moved. Read-only; counts come from
-    a plain ``json.loads`` so a registry the trusted-read gate would refuse
-    still gets a fingerprint (the gate's own refusal is unchanged elsewhere)."""
+    ACTIVE register's own file bytes, 16 hex — enough for two readers to
+    agree they are looking at the same file, which is the question the desk
+    asks when an operator says "ratified" and the queue has not moved.
+    Read-only; counts come from a plain ``json.loads`` so a registry the
+    trusted-read gate would refuse still gets a fingerprint (the gate's own
+    refusal is unchanged elsewhere).
+
+    ``proposals`` (pair 31f5d3af: proposals[] now lives in the broker-owned
+    sidecar, :func:`_proposals_path`, never the active register itself) is
+    read from that sidecar — a missing sidecar (no proposal ever queued
+    yet) counts as zero, not unreadable; only the ACTIVE file's own
+    fingerprint/exists/mtime speak to whether the identity check as a whole
+    succeeded, since that is the file whose trust root actually matters
+    here."""
     import hashlib
     p = path if path is not None else _envelopes.registry_path()
     out: dict[str, Any] = {"path": str(p), "fingerprint": None, "exists": False,
@@ -157,7 +166,17 @@ def registry_identity(path: Optional[Path] = None) -> dict:
         return out
     if isinstance(doc, dict):
         out["active"] = len(doc.get("active") or [])
+        # Legacy pre-split file (never migrated) may still carry proposals
+        # inline — read it if present, else fall through to the sidecar.
         out["proposals"] = len(doc.get("proposals") or [])
+    prop_path = p.with_name("proposals.json")
+    try:
+        prop_raw = prop_path.read_bytes()
+        prop_doc = json.loads(prop_raw.decode("utf-8"))
+        if isinstance(prop_doc, dict):
+            out["proposals"] = len(prop_doc.get("proposals") or [])
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
     return out
 
 
@@ -240,11 +259,77 @@ def _now_iso() -> str:
     )
 
 
+def _proposals_path() -> Path:
+    """Sealed pair 31f5d3af (2026-09-22): the active register
+    (``pre-approved.json``) and the proposal queue are two different trust
+    boundaries, not one file with two views. ``proposals[]``/``archived[]``
+    live in this sibling file instead — broker-owned (0600, the same uid
+    that has always run the broker), never signed, never requiring
+    trust-owner ownership. The broker writes it directly, exactly as it
+    always wrote the combined file before this split."""
+    return _envelopes.registry_path().with_name("proposals.json")
+
+
 def _load_registry() -> dict:
-    """Read the current registry. Routes through :func:`envelopes._load`, which
-    itself routes through ``paths.trusted_read`` — a writable/symlinked
-    registry is a forged-envelope vector and the read refuses it."""
-    return _envelopes._load(_envelopes.registry_path())
+    """Read the current registry as a MERGED VIEW: ``active`` from the
+    (now possibly trust-owner-owned, signed) active register
+    (:func:`envelopes.registry_path`); ``proposals``/``archived`` from the
+    broker-owned sidecar (:func:`_proposals_path`, pair 31f5d3af). Every
+    reader below (propose/ratify/reject/list_*) keeps operating on the one
+    shape it always has; only this function and :func:`_save_registry`
+    know the file is actually split in two. Both routed through
+    :func:`envelopes._load`, which itself routes through
+    ``paths.trusted_read`` — a writable/symlinked/unsigned-when-required
+    source is a forged-envelope vector and the read refuses it."""
+    active_doc = _envelopes._load(_envelopes.registry_path())
+    proposals_path = _proposals_path()
+    proposals_doc = _envelopes._load(proposals_path) if proposals_path.is_file() else {}
+    return {
+        "active": active_doc.get("active") or [],
+        "proposals": proposals_doc.get("proposals") or [],
+        "archived": proposals_doc.get("archived") or [],
+    }
+
+
+def _maybe_sign(path: Path) -> None:
+    """Re-sign ``path`` under ``WILLOW_PGP_FINGERPRINT`` when PGP is
+    enforced — the active register's own trust shape after pair 31f5d3af:
+    ``trusted_read``'s trust-owner branch refuses a trust-owner-owned file
+    whose detached signature does not verify, so a write that lands
+    unsigned (or signed under the wrong key) is unreadable to every OTHER
+    process on the box even though it wrote successfully here. Never
+    called for the broker-owned proposals sidecar, which stays on the
+    euid-ownership trust rail exactly as the whole registry did before
+    this split."""
+    from . import pgp
+
+    if not pgp.pgp_enabled():
+        return
+    ok, detail = pgp.sign_detached(path)
+    if not ok:
+        raise EnvelopeAuthoringError(
+            f"{path} was written but could not be re-signed under "
+            f"WILLOW_PGP_FINGERPRINT ({detail}) — the write already landed; "
+            "every other reader will refuse it as unsigned until this is fixed"
+        )
+
+
+def _save_registry(registry: dict) -> None:
+    """Split write, the counterpart to :func:`_load_registry`'s merged
+    read: ``active`` to the (signed) active register, ``proposals``/
+    ``archived`` to the broker-owned sidecar. Two atomic writes, not one —
+    a crash between them is a legitimate half-state under the sealed
+    shape, the same way a crash between two independently-owned files
+    always is; there is no single-file transaction to preserve here
+    anymore. Every call site that used to hand the whole merged dict to
+    ``_atomic_write(envelopes.registry_path(), registry)`` now calls this
+    instead."""
+    _atomic_write(_envelopes.registry_path(), {"active": registry.get("active") or []})
+    _maybe_sign(_envelopes.registry_path())
+    _atomic_write(_proposals_path(), {
+        "proposals": registry.get("proposals") or [],
+        "archived": registry.get("archived") or [],
+    })
 
 
 def _load_syscall_table() -> dict[int, dict]:
@@ -443,7 +528,7 @@ def propose(
     }
     proposals.append(row)
     registry["proposals"] = proposals
-    _atomic_write(_envelopes.registry_path(), registry)
+    _save_registry(registry)
 
     ledger_record_id = None
     ledger_error = None
@@ -546,7 +631,7 @@ def ratify(
     active.append(ratified)
     registry["proposals"] = proposals
     registry["active"] = active
-    _atomic_write(_envelopes.registry_path(), registry)
+    _save_registry(registry)
 
     result = dict(ratified)
     result["_ledger_record_id"] = ledger_record_id
@@ -616,7 +701,7 @@ def reject(
     })
     registry["proposals"] = proposals
     registry["archived"] = archived
-    _atomic_write(_envelopes.registry_path(), registry)
+    _save_registry(registry)
 
     ledger_record_id = None
     ledger_error = None
@@ -758,7 +843,7 @@ def revoke(
     row["revoked_at"] = revoked_at
     row["revoked_by"] = verifier
     row["revoked_reason"] = reason
-    _atomic_write(_envelopes.registry_path(), registry)
+    _save_registry(registry)
 
     ledger_record_id = None
     ledger_error = None
