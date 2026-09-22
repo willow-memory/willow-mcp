@@ -496,6 +496,14 @@ def _load_or_create_broker_signing_key(grants_root: Path):
 
 
 def _canonical_request_bytes(record: dict) -> bytes:
+    """The bytes the broker's signature actually covers. Generalized (pair
+    ``1bd6fd29`` amendment) to carry a ``verb``/``target`` pair for the four
+    trust-owner verbs added alongside ``manifest.grant`` — but ONLY when
+    ``verb`` is present and not ``manifest.grant`` itself, so a
+    ``manifest.grant`` record (whether or not it explicitly carries
+    ``"verb": "manifest.grant"``) signs the EXACT SAME bytes as before this
+    change: a pending file signed before this rework still verifies against
+    a broker key generated after it, and vice versa."""
     payload = {
         "pair_id": record.get("pair_id"),
         "envelope_id": record.get("envelope_id"),
@@ -505,6 +513,11 @@ def _canonical_request_bytes(record: dict) -> bytes:
         "pre_state": record.get("pre_state"),
         "requested_at": record.get("requested_at"),
     }
+    verb = record.get("verb") or VERB
+    if verb != VERB:
+        payload["verb"] = verb
+        payload["target"] = record.get("target")
+        payload["call_args"] = record.get("call_args")
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -537,12 +550,14 @@ def _verify_request_signature(record: dict, grants_root: Path) -> tuple[bool, st
     return True, "ok"
 
 
-def _bind_to_seal(pair_id: str, apps: list[str], groups: list[str], *,
-                   db_path: Optional[Path] = None) -> Optional[dict]:
-    """Refuse unless the sealed pair's ed25519 signature verifies AND its
-    own text names exactly ``apps``/``groups`` (read off the mutable SOIL
-    record). Returns a refusal dict, or ``None`` when the grant is bound
-    cleanly and the seal is genuine.
+def _verify_seal_only(pair_id: str, *, db_path: Optional[Path] = None) -> tuple[Optional[dict], Optional[dict]]:
+    """Refuse unless the sealed pair's ed25519 signature verifies — no
+    grammar, no target binding. ``(refusal, sealed)``: exactly one is
+    ``None``. Factored out of :func:`_bind_to_seal` (pair ``1bd6fd29``
+    amendment) so the four trust-owner verbs added alongside
+    ``manifest.grant`` share this half — the seal-state/ring/verify_seal
+    checks — while each still parses ITS OWN strict grammar out of
+    ``sealed["target_text"]``.
 
     Rework (pair ``b74019ac``): the seal binding used to compare text only,
     never checking ``seal_sig`` at all — a garbage signature on an
@@ -562,14 +577,14 @@ def _bind_to_seal(pair_id: str, apps: list[str], groups: list[str], *,
             "EUNREACH",
             f"nestor.db unreachable ({sealed.get('cause')}) — cannot bind this "
             "grant to what was actually sealed; the SOIL record alone is not enough",
-        )
+        ), None
     if state != "populated":
         return _refuse(
             "EACCES",
             f"pair_id={pair_id!r} is not a populated sealed pair in nestor.db "
             f"({sealed.get('why')}) — a governance record marked status=sealed "
             "is not enough on its own; the pair itself must be sealed",
-        )
+        ), None
 
     ring_kr = _keyring.get_keyring()
     if ring_kr is None:
@@ -577,7 +592,7 @@ def _bind_to_seal(pair_id: str, apps: list[str], groups: list[str], *,
             "EACCES",
             "no keyring configured (config/verifiers.json via WILLOW_KEYRING) — "
             "a grant cannot verify a seal without a ring to verify it against",
-        )
+        ), None
     # Loki audit 3, finding 1: "a permission grant is not a lease." The
     # default verify_seal age bound (net_authority.SEAL_MAX_AGE_S, 24h) was
     # written for a one-shot net-authority request; a manifest.grant sealed
@@ -594,7 +609,20 @@ def _bind_to_seal(pair_id: str, apps: list[str], groups: list[str], *,
             "a garbage or unverifiable seal_sig is refused regardless of what the "
             "SOIL record's own nestor_verifier field claims",
             field=field,
-        )
+        ), None
+    return None, sealed
+
+
+def _bind_to_seal(pair_id: str, apps: list[str], groups: list[str], *,
+                   db_path: Optional[Path] = None) -> Optional[dict]:
+    """Refuse unless the sealed pair's ed25519 signature verifies AND its
+    own text names exactly ``apps``/``groups`` (read off the mutable SOIL
+    record). Returns a refusal dict, or ``None`` when the grant is bound
+    cleanly and the seal is genuine. ``manifest.grant``'s own grammar
+    binder, built on :func:`_verify_seal_only`."""
+    refusal, sealed = _verify_seal_only(pair_id, db_path=db_path)
+    if refusal is not None:
+        return refusal
 
     parsed = _parse_ruling_text(sealed.get("target_text", ""))
     if parsed is None:
@@ -771,6 +799,202 @@ def manifest_grant_status(pair_id: str, *, grants_root: Optional[Path] = None) -
     except (OSError, ValueError) as exc:
         return {"state": "unreachable", "pair_id": pair_id, "cause": f"{type(exc).__name__}: {exc}"}
     return {"state": state, "pair_id": pair_id, "path": str(path), **record}
+
+
+# ── shared lock/cite plumbing, reused by every trust-owner verb ────────────
+#
+# Pair 1bd6fd29 amendment: four more verbs (envelope.revoke, manifest.retire,
+# manifest.create, federation.ratify — trust_owner_verbs.py) share this one
+# pending/done/failed queue with manifest.grant, distinguished by the
+# record's own "verb" field (defaulting to VERB when absent, so every
+# existing pending/done/failed file written before this change still
+# parses). The per-pair-id lock dance (stale-lock reclaim included) and the
+# write-then-cite-then-sign tail are identical in shape across verbs; they
+# are factored here rather than re-derived per verb.
+
+def _run_locked_request(grants_root_p: Path, pair_id: str, body) -> dict:
+    """Acquire ``pending/<pair_id>.lock`` (with the same stale-lock reclaim
+    :func:`manifest_grant_request` performs), run ``body()``, and always
+    release. ``body`` takes no arguments and returns the result dict; on a
+    reclaimed stale lock, ``reclaimed_stale_lock: True`` is folded in."""
+    lock_dir = grants_root_p / "pending"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{pair_id}.lock"
+    reclaimed_stale_lock = False
+
+    def _acquire() -> int:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, json.dumps({"pid": os.getpid(), "created_at": _now_iso()}).encode("utf-8"))
+        return fd
+
+    try:
+        lock_fd = _acquire()
+    except FileExistsError:
+        if _stale_lock(lock_path):
+            reclaim_path = lock_path.with_name(
+                f"{lock_path.name}.reclaimed-{int(time.time() * 1000)}-{os.getpid()}"
+            )
+            try:
+                lock_path.rename(reclaim_path)
+            except OSError:
+                return _refuse(
+                    "EALREADY",
+                    f"a request for pair_id={pair_id!r} is already being written by a "
+                    "concurrent call — one request per sealed pair",
+                )
+            try:
+                lock_fd = _acquire()
+                reclaimed_stale_lock = True
+            except FileExistsError:
+                return _refuse(
+                    "EALREADY",
+                    f"a request for pair_id={pair_id!r} is already being written by a "
+                    "concurrent call — one request per sealed pair",
+                )
+        else:
+            return _refuse(
+                "EALREADY",
+                f"a request for pair_id={pair_id!r} is already being written by a "
+                "concurrent call — one request per sealed pair",
+            )
+    os.close(lock_fd)
+    try:
+        result = body()
+        if reclaimed_stale_lock:
+            result["reclaimed_stale_lock"] = True
+        return result
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def _cite_and_persist(pending_path: Path, pending_record: dict, *, ledger,
+                       envelope_id: str, app_id: str, call_args: dict,
+                       project: str, session: str, pair_id: str,
+                       grants_root_p: Path) -> dict:
+    """The common tail of every verb's own ``*_request``: resolve the one
+    active envelope governing ``pending_record["verb"]`` for ``app_id``,
+    write the pending record durably, cite it, sign it, and persist again
+    — module docstring's 'write first, cite second, sign last.' On any
+    refusal below the durability write, the pending file (if written) is
+    removed again so a request nobody may act on is never left in
+    ``pending/``."""
+    from .envelopes import EnvelopeAuthority, governing_envelopes
+
+    verb = pending_record["verb"]
+    try:
+        rows = governing_envelopes(verb, app_id)
+    except (OSError, ValueError) as exc:
+        return _refuse("EAMBIG", f"envelope registry unreadable: {exc}")
+    matches = [row["id"] for row in rows]
+    if envelope_id:
+        if envelope_id not in matches:
+            return _refuse(
+                "ENOENT", f"envelope {envelope_id!r} does not govern {verb!r} for {app_id!r}",
+                envelope_ids=matches,
+            )
+        matches = [envelope_id]
+    if not matches:
+        return _refuse("ENOENT", f"no active {verb!r} envelope governs {app_id!r}")
+    if len(matches) > 1:
+        return _refuse(
+            "EAMBIG", f"multiple active {verb!r} envelopes govern {app_id!r} — "
+                      f"pass envelope_id to name which one to cite",
+            envelope_ids=matches,
+        )
+
+    # `call_args` is stashed on the record itself (not just handed to the
+    # envelope) so the apply side can re-derive exactly what the citation
+    # SHOULD carry without re-deriving verb-specific bounds shapes from
+    # `target` — `_verify_pending_signature_and_citation` compares the
+    # FRANK citation's own `call_args` against this stashed copy, verb-
+    # agnostically.
+    pending_record["call_args"] = call_args
+    _write_json_atomic(pending_path, pending_record)
+
+    result = EnvelopeAuthority(ledger).authorize_and_cite(
+        matches[0], actor=app_id, verb=verb, call_args=call_args,
+        project=project or "willow-mcp", session=session, pair_id=pair_id,
+    )
+    if not result.get("ok"):
+        pending_path.unlink(missing_ok=True)
+        errno = result.get("errno", "EAMBIG")
+        reason = result.get("reason", "")
+        fields = result.get("fields")
+        return _refuse(errno, reason, envelope_id=matches[0],
+                       citation_id=result.get("citation_id"), fields=fields)
+
+    pending_record["envelope_id"] = matches[0]
+    pending_record["citation_id"] = result.get("citation_id")
+    pending_record["broker_sig"] = _sign_request(pending_record, grants_root_p)
+    _write_json_atomic(pending_path, pending_record)
+
+    return {
+        "ok": True, "state": "requested", "pending_path": str(pending_path),
+        "pair_id": pair_id, "verb": verb, "envelope_id": matches[0],
+        "citation_id": result.get("citation_id"),
+    }
+
+
+def _verify_pending_signature_and_citation(record: dict, *, ledger, grants_root: Path,
+                                            applied_event: str) -> Optional[dict]:
+    """Apply-side steps shared by every trust-owner verb: the broker's own
+    signature over the request (:func:`_verify_request_signature`), and
+    confirmation that its ``envelope_id``/``citation_id`` actually exist in
+    FRANK as a granted citation for THIS ``pair_id`` and THIS verb's
+    ``target`` — never consumed already, either by an existing ``done/``
+    entry or by a prior ``applied_event`` FRANK row (the durable record,
+    read even when ``done/`` was deleted out from under it — Loki audit 5,
+    LIMIT, restated here for every verb rather than just ``manifest.grant``).
+    Returns a refusal dict, or ``None`` when both hold."""
+    pair_id = record.get("pair_id")
+    verb = record.get("verb") or VERB
+    sig_ok, sig_reason = _verify_request_signature(record, grants_root)
+    if not sig_ok:
+        return _refuse("eforged", sig_reason)
+
+    envelope_id = record.get("envelope_id")
+    citation_id = record.get("citation_id")
+    if not envelope_id or not citation_id:
+        return _refuse("eforged", "pending record carries no envelope_id/citation_id to confirm in FRANK")
+    if ledger is None:
+        return _refuse("EUNREACH", "no FRANK ledger available to confirm the citation against")
+
+    candidates = ledger.all_events("envelope_citation", match={"envelope_id": envelope_id, "outcome": "granted"})
+    cited = next((c for c in candidates if c.get("id") == citation_id), None)
+    if cited is None or (cited.get("content") or {}).get("verb") != verb:
+        return _refuse("eforged",
+                        f"FRANK carries no granted {verb!r} envelope_citation matching "
+                        f"citation_id={citation_id!r} for pair_id={pair_id!r}")
+    cited_args = (cited["content"].get("call_args") or {})
+    if cited_args.get("pair_id") != pair_id:
+        return _refuse("eforged",
+                        "FRANK citation's call_args.pair_id does not match this request's "
+                        f"pair_id={pair_id!r} — a citation minted for a different sealed "
+                        "pair can never authorize this one, even copied verbatim")
+    cited_without_pair = {k: v for k, v in cited_args.items() if k != "pair_id"}
+    if cited_without_pair != (record.get("call_args") or {}):
+        return _refuse("eforged",
+                        "FRANK citation's call_args does not match this request's own "
+                        "recorded call_args — the file was edited after the citation was inked")
+
+    consumed = _consumed_citation_ids(grants_root)
+    if citation_id in consumed:
+        return _refuse("eforged",
+                        f"citation_id={citation_id!r} was already consumed by a prior "
+                        "done/ grant — a spent citation is never replayable")
+    try:
+        applied_events = ledger.all_events(applied_event, match={"citation_id": citation_id})
+    except Exception as exc:  # noqa: BLE001 — ledger unreachable is refused, never swallowed as "not found"
+        return _refuse("EUNREACH",
+                        "FRANK ledger unreachable while checking for a prior "
+                        f"{applied_event!r} event naming citation_id={citation_id!r}: "
+                        f"{type(exc).__name__}: {exc} — refusing rather than treating an "
+                        "unreachable ledger as 'not previously consumed'")
+    if applied_events:
+        return _refuse("eforged",
+                        f"citation_id={citation_id!r} already has a FRANK {applied_event!r} "
+                        "event recorded — already consumed")
+    return None
 
 
 # ── request: the broker side — verify everything, write, then cite ─────────
@@ -1008,7 +1232,7 @@ def _manifest_grant_request_locked(
     # request nobody may act on is not left sitting in pending/.
     pending_path = _pending_path(grants_root_p, pair_id)
     pending_record = {
-        "pair_id": pair_id, "envelope_id": None, "citation_id": None,
+        "pair_id": pair_id, "verb": VERB, "envelope_id": None, "citation_id": None,
         "actor": app_id, "apps": apps, "groups": groups,
         "project": project or "willow-mcp", "session": session,
         "requested_at": _now_iso(), "pre_state": pre_state,
@@ -1480,8 +1704,23 @@ def manifest_grant_apply(
             processed.append(out)
             continue
         try:
-            processed.append(_apply_one(record, f, ledger=ledger, apps_root=apps_root_p,
-                                        db_path=db_path, grants_root=root))
+            verb = record.get("verb") or VERB
+            if verb == VERB:
+                outcome = _apply_one(record, f, ledger=ledger, apps_root=apps_root_p,
+                                      db_path=db_path, grants_root=root)
+            else:
+                from . import trust_owner_verbs as _tov
+
+                apply_fn = _tov.APPLY_DISPATCH.get(verb)
+                if apply_fn is None:
+                    out = {"ok": False, "error": "ENOSYS",
+                           "reason": f"no apply handler registered for verb {verb!r}"}
+                    _move(f, root / "failed", {**record, "result": out})
+                    outcome = {"pair_id": record.get("pair_id"), **out}
+                else:
+                    outcome = apply_fn(record, f, ledger=ledger, apps_root=apps_root_p,
+                                        db_path=db_path, grants_root=root)
+            processed.append(outcome)
         except Exception as exc:  # noqa: BLE001 — never let one bad request wedge the drain
             out = {"pair_id": record.get("pair_id", f.stem), "ok": False, "error": "eunexpected",
                    "reason": f"{type(exc).__name__}: {exc}"}
@@ -1511,7 +1750,20 @@ RETRYABLE_ERRORS = frozenset({"EUNREACH", "ecorrupt", "eunexpected", "eperm_pend
 #: refused for a standing policy reason — retrying resubmits exactly what
 #: was correctly refused. Never retryable, regardless of age or a
 #: plausible-sounding excuse.
-TERMINAL_ERRORS = frozenset({"eforged", "eseal_mismatch", "EPERM", "edrift"})
+#:
+#: ``estale_presigned`` (pair ``1bd6fd29`` amendment; sealed ``33654f35``,
+#: 2026-09-22) is minted OUTSIDE this module entirely — by
+#: ``deploy/manifest-grant/install.sh`` step 6b, which withdraws every
+#: request already sitting in ``pending/`` before enabling the timer,
+#: because step 6 (re-signing every manifest under a fresh fingerprint)
+#: just invalidated every such request's recorded ``pre_state`` and the
+#: seat set named in it may itself be stale. Written in the exact shape
+#: :func:`_move` produces (the original record's fields spread at the top
+#: level, plus a ``result`` key) so :func:`manifest_grant_status` and this
+#: set both read it with no special-casing — never retryable: the fix is a
+#: fresh request under a current sealed pair, not a replay of pre_state
+#: that is now definitionally stale.
+TERMINAL_ERRORS = frozenset({"eforged", "eseal_mismatch", "EPERM", "edrift", "estale_presigned"})
 
 
 def manifest_grant_retry(
