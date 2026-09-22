@@ -198,9 +198,14 @@ def test_collection_permitted_empty_scope_denies_all(apps_root):
 
 # ── gap backlog permission groups ────────────────────────────────────────────
 
-def test_gap_read_expands_to_gap_list_only(apps_root):
+def test_gap_read_expands_to_gap_list_and_gap_get_only(apps_root):
+    """Gap 1477ebb2bc35: gap_get is the id-lookup door the backlog was
+    missing (store_get refuses `gaps` -- outside every seat's store_scope --
+    and gap_list has no id lookup), added to the SAME read group as
+    gap_list rather than a new one."""
     _write_manifest(apps_root, "gap_reader", ["gap_read"])
     assert gate.permitted("gap_reader", "gap_list") is True
+    assert gate.permitted("gap_reader", "gap_get") is True
     assert gate.permitted("gap_reader", "gap_log") is False
     assert gate.permitted("gap_reader", "gap_promote") is False
 
@@ -253,7 +258,7 @@ def test_orchestrator_group_still_grants_verify_and_clear(apps_root):
 
 def test_gap_tools_included_in_full_access(apps_root):
     _write_manifest(apps_root, "admin", ["full_access"])
-    for tool in ("gap_log", "gap_list", "gap_resolve", "gap_promote"):
+    for tool in ("gap_log", "gap_list", "gap_get", "gap_resolve", "gap_promote"):
         assert gate.permitted("admin", tool) is True
 
 

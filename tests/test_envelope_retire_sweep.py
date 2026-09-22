@@ -178,6 +178,145 @@ def test_classify_counted_wins_when_branch_absent_but_max_count_set():
 
 
 # --------------------------------------------------------------------------
+# expires_at retires (gap b7a4ccdc8bbb, second half)
+# --------------------------------------------------------------------------
+
+def test_classify_expired_row_is_expired():
+    row = _row(expires_at="2020-01-01T00:00:00Z")
+    out = sweep_mod.classify(row)
+    assert out == {"class": "expired", "expires_at": "2020-01-01T00:00:00Z"}
+
+
+def test_classify_expiry_takes_priority_over_branch_bound():
+    row = _row(expires_at="2020-01-01T00:00:00Z")  # also branch-bound by default fixture
+    out = sweep_mod.classify(row)
+    assert out["class"] == "expired"
+
+
+def test_classify_expiry_takes_priority_over_counted():
+    row = _row(max_count=5, expires_at="2020-01-01T00:00:00Z")
+    out = sweep_mod.classify(row)
+    assert out["class"] == "expired"
+
+
+def test_classify_future_expires_at_is_not_expired():
+    row = _row(verb="envelope.apply", bounds={}, expires_at="2099-01-01T00:00:00Z")
+    out = sweep_mod.classify(row)
+    assert out == {"class": "standing"}
+
+
+def test_classify_unparseable_expires_at_is_unreachable_not_standing():
+    """Rework of Loki's F2 (23CAD2B4): a malformed expires_at used to fall
+    through to standing and be counted in the bare kept_standing total --
+    but envelopes.permitted refuses these rows EAMBIG, so the register
+    must not claim they are in force. classify() now surfaces them as
+    unreachable with why, never silently standing."""
+    row = _row(verb="envelope.apply", bounds={}, expires_at="not-a-timestamp")
+    out = sweep_mod.classify(row)
+    assert out["class"] == "unreachable"
+    assert "expires_at unparseable" in out["why"]
+    assert "not-a-timestamp" in out["why"]
+
+
+def test_classify_empty_string_expires_at_is_unreachable_not_absent():
+    """Rework of Loki's F2, second pass (EB30E84F): `""` is not the same as
+    the key being absent -- envelopes._deadline("") raises ("Invalid
+    isoformat string: ''"), so the gate refuses it EAMBIG the same as any
+    other unparseable value. Only `None` (the gate's own null test) is
+    genuinely "no expiry"."""
+    row = _row(verb="envelope.apply", bounds={}, expires_at="")
+    out = sweep_mod.classify(row)
+    assert out["class"] == "unreachable"
+    assert "expires_at unparseable" in out["why"]
+
+
+def test_classify_zero_expires_at_is_unreachable_not_absent():
+    """Same disagreement for `0`/`False`: envelopes._deadline(0) raises
+    ("must be a timestamp/date or null") because it is not a string and
+    not None -- the gate refuses it EAMBIG, so this must not be standing."""
+    row = _row(verb="envelope.apply", bounds={}, expires_at=0)
+    out = sweep_mod.classify(row)
+    assert out["class"] == "unreachable"
+    assert "expires_at unparseable" in out["why"]
+
+
+def test_classify_none_expires_at_is_genuinely_absent():
+    """The one falsy value that IS standing: None, matching the gate's own
+    null test in envelopes.permitted."""
+    row = _row(verb="envelope.apply", bounds={}, expires_at=None)
+    out = sweep_mod.classify(row)
+    assert out == {"class": "standing"}
+
+
+def test_classify_non_string_expires_at_is_unreachable():
+    row = _row(verb="envelope.apply", bounds={}, expires_at=12345)
+    out = sweep_mod.classify(row)
+    assert out["class"] == "unreachable"
+    assert "expires_at unparseable" in out["why"]
+
+
+def test_sweep_malformed_expires_at_row_is_unreachable_not_kept_standing():
+    row = _row(verb="envelope.apply", bounds={}, expires_at="not-a-timestamp")
+    reg = _registry([row])
+    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}))
+    assert receipt["kept_standing"] == 0
+    assert receipt["retired"] == []
+    assert len(receipt["unreachable"]) == 1
+    assert receipt["unreachable"][0]["id"] == "env-1"
+    assert "expires_at unparseable" in receipt["unreachable"][0]["why"]
+
+
+def test_classify_standing_row_has_no_expires_at():
+    row = _row(verb="envelope.apply", bounds={})
+    assert row.get("expires_at") is None
+    out = sweep_mod.classify(row)
+    assert out == {"class": "standing"}
+
+
+def test_sweep_expired_row_retires_dry_run():
+    row = _row(verb="envelope.apply", bounds={}, expires_at="2020-01-01T00:00:00Z")
+    reg = _registry([row])
+    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}))
+    assert receipt["retired"] == [
+        {"id": "env-1", "verb": "envelope.apply", "reason": "expired",
+         "expires_at": "2020-01-01T00:00:00Z"},
+    ]
+    # dry run: nothing written to the row itself
+    assert row.get("status") == "active"
+
+
+def test_sweep_expired_row_retires_live_and_writes_same_frank_shape():
+    row = _row(verb="envelope.apply", bounds={}, expires_at="2020-01-01T00:00:00Z")
+    backend = _Backend([row])
+    snapshot = backend.snapshot()
+    ledger = _FakeLedger()
+    receipt = sweep_mod.sweep(
+        dry_run=False, registry=snapshot, api=_fake_api({}), ledger=ledger,
+        reload_registry=backend.reload, write_registry=backend.write, lock=_null_lock,
+    )
+    assert len(receipt["retired"]) == 1
+    assert receipt["retired"][0]["reason"] == "expired"
+    assert backend.store["active"][0]["status"] == "revoked"
+    assert backend.store["active"][0]["revoked_reason"] == "expired"
+    assert backend.store["active"][0]["revoked_by"] == sweep_mod.DEFAULT_ACTOR
+    # same FRANK envelope_revoked row shape as branch_gone/spent
+    assert len(ledger.appended) == 1
+    project, event_type, content = ledger.appended[0]
+    assert event_type == sweep_mod.FRANK_EVENT_REVOKED
+    assert content["envelope_id"] == "env-1"
+    assert content["reason"] == "expired"
+    assert content["revoked_by"] == sweep_mod.DEFAULT_ACTOR
+
+
+def test_sweep_standing_row_without_expires_at_is_untouched_by_expiry_logic():
+    row = _row(verb="envelope.apply", bounds={})
+    reg = _registry([row])
+    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}))
+    assert receipt["kept_standing"] == 1
+    assert receipt["retired"] == []
+
+
+# --------------------------------------------------------------------------
 # sweep() — dry run / classification-only paths (registry snapshot only,
 # no reload/write backend needed since nothing is written)
 # --------------------------------------------------------------------------
@@ -888,6 +1027,64 @@ def test_mint_never_called_when_budget_is_already_under_the_floor(monkeypatch):
     receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}), time_budget_s=1.0)
     assert mint_calls == []
     assert receipt["examined"] == 0
+    assert receipt["truncated"] is True
+
+
+def test_counted_row_skipped_when_budget_already_under_the_floor_before_it_starts(monkeypatch):
+    """Gap 274baba06418 (T1): the per-row deadline check used to guard
+    branch_bound only, so a counted row's FRANK count ran UNCLIPPED past
+    the budget. Now a counted row with no budget left for one more call is
+    never even started -- not examined, not counted in kept_in_force, and
+    the ledger is never even asked."""
+    row = _row(max_count=5)
+    reg = _registry([row])
+    monkeypatch.setattr(sweep_mod.time, "monotonic", lambda: 1000.0)
+
+    calls = []
+
+    class _CountingLedger(_FakeLedger):
+        def citation_count(self, envelope_id):
+            calls.append(envelope_id)
+            return super().citation_count(envelope_id)
+
+    receipt = sweep_mod.sweep(
+        dry_run=True, registry=reg, api=_fake_api({}), ledger=_CountingLedger(),
+        time_budget_s=1.0,
+    )
+    assert calls == []  # FRANK was never asked
+    assert receipt["examined"] == 0
+    assert receipt["retired"] == receipt["kept_in_force"] == receipt["unreachable"] == []
+    assert receipt["truncated"] is True
+
+
+def test_counted_row_after_deadline_mid_sweep_is_clipped_and_reported_truncated(monkeypatch):
+    """A mixed register where the budget runs out partway through: the
+    counted row that would have needed a FRANK call after the deadline is
+    reported via `truncated`, never folded into `kept_in_force` -- it was
+    never actually examined, so nothing was decided about it either way."""
+    # ids chosen so sort order (by id) examines the standing row FIRST and
+    # the counted row second -- "env-a-*" < "env-b-*".
+    standing = _row(id="env-a-standing", verb="envelope.apply", bounds={})
+    counted = _row(id="env-b-counted", max_count=1)
+    reg = _registry([standing, counted])
+
+    # First call is `started`; the between-rows check must not yet trip
+    # (so the standing row is examined), but by the time the counted row's
+    # per-row clipped-timeout check runs, the budget must look spent.
+    calls = {"n": 0}
+
+    def fake_monotonic():
+        calls["n"] += 1
+        return 0.0 if calls["n"] <= 2 else 100.0
+
+    monkeypatch.setattr(sweep_mod.time, "monotonic", fake_monotonic)
+    ledger = _FakeLedger(counts={"env-b-counted": 1})
+    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}),
+                              ledger=ledger, time_budget_s=1.0)
+
+    assert receipt["kept_standing"] == 1
+    assert receipt["retired"] == []
+    assert not any(r["id"] == "env-b-counted" for r in receipt["kept_in_force"])
     assert receipt["truncated"] is True
 
 

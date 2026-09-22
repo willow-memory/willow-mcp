@@ -124,6 +124,26 @@ Full overlay text: `persona-overlays.md`.
 2. Work within manifest permissions
 3. Call `closeout.tool` (today: `handoff_write_v4`) — output will be `format: handoff_v1`
 
+`handoff_write_v4`'s accepted keyword fields are exactly `findings`, `narrative`,
+`checklist_resolved`, `envelope_clean`, `no_findings_reason` (plus the positional
+`app_id`/`dispatch_id`). There is no `summary` or `details` field — do not send
+one. A direct/test call passing one is refused by name (`EINVAL`, gap
+21f80b2b348a); a real MCP call is not — the SDK drops an unrecognized top-level
+key before this tool ever sees it (probed against the real stdio boundary,
+Loki 23CAD2B4 F1), so a typo'd field name is silently discarded and this call
+proceeds as if you had passed neither `findings` nor `narrative`. The
+empty-`findings` refusal still catches that (nothing gets written), but names
+"no `no_findings_reason`", not your typo — so if you see that refusal and you
+know you passed findings, check your field names against the list above.
+
+Each finding needs a one-line statement (`text`, or one of `title`/`finding`/
+`summary`). When `checklist_resolved=True` (the default), the tool also refuses
+up front unless SOME evidence exists somewhere: a counted result in `narrative`
+(e.g. "42 passed") or an `evidence` field (a list of non-empty strings — a test
+count, a commit sha, a diff reviewed) on at least one finding — the same check
+verify_handoff runs (gap 34c8e60f4260). An empty `findings` list is refused
+unless `no_findings_reason` explains why there is nothing to report.
+
 ### Human path
 
 1. `session_enter` → `entry_mode: human`

@@ -97,3 +97,154 @@ def test_log_after_promoted_reports_promoted_without_reopening():
     assert result["promoted_to"] == "KID1234"
     row = gaps.get(logged["id"])
     assert row["status"] == "promoted"
+
+
+# ── the read door: gap_get / gap_list query/since/topic-prefix/brief/cap
+# (gap 1477ebb2bc35) ──────────────────────────────────────────────────────
+
+def test_get_gap_hit_returns_full_record():
+    logged = gaps.log("t-get-hit", "What color is the sky?")
+    record = gaps.get_gap(logged["id"])
+    assert record["_id"] == logged["id"]
+    assert record["topic"] == "t-get-hit"
+    assert record["question"] == "What color is the sky?"
+    assert record["status"] == "open"
+
+
+def test_get_gap_miss_returns_not_found():
+    assert gaps.get_gap("does-not-exist-xyz") == {"error": "not_found", "id": "does-not-exist-xyz"}
+
+
+def test_list_gaps_query_narrows_by_substring_over_topic_and_question():
+    gaps.log("t-query", "How does the render pipeline work?")
+    gaps.log("t-query", "What is the deploy schedule?")
+    rows = gaps.list_gaps(topic="t-query", query="render pipeline")["items"]
+    assert len(rows) == 1
+    assert "render pipeline" in rows[0]["question"].lower()
+
+
+def test_list_gaps_query_is_and_not_or():
+    gaps.log("t-query-and", "alpha bravo question")
+    gaps.log("t-query-and", "alpha only question")
+    rows = gaps.list_gaps(topic="t-query-and", query="alpha bravo")["items"]
+    assert len(rows) == 1
+    assert "bravo" in rows[0]["question"]
+
+
+def test_list_gaps_query_matches_topic_too():
+    gaps.log("t-query-topic-marker", "an unrelated question body")
+    rows = gaps.list_gaps(query="query-topic-marker")["items"]
+    assert any(r["topic"] == "t-query-topic-marker" for r in rows)
+
+
+def test_list_gaps_since_narrows_to_recently_asked():
+    gaps.log("t-since", "an old-ish question")
+    from datetime import datetime, timedelta, timezone
+    future = (datetime.now(timezone.utc) + timedelta(days=3650)).isoformat()
+    rows = gaps.list_gaps(topic="t-since", since=future)["items"]
+    assert rows == []
+    rows_all = gaps.list_gaps(topic="t-since")["items"]
+    assert len(rows_all) == 1
+
+
+def test_list_gaps_topic_prefix_matches_nested_namespace():
+    gaps.log("t-prefix/child", "a nested question")
+    gaps.log("t-prefix-other", "not nested, just similarly named")
+    rows = gaps.list_gaps(topic="t-prefix")["items"]
+    topics = {r["topic"] for r in rows}
+    assert "t-prefix/child" in topics
+    assert "t-prefix-other" not in topics
+
+
+def test_list_gaps_topic_exact_still_matches():
+    gaps.log("t-prefix-exact", "an exact-topic question")
+    rows = gaps.list_gaps(topic="t-prefix-exact")["items"]
+    assert len(rows) == 1
+
+
+def test_list_gaps_page_cap_is_25_even_when_more_is_asked():
+    # `log`'s dedup key drops tokens under 3 chars (see gaps._tokens), so a
+    # bare digit like "0"/"1" would collapse every question into one row --
+    # each token here is >=3 chars and unique per iteration.
+    for i in range(30):
+        gaps.log("t-cap", f"unique caps question variant q{i:03d}x")
+    rows = gaps.list_gaps(topic="t-cap", limit=1000)["items"]
+    assert len(rows) == gaps.MAX_LIST_LIMIT == 25
+
+
+def test_list_gaps_brief_default_shape():
+    logged = gaps.log("t-brief", "x" * 400)
+    rows = gaps.list_gaps(topic="t-brief")["items"]
+    row = rows[0]
+    assert set(row.keys()) == {"id", "topic", "status", "asked_count", "last_asked_at", "question"}
+    assert row["id"] == logged["id"]
+    assert len(row["question"]) == 200
+
+
+def test_list_gaps_brief_false_returns_full_record():
+    gaps.log("t-full", "a full record question")
+    rows = gaps.list_gaps(topic="t-full", brief=False)["items"]
+    row = rows[0]
+    assert "first_asked_at" in row
+    assert "_id" in row
+
+
+# ── page byte budget in both modes (Loki EB30E84F F1) ────────────────────────
+# 25 rows x ~5 KB questions used to measure 134,233 bytes (~33.5k tokens) for
+# brief=False -- over a real MCP client's ~25k-token tool-result cap by a
+# third, even though the docstring claimed the page "can never exceed the
+# tool-result limit". brief=False is now capped at MAX_LIST_LIMIT_FULL (5)
+# rather than MAX_LIST_LIMIT (25).
+
+_APPROX_CLIENT_TOKEN_CAP = 25_000
+_BYTES_PER_TOKEN_FLOOR = 3  # conservative: real tokenizers average ~4 bytes/token
+
+
+def test_list_gaps_brief_false_page_stays_under_client_budget():
+    import json as _json
+
+    for i in range(30):
+        gaps.log(f"t-bytebudget/{i:03d}", ("x" * 5000) + f" unique{i:03d}")
+    rows = gaps.list_gaps(topic="t-bytebudget", limit=1000, brief=False)["items"]
+    assert len(rows) <= gaps.MAX_LIST_LIMIT_FULL
+    page_bytes = len(_json.dumps(rows).encode("utf-8"))
+    approx_tokens = page_bytes / _BYTES_PER_TOKEN_FLOOR
+    assert approx_tokens < _APPROX_CLIENT_TOKEN_CAP, (
+        f"brief=False page was {page_bytes} bytes (~{approx_tokens:.0f} tokens), "
+        f"over the client budget of {_APPROX_CLIENT_TOKEN_CAP}"
+    )
+
+
+def test_list_gaps_brief_true_page_stays_under_client_budget_at_same_rows():
+    import json as _json
+
+    for i in range(30):
+        gaps.log(f"t-bytebudget2/{i:03d}", ("x" * 5000) + f" unique{i:03d}")
+    rows = gaps.list_gaps(topic="t-bytebudget2", limit=1000, brief=True)["items"]
+    assert len(rows) <= gaps.MAX_LIST_LIMIT
+    page_bytes = len(_json.dumps(rows).encode("utf-8"))
+    approx_tokens = page_bytes / _BYTES_PER_TOKEN_FLOOR
+    assert approx_tokens < _APPROX_CLIENT_TOKEN_CAP
+
+
+# ── since is parsed, not string-compared (Loki EB30E84F F4) ─────────────────
+
+def test_list_gaps_since_z_suffix_same_second_still_matches():
+    """The old string compare excluded a later, microsecond-bearing row
+    because '.' < 'Z'. Parsed comparison must not repeat that."""
+    logged = gaps.log("t-since-z", "a question asked just now")
+    from datetime import datetime, timedelta, timezone
+    last_asked = gaps.get_gap(logged["id"])["last_asked_at"]
+    same_second_z = last_asked.split(".")[0] + "Z"
+    rows = gaps.list_gaps(topic="t-since-z", since=same_second_z)["items"]
+    assert len(rows) == 1
+
+    future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    assert gaps.list_gaps(topic="t-since-z", since=future)["items"] == []
+
+
+def test_list_gaps_since_malformed_refuses_einval():
+    gaps.log("t-since-bad", "a question")
+    result = gaps.list_gaps(topic="t-since-bad", since="yesterday")
+    assert result["error"] == "EINVAL"
+    assert "since" in result["message"]

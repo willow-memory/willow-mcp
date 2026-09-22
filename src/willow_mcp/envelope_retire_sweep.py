@@ -4,14 +4,18 @@ Sealed decision 83faa340 (operator, 2026-09-21; SOIL record
 ``envelopes-retire-when-spent-2026-09-21``): an envelope whose bounds name a
 branch is retired when that branch is merged and deleted on the remote; an
 envelope with ``max_count`` is retired when FRANK shows the count consumed.
-Retirement is a revoke with ``revoked_reason=branch_gone`` or ``=spent`` and a
-FRANK ``envelope_revoked`` row — the grant and its uses stay auditable, it is
-just no longer listed as in force. Standing envelopes (no branch bound, no
-``max_count`` — the planting, the per-class dispatch envelopes,
-``envelope.apply``) are untouched. Gap 4c7512c57a7e (registry honesty): the
-same resolver :func:`envelopes.registry_path` / :mod:`envelope_authoring`
-already use, so this sweep and the gate cannot disagree about which file is
-"the" registry.
+Gap b7a4ccdc8bbb (second half): an envelope whose ``expires_at`` has passed
+is retired too, regardless of whatever else it is bound to — the register
+used to keep reporting an expired row ``kept_in_force`` since expiry was
+never itself a retirement condition here (only the gate checked it, at
+enforcement time). Retirement is a revoke with ``revoked_reason=branch_gone``,
+``=spent``, or ``=expired`` and a FRANK ``envelope_revoked`` row — the grant
+and its uses stay auditable, it is just no longer listed as in force.
+Standing envelopes (no branch bound, no ``max_count``, no ``expires_at`` —
+the planting, the per-class dispatch envelopes, ``envelope.apply``) are
+untouched. Gap 4c7512c57a7e (registry honesty): the same resolver
+:func:`envelopes.registry_path` / :mod:`envelope_authoring` already use, so
+this sweep and the gate cannot disagree about which file is "the" registry.
 
 **The gate does not depend on this.** A retired envelope was already
 unusable (branch gone / count spent); this fixes what the register SAYS, not
@@ -21,6 +25,12 @@ gate honours.
 Classification (one pass over a snapshot of ``active[]``, never touching
 ``proposals[]``):
 
+* **expired** — ``expires_at`` parses (:func:`envelopes._deadline`, the
+  SAME parser the gate's own ``EEXPIRED`` check uses) and is ``<=`` now.
+  Checked FIRST, ahead of branch-bound/counted: a row that has also
+  expired retires for that reason without waiting on a network call or a
+  FRANK count. Retired unconditionally — there is no "left alone" outcome
+  for expiry the way an unmerged deleted branch is left alone.
 * **branch-bound** — the verb's bounds carry a branch-NAME field whose value
   is a single non-glob branch (``branches`` for ``git.commit``/``git.push``
   only — ``pr.open``'s only branch-shaped bound, ``base_branches``, names the
@@ -37,7 +47,8 @@ Classification (one pass over a snapshot of ``active[]``, never touching
   reported ``unreachable`` rather than trusted). Retired when FRANK's
   granted-citation count for that envelope id is ``>= max_count``
   (:meth:`governance_ledger.GovernanceLedger.citation_count`).
-* **standing** — neither. Untouched; counted in ``kept_standing``.
+* **standing** — none of the above (no expiry, no max_count, no single
+  literal branch). Untouched; counted in ``kept_standing``.
 
 A bounds row whose branch field is absent, empty, or a glob (``*``, ``?``,
 ``[``) is treated as standing too — a glob is not bound to any one branch's
@@ -130,6 +141,7 @@ import os
 import re
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterator, Optional
 
 from . import envelope_authoring as _authoring
@@ -269,20 +281,71 @@ def _single_branch(bounds: dict, verb: str) -> Optional[str]:
     return branch
 
 
-def classify(row: dict) -> dict:
-    """``{class: "branch_bound"|"counted"|"standing", ...}`` for one active
-    row. Pure — reads only the row, no network, no ledger. ``branch_bound``
-    carries ``repo``/``branch``; ``counted`` carries ``max_count``.
+def _row_expiry(row: dict) -> tuple[Optional[datetime], Optional[str]]:
+    """``(deadline, error)`` for the row's ``expires_at``. Reuses
+    :func:`envelopes._deadline` — the SAME parser the gate itself uses to
+    decide ``EEXPIRED`` (module docstring's own rule: this sweep and the
+    gate must never disagree about what "expired" means).
 
-    ``max_count`` is checked first: it is a universal per-row metering
+    ``(None, None)`` — no ``expires_at`` at all (``None``, the gate's own
+    null test — :func:`envelopes.permitted` reads ``envelope.get(
+    "expires_at")`` and treats exactly ``None`` as absent): a genuinely
+    standing row as far as expiry is concerned. ``(None, <message>)`` —
+    present but unparseable: rework of Loki's finding F2, twice
+    (23CAD2B4, then EB30E84F). The first cut treated ``"not-a-date"`` and a
+    bare int as unparseable but used a truthiness test (`if not value`)
+    that ALSO caught ``""`` and ``0``/``False`` as "absent" — silently
+    re-enshrining the same disagreement one level down: ``envelopes.
+    _deadline("")`` raises (``Invalid isoformat string: ''``) and
+    ``_deadline(0)`` raises (``must be a timestamp/date or null``), so the
+    gate refuses both ``EAMBIG`` while this sweep folded them into the bare
+    ``kept_standing`` count. The test is now the gate's own — ``value is
+    None`` — so every value the gate would raise on reaches
+    :func:`envelopes._deadline` here too and comes back ``unreachable``
+    with why, never silently ``standing``."""
+    value = row.get("expires_at")
+    if value is None:
+        return None, None
+    try:
+        return _envelopes._deadline(value), None
+    except ValueError as exc:
+        return None, f"expires_at unparseable: {value!r} ({exc})"
+
+
+def classify(row: dict) -> dict:
+    """``{class: "expired"|"branch_bound"|"counted"|"standing"|"unreachable",
+    ...}`` for one active row. Pure — reads only the row, no network, no
+    ledger. ``expired`` carries ``expires_at``; ``branch_bound`` carries
+    ``repo``/``branch``; ``counted`` carries ``max_count``; ``unreachable``
+    carries ``why`` (a malformed ``expires_at`` — see :func:`_row_expiry`).
+
+    ``expires_at`` is checked FIRST, ahead of ``max_count``/branch-bound
+    (gap b7a4ccdc8bbb, second half): a row whose deadline has already
+    passed retires regardless of what else it is bound to — expiry is not
+    conditioned on the row also being branch-bound or counted, and a
+    counted/branch-bound row that has also expired should not wait on a
+    network or FRANK round trip just to be reported ``kept_in_force`` for
+    the wrong reason. The comparison is ``<=`` now, matching
+    :func:`envelopes.permitted`'s own ``EEXPIRED`` check exactly. A row
+    whose ``expires_at`` does not even PARSE is ``unreachable`` (Loki
+    23CAD2B4 F2) rather than falling through to ``standing`` — the gate
+    refuses those rows EAMBIG, so the register must not claim they are in
+    force.
+
+    ``max_count`` is checked next: it is a universal per-row metering
     field (set by the proposer independently of which bounds keys the
     verb declares — see ``envelope_authoring.propose``'s ``max_count``
     kwarg), so a row that happens to carry BOTH a single literal branch
     and a max_count is countable regardless of verb. A ``max_count`` row
     whose ``use_count_source`` is not ``"frank"`` is NOT counted here —
     :func:`sweep` reports it ``unreachable`` rather than trusting a source
-    this module cannot verify. A row with no max_count and no
+    this module cannot verify. A row with no expiry, no max_count, and no
     single-literal branch (bounds absent, empty, or a glob) is standing."""
+    expiry, expiry_error = _row_expiry(row)
+    if expiry_error:
+        return {"class": "unreachable", "why": expiry_error}
+    if expiry is not None and expiry <= datetime.now(timezone.utc):
+        return {"class": "expired", "expires_at": row.get("expires_at")}
     verb = row.get("verb") or ""
     bounds = row.get("bounds") or {}
     max_count = row.get("max_count")
@@ -538,14 +601,36 @@ def sweep(
     FAAD3E4A: an unwritable cursor store used to fail silently and every
     call re-examined the same prefix with no sign why).
 
-    A row whose class needs a network round trip (``branch_bound``) is
-    never even started once there is not enough of the wall-clock budget
-    left for one more call — that row is NOT counted in ``examined`` and
-    the cursor does NOT advance onto it; the call ends there instead
-    (rework of Loki's MEDIUM finding, probe 7AFN806Y, FAAD3E4A: a zero
-    clipped timeout used to mean "every remaining row is instantly
-    unreachable," burning the whole tail as fake-examined progress and
-    defeating the cursor).
+    A row whose class needs a round trip (``branch_bound`` — GitHub;
+    ``counted`` — FRANK) is never even started once there is not enough of
+    the wall-clock budget left for one more call — that row is NOT counted
+    in ``examined`` and the cursor does NOT advance onto it; the call ends
+    there instead (rework of Loki's MEDIUM finding, probe 7AFN806Y,
+    FAAD3E4A: a zero clipped timeout used to mean "every remaining row is
+    instantly unreachable," burning the whole tail as fake-examined
+    progress and defeating the cursor; gap 274baba06418 (T1) extended the
+    same per-row check to ``counted`` rows, which previously had none — a
+    row's FRANK count could run past the wall-clock budget uncounted and
+    unclipped). A skipped ``counted``/``branch_bound`` row is reported via
+    ``truncated``, never folded into ``kept_in_force`` — it was not
+    examined, so nothing was actually decided about it either way.
+
+    **Effective budget (gap 274baba06418 (T2), previously undocumented):**
+    ``time_budget_s`` is the ceiling on total elapsed wall-clock time, but a
+    row needing a round trip stops being STARTED once fewer than
+    ``_MIN_CALL_TIMEOUT_S`` (3) seconds of that budget remain (see
+    :func:`_clipped_timeout` — a call given less than the floor is
+    indistinguishable from "never try" and is skipped rather than attempted).
+    So the last ``branch_bound``/``counted`` row this call will examine is
+    the one still in flight at ``time_budget_s - _MIN_CALL_TIMEOUT_S``
+    elapsed, not at ``time_budget_s`` itself; ``expired``/``standing`` rows
+    (no round trip) have no such floor and are examined right up to
+    ``time_budget_s``.
+
+    ``expired`` rows (``expires_at`` in the past — gap b7a4ccdc8bbb, second
+    half) retire unconditionally, ahead of the branch-bound/counted checks:
+    expiry is not itself conditioned on a round trip, so it is never left
+    ``kept_in_force`` for want of one.
 
     A dry run performs every read (remote lookups, FRANK counts) and
     reports the SAME shape with ``retired`` meaning "would retire" —
@@ -624,16 +709,50 @@ def sweep(
         # A zero clipped timeout means THIS CALL IS OVER, not "every
         # remaining row is unreachable" (rework of Loki's MEDIUM finding,
         # probe 7AFN806Y, FAAD3E4A): once there is not enough budget left
-        # for even one more network round trip, stop here — do not count
-        # this row as examined, do not advance the cursor onto it, and do
-        # not spend a token mint (or a branch check) that has no time left
-        # to complete honestly.
-        if shape["class"] == "branch_bound" and _clipped_timeout(deadline) == 0:
+        # for even one more round trip, stop here — do not count this row
+        # as examined, do not advance the cursor onto it, and do not spend
+        # a token mint / branch check / FRANK count that has no time left
+        # to complete honestly. Gap 274baba06418 (T1): this used to guard
+        # ``branch_bound`` only, so a ``counted`` row's FRANK count ran
+        # UNCLIPPED past the budget — the same floor now applies to both
+        # of this sweep's round-trip classes. ``expired``, ``standing``, and
+        # ``unreachable`` (a malformed ``expires_at``) need no round trip (a
+        # pure in-memory comparison / no-op) and are correctly exempt from
+        # this check.
+        if shape["class"] in ("branch_bound", "counted") and _clipped_timeout(deadline) == 0:
             truncated = True
             break
 
         examined += 1
         last_examined_id = envelope_id
+
+        if shape["class"] == "expired":
+            # gap b7a4ccdc8bbb (second half): expiry retires on its own,
+            # ahead of (and independent of) the branch-bound/counted checks
+            # below — see classify()'s docstring for why it is checked first.
+            if dry_run:
+                retired.append({"id": envelope_id, "verb": verb, "reason": "expired",
+                                "expires_at": shape["expires_at"]})
+            else:
+                outcome = _retire_locked(
+                    envelope_id, reason="expired", actor=actor, ledger=ledger,
+                    reload_registry=_reload, write_registry=_write, lock=_lock,
+                    registry_path=path,
+                )
+                if outcome["ok"]:
+                    retired.append({"id": envelope_id, "verb": verb, "reason": "expired",
+                                    "expires_at": shape["expires_at"]})
+                else:
+                    kept_in_force.append({"id": envelope_id, "verb": verb,
+                                          "why": outcome["why"]})
+            continue
+
+        if shape["class"] == "unreachable":
+            # A malformed expires_at (Loki 23CAD2B4 F2): never fold into
+            # kept_standing -- the gate refuses these rows EAMBIG, so the
+            # register must not claim they are in force either.
+            unreachable.append({"id": envelope_id, "verb": verb, "why": shape["why"]})
+            continue
 
         if shape["class"] == "standing":
             kept_standing += 1

@@ -100,7 +100,10 @@ def test_b53_willow_can_accept_and_complete_with_human_env(home, monkeypatch):
     accepted = server.dispatch_accept("willow", did)
     assert accepted["status"]["status"] == "working"
 
-    completed = server.handoff_write_v4("willow", did, narrative="done")
+    completed = server.handoff_write_v4(
+        "willow", did, narrative="done: 1 passed",
+        no_findings_reason="test fixture: lifecycle smoke test",
+    )
     assert completed["status"] == "complete"
 
 
@@ -114,7 +117,10 @@ def test_b51_builder_cannot_verify_its_own_forged_lifecycle(home):
     accepted = server.dispatch_accept("loki", did)
     assert accepted["status"]["status"] == "working"
 
-    closed = server.handoff_write_v4("loki", did, narrative="done", findings=[])
+    closed = server.handoff_write_v4(
+        "loki", did, narrative="done: 1 passed", findings=[],
+        no_findings_reason="test fixture: lifecycle smoke test",
+    )
     assert closed["status"] == "complete"
 
     result = server.verify_handoff("hanuman", did)
@@ -129,7 +135,10 @@ def test_b51_builder_cannot_clear_its_own_forged_lifecycle(home):
     sent = server.dispatch_send("hanuman", "loki", "# Assignment\n\nAudit x.\n")
     did = sent["dispatch_id"]
     server.dispatch_accept("loki", did)
-    server.handoff_write_v4("loki", did, narrative="done", findings=[])
+    server.handoff_write_v4(
+        "loki", did, narrative="done", findings=[],
+        no_findings_reason="test fixture: lifecycle smoke test",
+    )
 
     result = server.agent_clear("hanuman", "loki", did)
     assert "error" in result
@@ -148,6 +157,7 @@ def test_b51_orchestrator_can_still_verify_and_clear(home, monkeypatch):
     server.dispatch_accept("loki", did)
     server.handoff_write_v4(
         "loki", did, narrative="Audited x: 5 checks, 0 issues.", findings=[],
+        no_findings_reason="test fixture: lifecycle smoke test",
     )
 
     verified = server.verify_handoff("willow", did)
@@ -181,7 +191,10 @@ def test_b54_unrelated_app_cannot_read_someone_elses_handoff(home):
     sent = server.dispatch_send("hanuman", "loki", "# Assignment\n\nAudit x.\n")
     did = sent["dispatch_id"]
     server.dispatch_accept("loki", did)
-    server.handoff_write_v4("loki", did, narrative="done", findings=[])
+    server.handoff_write_v4(
+        "loki", did, narrative="done", findings=[],
+        no_findings_reason="test fixture: lifecycle smoke test",
+    )
 
     result = server.handoff_read("jeles", did)
     assert "error" in result
@@ -378,7 +391,10 @@ def test_b52_symlinked_handoff_is_refused_by_handoff_read(home, monkeypatch):
     sent = server.dispatch_send("hanuman", "loki", "# Assignment\n\nAudit x.\n")
     did = sent["dispatch_id"]
     server.dispatch_accept("loki", did)
-    server.handoff_write_v4("loki", did, narrative="done")
+    server.handoff_write_v4(
+        "loki", did, narrative="done: 1 passed",
+        no_findings_reason="test fixture: lifecycle smoke test",
+    )
 
     secret = home / "secret_handoff.json"
     secret.write_text(json.dumps({"findings": []}), encoding="utf-8")

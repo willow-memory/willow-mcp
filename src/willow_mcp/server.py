@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 139 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 140 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -1795,12 +1795,17 @@ def envelope_retire_sweep(app_id: str, dry_run: bool = True, max_rows: int = 0) 
     """One pass over the active envelope register (sealed decision 83faa340;
     gap 4c7512c57a7e): an envelope whose bounds name a branch is retired
     when that branch is merged and deleted on the remote; an envelope with
-    `max_count` is retired when FRANK shows the count consumed. Retirement
-    is a revoke with `revoked_reason=branch_gone` or `=spent` and a FRANK
-    `envelope_revoked` row per envelope — the grant and its uses stay
-    auditable, it is just no longer listed as in force. Standing envelopes
-    (no branch bound, no `max_count` — the planting, the per-class dispatch
-    envelopes, `envelope.apply`) are untouched.
+    `max_count` is retired when FRANK shows the count consumed; an envelope
+    whose `expires_at` has passed is retired outright (gap b7a4ccdc8bbb).
+    Retirement is a revoke with `revoked_reason=branch_gone`, `=spent`, or
+    `=expired` and a FRANK `envelope_revoked` row per envelope — the grant
+    and its uses stay auditable, it is just no longer listed as in force.
+    Standing envelopes (no branch bound, no `max_count`, no `expires_at` —
+    the planting, the per-class dispatch envelopes, `envelope.apply`) are
+    untouched. A row whose `expires_at` does not even parse is reported
+    `unreachable` with why, never folded into standing (gap b7a4ccdc8bbb):
+    the gate refuses those rows outright, so the register must not claim
+    they are in force.
 
     Orchestrator-scoped like `net_authority_drain` / `seal_drain`: this
     mints no new authority and changes nothing the gate enforces (a
@@ -2440,15 +2445,43 @@ def gap_list(
     app_id: str,
     topic: Optional[str] = None,
     status: Optional[str] = None,
+    query: Optional[str] = None,
+    since: Optional[str] = None,
     limit: int = 50,
     cursor: Optional[str] = None,
+    brief: bool = True,
 ) -> dict:
     """List backlog gaps, most-asked first — the fleet's shared "what we don't
     know yet" queue.  Paginated: returns ``{items, next_cursor}`` — pass the
     returned ``next_cursor`` as ``cursor`` to fetch the next page.  Filter by
-    ``topic`` and/or ``status`` (open | resolved | promoted); asked_count shows
-    demand for each answer. Read-only."""
-    return gap_backlog.list_gaps(topic=topic, status=status, limit=limit, cursor=cursor)
+    ``topic`` (exact, or a namespace prefix — "a/b/c" is under "a/b"),
+    ``status`` (open | resolved | promoted), ``query`` (whitespace tokens,
+    AND, substring over topic+question), and/or ``since`` (an ISO-8601
+    timestamp, parsed and normalized to UTC, filters on ``last_asked_at``;
+    an unparseable ``since`` is refused with ``{error: EINVAL}`` rather than
+    silently matching nothing). ``asked_count`` shows demand for each
+    answer. ``limit`` is capped at 25 (``brief=True``, the default) or 5
+    (``brief=False``) regardless of what is asked for — a full record is
+    large enough that the brief page's cap does not also bound it, so
+    ``brief=False`` gets a lower one (gap 1477ebb2bc35). ``brief`` (default
+    True) returns id/topic/status/asked_count/last_asked_at plus the first
+    200 chars of the question per row; ``brief=False`` returns full
+    records. Read-only."""
+    return gap_backlog.list_gaps(
+        topic=topic, status=status, query=query, since=since,
+        limit=limit, cursor=cursor, brief=brief,
+    )
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("gap_get")
+def gap_get(app_id: str, gap_id: str) -> dict:
+    """One backlog gap's full record by id (gap 1477ebb2bc35) — the id-lookup
+    door the backlog was missing: ``store_get`` refuses ``gaps`` (outside
+    every seat's ``store_scope``), and ``gap_list`` has no id lookup and
+    always shows the ``brief`` shape unless asked otherwise. Returns the
+    record, or ``{error: not_found}``. Read-only, same group as gap_list."""
+    return gap_backlog.get_gap(gap_id)
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -4559,13 +4592,42 @@ def handoff_write_v4(
     narrative: str = "",
     checklist_resolved: bool = True,
     envelope_clean: bool = True,
+    no_findings_reason: Optional[str] = None,
 ) -> dict:
     """Close out a dispatch you accepted: writes handoff.json (the structured
     `findings` list) plus closeout.md (the `narrative`) into the packet and
     flips its status to complete. `checklist_resolved` and `envelope_clean`
     are your declarations that the assignment checklist is finished and no
     authority envelope was left open — the orchestrator checks both in
-    verify_handoff before releasing you via agent_clear."""
+    verify_handoff before releasing you via agent_clear.
+
+    The accepted keyword fields are exactly: `findings`, `narrative`,
+    `checklist_resolved`, `envelope_clean`, `no_findings_reason` (plus the
+    positional `app_id`/`dispatch_id`). There is no `summary` or `details`
+    field. A direct/test caller passing one is refused by name (`EINVAL`,
+    gap 21f80b2b348a); a real MCP client is not — the SDK's own argument
+    validation drops an unrecognized top-level key before this tool ever
+    sees it (Loki 23CAD2B4 F1, probed against the real stdio boundary), so
+    `summary`/`details` are silently discarded there and this call then
+    proceeds as if `findings`/`narrative` were never given. In that case the
+    empty-`findings` refusal below still catches it (nothing was written),
+    but its message names "no `no_findings_reason`", not the mistyped
+    field — closing THAT gap needs a `ServerMiddleware` reading the raw
+    pre-validation arguments (the pattern `request_context.py`'s
+    `RequestContextMiddleware` establishes), which does not exist yet.
+
+    Each finding is an object with a one-line statement (`text`, or one of
+    `title`/`finding`/`summary`); that much both this tool and verify_handoff
+    refuse identically if missing. `evidence` (a list of non-empty strings
+    naming what backs it — a test count, a commit sha, a diff reviewed) is
+    NOT required on every finding, but when `checklist_resolved=True` this
+    tool now refuses the handoff up front unless SOME evidence exists
+    somewhere — a counted result in `narrative` (e.g. "42 passed") or an
+    `evidence` field on at least one finding — the exact same check
+    verify_handoff runs (gap 34c8e60f4260; Loki 23CAD2B4 F3). An empty
+    `findings` list is refused unless `no_findings_reason` explains why
+    there is nothing to report (e.g. a genuine blocker); the reason is
+    recorded in the closeout."""
     return handoff_stack.handoff_write_v4(
         app_id,
         dispatch_id,
@@ -4573,6 +4635,7 @@ def handoff_write_v4(
         narrative=narrative,
         checklist_resolved=checklist_resolved,
         envelope_clean=envelope_clean,
+        no_findings_reason=no_findings_reason,
     )
 
 
