@@ -121,6 +121,25 @@ class RegistryMismatchError(EnvelopeAuthoringError):
         self.detail = detail
 
 
+class RegisterUnwritableError(EnvelopeAuthoringError):
+    """``EACCES`` (Loki audit 367C367A, T1): this process cannot write the
+    active register's own directory. Refused UP FRONT, before the proposal
+    is touched or FRANK is inked — ``ratify()`` used to discover this only
+    at the register write itself, after the proposal was already deleted
+    from the sidecar and ``envelope_ratified`` already appended: the
+    proposal was lost and FRANK said something that never happened. On an
+    installed box where ``constitutional/`` is trust-owner-owned (sealed
+    31f5d3af), the desk's own uid can never write it — ``ratify()`` is a
+    trust-owner act there until a trust-owner ``envelope.ratify`` apply-half
+    verb exists (tracked, not built in this packet — see the ``gap_log``
+    entry this module's docstring cites). ``detail`` names the path and the
+    uid that owns it."""
+
+    def __init__(self, message: str, detail: dict):
+        super().__init__(message)
+        self.detail = detail
+
+
 # ---------------------------------------------------------------------------
 # Registry identity — which file is in effect, and is it the home's own
 # ---------------------------------------------------------------------------
@@ -352,20 +371,71 @@ def _save_proposals(registry: dict) -> None:
     })
 
 
+def _register_writable() -> tuple[bool, str, dict]:
+    """Whether THIS process (this uid) could actually write the active
+    register — checked before any write, and before any other mutation
+    (proposal removal, FRANK ink) that a caller might be tempted to do
+    first. Loki audit 367C367A, T1: ``ratify()`` used to find this out only
+    at the register write itself, after the sidecar had already lost the
+    proposal and FRANK already carried ``envelope_ratified`` — this call
+    lets ``ratify()`` refuse loudly before touching anything. Mirrors
+    ``manifest_grant_executor._dirs_writable``'s pre-check shape: a missing
+    directory (a never-installed box — whichever uid runs first creates it)
+    is not a refusal, only an existing, unwritable one is."""
+    path = _envelopes.registry_path()
+    d = path.parent
+    if not d.exists():
+        return True, "ok", {}
+    if os.access(d, os.W_OK | os.X_OK):
+        return True, "ok", {}
+    try:
+        import pwd
+        owner = pwd.getpwuid(d.stat().st_uid).pw_name
+    except (KeyError, OSError):
+        owner = str(d.stat().st_uid)
+    reason = (
+        f"{d} is not writable by this process (uid {os.geteuid()}) — owned "
+        f"by {owner!r}. Once constitutional/ is trust-owner-owned, ratify() "
+        f"is a trust-owner act (sudo -u {owner} ...) until a trust-owner "
+        "envelope.ratify apply-half verb exists."
+    )
+    return False, reason, {"error": "EACCES", "path": str(d), "owner": owner}
+
+
 def _save_active(registry: dict) -> None:
     """Write ONLY ``active[]`` to the (signed) active register — NEVER
     touches the proposals sidecar. The one write path that mutates the
     trust-owner-owned register: :func:`ratify` (the one broker-side act
-    the sealed text names as touching it — signs with ``--local-user
-    WILLOW_PGP_FINGERPRINT`` via :func:`_maybe_sign`, refusing when unset
-    rather than falling back to an unsigned or wrong-key write) and
-    :func:`revoke` (reached only through the trust-owner apply half in
-    this codebase, :mod:`trust_owner_verbs`, which already runs as the
-    trust-owner uid). A write attempted by a process that does not own
-    ``constitutional/`` raises a plain ``OSError`` here — REFUSED, not
-    silently rescued by directory ownership the way the prior draft was;
-    there is no special-casing, the write simply fails the way any
-    other-uid write into a 0755 directory fails."""
+    the sealed text names as touching it) and :func:`revoke` (reached only
+    through the trust-owner apply half in this codebase,
+    :mod:`trust_owner_verbs`, which already runs as the trust-owner uid).
+    A write attempted by a process that does not own ``constitutional/``
+    raises a plain ``OSError`` here — REFUSED, not silently rescued by
+    directory ownership the way the prior draft was; there is no
+    special-casing, the write simply fails the way any other-uid write
+    into a 0755 directory fails.
+
+    Signing (:func:`_maybe_sign`): under ``--local-user
+    WILLOW_PGP_FINGERPRINT`` when PGP enforcement is on
+    (``pgp.pgp_enabled()``) — **corrected, Loki audit 367C367A, T3: this
+    does NOT refuse when the fingerprint is unset.** It writes the register
+    UNSIGNED and returns, the same "unsigned atomic write when PGP is not
+    enforced" posture every other write in this codebase takes (e.g.
+    ``manifest_admin.create_manifest``) — a prior draft of this docstring
+    claimed the opposite ("refusing when unset"), which was never true of
+    the code. This matters operationally: a trust-owner CLI run via ``sudo
+    -u willow-operator`` strips ``WILLOW_PGP_FINGERPRINT`` from the
+    environment unless the operator re-exports it, so an un-thought-through
+    ``sudo`` invocation silently produces an unsigned (or stale-signed)
+    register that every OTHER reader then refuses via
+    ``paths.trusted_read``'s signature branch — a clean-looking ratify
+    followed by a fleet-wide ``EUNREACH``. Not hardened into a hard refusal
+    in this pass (an unconditional refusal would also break every existing
+    test and CLI invocation on a box that has not opted into PGP
+    enforcement at all) — named here so the next reader does not repeat
+    the prior draft's false claim, and so INSTALL.md's operator-facing
+    ``sudo -u willow-operator`` examples carry an explicit
+    ``WILLOW_PGP_FINGERPRINT=$FPR`` re-export."""
     _atomic_write(_envelopes.registry_path(), {"active": registry.get("active") or []})
     _maybe_sign(_envelopes.registry_path())
 
@@ -383,8 +453,25 @@ def _load_syscall_table() -> dict[int, dict]:
 def _atomic_write(path: Path, doc: dict) -> None:
     """Write ``doc`` atomically. Mirrors ``sign_session_cli``'s discipline:
     write to a tmp file, replace atomically, so a mid-flight failure never
-    leaves the registry half-written."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    leaves the registry half-written.
+
+    Loki audit 367C367A, T2: ``path.parent.mkdir`` used to take no explicit
+    ``mode``, so a freshly-created directory landed at whatever the calling
+    process's umask allowed (measured: 0o775 under this box's 0002 umask).
+    ``paths.trusted_read`` refuses a group/other-writable PARENT directory
+    exactly like it refuses a group/other-writable file — so the very first
+    ``propose()`` on a fresh ``$WILLOW_HOME`` (typically
+    ``_auto_propose_on_gate_miss`` on the first ungoverned dispatch, well
+    before ``install.sh`` ever runs) could brick every later authoring read
+    against its own sidecar. ``mkdir`` now sets ``0o755`` explicitly — not
+    left to the umask — the same mode ``install.sh`` already uses when it
+    creates this directory itself; a pre-existing directory is untouched
+    (this only fixes a directory THIS call creates new)."""
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        os.chmod(path.parent, 0o755)  # mkdir's mode is umask-masked too
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     # paths.trusted_read fail-closed refuses a group/other-writable source
@@ -615,6 +702,21 @@ def ratify(
 
     Returns the ratified envelope row. Appends ``envelope_ratified`` to the
     FRANK ledger when one is available.
+
+    **Honest state as of Loki audit 367C367A, T1:** once ``constitutional/``
+    is trust-owner-owned (sealed 31f5d3af, an installed box), the desk's own
+    uid cannot write the register — this function now refuses ``EACCES``
+    UP FRONT (:func:`_register_writable`, :class:`RegisterUnwritableError`)
+    rather than half-executing (inking FRANK and deleting the proposal
+    before discovering the register write cannot succeed, which is what the
+    prior draft did — measured, not theoretical). On an installed box,
+    ratifying for real is a trust-owner act (``sudo -u willow-operator
+    ... envelope ratify``) until a trust-owner ``envelope.ratify``
+    apply-half verb exists, mirroring ``manifest.grant``'s request/apply
+    split for the other four verbs — tracked as a gap (``gap_log``, topic
+    ``envelope.ratify apply-half verb``), not built in this packet. The
+    desk's ``envelope_ratify`` MCP tool will refuse ``EACCES`` there rather
+    than run partway.
     """
     if not _keyring_verifier_active(verifier):
         raise OperatorVerifierRequired(
@@ -622,6 +724,15 @@ def ratify(
             f"and not compromised; got {verifier!r}."
         )
     _refuse_registry_mismatch("ratify")
+
+    # Loki audit 367C367A, T1: refused UP FRONT, before the proposal is
+    # touched or FRANK is inked. This used to be discovered only at the
+    # register write below, by which point the proposal was already gone
+    # from the sidecar and envelope_ratified already appended to FRANK —
+    # the proposal was lost and FRANK said something that never happened.
+    writable, writable_reason, writable_detail = _register_writable()
+    if not writable:
+        raise RegisterUnwritableError(writable_reason, writable_detail)
 
     registry = _load_registry()
     proposals = list(registry.get("proposals") or [])
@@ -632,7 +743,6 @@ def ratify(
             f"no pending proposal with id {proposal_id!r}"
         )
     proposal = matches[0]
-    proposals = [row for row in proposals if row.get("id") != proposal_id]
 
     ratified_at = _now_iso()
     ratified: dict = {
@@ -640,7 +750,41 @@ def ratify(
         "issued_by": "root",
         "issued_at": ratified_at,
         "status": "active",
+        # Loki audit 367C367A, T1: no longer conditioned on whether the
+        # FRANK ink below succeeds -- FRANK is now inked AFTER this row is
+        # already durably in the register (see the ordering note below), so
+        # its outcome cannot be known yet when this row is built. The
+        # keyring verifier is provenance enough for the row itself; the
+        # FRANK cross-reference lives in the ledger event's own content
+        # (envelope_id, ratified_at), not embedded back into the register.
+        "ratified_via": f"keyring verifier {verifier}",
     }
+
+    # Rework (Loki audit 54E3DFC0, R2 / 367C367A, T1): ratify is the ONE
+    # broker-side act the sealed text names as touching the trust-owner-owned
+    # active register at all. On an installed box where constitutional/ is
+    # trust-owner-owned, this call needs to run AS the trust owner (sudo -u
+    # willow-operator) for the register write to succeed at the OS level --
+    # _register_writable() above already refused before anything was
+    # touched if that is not the case, so reaching this point means the
+    # write below is expected to succeed.
+    #
+    # Order matters (T1's fix): the REGISTER write happens FIRST, while the
+    # proposal is still sitting untouched in the sidecar and FRANK is still
+    # untouched. Only once that has actually landed does the sidecar lose
+    # the proposal; only once BOTH files agree does FRANK get inked. A
+    # failure at any step before its own write leaves every earlier state
+    # exactly as it was -- there is no window where FRANK says "ratified"
+    # and the register disagrees, and no window where the proposal is gone
+    # from the sidecar but never made it into the register. The register
+    # write signs under WILLOW_PGP_FINGERPRINT via --local-user when PGP is
+    # enforced (_save_active -> _maybe_sign), never gpg's ambient default
+    # key (R2's other measured defect).
+    active.append(ratified)
+    _save_active({"active": active})
+
+    proposals = [row for row in proposals if row.get("id") != proposal_id]
+    _save_proposals({"proposals": proposals, "archived": registry.get("archived") or []})
 
     ledger_record_id = None
     ledger_error = None
@@ -661,35 +805,6 @@ def ratify(
             )
         except Exception as exc:  # pragma: no cover — ledger is optional
             ledger_error = str(exc)
-
-    ratified["ratified_via"] = (
-        f"frank ledger entry {ledger_record_id}" if ledger_record_id
-        else f"keyring verifier {verifier}"
-    )
-    active.append(ratified)
-    registry["proposals"] = proposals
-    registry["active"] = active
-    # Rework (Loki audit 54E3DFC0, R2): ratify is the ONE broker-side act
-    # the sealed text names as touching the trust-owner-owned active
-    # register at all. It writes BOTH files (the proposal leaves the
-    # sidecar, the envelope lands in the register); the register write
-    # signs under WILLOW_PGP_FINGERPRINT via --local-user when PGP is
-    # enforced (_save_active -> _maybe_sign — same pgp_enabled() gate every
-    # other write in this codebase uses, e.g. manifest_admin.create_manifest's
-    # "unsigned atomic write when PGP is not enforced"; a box that has not
-    # opted into PGP enforcement is unaffected, exactly as before). What R2
-    # actually measured and this closes: the signature, when one IS made,
-    # is now minted under the fingerprint by name, never gpg's ambient
-    # default key. On an installed box where constitutional/ is
-    # trust-owner-owned, this call also now needs to run AS the trust
-    # owner (sudo -u willow-operator) for the register write itself to
-    # succeed at the OS level — this function raises whatever OSError that
-    # produces rather than rescuing it; ratify from the desk (the MCP
-    # tool, running as the broker) is refused there, documented in
-    # INSTALL.md's closing section as a follow-on (a trust-owner
-    # envelope.ratify apply-half verb) not built in this packet.
-    _save_proposals(registry)
-    _save_active(registry)
 
     result = dict(ratified)
     result["_ledger_record_id"] = ledger_record_id

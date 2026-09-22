@@ -229,13 +229,30 @@ queue is `manifest_grant_retry`-able, `estale_presigned` is not.
 proposals.json` into the signed active register — reachable from the CLI
 and from the `envelope_ratify` MCP tool) still runs as whoever calls it,
 not through the trust-owner apply half. Once `constitutional/` is
-trust-owner-owned, a plain broker-uid call to `ratify()` fails at the OS
-level the same way any other-uid write into a `0755` directory it does not
-own fails — `ratify()` raises that `OSError` rather than rescuing it. Until
-a trust-owner `envelope.ratify` verb exists (mirroring `manifest.grant`'s
-own request/apply split), ratifying a proposal for real needs `sudo -u
-willow-operator` from the operator's own terminal, exactly like the signing
-key operations this script itself performs (`as_to gpg ...`). `propose()`
-and `reject()` are unaffected — they only ever touch the broker-owned
-`$H/proposals/` sidecar, never the register, from any uid. Named honestly
-here rather than implied solved by the register's ownership change alone.
+trust-owner-owned, a plain broker-uid call to `ratify()` now refuses
+`EACCES` UP FRONT (Loki audit 367C367A, T1 — a prior draft discovered this
+only at the register write itself, after already inking FRANK and deleting
+the proposal from the queue; fixed to refuse before touching either file).
+Until a trust-owner `envelope.ratify` verb exists (mirroring
+`manifest.grant`'s own request/apply split — tracked via `gap_log`, topic
+`envelope.ratify apply-half verb`), ratifying a proposal for real needs
+`sudo -u willow-operator` from the operator's own terminal, exactly like
+the signing key operations this script itself performs (`as_to gpg ...`).
+
+**`sudo -u willow-operator` strips `WILLOW_PGP_FINGERPRINT` from the
+environment unless re-exported** (Loki audit 367C367A, T3): `ratify()`
+signs the register when PGP enforcement is on, but does NOT refuse when
+the fingerprint is unset — it writes the register unsigned and returns
+(the same posture every other write in this codebase takes when PGP is
+not enforced). A `sudo -u willow-operator` ratify run without re-exporting
+the fingerprint silently produces an unsigned register that every OTHER
+reader then refuses via `trusted_read`'s signature branch — a clean-looking
+ratify followed by a fleet-wide `EUNREACH`. Always:
+
+    sudo -u willow-operator env WILLOW_HOME=$H WILLOW_PGP_FINGERPRINT=$FPR \
+      $H/venvs/willow-mcp/bin/python -m willow_mcp envelope ratify <proposal_id>
+
+`propose()` and `reject()` are unaffected — they only ever touch the
+broker-owned `$H/proposals/` sidecar, never the register, from any uid.
+Named honestly here rather than implied solved by the register's ownership
+change alone.

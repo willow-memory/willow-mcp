@@ -272,6 +272,149 @@ def test_ratify_moves_proposal_to_active_with_issued_by_root(
     assert on_disk["active"][0]["issued_by"] == "root"
 
 
+# --- ratify: T1 (Loki audit 367C367A) — a failed register write must never
+# lose the proposal or ink a FRANK row that never happened ------------------
+
+
+def test_ratify_register_write_failure_leaves_sidecar_and_ledger_untouched(
+    ring_with_rita, fresh_registry,
+):
+    """T1's own Prove line: patched _save_active raising -> sidecar
+    unchanged, FRANK empty, refusal returned (propagated as an exception —
+    ratify() itself never catches its own writer's failure). Order fixed:
+    the register write happens BEFORE the sidecar is touched or FRANK is
+    inked, so a failure here means NEITHER of those has happened yet."""
+    from willow_mcp import envelope_authoring as ea_mod
+
+    registry_path, _ = fresh_registry
+    proposal = ea.propose(
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 1024}, reason="t",
+        verifier="rita", session_id="s-orch",
+    )
+
+    class _FakeLedger:
+        def __init__(self):
+            self.calls = []
+
+        def append(self, project, event, content):
+            self.calls.append((project, event, content))
+            return "should-never-be-called"
+
+    ledger = _FakeLedger()
+
+    with mock.patch.object(ea_mod, "_save_active", side_effect=OSError("simulated: not writable")):
+        with pytest.raises(OSError):
+            ea.ratify(proposal["id"], verifier="rita", ledger=ledger)
+
+    proposals_path = registry_path.parent.parent / "proposals" / "proposals.json"
+    proposals_on_disk = json.loads(proposals_path.read_text(encoding="utf-8"))
+    assert len(proposals_on_disk["proposals"]) == 1, "proposal still in the sidecar"
+    assert proposals_on_disk["proposals"][0]["id"] == proposal["id"]
+
+    on_disk = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert on_disk.get("active") in (None, []), "register unchanged"
+
+    assert ledger.calls == [], "FRANK never inked — the register write never landed"
+
+
+def test_ratify_refuses_eacces_up_front_before_touching_anything(
+    ring_with_rita, fresh_registry,
+):
+    """The pre-check (_register_writable) refuses BEFORE the proposal is
+    removed from the sidecar or FRANK is inked — simulated here by making
+    the register's own directory unwritable, the same condition an
+    installed box's trust-owner-owned constitutional/ presents to the
+    desk's uid."""
+    registry_path, _ = fresh_registry
+    proposal = ea.propose(
+        verb="demo_verb", grantee="hanuman",
+        bounds={"path_pattern": "docs/**", "max_bytes": 1024}, reason="t",
+        verifier="rita", session_id="s-orch",
+    )
+
+    class _FakeLedger:
+        def __init__(self):
+            self.calls = []
+
+        def append(self, project, event, content):
+            self.calls.append((project, event, content))
+            return "should-never-be-called"
+
+    ledger = _FakeLedger()
+
+    registry_path.parent.chmod(0o500)
+    try:
+        with pytest.raises(ea.RegisterUnwritableError) as excinfo:
+            ea.ratify(proposal["id"], verifier="rita", ledger=ledger)
+    finally:
+        registry_path.parent.chmod(0o700)  # let pytest's tmp_path cleanup remove it
+
+    assert excinfo.value.detail["error"] == "EACCES"
+    assert excinfo.value.detail["path"] == str(registry_path.parent)
+
+    proposals_path = registry_path.parent.parent / "proposals" / "proposals.json"
+    proposals_on_disk = json.loads(proposals_path.read_text(encoding="utf-8"))
+    assert len(proposals_on_disk["proposals"]) == 1, "proposal untouched"
+    assert ledger.calls == [], "FRANK never inked"
+
+
+# --- _atomic_write: T2 (Loki audit 367C367A) — the sidecar directory it
+# creates must never be born group/other-writable, regardless of umask ------
+
+
+def test_atomic_write_creates_new_directory_0755_under_permissive_umask(tmp_path, monkeypatch):
+    """T2's own Prove line: this box's umask is 0002 -- a bare
+    ``Path.mkdir(parents=True, exist_ok=True)`` with no explicit mode leaves
+    a freshly-created directory at 0o775, which paths.trusted_read then
+    refuses forever as a group-writable source. _atomic_write must set an
+    explicit 0o755 regardless of the calling process's umask."""
+    from willow_mcp import envelope_authoring as ea_mod
+
+    old_umask = os.umask(0o002)
+    try:
+        target_dir = tmp_path / "fresh-proposals-dir"
+        assert not target_dir.exists()
+        ea_mod._atomic_write(target_dir / "proposals.json", {"proposals": [], "archived": []})
+    finally:
+        os.umask(old_umask)
+
+    mode = target_dir.stat().st_mode & 0o777
+    assert mode == 0o755, f"expected 0o755, got {oct(mode)}"
+    # And the umask must not have leaked into the FILE either (pre-existing
+    # guard in _atomic_write, unaffected by this fix — re-asserted here as a
+    # belt-and-suspenders under the same permissive umask).
+    file_mode = (target_dir / "proposals.json").stat().st_mode & 0o777
+    assert file_mode & 0o022 == 0, f"file must not be group/other-writable, got {oct(file_mode)}"
+
+
+def test_second_propose_survives_a_umask_born_sidecar_directory(
+    ring_with_rita, fresh_registry,
+):
+    """End-to-end version of T2: two propose() calls in a row, under the
+    box's real umask (whatever the test runner's is) forced to 0o002 for
+    this test — the SECOND propose() (and a list_pending after it) must not
+    refuse the sidecar directory the FIRST call created."""
+    old_umask = os.umask(0o002)
+    try:
+        ea.propose(
+            verb="demo_verb", grantee="hanuman",
+            bounds={"path_pattern": "a/**", "max_bytes": 1}, reason="t1",
+            verifier="rita", session_id="s-orch",
+        )
+        second = ea.propose(
+            verb="demo_verb", grantee="hanuman",
+            bounds={"path_pattern": "b/**", "max_bytes": 1}, reason="t2",
+            verifier="rita", session_id="s-orch",
+        )
+    finally:
+        os.umask(old_umask)
+
+    assert second["id"]
+    pending = ea.list_pending()
+    assert len(pending) == 2
+
+
 # --- reject ----------------------------------------------------------------
 
 

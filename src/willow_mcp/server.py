@@ -6025,6 +6025,11 @@ def envelope_ratify(proposal_id: str) -> dict:
         row = _ea.ratify(proposal_id, verifier=verifier, ledger=ledger)
     except _ea.RegistryMismatchError as exc:
         return {**exc.detail, "message": str(exc)}
+    except _ea.RegisterUnwritableError as exc:
+        # Loki audit 367C367A, T1: refused before either file was touched —
+        # the desk's own uid cannot write a trust-owner-owned register on an
+        # installed box. exc.detail already carries error=EACCES, path, owner.
+        return {**exc.detail, "message": str(exc)}
     except _ea.EnvelopeAuthoringError as exc:
         return {"error": type(exc).__name__, "message": str(exc)}
     return {"ok": True, "envelope": row, "registry": _ea.registry_identity()}
