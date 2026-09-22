@@ -13,6 +13,16 @@ trust-owner ownership-and-signing half of the installer step (`chown`,
 `as_to gpg --detach-sign`) is NOT testable in Kart — Kart cannot switch uid
 and has no systemctl — and is not exercised by these tests; see the PR body
 for which CI leg covers install.sh's shell syntax/shape instead.
+
+Amendment (dispatch A9BF01A9, amending BD5843FD): `sync_and_sign()` is the
+fix for the defect the operator's first live run actually measured — sync
+and sign used to be two acts, and a signing failure in between left a
+replaced-but-unsigned governance file. `sign_fn`/`verify_fn` are injected
+callables, so the rollback/verify CONTROL FLOW below is fully exercised
+with FAKE signers — never real gpg or a real uid switch (still not
+testable in Kart, same limit as always) — including the one case that
+matters most: a signing failure restores the file's exact previous bytes
+AND its exact previous `.sig`.
 """
 from __future__ import annotations
 
@@ -166,3 +176,157 @@ def test_cli_main_prints_before_after_counts_on_success(bundle_and_box, capsys):
     assert "syscall-table.json" in out
     assert "22" in out
     assert "23" in out
+
+
+# ── sync_and_sign(): sync + sign as ONE act, with rollback on failure ───────
+
+
+class _FakeSigner:
+    """A fake sign_fn/verify_fn pair. `fail_signing`/`fail_verify` let a test
+    inject a failure at either point; every call is recorded so a test can
+    assert exactly what ran."""
+
+    def __init__(self, *, fail_signing: bool = False, fail_verify: bool = False):
+        self.fail_signing = fail_signing
+        self.fail_verify = fail_verify
+        self.sign_calls: list[str] = []
+        self.verify_calls: list[str] = []
+
+    def sign_fn(self, path):
+        self.sign_calls.append(path.name)
+        if self.fail_signing:
+            raise RuntimeError("fake gpg: signing failed")
+        return f"SIG-OF:{path.read_bytes().decode()}".encode()
+
+    def verify_fn(self, path, sig_bytes) -> bool:
+        self.verify_calls.append(path.name)
+        if self.fail_verify:
+            return False
+        return sig_bytes == f"SIG-OF:{path.read_bytes().decode()}".encode()
+
+
+def test_sync_and_sign_signs_a_freshly_written_file_and_verifies_it(bundle_and_box):
+    bundle_dir, box_dir = bundle_and_box
+    _write_syscall_table(bundle_dir / "syscall-table.json", list(range(1, 24)))
+    signer = _FakeSigner()
+
+    report = sync_constitutional.sync_and_sign(bundle_dir, box_dir, signer.sign_fn, signer.verify_fn)
+
+    assert report["written"][0]["name"] == "syscall-table.json"
+    assert report["signed"] == ["syscall-table.json"]
+    assert report["already_signed"] == []
+    box_file = box_dir / "syscall-table.json"
+    sig_path = box_dir / "syscall-table.json.sig"
+    assert sig_path.exists()
+    assert sig_path.read_bytes() == f"SIG-OF:{box_file.read_text()}".encode()
+    assert signer.sign_calls == ["syscall-table.json"]
+    assert signer.verify_calls == ["syscall-table.json"]
+
+
+def test_sync_and_sign_signing_failure_restores_previous_content_and_signature(bundle_and_box):
+    bundle_dir, box_dir = bundle_and_box
+    box_file = box_dir / "syscall-table.json"
+    sig_file = box_dir / "syscall-table.json.sig"
+    _write_syscall_table(box_file, list(range(1, 23)))  # stale: 22 rows, previously signed
+    old_bytes = box_file.read_bytes()
+    old_sig = b"OLD-SIGNATURE-BYTES"
+    sig_file.write_bytes(old_sig)
+    _write_syscall_table(bundle_dir / "syscall-table.json", list(range(1, 24)))  # bundle: 23 rows
+
+    signer = _FakeSigner(fail_signing=True)
+    with pytest.raises(sync_constitutional.SigningFailed) as exc_info:
+        sync_constitutional.sync_and_sign(bundle_dir, box_dir, signer.sign_fn, signer.verify_fn)
+
+    assert exc_info.value.name == "syscall-table.json"
+    # the box is exactly as it was BEFORE this run touched anything —
+    # sync() had already written the new 23-row content when signing failed;
+    # sync_and_sign() must have rolled that back too, not just the .sig.
+    assert box_file.read_bytes() == old_bytes
+    assert sig_file.read_bytes() == old_sig
+
+
+def test_sync_and_sign_verify_failure_after_signing_also_rolls_back(bundle_and_box):
+    bundle_dir, box_dir = bundle_and_box
+    box_file = box_dir / "syscall-table.json"
+    _write_syscall_table(box_file, list(range(1, 23)))
+    old_bytes = box_file.read_bytes()
+    _write_syscall_table(bundle_dir / "syscall-table.json", list(range(1, 24)))
+
+    signer = _FakeSigner(fail_verify=True)
+    with pytest.raises(sync_constitutional.SigningFailed):
+        sync_constitutional.sync_and_sign(bundle_dir, box_dir, signer.sign_fn, signer.verify_fn)
+
+    assert box_file.read_bytes() == old_bytes
+    assert not (box_dir / "syscall-table.json.sig").exists()
+
+
+def test_sync_and_sign_signing_failure_on_first_install_removes_the_new_file_and_sig(bundle_and_box):
+    """No previous copy existed at all (first install) — a signing failure
+    must leave the box with NEITHER the new content NOR a signature, not a
+    half-applied pair."""
+    bundle_dir, box_dir = bundle_and_box
+    _write_syscall_table(bundle_dir / "syscall-table.json", list(range(1, 24)))
+    signer = _FakeSigner(fail_signing=True)
+
+    with pytest.raises(sync_constitutional.SigningFailed):
+        sync_constitutional.sync_and_sign(bundle_dir, box_dir, signer.sign_fn, signer.verify_fn)
+
+    assert not (box_dir / "syscall-table.json").exists()
+    assert not (box_dir / "syscall-table.json.sig").exists()
+
+
+def test_sync_and_sign_unchanged_file_with_a_verifying_signature_is_left_alone(bundle_and_box):
+    bundle_dir, box_dir = bundle_and_box
+    box_file = box_dir / "syscall-table.json"
+    _write_syscall_table(box_file, list(range(1, 24)))
+    _write_syscall_table(bundle_dir / "syscall-table.json", list(range(1, 24)))  # identical
+    sig_file = box_dir / "syscall-table.json.sig"
+    good_sig = f"SIG-OF:{box_file.read_text()}".encode()
+    sig_file.write_bytes(good_sig)
+
+    signer = _FakeSigner()
+    report = sync_constitutional.sync_and_sign(bundle_dir, box_dir, signer.sign_fn, signer.verify_fn)
+
+    assert report["written"] == []
+    assert report["already_signed"] == ["syscall-table.json"]
+    assert report["signed"] == []
+    assert signer.sign_calls == []  # never re-signed — nothing to fix
+    assert sig_file.read_bytes() == good_sig  # untouched
+
+
+def test_sync_and_sign_unchanged_file_with_a_stale_signature_is_re_signed(bundle_and_box):
+    """Content unchanged, but the existing .sig does not verify (e.g. a key
+    rotation between runs, or a corrupted .sig) — re-signed anyway, the same
+    'never leave a governance file whose signature does not check' rule
+    that applies to a fresh write."""
+    bundle_dir, box_dir = bundle_and_box
+    box_file = box_dir / "syscall-table.json"
+    _write_syscall_table(box_file, list(range(1, 24)))
+    _write_syscall_table(bundle_dir / "syscall-table.json", list(range(1, 24)))
+    sig_file = box_dir / "syscall-table.json.sig"
+    sig_file.write_bytes(b"STALE-SIGNATURE-DOES-NOT-VERIFY")
+
+    signer = _FakeSigner()
+    report = sync_constitutional.sync_and_sign(bundle_dir, box_dir, signer.sign_fn, signer.verify_fn)
+
+    assert report["written"] == []
+    assert report["signed"] == ["syscall-table.json"]
+    assert signer.sign_calls == ["syscall-table.json"]
+    expected_sig = f"SIG-OF:{box_file.read_text()}".encode()
+    assert sig_file.read_bytes() == expected_sig
+
+
+def test_sync_and_sign_propagates_sync_failures_before_signing_anything(tmp_path):
+    """sync()'s own refusals (missing allowlist entry, absent/unreadable
+    bundle) propagate untouched — nothing has been written yet, so there is
+    nothing for sync_and_sign() to roll back."""
+    bundle_dir = tmp_path / "bundle"
+    box_dir = tmp_path / "box"
+    bundle_dir.mkdir()
+    box_dir.mkdir()
+    signer = _FakeSigner()
+
+    with pytest.raises(sync_constitutional.AllowlistFileMissing):
+        sync_constitutional.sync_and_sign(bundle_dir, box_dir, signer.sign_fn, signer.verify_fn)
+    assert signer.sign_calls == []
+    assert signer.verify_calls == []
