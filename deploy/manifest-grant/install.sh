@@ -90,6 +90,36 @@
 # signs under WILLOW_PGP_FINGERPRINT via --local-user, never gpg's ambient
 # default key — R2's other measured defect); revoke() (trust-owner apply
 # half only) touches only the register.
+#
+# Amendment 2 (dispatch A9BF01A9, amending BD5843FD — the operator's first
+# real run of this script, and what happened in the hour after):
+#   * Step 1c's sync (gap c1395b307421) and its signing used to be TWO acts,
+#     separated by steps 2-5 — measured: a pre-existing gpg bug (below) died
+#     in that window and left the box with a replaced-but-unsigned
+#     syscall-table.json, refused outright by paths.trusted_read and locked
+#     harder than before the install ran. sync_constitutional.py's
+#     sync_and_sign() now does both in one act, verifies immediately, and
+#     rolls back to the exact previous bytes AND .sig on any failure — the
+#     signing key setup (formerly step "3") moved ahead of step 1c
+#     (now "1b") so $FPR exists before that atomic step needs it.
+#   * Carried 338bbdb ("fix(deploy): step 6's sign temp file no longer
+#     belongs to the wrong uid") — the gpg bug itself: `SIG_TMP=$(mktemp)`
+#     ran as root, `as_to gpg -o "$SIG_TMP"` ran as the trust owner, which
+#     cannot open a root-owned file for writing. Fixed everywhere signing
+#     happens (step 6's two loops, and sync_and_sign's sign_fn) by never
+#     handing gpg a path to open: `--output -` writes to gpg's own stdout,
+#     and root's own `>` redirection is what actually owns the fd.
+#   * Seeded the envelope.ratify bootstrap envelope (gap 18affe49e198, new
+#     step "1d") — with row 24 present, envelope_propose(verb=
+#     'envelope.ratify') succeeds but nothing could ever ratify it: no
+#     ACTIVE envelope governs envelope.ratify, and the only way to create
+#     one is envelope.ratify. Only root, once, spans both uids this
+#     deadlock needs; deploy/manifest-grant/seed_envelope_ratify.py calls
+#     the same envelope_authoring.ratify_proposal_row the real apply half
+#     uses. Idempotent.
+#   * install.sh and sync_constitutional.py are now mode 0755 in git —
+#     `sudo <path>` (as opposed to `sudo bash <path>`) failed with EACCES on
+#     a tracked 0644 script.
 
 set -euo pipefail
 
@@ -111,6 +141,53 @@ say()  { printf '%s\n' "$*"; }
 stop() { printf 'STOP: %s\n' "$*" >&2; exit 2; }
 as_op() { sudo -u "$OPERATOR" XDG_RUNTIME_DIR="/run/user/$OPERATOR_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$OPERATOR_UID/bus" "$@"; }
 as_to() { sudo -u "$TRUST_OWNER" GNUPGHOME="$GNUPGHOME_TO" "$@"; }
+
+# ------------------------------------------------------- --dry-run-sign
+# A real two-uid run of the signing steps cannot be exercised in Kart
+# (single-uid sandbox) or by any test fixture that fakes the interpreter
+# under one uid — exactly the gap that let the mktemp-owned-by-root bug
+# through in the first place (2026-09-22, first live install; fixed below,
+# 338bbdb). This prints the EXACT command sequence signing runs, uid by
+# uid, for a reader to check by eye instead of by running it — no root
+# required, touches nothing, needs no real box.
+if [ "${1:-}" = "--dry-run-sign" ]; then
+  cat <<DRYRUN
+--dry-run-sign: the sign sequence, one file, every loop is identical in shape.
+Three processes, two uids -- read top to bottom:
+
+  SIG_TMP=\$(mktemp)
+      # uid: root (this script). Creates a 0600 file THIS process owns.
+      # Nothing here yet involves $TRUST_OWNER.
+
+  as_to gpg --batch --yes --detach-sign --armor --local-user "\$FPR" --output - "<file>" > "\$SIG_TMP"
+      # uid: root opens \$SIG_TMP for writing (the ">" redirection is
+      # evaluated by THIS shell, before sudo runs) -- root now holds an
+      # already-open, root-owned file descriptor.
+      # uid: $TRUST_OWNER (via "sudo -u $TRUST_OWNER", inside as_to) runs gpg.
+      # gpg writes its detached signature to ITS OWN stdout (--output -),
+      # never touching \$SIG_TMP's path at all -- gpg as $TRUST_OWNER never
+      # needs permission on that path, because it never opens it. The bytes
+      # land in \$SIG_TMP because that fd (root's) is what stdout was
+      # connected to before gpg ever started.
+      # This is the fix for "gpg: can't create '/tmp/tmp.xxx': Permission
+      # denied" -- SIG_TMP used to be handed to gpg as a path (-o \$SIG_TMP),
+      # which gpg-as-$TRUST_OWNER cannot open for writing.
+
+  install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "\$SIG_TMP" "<file>.sig"
+      # uid: root. Installs the signature at its live path, correctly owned.
+
+  rm -f "\$SIG_TMP"
+      # uid: root. Cleans up its own temp file.
+
+Run once per mcp_apps/*/manifest.json, and once each for the active register
+(constitutional/pre-approved.json) and the federation registry
+(mcp_apps/_federation/servers.json) -- same four lines, same two uids.
+syscall-table.json is signed separately and atomically, in the SAME act as
+it is synced (sync_constitutional.py's --sign-as path, called from step 1c,
+via this same sign_fn/verify_fn shape) -- not here, and not by step 6.
+DRYRUN
+  exit 0
+fi
 
 # ---------------------------------------------------------------- preflight
 [ "$(id -u)" = 0 ] || stop "run as root (sudo bash install.sh)"
@@ -254,57 +331,12 @@ fi
 # apply process itself (runs as $TRUST_OWNER), so it is born correctly
 # owned, mode 0644, no ACL.
 
-# ---- gap c1395b307421: sync syscall-table.json from the checkout's bundle
-# Nothing before this step ever copied the checkout's
-# src/willow_mcp/bundle/constitutional/syscall-table.json onto an installed
-# box, so a box could sit indefinitely on a stale table — measured
-# 2026-09-22: the box was missing row 24 (envelope.ratify, PR 628),
-# freezing every envelope ratification behind it because the verb could
-# never be governed at all (UnknownVerbError). Prior to this step
-# syscall-table.json was left BROKER-owned deliberately, since nothing
-# wrote it at install time; now that this step DOES write it, the same
-# governance-integrity shape pre-approved.json already has (sealed
-# 31f5d3af) applies to it too — synced, chowned, and re-signed as the
-# trust owner below (step 6), never a broker-owned write.
-# deploy/manifest-grant/sync_constitutional.py is an explicit ALLOWLIST
-# copy (currently exactly syscall-table.json): anything else the bundle
-# ships (e.g. its own seed copy of pre-approved.json) is skipped and
-# reported, never copied — an include list fails loudly on a missing name
-# instead of an exclude list growing wrong silently as new live state is
-# added beside the register. Runs as root (like the split script above),
-# so it can write regardless of current ownership; chown to the trust
-# owner happens immediately after, before this script does anything else
-# with the directory.
-say "== 1c. sync constitutional policy files from the checkout bundle"
-BUNDLE_CONSTITUTIONAL="$CHECKOUT/src/willow_mcp/bundle/constitutional"
-SYSCALL_TABLE="$H/constitutional/syscall-table.json"
-"$PY" "$HERE/sync_constitutional.py" "$BUNDLE_CONSTITUTIONAL" "$H/constitutional" \
-  || stop "constitutional bundle sync failed — see the STOP line above; the box's constitutional/ was left untouched"
-[ -f "$SYSCALL_TABLE" ] && chown "$TRUST_OWNER:$TRUST_OWNER" "$SYSCALL_TABLE" && chmod 644 "$SYSCALL_TABLE"
-
-# nestor.db (gap 035d287206e1, F1, rework per Loki audit B00BD43E): the
-# apply half no longer reads this at all — it is a WAL database, and a
-# read-only opener under this unit's ProtectHome=read-only cannot create
-# the -shm sidecar a WAL reader needs (measured: every permission shape
-# gives either "unable to open database file" or "attempt to write a
-# readonly database", or silently hides rows still sitting in the WAL under
-# immutable=1). The request half (broker, uid 1000, which CAN read
-# nestor.db without any of these constraints) now embeds the sealed row's
-# own verified bytes in the signed pending record instead; the apply half
-# re-verifies the ed25519 signature over those embedded bytes. No ACL on
-# nestor.db is granted here any more — the prior `setfacl u:$TRUST_OWNER:r
-# nestor.db` line is gone.
-
-# ---------------------------------------------------- 2. retire the --user unit
-say "== 2. retire the --user unit"
-as_op systemctl --user disable --now willow-mcp-manifest-grant.timer 2>/dev/null || true
-as_op systemctl --user stop willow-mcp-manifest-grant.service 2>/dev/null || true
-rm -f "/home/$OPERATOR/.config/systemd/user/willow-mcp-manifest-grant.service" \
-      "/home/$OPERATOR/.config/systemd/user/willow-mcp-manifest-grant.timer"
-as_op systemctl --user daemon-reload
-
-# ------------------------------------------- 3. the trust owner's signing key
-say "== 3. signing key owned by $TRUST_OWNER"
+# ------------------------------------------- 1b. the trust owner's signing key
+# Moved ahead of step 1c (dispatch A9BF01A9, amending BD5843FD): step 1c's
+# atomic sync-and-sign needs $FPR to exist BEFORE it writes anything, so the
+# key must be established first. This is the same step that used to run as
+# "3.", unchanged in content, only in position.
+say "== 1b. signing key owned by $TRUST_OWNER"
 install -d -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 700 "$(dirname "$GNUPGHOME_TO")" "$GNUPGHOME_TO"
 FPR=$(as_to gpg --batch --list-keys --with-colons "$KEY_UID" 2>/dev/null | awk -F: '/^fpr/{print $10; exit}' || true)
 if [ -z "$FPR" ]; then
@@ -324,6 +356,74 @@ if grep -qE '^WILLOW_PGP_FINGERPRINT=' "$H/env"; then
 else
   printf 'WILLOW_PGP_FINGERPRINT=%s\n' "$FPR" >> "$H/env"
 fi
+
+# ---- gap c1395b307421: sync + SIGN syscall-table.json, in the SAME ACT
+# Amendment (dispatch A9BF01A9, amending BD5843FD): measured on the box —
+# the prior shape here synced (this step) and signed (step 6, several steps
+# and real wall-clock time later) as TWO acts. A pre-existing gpg bug in
+# step 6 died in the window between them, leaving the box with a REPLACED
+# but UNSIGNED syscall-table.json: paths.trusted_read correctly refused it
+# outright ("trust-owner-owned but its detached signature does not
+# verify"), and no verb could be proposed at all — locked harder than
+# before the install ran. ANY interruption in that window — this bug or a
+# different one — produces the same lock. Fixed by making sync_constitutional.
+# py's --sign-as path do both in one process, one file write, immediately
+# verified, with an automatic rollback to the exact previous bytes AND the
+# exact previous .sig if signing or verification fails (sync_and_sign(),
+# tested directly with fake sign/verify callables — the two-uid gpg
+# boundary itself stays untested here, same limit this script's own
+# chown/ACL steps have always had; see the PR body for which CI leg covers
+# it). syscall-table.json is signed HERE, once — no longer re-signed in
+# step 6's loop below.
+say "== 1c. sync + sign constitutional policy files from the checkout bundle (one act)"
+BUNDLE_CONSTITUTIONAL="$CHECKOUT/src/willow_mcp/bundle/constitutional"
+SYSCALL_TABLE="$H/constitutional/syscall-table.json"
+"$PY" "$HERE/sync_constitutional.py" "$BUNDLE_CONSTITUTIONAL" "$H/constitutional" \
+  --sign-as "$TRUST_OWNER" --gnupg-home "$GNUPGHOME_TO" --fingerprint "$FPR" \
+  || stop "constitutional bundle sync/sign failed — see the STOP line above; sync_and_sign() has already restored the box's constitutional/ to exactly what it was before this step ran"
+
+# nestor.db (gap 035d287206e1, F1, rework per Loki audit B00BD43E): the
+# apply half no longer reads this at all — it is a WAL database, and a
+# read-only opener under this unit's ProtectHome=read-only cannot create
+# the -shm sidecar a WAL reader needs (measured: every permission shape
+# gives either "unable to open database file" or "attempt to write a
+# readonly database", or silently hides rows still sitting in the WAL under
+# immutable=1). The request half (broker, uid 1000, which CAN read
+# nestor.db without any of these constraints) now embeds the sealed row's
+# own verified bytes in the signed pending record instead; the apply half
+# re-verifies the ed25519 signature over those embedded bytes. No ACL on
+# nestor.db is granted here any more — the prior `setfacl u:$TRUST_OWNER:r
+# nestor.db` line is gone.
+
+# ---- gap 18affe49e198: seed the envelope.ratify bootstrap envelope
+# Amendment (dispatch A9BF01A9): with row 24 now present (step 1c, just
+# above), envelope_propose(verb='envelope.ratify') succeeds but
+# envelope_ratify_request still refuses ENOENT — the request half needs an
+# ACTIVE envelope governing envelope.ratify, and the only way to activate
+# one is envelope.ratify. No principal but root, once, at install time, can
+# break this (the broker can read its own proposals sidecar but cannot
+# write the trust-owner register; the trust owner can write the register
+# but cannot read the broker-owned 0600 sidecar — Loki 42B3B46F, U1).
+# deploy/manifest-grant/seed_envelope_ratify.py calls
+# envelope_authoring.ratify_proposal_row — the SAME function the real
+# envelope.ratify apply half calls — rather than hand-building the active
+# register row's shape a second time. Idempotent: an existing active grant
+# for (envelope.ratify, willow) means this prints that and changes nothing;
+# it disturbs no other active envelope. Runs as the trust owner (needs
+# write access to the register) with $FPR so the register write is signed;
+# see the module's own docstring for why its bounds are the unbounded
+# {"proposal_ids": ["*"]} wildcard rather than a proposal-id-bounded shape.
+say "== 1d. seed the envelope.ratify bootstrap envelope"
+as_to WILLOW_HOME="$H" WILLOW_PGP_FINGERPRINT="$FPR" "$PY" "$HERE/seed_envelope_ratify.py" \
+  || stop "seeding the envelope.ratify bootstrap envelope failed — see the STOP line above; ratify_proposal_row() refuses before any write on every failure path, so the register is untouched"
+
+# ---------------------------------------------------- 2. retire the --user unit
+say "== 2. retire the --user unit"
+as_op systemctl --user disable --now willow-mcp-manifest-grant.timer 2>/dev/null || true
+as_op systemctl --user stop willow-mcp-manifest-grant.service 2>/dev/null || true
+rm -f "/home/$OPERATOR/.config/systemd/user/willow-mcp-manifest-grant.service" \
+      "/home/$OPERATOR/.config/systemd/user/willow-mcp-manifest-grant.timer"
+as_op systemctl --user daemon-reload
 
 # ---------------------------------------------------------- 4. env file, units
 say "== 4. $ETC and system units"
@@ -346,12 +446,25 @@ sudo -u postgres psql -v ON_ERROR_STOP=1 -qd "$PG_DB" -c "GRANT CONNECT ON DATAB
 sudo -u "$TRUST_OWNER" psql -d "$PG_DB" -qtc 'select 1' >/dev/null || stop "peer auth for $TRUST_OWNER on $PG_DB failed — check pg_hba.conf"
 
 # --------------------------- 6. re-sign every seat manifest under the new key
+# Fix (2026-09-22, first real two-uid install; 338bbdb): `SIG_TMP=$(mktemp)`
+# here runs as ROOT (this whole script), producing a 0600 root-owned file —
+# but `as_to` runs gpg as the trust owner (uid 994), which cannot open a
+# root-owned file for writing even via `-o`. The fake-interpreter test that
+# exercised this control flow ran everything as one uid and could not see
+# it; the operator's first live run did (`gpg: can't create
+# '/tmp/tmp.xxx': Permission denied`). Fixed by never handing gpg a path to
+# open at all: `--output -` writes the signature to gpg's own stdout, and
+# `> "$SIG_TMP"` is THIS shell's (root's) redirection, evaluated and opened
+# before `as_to`'s `sudo -u <trust owner>` ever runs — the fd is already
+# open and root-owned by the time gpg (as the trust owner) inherits and
+# writes to it, so the child uid's permissions on the PATH never matter. No
+# temp file is ever owned by the trust-owner uid, on success or on failure.
 say "== 6. re-sign every manifest under $FPR"
 for a in "$H"/mcp_apps/*/; do
   [ -f "$a/manifest.json" ] || continue
   s=$(basename "$a")
   SIG_TMP=$(mktemp)
-  as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" -o "$SIG_TMP" "$a/manifest.json"
+  as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" --output - "$a/manifest.json" > "$SIG_TMP"
   install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$SIG_TMP" "$a/manifest.json.sig"
   rm -f "$SIG_TMP"
   say "  signed $s"
@@ -363,28 +476,20 @@ done
 # moment the fingerprint changes. Missing the federation registry here was
 # exactly Loki's F3: the first post-install federation.ratify would otherwise
 # read "no ratified servers" and silently drop every existing entry.
-# gap c1395b307421: syscall-table.json joins them the moment step 1c starts
-# writing it — an edited-but-unsigned governance file locks the whole box
-# out under a denial that blames something else, and that has already
-# happened here once (this same file's own INSTALL.md note).
-for f in "$REG" "$SYSCALL_TABLE" "$H/mcp_apps/_federation/servers.json"; do
+# gap c1395b307421 / dispatch A9BF01A9: syscall-table.json does NOT join
+# this loop — it is synced AND signed atomically back in step 1c
+# (sync_and_sign(), before $FPR even needed to exist yet at the OLD step 3's
+# position). Re-signing it again here would be redundant on every run and,
+# worse, re-introduces exactly the two-acts-not-one shape this PR exists to
+# close if this loop ever runs on its own between 1c and a failure.
+for f in "$REG" "$H/mcp_apps/_federation/servers.json"; do
   [ -f "$f" ] || continue
   SIG_TMP=$(mktemp)
-  as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" -o "$SIG_TMP" "$f"
+  as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" --output - "$f" > "$SIG_TMP"
   install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$SIG_TMP" "$f.sig"
   rm -f "$SIG_TMP"
   say "  signed $(basename "$f")"
 done
-# gap c1395b307421: verify the syscall table's own signature right after
-# writing it — this is the file this PR newly writes, so it is the one an
-# unsigned-or-mis-signed governance file would lock the box out on. The
-# other two files in the loop above have carried this exact shape since
-# sealed 31f5d3af / the federation.ratify row and are not re-touched here.
-if [ -f "$SYSCALL_TABLE" ]; then
-  as_to gpg --batch --verify "$SYSCALL_TABLE.sig" "$SYSCALL_TABLE" \
-    || stop "syscall-table.json.sig does not verify under $FPR immediately after signing — refusing rather than leaving a governance file whose signature does not check"
-  say "  verified $(basename "$SYSCALL_TABLE").sig"
-fi
 
 # ------------------ 6b. guard: no request minted before this install may apply
 # Sealed 33654f35 (2026-09-22): d23a3726's pending request "is withdrawn, not
