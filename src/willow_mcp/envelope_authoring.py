@@ -397,14 +397,17 @@ def _register_writable() -> tuple[bool, str, dict]:
         owner = str(d.stat().st_uid)
     reason = (
         f"{d} is not writable by this process (uid {os.geteuid()}) — owned "
-        f"by {owner!r}. On the installed box, ratifying an envelope is not "
-        "possible until envelope.ratify (gap d3f79320ccb5) lands: a "
-        f"sudo -u {owner} run of this same function fails too, on the "
-        "OTHER file this ratify would need to touch (the broker-owned, "
-        "0600 proposals sidecar it cannot read as this uid) — there is no "
-        "uid on the box that can complete ratify() as written. The "
-        "proposal named here queues in $WILLOW_HOME/proposals/ and is not "
-        "lost; nothing was touched by this refusal."
+        f"by {owner!r}. This process (the desk, via the envelope_ratify MCP "
+        f"tool) cannot complete ratify() as written — a sudo -u {owner} run "
+        "of this same function fails too, on the OTHER file this call would "
+        "need to touch (the broker-owned, 0600 proposals sidecar it cannot "
+        "read as this uid). Use envelope_ratify_request instead: it verifies "
+        "a human-sealed Nestor pair, writes one signed request, and the "
+        "trust-owner apply half (envelope.ratify, gap d3f79320ccb5) moves "
+        "the proposal into the register from there — the same request/apply "
+        "split manifest.grant and envelope.revoke already use. The proposal "
+        "named here queues in $WILLOW_HOME/proposals/ and is not lost; "
+        "nothing was touched by this refusal."
     )
     return False, reason, {"error": "EACCES", "path": str(d), "owner": owner}
 
@@ -834,6 +837,99 @@ def ratify(
     return result
 
 
+def ratify_proposal_row(
+    row: dict,
+    *,
+    ratified_by: str,
+    ratified_via: str,
+    citation_id: Optional[str] = None,
+    ledger: Optional[Any] = None,
+) -> dict:
+    """Move an ALREADY-KNOWN proposal ROW into ``active[]`` — the
+    sidecar-free sibling of :func:`ratify`, built for
+    :mod:`trust_owner_verbs`'s ``envelope.ratify`` apply half (gap
+    ``d3f79320ccb5``). On an installed box the apply half runs AS the
+    trust owner, which can write the register (:func:`_register_writable`
+    holds) but cannot read the broker-owned 0600 proposals sidecar at all
+    (that function's own docstring, Loki audit 42B3B46F, U1) — so unlike
+    :func:`ratify`, this never looks the proposal up itself. The caller
+    (the ``envelope.ratify`` request half, running as the broker, which
+    CAN read its own sidecar) copies the full row into the signed request
+    at request time; this function only ever receives that copy.
+
+    Same register-write discipline as :func:`ratify`: refuses
+    :class:`RegisterUnwritableError` up front via
+    :func:`_register_writable`, before anything is touched; refuses when
+    ``row['id']`` is already in ``active[]`` (the caller re-checks this
+    itself too, immediately before calling — the check here is the one
+    that actually holds under a race, since it runs right before the
+    write it guards); writes ``active[]`` via :func:`_save_active`
+    (atomic write + re-sign under ``WILLOW_PGP_FINGERPRINT`` when PGP
+    enforcement is on); and appends ``envelope_ratified`` to FRANK — the
+    SAME event name :func:`ratify` inks, so a reader filtering FRANK for
+    "what did the operator say yes to" sees both paths identically.
+    ``citation_id``, when given, rides in the FRANK payload so
+    :func:`manifest_grant_executor._verify_pending_signature_and_citation`
+    can use this same event as its own replay guard — no second event
+    name to keep in sync. Unlike :func:`ratify`, ``ratified_by`` (the
+    sealed row's own verifier, read by the caller — this function does
+    not touch the keyring) is stamped onto the row as its own field,
+    alongside ``ratified_via``; the caller composes ``ratified_via`` (the
+    packet's own shape: ``"frank ledger entry <citation_id>"``) rather
+    than this function guessing at it."""
+    _refuse_registry_mismatch("ratify")
+    writable, writable_reason, writable_detail = _register_writable()
+    if not writable:
+        raise RegisterUnwritableError(writable_reason, writable_detail)
+
+    registry = _load_registry()
+    active = list(registry.get("active") or [])
+    proposal_id = row.get("id")
+    if any(r.get("id") == proposal_id for r in active):
+        raise EnvelopeAuthoringError(
+            f"envelope {proposal_id!r} is already active — nothing to ratify"
+        )
+
+    ratified_at = _now_iso()
+    ratified: dict = {
+        **{k: v for k, v in row.items() if not k.startswith("_")},
+        "issued_by": "root",
+        "issued_at": ratified_at,
+        "status": "active",
+        "ratified_via": ratified_via,
+        "ratified_by": ratified_by,
+    }
+    active.append(ratified)
+    _save_active({"active": active})
+
+    ledger_record_id = None
+    ledger_error = None
+    if ledger is not None:
+        try:
+            ledger_record_id = ledger.append(
+                "willow",
+                FRANK_EVENT_RATIFIED,
+                {
+                    "envelope_id": proposal_id,
+                    "verb": row.get("verb"),
+                    "verb_id": row.get("verb_id"),
+                    "grantee": row.get("grantee"),
+                    "bounds_digest": _bounds_digest(row.get("bounds") or {}),
+                    "verifier": ratified_by,
+                    "ratified_at": ratified_at,
+                    "citation_id": citation_id,
+                },
+            )
+        except Exception as exc:  # pragma: no cover — ledger is optional
+            ledger_error = str(exc)
+
+    result = dict(ratified)
+    result["_ledger_record_id"] = ledger_record_id
+    if ledger_error:
+        result["_ledger_error"] = ledger_error
+    return result
+
+
 def reject(
     proposal_id: str,
     *,
@@ -1102,6 +1198,36 @@ def list_archived(
     return rows
 
 
+def _reconcile_pending_against_active(registry: dict) -> dict:
+    """Drop any sidecar ``proposals[]`` row whose id is already in the
+    register's ``active[]`` — the trust-owner ``envelope.ratify`` apply
+    half (:mod:`trust_owner_verbs`) moves a proposal into ``active[]`` but
+    can never touch the broker-owned sidecar at all (it cannot even read
+    it, let alone write it), so without this the sidecar keeps showing a
+    proposal as pending long after it became a real, active grant. Called
+    from the broker's own read paths (:func:`list_pending`,
+    :func:`envelope_pending_read`'s underlying call) — reading ``active[]``
+    here is the same ``trusted_read`` signature-verified branch every other
+    reader of the trust-owner-owned register already takes; WRITING the
+    trimmed sidecar back is safe because the broker (not the apply half)
+    is the one calling this, and the broker owns that file. A write
+    failure here (read-only mount, race, whatever) never breaks the read
+    itself — the stale rows are filtered out of what this call returns
+    regardless of whether the on-disk cleanup could complete."""
+    proposals = registry.get("proposals") or []
+    active_ids = {row.get("id") for row in (registry.get("active") or [])}
+    if not any(row.get("id") in active_ids for row in proposals):
+        return registry
+    remaining = [row for row in proposals if row.get("id") not in active_ids]
+    try:
+        _save_proposals({"proposals": remaining, "archived": registry.get("archived") or []})
+    except OSError:
+        pass
+    registry = dict(registry)
+    registry["proposals"] = remaining
+    return registry
+
+
 def list_pending(
     *,
     oldest_first: bool = True,
@@ -1125,6 +1251,7 @@ def list_pending(
     actually still on record. Empty list on a row with no precedents.
     """
     registry = _load_registry()
+    registry = _reconcile_pending_against_active(registry)
     rows = list(registry.get("proposals") or [])
     rows.sort(key=lambda r: r.get("proposed_at") or "", reverse=not oldest_first)
     rows = rows[: max(0, int(limit))]

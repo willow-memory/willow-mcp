@@ -1,6 +1,6 @@
-"""willow_mcp/trust_owner_verbs.py — four more trust-owner verbs on
+"""willow_mcp/trust_owner_verbs.py — five trust-owner verbs on
 manifest_grant_executor's own queue: ``envelope.revoke``, ``manifest.retire``,
-``manifest.create``, ``federation.ratify``.
+``manifest.create``, ``federation.ratify``, ``envelope.ratify``.
 
 Sealed pair ``1bd6fd29`` (operator, 2026-09-22): "Setup is the installer's
 (root, once, detects rather than asks). Operations are Willow's, executed by
@@ -12,7 +12,7 @@ template (:mod:`manifest_grant_executor`, verb 18, sealed ``d5504878`` /
 ``b74019ac`` / ``6bd11def``) — read that module's docstring first, every
 rule there applies here.
 
-Same two halves, same one queue, four more verbs:
+Same two halves, same one queue, five verbs:
 
 * **Request** (broker, orchestrator-only, signs nothing): one function per
   verb below, each mirroring :func:`manifest_grant_executor.
@@ -43,7 +43,16 @@ underscores: ``envelope_revoke_applied`` / ``manifest_retire_applied`` /
 ``manifest_create_applied`` / ``federation_ratify_applied``), citing the
 pair and the FRANK citation that authorized it — the same "grants and
 denials get the same ink" contract every other verb in
-``bundle/constitutional/syscall-table.json`` carries.
+``bundle/constitutional/syscall-table.json`` carries. ``envelope.ratify`` is
+the one deliberate exception: it inks ``envelope_ratified`` (never
+``envelope_ratify_applied``) — the SAME event name
+:func:`envelope_authoring.ratify` already inks for the sidecar path, so a
+FRANK reader filtering for "what did the operator say yes to" sees an
+envelope becoming active identically regardless of which of the two paths
+produced it. That event's payload still carries ``citation_id``, so
+:func:`manifest_grant_executor._verify_pending_signature_and_citation`'s
+own replay guard (which needs SOME event name to check a citation was not
+already consumed) works unchanged with no second event to keep in sync.
 
 Grammar-scope note, restated once rather than per verb: each ``_parse_*``
 function below reads ONLY the first line of the sealed ``target_text``; a
@@ -1022,6 +1031,243 @@ def _apply_federation_ratify(record: dict, path: Path, *, ledger, apps_root: Pat
     return {"pair_id": pair_id, **out}
 
 
+# ── envelope.ratify ──────────────────────────────────────────────────────
+#
+# Gap d3f79320ccb5, measured live 2026-09-22T07:4xZ right after the
+# installer ran: the desk's own envelope_ratify -> EACCES, "there is no
+# uid on the box that can complete ratify() as written"
+# (envelope_authoring._register_writable). Three envelopes were queued
+# behind it (two pushes, one pr.open) and every governed act on the desk
+# was stopped. Same shape as the other four verbs above, with one twist
+# forced by the box's own two-uid split (Loki audits 367C367A T1 / 42B3B46F
+# U1): the trust-owner apply half can WRITE the active register but cannot
+# READ the broker-owned 0600 proposals sidecar at all, so unlike
+# envelope.revoke (which only ever touches the register), this request half
+# copies the proposal's FULL row into the signed request at request time —
+# the broker CAN read its own sidecar; the apply half then needs only the
+# request, never the sidecar.
+
+VERB_ENVELOPE_RATIFY = "envelope.ratify"
+EVENT_ENVELOPE_RATIFIED = "envelope_ratified"
+
+_ENVELOPE_RATIFY_RE = re.compile(
+    r"^ratify envelope (?P<proposal_id>[A-Za-z0-9_.\-]+): (?P<words>.+)$"
+)
+
+
+def _parse_envelope_ratify_text(text: str) -> Optional[dict]:
+    first_line = (text or "").strip().splitlines()[:1]
+    if not first_line:
+        return None
+    m = _ENVELOPE_RATIFY_RE.match(first_line[0].strip())
+    if not m:
+        return None
+    words = m.group("words").strip()
+    if not words:
+        return None
+    return {"proposal_id": m.group("proposal_id"), "words": words}
+
+
+def _envelope_registry_view() -> dict:
+    """The merged registry view (``active``/``proposals``/``archived``) —
+    the broker's own read, used ONLY at request time (this half runs as
+    the broker, which owns the sidecar and can read the register through
+    ``trusted_read``'s signature branch). Deferred import: :mod:`envelope_authoring`
+    is a heavier import than the rest of this module needs at load time."""
+    from . import envelope_authoring as _ea
+
+    return _ea._load_registry()
+
+
+def envelope_ratify_request(
+    app_id: str,
+    *,
+    envelope_id: str = "",
+    pair_id: str,
+    project: str = "",
+    session: str = "",
+    ledger=None,
+    store=None,
+    db_path: Optional[Path] = None,
+    grants_root: Optional[Path] = None,
+) -> dict:
+    """Broker side of ``envelope.ratify``. Sealed text: ``ratify envelope
+    <proposal_id>: <the operator's verbatim words>`` — the operator's
+    ratification words ARE the sealed text, so the seal itself is the
+    ratification; there is no second act. Request pre-state: the named
+    proposal exists in the broker's own sidecar (readable here — this half
+    runs as the broker) and is not already in ``active[]``. Writes one
+    signed request carrying a full copy of the proposal row (option (a) of
+    the packet: the apply half runs as the trust owner and cannot read the
+    sidecar at all, so the row travels inside the signed request instead);
+    never touches the register itself — that is :func:`_apply_envelope_ratify`'s
+    job, run as the trust-owner unit. The broker's own next
+    ``envelope_pending_read`` prunes the sidecar's now-stale copy once it
+    sees the id active in the register."""
+    from .human_session import is_orchestrator_app
+
+    if not is_orchestrator_app(app_id):
+        return mgx._refuse(
+            "EPERM", f"{VERB_ENVELOPE_RATIFY} is orchestrator-only; {app_id!r} may not call it"
+        )
+
+    grants_root_p = mgx._grants_root(grants_root)
+
+    def _body() -> dict:
+        existing = mgx._existing_request_state(grants_root_p, pair_id)
+        if existing is not None:
+            return mgx._refuse(
+                "EALREADY",
+                f"a {VERB_ENVELOPE_RATIFY} request for pair_id={pair_id!r} already exists ({existing})",
+                state=existing,
+            )
+
+        pair_result = mgx._load_sealed_pair(pair_id, store=store)
+        if not pair_result.get("ok"):
+            return pair_result
+        gov_record = pair_result["record"]
+        if gov_record.get("status") != "sealed":
+            return mgx._refuse(
+                "EACCES",
+                f"pair_id={pair_id!r} governance record is status={gov_record.get('status')!r}, "
+                "not 'sealed'",
+            )
+
+        refusal, sealed = mgx._verify_seal_only(pair_id, db_path=db_path)
+        if refusal is not None:
+            return refusal
+        parsed = _parse_envelope_ratify_text(sealed.get("target_text", ""))
+        if parsed is None:
+            return mgx._refuse(
+                "EINVAL",
+                f"sealed pair {pair_id!r} text does not match the strict {VERB_ENVELOPE_RATIFY} "
+                "grammar ('ratify envelope <proposal_id>: <the operator's verbatim words>', "
+                "one line)",
+                sealed_text=sealed.get("target_text"),
+            )
+
+        target_proposal_id = parsed["proposal_id"]
+
+        registry = _envelope_registry_view()
+        active_ids = {r.get("id") for r in (registry.get("active") or [])}
+        if target_proposal_id in active_ids:
+            return mgx._refuse(
+                "EALREADY",
+                f"envelope {target_proposal_id!r} is already active — nothing to ratify",
+                envelope_id=target_proposal_id,
+            )
+
+        proposal_row = None
+        for row in registry.get("proposals") or []:
+            if row.get("id") == target_proposal_id:
+                proposal_row = row
+                break
+        if proposal_row is None:
+            return mgx._refuse(
+                "ENOENT", f"no pending proposal with id={target_proposal_id!r} to ratify"
+            )
+
+        if ledger is None:
+            return mgx._refuse("EAMBIG", "no governance ledger: a request that cannot be cited is not performed")
+
+        target = {
+            "proposal_id": target_proposal_id,
+            "words": parsed["words"],
+            "proposal": {k: v for k, v in proposal_row.items() if not k.startswith("_")},
+        }
+        pending_path = mgx._pending_path(grants_root_p, pair_id)
+        pending_record = {
+            "pair_id": pair_id, "verb": VERB_ENVELOPE_RATIFY, "envelope_id": None, "citation_id": None,
+            "actor": app_id, "target": target,
+            "project": project or "willow-mcp", "session": session,
+            "requested_at": mgx._now_iso(),
+            "pre_state": {"proposal": {"exists": True}, target_proposal_id: {"active": False}},
+        }
+        return mgx._cite_and_persist(
+            pending_path, pending_record, ledger=ledger, envelope_id=envelope_id,
+            app_id=app_id, call_args={"proposal_ids": [target_proposal_id]},
+            project=project, session=session,
+            pair_id=pair_id, grants_root_p=grants_root_p,
+        )
+
+    return mgx._run_locked_request(grants_root_p, pair_id, _body)
+
+
+def _apply_envelope_ratify(record: dict, path: Path, *, ledger, apps_root: Path,
+                            db_path: Optional[Path], grants_root: Path) -> dict:
+    pair_id = record.get("pair_id")
+    target = record.get("target") or {}
+    proposal_id = target.get("proposal_id")
+    words = target.get("words")
+    proposal_row = target.get("proposal") or {}
+
+    def _fail(errno: str, reason_msg: str, **extra) -> dict:
+        out = {"ok": False, "error": errno, "reason": reason_msg, **extra}
+        mgx._move(path, grants_root / "failed", {**record, "result": out})
+        return {"pair_id": pair_id, **out}
+
+    dirs_ok, dirs_reason = mgx._dirs_writable(grants_root)
+    if not dirs_ok:
+        out = {"ok": False, "error": "eperm_pending", "reason": dirs_reason}
+        try:
+            mgx._move(path, grants_root / "failed", {**record, "result": out})
+        except OSError:
+            pass
+        return {"pair_id": pair_id, **out}
+
+    citation_refusal = mgx._verify_pending_signature_and_citation(
+        record, ledger=ledger, grants_root=grants_root, applied_event=EVENT_ENVELOPE_RATIFIED)
+    if citation_refusal is not None:
+        return _fail(citation_refusal["error"], citation_refusal["reason"])
+
+    seal_refusal, sealed = mgx._verify_seal_only(pair_id, db_path=db_path)
+    if seal_refusal is not None:
+        return _fail(seal_refusal["error"], seal_refusal["reason"])
+    parsed = _parse_envelope_ratify_text(sealed.get("target_text", ""))
+    if parsed is None or parsed["proposal_id"] != proposal_id or parsed["words"] != words:
+        return _fail("eseal_mismatch", "sealed text no longer matches this request's recorded target")
+
+    if not proposal_row or proposal_row.get("id") != proposal_id:
+        return _fail("eforged", "request carries no valid copy of the proposal row to ratify")
+
+    if _envelope_active_row(proposal_id) is not None:
+        return _fail("edrift", f"envelope {proposal_id!r} was already ratified since the request was made")
+
+    from . import envelope_authoring, envelopes
+
+    verifier = sealed.get("verifier") or ""
+    try:
+        result = envelope_authoring.ratify_proposal_row(
+            proposal_row,
+            ratified_by=verifier,
+            ratified_via=f"frank ledger entry {record.get('citation_id')}",
+            citation_id=record.get("citation_id"),
+            ledger=ledger,
+        )
+    except envelope_authoring.RegisterUnwritableError as exc:
+        return _fail("EACCES", str(exc), **exc.detail)
+    except envelope_authoring.EnvelopeAuthoringError as exc:
+        return _fail("eunexpected", f"{type(exc).__name__}: {exc}")
+    except OSError as exc:
+        return _fail(
+            "EACCES",
+            f"envelope registry not writable by this process: {type(exc).__name__}: {exc}",
+            path=str(envelopes.registry_path()),
+        )
+
+    receipt_ids: list[str] = []
+    if result.get("_ledger_record_id"):
+        receipt_ids.append(result["_ledger_record_id"])
+    out = {
+        "ok": True, "envelope_id": proposal_id, "ratified_at": result.get("issued_at"),
+        "ratified_by": result.get("ratified_by"), "receipt_ids": receipt_ids,
+    }
+    if result.get("_ledger_error"):
+        out["receipt_error"] = result["_ledger_error"]
+    mgx._move(path, grants_root / "done", {**record, "result": out})
+    return {"pair_id": pair_id, **out}
+
+
 # ── apply-side dispatch, read by manifest_grant_executor.manifest_grant_apply ──
 
 APPLY_DISPATCH = {
@@ -1029,4 +1275,5 @@ APPLY_DISPATCH = {
     VERB_RETIRE: _apply_manifest_retire,
     VERB_CREATE: _apply_manifest_create,
     VERB_RATIFY: _apply_federation_ratify,
+    VERB_ENVELOPE_RATIFY: _apply_envelope_ratify,
 }
