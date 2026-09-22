@@ -59,6 +59,12 @@ def default_exposure_config() -> dict[str, Any]:
             "cloud_llm": "voice_only",
             "sentry": "telemetry",
             "dispatch": "work_context",
+            # Sealed ae23d366 clause 3: federation_call's own destination —
+            # a VISIBILITY TIER name (see _VISIBILITY_TIERS below), not a
+            # seed-field preset. Narrowest by default (fail closed): a
+            # caller with no explicit override sees only "internal" rows
+            # from a federated corpus hit.
+            "federation_call": "internal",
             "*": "voice_only",
         },
         "agents": {
@@ -68,6 +74,65 @@ def default_exposure_config() -> dict[str, Any]:
             }
         },
     }
+
+
+# ── Federation exposure tier (sealed ae23d366 clause 3) ─────────────────────
+#
+# Reuses resolve_preset()'s existing per-agent/per-destination default
+# lookup (same exposure.json shape, same reader) for a DIFFERENT axis: not
+# "which seed fields does this destination see" but "which visibility tier
+# of a federated corpus row does this caller see". The destination key is
+# FEDERATION_DESTINATION ("federation_call"); the "preset" values for that
+# one destination are visibility tier names instead of seed presets.
+#
+# Ordering and the drop rule (decided this session — no prior code or doc
+# fixed this, so it is recorded here rather than assumed): "internal" is
+# its own closed bucket, visible only to an "internal"-tier caller; "serve"
+# and "public" together form the externally-cleared pool, visible to any
+# caller whose own tier is NOT "internal" (a caller already operating in an
+# externally-reachable context — grove serve, a remote claude.ai session —
+# has no use for content that was marked never to leave the fleet's own
+# reasoning, and an internal-only caller has no need for content phrased
+# for an external audience). This is deliberately NOT a linear ceiling
+# ("public" is not simply "more" than "serve") — it is an audience match
+# with exactly one privileged, isolated bucket ("internal") and one shared
+# external pool. A caller tier that is itself literally "public" still
+# reads the shared external pool (serve + public), same as "serve" does;
+# there is no narrower-than-"internal" tier to fall through to.
+FEDERATION_DESTINATION = "federation_call"
+
+#: The only visibility tier names this module recognizes. A row's
+#: `visibility` field, or a caller's resolved federation_call preset, that
+#: is not one of these three is treated as "internal" — the narrowest,
+#: fail-closed reading (rework-proof: a config typo or an unrelated seed
+#: preset leaking through the "*" wildcard must never WIDEN what a caller
+#: sees).
+_VISIBILITY_TIERS = frozenset({"internal", "serve", "public"})
+_EXTERNAL_VISIBILITIES = frozenset({"serve", "public"})
+DEFAULT_VISIBILITY_TIER = "internal"
+
+
+def resolve_exposure_tier(app_id: str) -> str:
+    """The caller's exposure tier for federation_call row filtering. Falls
+    back to `DEFAULT_VISIBILITY_TIER` ("internal", the narrowest) whenever
+    the resolved value is not a recognized tier name — including the
+    common case of an on-disk exposure.json written before this destination
+    existed, where the "*" wildcard default ("voice_only", a seed preset)
+    would otherwise resolve here and mean nothing as a visibility tier."""
+    preset, _source = resolve_preset(app_id, FEDERATION_DESTINATION)
+    return preset if preset in _VISIBILITY_TIERS else DEFAULT_VISIBILITY_TIER
+
+
+def visible_to(caller_tier: str, row_visibility: str | None) -> bool:
+    """True when a row carrying `row_visibility` may be returned to a
+    caller at `caller_tier`. An absent/unrecognized `row_visibility` is
+    treated as "internal" (the narrowest — a row with no visibility marker
+    gets the least benefit of the doubt, not the most)."""
+    tier = caller_tier if caller_tier in _VISIBILITY_TIERS else DEFAULT_VISIBILITY_TIER
+    vis = row_visibility if row_visibility in _VISIBILITY_TIERS else DEFAULT_VISIBILITY_TIER
+    if tier == "internal":
+        return vis == "internal"
+    return vis in _EXTERNAL_VISIBILITIES
 
 
 def load_exposure_config() -> dict[str, Any]:

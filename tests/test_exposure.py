@@ -159,3 +159,60 @@ def test_exposure_slice_tool(reader_app, home, monkeypatch):
     out = server.exposure_slice(reader_app, "ada", destination="grove")
     assert out["ok"] is True
     assert out["preset"] == "voice_only"
+
+
+# ── Federation exposure tier (sealed ae23d366 clause 3) ──────────────────────
+
+
+def test_default_exposure_config_carries_federation_call_destination():
+    cfg = exp.default_exposure_config()
+    assert cfg["defaults"]["federation_call"] == "internal"
+
+
+def test_resolve_exposure_tier_defaults_to_internal_when_unconfigured(home):
+    hi.ensure_home_layout()
+    assert exp.resolve_exposure_tier("reader") == "internal"
+
+
+def test_resolve_exposure_tier_honors_a_per_agent_override(home):
+    hi.ensure_home_layout()
+    cfg = exp.load_exposure_config()
+    cfg["agents"]["reader"] = {"defaults": {"federation_call": "serve"}}
+    paths.exposure_config_path().write_text(json.dumps(cfg), encoding="utf-8")
+    assert exp.resolve_exposure_tier("reader") == "serve"
+
+
+def test_resolve_exposure_tier_falls_back_to_internal_on_an_unrecognized_value(home):
+    """An on-disk exposure.json written before this destination existed
+    resolves federation_call through the "*" wildcard ("voice_only", a
+    seed preset, not a visibility tier) — that must never widen what a
+    caller sees. Falls back to the narrowest tier instead of passing an
+    invalid value through."""
+    hi.ensure_home_layout()
+    cfg = exp.load_exposure_config()
+    del cfg["defaults"]["federation_call"]
+    paths.exposure_config_path().write_text(json.dumps(cfg), encoding="utf-8")
+    assert exp.resolve_exposure_tier("reader") == "internal"
+
+
+def test_visible_to_internal_caller_sees_only_internal_rows():
+    assert exp.visible_to("internal", "internal") is True
+    assert exp.visible_to("internal", "serve") is False
+    assert exp.visible_to("internal", "public") is False
+
+
+def test_visible_to_serve_caller_sees_the_external_pool_not_internal():
+    assert exp.visible_to("serve", "serve") is True
+    assert exp.visible_to("serve", "public") is True
+    assert exp.visible_to("serve", "internal") is False
+
+
+def test_visible_to_missing_visibility_is_treated_as_internal():
+    assert exp.visible_to("internal", None) is True
+    assert exp.visible_to("internal", "") is True
+    assert exp.visible_to("serve", None) is False
+
+
+def test_visible_to_unrecognized_caller_tier_falls_back_to_internal():
+    assert exp.visible_to("bogus-tier", "internal") is True
+    assert exp.visible_to("bogus-tier", "serve") is False

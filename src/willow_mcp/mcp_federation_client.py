@@ -27,6 +27,7 @@ of the first resolution (Decision 5).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import threading
@@ -40,7 +41,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
-from . import external_guard, mcp_federation, signing, tier_policy
+from . import exposure, external_guard, mcp_federation, signing, tier_policy
 
 logger = logging.getLogger("willow_mcp.mcp_federation_client")
 
@@ -80,6 +81,32 @@ def _unwrap(exc: BaseException) -> BaseException:
 def _scan_text(text: str) -> tuple[str, list[dict]]:
     hits = external_guard.scan(text or "")
     return external_guard.verdict(hits), hits
+
+
+def _filter_by_visibility(parsed: Any, caller_tier: str) -> tuple[Any, int]:
+    """Sealed ae23d366 clause 3: drop rows whose `visibility` is not
+    visible to `caller_tier` (`exposure.visible_to`) — never rewrite a
+    surviving row, only withhold the ones the caller's tier does not
+    clear. Operates on EVERY top-level list-of-dicts in `parsed` (a
+    federated corpus server's exact result shape — `result`, `hits`,
+    `rows`, whatever key it uses — is not this module's to assume), so it
+    works regardless of which key the downstream server names its rows
+    under. Returns `(filtered, dropped_count)`; `filtered is parsed`
+    (no copy) when nothing was dropped."""
+    if not isinstance(parsed, dict):
+        return parsed, 0
+    dropped = 0
+    out: Optional[dict] = None
+    for key, val in parsed.items():
+        if not isinstance(val, list) or not val or not all(isinstance(i, dict) for i in val):
+            continue
+        kept = [row for row in val if exposure.visible_to(caller_tier, row.get("visibility"))]
+        if len(kept) != len(val):
+            dropped += len(val) - len(kept)
+            if out is None:
+                out = dict(parsed)
+            out[key] = kept
+    return (out if out is not None else parsed), dropped
 
 
 def _guard_tool_listing(tools: list[Any]) -> list[dict]:
@@ -368,11 +395,24 @@ class _ServerConnection:
         self._ensure_started()
         return self._tools_cache
 
-    def call_tool(self, tool: str, arguments: dict[str, Any]) -> dict:
+    def call_tool(self, tool: str, arguments: dict[str, Any], *, app_id: str = "") -> dict:
         result = self._request("call", (tool, arguments))
         text = "".join(
             getattr(block, "text", "") or "" for block in (result.content or [])
         )
+
+        # Sealed ae23d366 clause 3: withhold rows above the caller's
+        # exposure tier BEFORE the guard scan below — a row already
+        # dropped for visibility must never be the reason a call reads as
+        # BLOCKED, and the guard must scan exactly the text a caller will
+        # actually receive, not text for rows they never see.
+        dropped = 0
+        caller_tier = exposure.resolve_exposure_tier(app_id) if app_id else exposure.DEFAULT_VISIBILITY_TIER
+        parsed = signing._result_dict(result)
+        filtered, dropped = _filter_by_visibility(parsed, caller_tier)
+        if dropped:
+            text = json.dumps(filtered, separators=(",", ":"))
+
         verdict, hits = _scan_text(text)
         content_text = text
         escaped = False
@@ -386,6 +426,8 @@ class _ServerConnection:
             "content_text": content_text,
             "guard_verdict": verdict,
             "guard_hits": hits,
+            "visibility_tier": caller_tier,
+            "visibility_dropped": dropped,
         }
         if escaped:
             out["guard_escape"] = True
@@ -441,13 +483,18 @@ def list_server_tools(server_id: str, *, refresh: bool = False) -> list[dict]:
     return _get_connection(server_id).list_tools(refresh=refresh)
 
 
-def call_tool(server_id: str, tool: str, arguments: Optional[dict[str, Any]] = None) -> dict:
+def call_tool(server_id: str, tool: str, arguments: Optional[dict[str, Any]] = None,
+              *, app_id: str = "") -> dict:
     """Call one tool on one connected-or-connecting server. Callers are
     expected to have already cleared `federation_egress.egress_denial` —
     this module has no gate of its own, exactly as `mcp_generic.py`'s
     upstream ancestor did not: connection-layer code is not where
-    authorization decisions belong."""
-    return _get_connection(server_id).call_tool(tool, dict(arguments or {}))
+    authorization decisions belong.
+
+    `app_id` resolves the CALLER's exposure tier (sealed ae23d366 clause
+    3) for filtering the downstream result's rows by `visibility` before
+    they are guard-scanned; omitted, the narrowest tier applies."""
+    return _get_connection(server_id).call_tool(tool, dict(arguments or {}), app_id=app_id)
 
 
 def disconnect_server(server_id: str) -> bool:

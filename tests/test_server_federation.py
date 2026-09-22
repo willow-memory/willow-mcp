@@ -102,6 +102,37 @@ def test_federation_call_full_round_trip(home, monkeypatch):
     assert server_id in detail_blob and "tool=echo" in detail_blob
 
 
+def test_federation_call_drops_rows_above_the_callers_exposure_tier_and_says_so_in_the_receipt(
+    home, monkeypatch
+):
+    """Sealed ae23d366 clause 3, end to end through the guarded MCP tool:
+    an unconfigured caller (narrowest tier, "internal") calling the
+    fixture's corpus_hits tool gets only the internal-visibility row back,
+    and receipts_tail names how many were dropped and at which tier."""
+    from willow_mcp import lease
+
+    server_id = _ratify_echo_fixture(home)
+    perm = gate.federated_tool_permission(server_id, "corpus_hits")
+    _manifest(home, "caller", [gate.MCP_FEDERATION_PERMISSION, perm, "federation_call",
+                               "receipts_tail"])
+    monkeypatch.setattr("willow_mcp.consent.federation_permitted", lambda: True)
+    lease.grant("caller", 1800, issuer="operator", reason="test")
+
+    out = server.federation_call(app_id="caller", server_id=server_id,
+                                 tool="corpus_hits", arguments={})
+    assert "error" not in out
+    assert out["visibility_tier"] == "internal"
+    assert out["visibility_dropped"] == 2
+    body = json.loads(out["content_text"])
+    ids = {r["id"] for r in body["hits"]}
+    assert ids == {"nugget-1", "nugget-4"}
+
+    receipts = server.receipts_tail(app_id="caller", limit=10)["receipts"]
+    detail_blob = " ".join(r.get("detail") or "" for r in receipts)
+    assert "visibility_tier=internal" in detail_blob
+    assert "visibility_dropped=2" in detail_blob
+
+
 def test_federation_call_grant_on_one_tool_does_not_reach_another(home, monkeypatch):
     """Decision 1, exercised end to end: a grant for `echo` must not let the
     same caller reach `suspicious` on the same ratified server."""

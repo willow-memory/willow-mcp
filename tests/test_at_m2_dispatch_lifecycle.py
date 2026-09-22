@@ -479,3 +479,41 @@ def test_b55_untampered_assignment_reads_fine(home):
     result = server.dispatch_read("hanuman", sent["dispatch_id"])
     assert result.get("error") is None
     assert "Audit x." in result["assignment"]
+
+
+# ── Sealed ae23d366 clause 5: the retired jeles seat is refused by name ──────
+#
+# Not a red-team finding -- reusing this file's _write_manifest fixture for
+# a topically-unrelated packet-level refusal added the same session as the
+# rest of the seat retirement work.
+
+def test_dispatch_send_to_jeles_is_refused_by_name_not_eambig(home):
+    """The jeles seat is retired (sealed ae23d366). A caller who still
+    holds env-dispatch-301fa3b93732 (deliberately not revoked by this
+    change) must get a clean, named refusal here -- before the envelope
+    gate runs -- rather than either an EAMBIG against a seat that no
+    longer has a persona, or a packet silently written to a dead seat."""
+    _write_manifest(home, "hanuman", permissions=["dispatch_read", "dispatch_write"])
+
+    result = server.dispatch_send("hanuman", "jeles", "# Assignment\n\nFind sources.\n")
+    assert result.get("error") == "ESEATRETIRED"
+    assert "ae23d366" in result["message"]
+    assert "to_app" in result and result["to_app"] == "jeles"
+
+
+def test_dispatch_send_to_jeles_is_refused_case_insensitively(home):
+    _write_manifest(home, "hanuman", permissions=["dispatch_read", "dispatch_write"])
+    result = server.dispatch_send("hanuman", "JELES", "# Assignment\n\nFind sources.\n")
+    assert result.get("error") == "ESEATRETIRED"
+
+
+def test_dispatch_send_with_librarian_role_to_a_live_seat_is_unaffected(home):
+    """The refusal keys on the DESTINATION seat (to_app == "jeles"), not on
+    the `role`/task_class label -- a "librarian"-flavored task addressed to
+    a seat that still exists must not be caught by this refusal."""
+    _write_manifest(home, "hanuman", permissions=["dispatch_read", "dispatch_write"])
+    _write_manifest(home, "loki", permissions=["dispatch_read", "dispatch_write"])
+
+    result = server.dispatch_send("hanuman", "loki", "# Assignment\n\nFind sources.\n",
+                                  role="librarian")
+    assert result.get("error") != "ESEATRETIRED"

@@ -4374,6 +4374,29 @@ def dispatch_send(
     if (app_id or "").strip().lower() == (to_app or "").strip().lower():
         return {"error": "EINVAL", "message": "a packet cannot be sent to its sender",
                 "from_app": app_id, "to_app": to_app}
+    # Sealed ae23d366 clause 5: the jeles seat is retired. Refused by NAME,
+    # before the envelope gate runs (no quota spent, same shape as the
+    # self-send EINVAL above) -- not routed to a substitute seat. The
+    # sealed text itself answers the "route research to a seat whose role
+    # allows it" option: "Research as a task class needs no seat of its
+    # own... a dedicated researcher, if ever wanted, gets a name that is
+    # not Jeles" -- inventing a stand-in seat here would be exactly the
+    # stretch the seal refuses. A caller still holding env-dispatch-
+    # 301fa3b93732 (operator-keyed, deliberately not revoked by this
+    # change -- see the install note) would otherwise pass the envelope
+    # gate and write a packet to a seat with no persona to accept it,
+    # which is a worse failure than a clean, named refusal here.
+    if (to_app or "").strip().lower() == "jeles":
+        return {
+            "error": "ESEATRETIRED",
+            "message": ("the jeles specialist seat is retired (sealed ae23d366, "
+                        "'Jeles is the organ'): research is not a task class with "
+                        "a seat of its own. A wake that must retrieve and cite is "
+                        "any seat's crown on the research rung of the ladder, using "
+                        "the jeles corpus (federation_call) as a tool -- not a "
+                        "dispatch to a seat named jeles."),
+            "to_app": to_app,
+        }
     # #333: cite-before-act. `role` is resolved here with dispatch.py's own
     # fallback (`role or to_app`, lowercased) so the bounds an envelope is
     # checked against name the same task_class dispatch.py will actually
@@ -6168,7 +6191,13 @@ def federation_call(app_id: str, server_id: str, tool: str,
 
     The downstream tool's result is scanned by external-guard and
     sandwich-wrapped if flagged (untrusted output, same treatment
-    willow_web_fetch gives fetched pages) before it comes back."""
+    willow_web_fetch gives fetched pages) before it comes back.
+
+    Sealed ae23d366 clause 3: before the guard scan, any row in the
+    result carrying a `visibility` above the caller's exposure tier
+    (`exposure.resolve_exposure_tier`) is withheld — never rewritten,
+    only dropped. A row with no `visibility` is treated as `internal`.
+    The receipt names how many rows were dropped and at which tier."""
     from . import federation_egress, mcp_federation_client
 
     denial = federation_egress.egress_denial(app_id, server_id, tool)
@@ -6176,11 +6205,13 @@ def federation_call(app_id: str, server_id: str, tool: str,
         return denial
 
     from . import mcp_federation
-    result = mcp_federation_client.call_tool(server_id, tool, arguments)
+    result = mcp_federation_client.call_tool(server_id, tool, arguments, app_id=app_id)
     _receipt_log.record(
         app_id, "federation_call", "federated_call",
         f"server_id={server_id} tool={tool} "
-        f"guard_verdict={result.get('guard_verdict')}")
+        f"guard_verdict={result.get('guard_verdict')} "
+        f"visibility_tier={result.get('visibility_tier')} "
+        f"visibility_dropped={result.get('visibility_dropped') or 0}")
     entry = mcp_federation.get_ratified(server_id) or {}
     result["server_id"] = server_id
     result["server_name"] = entry.get("name")
