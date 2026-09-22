@@ -48,15 +48,17 @@ def test_row_17_note_names_the_seal_for_the_live_table_sync():
 
 def test_row_ids_are_dense_and_17_is_not_the_last_anymore():
     """Row 18 (manifest.grant, tests/test_manifest_grant.py) landed after this
-    row, and rows 20-23 (envelope.revoke, manifest.retire, manifest.create,
+    row, rows 20-23 (envelope.revoke, manifest.retire, manifest.create,
     federation.ratify — tests/test_trust_owner_verbs.py, pair 1bd6fd29) landed
-    after that — dense ids still hold everywhere except row 19, which is
-    deliberately RESERVED for the sealed but not-yet-landed net.egress verb
-    (pair c9ddd197; Loki audit BFCC5C79, finding F4 — the original draft used
-    19-22 and collided with it, renumbered before any envelope citing them
-    was ever ratified). 17 is just no longer the tail."""
+    after that, and row 24 (envelope.ratify — same file, same sealed pair,
+    gap d3f79320ccb5) landed after that — dense ids still hold everywhere
+    except row 19, which is deliberately RESERVED for the sealed but
+    not-yet-landed net.egress verb (pair c9ddd197; Loki audit BFCC5C79,
+    finding F4 — the original draft used 19-22 and collided with it,
+    renumbered before any envelope citing them was ever ratified). 17 is
+    just no longer the tail."""
     ids = sorted(_rows())
-    assert ids == list(range(1, 19)) + list(range(20, 24))
+    assert ids == list(range(1, 19)) + list(range(20, 25))
     assert 19 not in ids
     assert 17 in ids
 
