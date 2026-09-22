@@ -115,16 +115,19 @@ def test_unsupported_transport_is_reported_not_silently_ignored(monkeypatch):
 # ── Exposure filter (sealed ae23d366 clause 3) ────────────────────────────
 
 
-def test_filter_by_visibility_keeps_only_the_internal_row_for_an_internal_caller():
+# Ceiling model (Loki 8AA7CBE7, HIGH rework): public < serve < internal;
+# a caller at tier T sees every row at or below T's rank.
+
+def test_filter_by_visibility_internal_caller_sees_every_tier():
     parsed = {"hits": [
         {"id": "a", "visibility": "internal"},
         {"id": "b", "visibility": "serve"},
         {"id": "c", "visibility": "public"},
-        {"id": "d"},  # no visibility marker -> treated as internal
+        {"id": "d"},  # no visibility marker -> treated as internal, still visible to internal
     ]}
     filtered, dropped = mfc._filter_by_visibility(parsed, "internal")
-    assert [r["id"] for r in filtered["hits"]] == ["a", "d"]
-    assert dropped == 2
+    assert [r["id"] for r in filtered["hits"]] == ["a", "b", "c", "d"]
+    assert dropped == 0
 
 
 def test_filter_by_visibility_keeps_the_external_pool_for_a_serve_caller():
@@ -136,6 +139,18 @@ def test_filter_by_visibility_keeps_the_external_pool_for_a_serve_caller():
     filtered, dropped = mfc._filter_by_visibility(parsed, "serve")
     assert [r["id"] for r in filtered["hits"]] == ["b", "c"]
     assert dropped == 1
+
+
+def test_filter_by_visibility_public_caller_sees_public_only():
+    parsed = {"hits": [
+        {"id": "a", "visibility": "internal"},
+        {"id": "b", "visibility": "serve"},
+        {"id": "c", "visibility": "public"},
+        {"id": "d"},  # no marker -> internal, hidden from a public caller
+    ]}
+    filtered, dropped = mfc._filter_by_visibility(parsed, "public")
+    assert [r["id"] for r in filtered["hits"]] == ["c"]
+    assert dropped == 3
 
 
 def test_filter_by_visibility_never_rewrites_a_surviving_row():
@@ -159,15 +174,57 @@ def test_filter_by_visibility_on_a_non_dict_is_a_no_op():
     assert mfc._filter_by_visibility(["not", "a", "dict"], "internal") == (["not", "a", "dict"], 0)
 
 
-def test_call_tool_filters_corpus_hits_end_to_end_for_an_internal_caller(echo_entry):
+def test_filter_by_visibility_recurses_into_a_nested_result_wrapper():
+    """Loki 8AA7CBE7, MEDIUM: the original pass only looked at parsed's own
+    top-level values, so `{"result": {"hits": [...]}}` went through
+    unfiltered. This shape (a downstream boxing its rows under a nested
+    key) must be filtered exactly like a top-level list."""
+    parsed = {"result": {"hits": [
+        {"id": "a", "visibility": "internal"},
+        {"id": "b", "visibility": "public"},
+    ]}}
+    filtered, dropped = mfc._filter_by_visibility(parsed, "public")
+    assert [r["id"] for r in filtered["result"]["hits"]] == ["b"]
+    assert dropped == 1
+
+
+def test_filter_by_visibility_withholds_a_singleton_row_dict_that_carries_visibility():
+    """A single dict value (not wrapped in a list with siblings — a
+    corpus's top-hit shape) is still withheld when it explicitly carries a
+    `visibility` key the caller's tier does not clear; never rewritten,
+    replaced with None rather than silently vanishing."""
+    row = {"id": "top", "visibility": "internal", "text": "verbatim"}
+    parsed = {"nugget": row, "candidates": []}
+    filtered, dropped = mfc._filter_by_visibility(parsed, "public")
+    assert filtered["nugget"] is None
+    assert dropped == 1
+
+    kept, dropped2 = mfc._filter_by_visibility(parsed, "internal")
+    assert kept["nugget"] is row
+    assert dropped2 == 0
+
+
+def test_filter_by_visibility_a_singleton_dict_without_a_visibility_key_is_not_treated_as_a_row():
+    """A bare wrapper/metadata dict must never be read as an unmarked row —
+    only list membership or an explicit `visibility` key identifies one.
+    Otherwise the whole result envelope could be wiped for a narrow caller."""
+    parsed = {"found": True, "meta": {"source": "jeles"}}
+    filtered, dropped = mfc._filter_by_visibility(parsed, "public")
+    assert filtered == parsed
+    assert dropped == 0
+
+
+def test_call_tool_filters_corpus_hits_end_to_end_for_the_default_public_caller(echo_entry):
+    """REWORK (Loki 8AA7CBE7, HIGH): fail-closed default is now "public",
+    not "internal" -- an unconfigured/omitted-app_id caller sees the least."""
     result = mfc.call_tool(echo_entry, "corpus_hits", {}, app_id="")
-    assert result["visibility_tier"] == "internal"
-    # nugget-1 (internal) and nugget-4 (no marker -> treated as internal)
-    # survive; nugget-2 (serve) and nugget-3 (public) are dropped.
-    assert result["visibility_dropped"] == 2
+    assert result["visibility_tier"] == "public"
+    # Only nugget-3 (public) survives; internal, serve, and the no-marker
+    # (treated internal) rows are all dropped.
+    assert result["visibility_dropped"] == 3
     body = json.loads(result["content_text"])
     ids = {r["id"] for r in body["hits"]}
-    assert ids == {"nugget-1", "nugget-4"}
+    assert ids == {"nugget-3"}
 
 
 def test_call_tool_filters_corpus_hits_end_to_end_for_a_serve_caller(echo_entry, home):
@@ -183,6 +240,45 @@ def test_call_tool_filters_corpus_hits_end_to_end_for_a_serve_caller(echo_entry,
     result = mfc.call_tool(echo_entry, "corpus_hits", {}, app_id="caller")
     assert result["visibility_tier"] == "serve"
     assert result["visibility_dropped"] == 2  # internal + the no-marker row
+    body = json.loads(result["content_text"])
+    ids = {r["id"] for r in body["hits"]}
+    assert ids == {"nugget-2", "nugget-3"}
+
+
+def test_call_tool_filters_corpus_hits_end_to_end_for_an_internal_caller_over_stdio(echo_entry, home):
+    from willow_mcp import exposure as exp
+    from willow_mcp import home_init as hi
+    from willow_mcp import paths
+
+    hi.ensure_home_layout()
+    cfg = exp.load_exposure_config()
+    cfg["agents"]["caller"] = {"defaults": {"federation_call": "internal"}}
+    paths.exposure_config_path().write_text(json.dumps(cfg), encoding="utf-8")
+
+    result = mfc.call_tool(echo_entry, "corpus_hits", {}, app_id="caller", serve_mode=False)
+    assert result["visibility_tier"] == "internal"
+    assert result["visibility_dropped"] == 0
+    body = json.loads(result["content_text"])
+    ids = {r["id"] for r in body["hits"]}
+    assert ids == {"nugget-1", "nugget-2", "nugget-3", "nugget-4"}
+
+
+def test_call_tool_caps_an_internal_override_at_serve_when_the_transport_is_serve_mode(echo_entry, home):
+    """Loki 8AA7CBE7, finding 3: a caller configured for "internal" must
+    still cap at "serve" when this call arrived over a serve/OAuth process
+    -- the transport ceiling wins even over an explicit per-agent override."""
+    from willow_mcp import exposure as exp
+    from willow_mcp import home_init as hi
+    from willow_mcp import paths
+
+    hi.ensure_home_layout()
+    cfg = exp.load_exposure_config()
+    cfg["agents"]["caller"] = {"defaults": {"federation_call": "internal"}}
+    paths.exposure_config_path().write_text(json.dumps(cfg), encoding="utf-8")
+
+    result = mfc.call_tool(echo_entry, "corpus_hits", {}, app_id="caller", serve_mode=True)
+    assert result["visibility_tier"] == "serve"
+    assert result["visibility_dropped"] == 2
     body = json.loads(result["content_text"])
     ids = {r["id"] for r in body["hits"]}
     assert ids == {"nugget-2", "nugget-3"}

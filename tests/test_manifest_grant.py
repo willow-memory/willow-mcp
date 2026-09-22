@@ -445,6 +445,34 @@ def test_d23a3726_exact_text_parses_to_seven_seats_two_groups():
     }
 
 
+def test_d23a3726_refused_enomanifest_once_jeles_manifest_is_gone(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Sealed ae23d366 clause 6 — the actual stale-pair case (Loki 8AA7CBE7,
+    MEDIUM: the cited `test_seat_with_no_manifest_is_refused_enomanifest`
+    uses a synthetic 'ghost' seat, not pair d23a3726 itself). Pair
+    d23a3726 is the LIVE grant naming all seven receive_dispatch
+    specialists including jeles (grammar confirmed above in
+    test_d23a3726_exact_text_parses_to_seven_seats_two_groups). Once the
+    operator retires jeles ($WILLOW_HOME/mcp_apps/jeles/ removed), a fresh
+    re-request of THIS pair by its own id must be refused enomanifest
+    naming jeles specifically, before any pending request or citation is
+    written — so the stale pair can never half-apply the other six seats."""
+    seats = ("hanuman", "loki", "jeles", "ada", "skirnir", "heimdallr", "binder")
+    groups = ("grove_read", "grove_write")
+    _charter(tmp_path, monkeypatch, apps=seats, groups=groups)
+    for seat in seats:
+        if seat != "jeles":
+            _manifest(home, seat)
+    _seal(home, store, pair_id="d23a3726", seats=seats, groups=groups, kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps",
+                   grants_root=home / "manifest_grants", pair_id="d23a3726")
+    assert out["error"] == "enomanifest"
+    assert out.get("app_id") == "jeles"
+    assert not (home / "mcp_apps" / "jeles" / "manifest.json").exists()
+    assert not _pending_files(home / "manifest_grants")
+
+
 def test_10ed2707_prose_is_refused_naming_the_grammar(home, tmp_path, monkeypatch, store, ring_with_sean):
     """Pair 10ed2707's actual sealed text — prose, no grammar line — must be
     refused with a message naming the grammar this verb requires, not

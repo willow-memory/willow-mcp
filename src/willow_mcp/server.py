@@ -6195,9 +6195,14 @@ def federation_call(app_id: str, server_id: str, tool: str,
 
     Sealed ae23d366 clause 3: before the guard scan, any row in the
     result carrying a `visibility` above the caller's exposure tier
-    (`exposure.resolve_exposure_tier`) is withheld — never rewritten,
-    only dropped. A row with no `visibility` is treated as `internal`.
-    The receipt names how many rows were dropped and at which tier."""
+    (`exposure.resolve_exposure_tier`, a ceiling: public < serve <
+    internal) is withheld — never rewritten, only dropped. A row with no
+    `visibility` is treated as `internal` (the widest — least benefit of
+    the doubt for an unmarked row). The caller's tier is capped by this
+    process's own transport (`_serve_mode()`, Loki 8AA7CBE7 finding 3): a
+    serve/OAuth process never resolves above "serve" regardless of the
+    caller's own exposure.json. The receipt names how many rows were
+    dropped and at which tier."""
     from . import federation_egress, mcp_federation_client
 
     denial = federation_egress.egress_denial(app_id, server_id, tool)
@@ -6205,7 +6210,8 @@ def federation_call(app_id: str, server_id: str, tool: str,
         return denial
 
     from . import mcp_federation
-    result = mcp_federation_client.call_tool(server_id, tool, arguments, app_id=app_id)
+    result = mcp_federation_client.call_tool(
+        server_id, tool, arguments, app_id=app_id, serve_mode=_serve_mode())
     _receipt_log.record(
         app_id, "federation_call", "federated_call",
         f"server_id={server_id} tool={tool} "

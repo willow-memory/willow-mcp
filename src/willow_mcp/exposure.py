@@ -61,10 +61,13 @@ def default_exposure_config() -> dict[str, Any]:
             "dispatch": "work_context",
             # Sealed ae23d366 clause 3: federation_call's own destination —
             # a VISIBILITY TIER name (see _VISIBILITY_TIERS below), not a
-            # seed-field preset. Narrowest by default (fail closed): a
-            # caller with no explicit override sees only "internal" rows
-            # from a federated corpus hit.
-            "federation_call": "internal",
+            # seed-field preset. REWORK (Loki 8AA7CBE7): narrowest-by-default
+            # means the caller sees the LEAST by default, not the most —
+            # "public" is the fail-closed default here, the same way
+            # "telemetry" (exposes nothing) is the fail-closed default for
+            # the seed-field presets above. A caller with no explicit
+            # override sees only "public" rows from a federated corpus hit.
+            "federation_call": "public",
             "*": "voice_only",
         },
         "agents": {
@@ -85,54 +88,87 @@ def default_exposure_config() -> dict[str, Any]:
 # FEDERATION_DESTINATION ("federation_call"); the "preset" values for that
 # one destination are visibility tier names instead of seed presets.
 #
-# Ordering and the drop rule (decided this session — no prior code or doc
-# fixed this, so it is recorded here rather than assumed): "internal" is
-# its own closed bucket, visible only to an "internal"-tier caller; "serve"
-# and "public" together form the externally-cleared pool, visible to any
-# caller whose own tier is NOT "internal" (a caller already operating in an
-# externally-reachable context — grove serve, a remote claude.ai session —
-# has no use for content that was marked never to leave the fleet's own
-# reasoning, and an internal-only caller has no need for content phrased
-# for an external audience). This is deliberately NOT a linear ceiling
-# ("public" is not simply "more" than "serve") — it is an audience match
-# with exactly one privileged, isolated bucket ("internal") and one shared
-# external pool. A caller tier that is itself literally "public" still
-# reads the shared external pool (serve + public), same as "serve" does;
-# there is no narrower-than-"internal" tier to fall through to.
+# REWORK (Loki audit 8AA7CBE7, both HIGH findings): the first build here
+# invented a two-bucket audience-match model and got the fail-closed default
+# backwards. The seal's own verb is "drops rows ABOVE the caller's exposure
+# tier" — a CEILING, a linear order, exactly the shape this module already
+# uses for seed-field presets (telemetry < voice_only < work_context <
+# full_seed, emptiest-first, emptiest as the fail-closed default). The
+# analogous order here is:
+#
+#     public  <  serve  <  internal        (ascending sensitivity)
+#
+# A caller at tier T sees every row whose visibility rank is <= rank(T):
+# an "internal" caller sees internal + serve + public rows (everything); a
+# "serve" caller sees serve + public; a "public" caller (or a caller with
+# no configured override — DEFAULT_VISIBILITY_TIER) sees public only. Fail
+# closed means the caller sees the LEAST by default, matching "telemetry"
+# being the fail-closed seed-field default above — not the MOST, which is
+# what the superseded two-bucket model produced.
 FEDERATION_DESTINATION = "federation_call"
 
-#: The only visibility tier names this module recognizes. A row's
-#: `visibility` field, or a caller's resolved federation_call preset, that
-#: is not one of these three is treated as "internal" — the narrowest,
-#: fail-closed reading (rework-proof: a config typo or an unrelated seed
-#: preset leaking through the "*" wildcard must never WIDEN what a caller
-#: sees).
-_VISIBILITY_TIERS = frozenset({"internal", "serve", "public"})
-_EXTERNAL_VISIBILITIES = frozenset({"serve", "public"})
-DEFAULT_VISIBILITY_TIER = "internal"
+#: The visibility tiers, ascending by sensitivity — index is the rank used
+#: by `visible_to`/`resolve_exposure_tier`. A row's `visibility` field, or a
+#: caller's resolved federation_call preset, that is not one of these three
+#: is treated at its respective fail-closed end (see the two distinct
+#: fallbacks below — a caller falls closed NARROW, a row falls closed WIDE).
+_VISIBILITY_TIERS: tuple[str, ...] = ("public", "serve", "internal")
+_TIER_RANK: dict[str, int] = {name: i for i, name in enumerate(_VISIBILITY_TIERS)}
+
+#: Fail-closed default for a CALLER whose tier cannot be resolved (no
+#: per-agent override on disk, or a value this module does not recognize —
+#: e.g. an on-disk exposure.json written before this destination existed,
+#: where the "*" wildcard default such as "voice_only" would otherwise
+#: resolve here and mean nothing as a visibility tier). The narrowest tier:
+#: an unresolvable caller sees the least, never the most.
+DEFAULT_VISIBILITY_TIER = "public"
+
+#: Fail-closed default for a ROW whose `visibility` field is absent or
+#: unrecognized: the WIDEST (most sensitive) tier, so an unmarked row gets
+#: the least benefit of the doubt, not the most — it takes an "internal"
+#: caller to see it, same as an explicitly `visibility: "internal"` row.
+_UNMARKED_ROW_VISIBILITY = "internal"
 
 
-def resolve_exposure_tier(app_id: str) -> str:
-    """The caller's exposure tier for federation_call row filtering. Falls
-    back to `DEFAULT_VISIBILITY_TIER` ("internal", the narrowest) whenever
-    the resolved value is not a recognized tier name — including the
-    common case of an on-disk exposure.json written before this destination
-    existed, where the "*" wildcard default ("voice_only", a seed preset)
-    would otherwise resolve here and mean nothing as a visibility tier."""
+def transport_ceiling(serve_mode: bool) -> str:
+    """The maximum visibility tier this PROCESS's transport permits,
+    regardless of what the caller's own exposure.json says. A stdio process
+    (Kart, a local desk/specialist session) speaks for a trusted fleet
+    member already running inside this box — its ceiling is "internal", no
+    extra restriction from the transport. An HTTP+OAuth serve-mode process
+    (`server._serve_mode()`) may be answering a bound-but-remote session —
+    grove serve, a claude.ai client — so its ceiling caps at "serve" even
+    for a caller configured (or defaulted) to "internal"; the transport is
+    the stronger signal for "is this call remote" (Loki 8AA7CBE7, finding
+    3), and the effective tier is always the minimum of the two."""
+    return "serve" if serve_mode else "internal"
+
+
+def resolve_exposure_tier(app_id: str, *, serve_mode: bool = False) -> str:
+    """The caller's exposure tier for federation_call row filtering: the
+    minimum of the app_id's own configured tier (fail-closed to
+    DEFAULT_VISIBILITY_TIER, "public", when unconfigured or unrecognized)
+    and this process's transport ceiling (`transport_ceiling`). `serve_mode`
+    defaults to False (stdio) for callers — like exposure.py's own unit
+    tests — that have no transport of their own to report; a caller that
+    does (server.federation_call) must pass its own `_serve_mode()`."""
     preset, _source = resolve_preset(app_id, FEDERATION_DESTINATION)
-    return preset if preset in _VISIBILITY_TIERS else DEFAULT_VISIBILITY_TIER
+    app_tier = preset if preset in _VISIBILITY_TIERS else DEFAULT_VISIBILITY_TIER
+    ceiling = transport_ceiling(serve_mode)
+    return app_tier if _TIER_RANK[app_tier] <= _TIER_RANK[ceiling] else ceiling
 
 
 def visible_to(caller_tier: str, row_visibility: str | None) -> bool:
     """True when a row carrying `row_visibility` may be returned to a
-    caller at `caller_tier`. An absent/unrecognized `row_visibility` is
-    treated as "internal" (the narrowest — a row with no visibility marker
-    gets the least benefit of the doubt, not the most)."""
+    caller at `caller_tier` — a ceiling: the row's rank must be at or below
+    the caller's own rank. An unrecognized `caller_tier` falls closed to
+    DEFAULT_VISIBILITY_TIER ("public", the narrowest); an absent/
+    unrecognized `row_visibility` falls closed to `_UNMARKED_ROW_VISIBILITY`
+    ("internal", the widest — least benefit of the doubt for an unmarked
+    row, not the most)."""
     tier = caller_tier if caller_tier in _VISIBILITY_TIERS else DEFAULT_VISIBILITY_TIER
-    vis = row_visibility if row_visibility in _VISIBILITY_TIERS else DEFAULT_VISIBILITY_TIER
-    if tier == "internal":
-        return vis == "internal"
-    return vis in _EXTERNAL_VISIBILITIES
+    vis = row_visibility if row_visibility in _VISIBILITY_TIERS else _UNMARKED_ROW_VISIBILITY
+    return _TIER_RANK[vis] <= _TIER_RANK[tier]
 
 
 def load_exposure_config() -> dict[str, Any]:
