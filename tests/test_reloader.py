@@ -90,10 +90,11 @@ class _FakeLedger:
                 out.append(self.receipt)
         return [row for row in out if all(row["content"].get(k) == v for k, v in match.items())]
 
-    def append(self, project, event_type, content):
+    def append(self, project, event_type, content, *, rid=None):
         self.appended.append((project, event_type, content))
-        rid = f"reload-receipt-{len(self.appended)}" if event_type == urx.EVENT \
-            else f"{event_type}-receipt-{len(self.appended)}"
+        if rid is None:
+            rid = f"reload-receipt-{len(self.appended)}" if event_type == urx.EVENT \
+                else f"{event_type}-receipt-{len(self.appended)}"
         self._rows.setdefault(event_type, []).insert(
             0, {"id": rid, "content": content, "created_at": datetime.now(timezone.utc)})
         return rid
@@ -417,7 +418,8 @@ def test_consumed_receipt_is_not_re_offered_to_a_stray_later_seal(tmp_path, chec
     db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     git = _FakeSystemctlGit()  # active_enter (2026-09-15) predates receipt-7 (2026-09-16)
     ledger = _FakeLedger(_receipt(checkout))
-    ledger.append("willow-memory/willow-mcp", urx.EVENT, {"pull_receipt_id": "receipt-7"})
+    ledger.append("willow-memory/willow-mcp", urx.EVENT,
+                  {"repo": "willow-memory/willow-mcp", "checkout": str(checkout), "pull_receipt_id": "receipt-7"})
     out = reloader.check(_config(checkout, db), ledger=ledger, runner=git)
     assert out["error"] == "EALREADY"
     assert git.restarts == []
@@ -440,6 +442,81 @@ def test_real_pull_to_a_new_sha_leaves_the_old_sealed_receipt_as_drift(tmp_path,
     out = reloader.check(_config(checkout, db), ledger=ledger, runner=git)
     assert out["error"] == "EDRIFT"
     assert out["receipt_id"] == "receipt-7" and out["head"] == "cafef00d"
+
+
+# ── Loki 797924DB rework: V1 exhaust the scan, V2 name stale seals, ───────────
+# ── V3 consume every sealed candidate at a sha in one restart ────────────────
+
+def test_sealed_receipt_survives_thirty_later_no_op_rows_at_the_same_sha(tmp_path, checkout, ring_with_sean):
+    """V1 (blocking): the old fixed-window scan kept only the newest 20 rows
+    at HEAD; on the ledger the fix exists to rescue, the sealed receipt is
+    the OLDEST row at that sha, so enough sweep rows in front of it
+    reproduced the exact silent non-fire the fix was written to end. The
+    at-HEAD set is exhausted, not sliced to a curated window."""
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
+    git = _FakeSystemctlGit()
+    ledger = _FakeLedger(_receipt(checkout))
+    for _ in range(30):
+        ledger.append("willow-memory/willow-mcp", "git_pull",
+                      {"repo": "willow-memory/willow-mcp", "checkout": str(checkout),
+                       "before": "deadbeef", "after": "deadbeef"})
+    out = reloader.check(_config(checkout, db), ledger=ledger, runner=git)
+    assert out["ok"] and out["act"], out
+    assert out["receipt_id"] == "receipt-7"
+
+
+def test_stale_sealed_receipt_at_another_sha_is_named_in_enoseal(tmp_path, checkout, ring_with_sean):
+    """V2: a receipt sealed at the OLD sha does not vanish from the journal
+    once a real pull to a NEW sha mints its own (unsealed) receipt — the
+    moot seal is surfaced as `stale_sealed` so the desk can see its earlier
+    seal is spent on nothing and a new pair is needed for the new id."""
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))  # seals receipt-7 (after="deadbeef")
+    git = _FakeSystemctlGit(head="cafef00d")  # the tree has since moved on
+    ledger = _FakeLedger(_receipt(checkout))  # receipt-7, after="deadbeef"
+    ledger.append("willow-memory/willow-mcp", "git_pull",
+                  {"repo": "willow-memory/willow-mcp", "checkout": str(checkout),
+                   "before": "deadbeef", "after": "cafef00d"})  # R2: real pull, unsealed, at new HEAD
+    out = reloader.check(_config(checkout, db), ledger=ledger, runner=git)
+    assert out["error"] == "ENOSEAL"
+    assert "receipt-7" in out.get("stale_sealed", [])
+    assert "receipt-7" in out["reason"]
+
+
+def test_two_sealed_receipts_at_one_sha_are_both_cited_by_one_restart(tmp_path, checkout, ring_with_sean):
+    """V3: two receipts sealed at the same HEAD must not leave one seal
+    live to fire a second restart on a later revert-and-reapply to that
+    sha. The single restart cites and consumes BOTH."""
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7", pid="pair-1"),
+                    _sealed(ring_with_sean, "receipt-8", pid="pair-2"))
+    git = _FakeSystemctlGit()
+    ledger = _FakeLedger(None)
+    ledger.append("willow-memory/willow-mcp", "git_pull",
+                  {"repo": "willow-memory/willow-mcp", "checkout": str(checkout),
+                   "before": "0ld", "after": "deadbeef"}, rid="receipt-7")
+    ledger.append("willow-memory/willow-mcp", "git_pull",
+                  {"repo": "willow-memory/willow-mcp", "checkout": str(checkout),
+                   "before": "0ld", "after": "deadbeef"}, rid="receipt-8")
+
+    out = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
+    assert out["ok"] and out["reloaded"], out
+    assert len(git.restarts) == 1
+    _, event, content = ledger.appended[-1]
+    assert event == urx.EVENT
+    assert set(content["pull_receipt_ids"]) == {"receipt-7", "receipt-8"}
+
+    # tick2: unit active since the restart — quiet, no new act.
+    second = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
+    assert not second.get("reloaded")
+    assert len(git.restarts) == 1
+
+    # A later, unsealed revert-and-reapply to the SAME sha must not spend
+    # either already-consumed seal a second time.
+    ledger.append("willow-memory/willow-mcp", "git_pull",
+                  {"repo": "willow-memory/willow-mcp", "checkout": str(checkout),
+                   "before": "0ld", "after": "deadbeef"}, rid="receipt-9")
+    third = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
+    assert not third.get("reloaded")
+    assert len(git.restarts) == 1
 
 
 # ── the act ───────────────────────────────────────────────────────────────────

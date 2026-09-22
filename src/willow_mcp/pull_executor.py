@@ -46,6 +46,16 @@ receipt from "newest" before the reloader's next tick could ever see it
 sealed. Nothing changed, so there is nothing to request a restart onto —
 ``execute_pull`` reports ``changed: false``, ``receipt_id: None``, and
 ``reason: "no-op: already at <sha>"`` instead.
+
+Rework (Loki 797924DB V4, same gap): a no-op result used to hand back
+nothing else to go on. If THIS pull was the desk's own "are we current"
+check, there was no id left to point an operator's seal at — the desk had
+to read FRANK directly to find the receipt the steward's earlier real
+pull had minted. The no-op branch now also returns ``confirm_receipt_id``
+— the newest ``git_pull`` receipt already on file at this sha that no
+``unit_reload`` has cited — and folds it into ``reason`` when found. Best
+effort and read-only: a ledger that cannot answer just yields ``None``,
+never a reason to treat the pull itself as failed.
 """
 from __future__ import annotations
 
@@ -111,6 +121,40 @@ def inspect_for_pull(checkout: str | Path, *, remote: str = "origin",
     facts["dirty_files"] = [line[3:] for line in raw.splitlines() if line.strip()][:20]
     facts["_matches"] = _repo_matches_remote
     return facts
+
+
+#: The event type `reloader.py` writes for a restart — duplicated here
+#: rather than imported to avoid a reloader<->pull_executor coupling for
+#: one string constant; both modules independently agree it is "unit_reload".
+_UNIT_RELOAD_EVENT = "unit_reload"
+
+
+def _unconsumed_pull_receipt_id_at(ledger, *, repo: str, checkout: str, after: str) -> Optional[str]:
+    """Gap 797924DB V4: the newest ``git_pull`` receipt for ``repo``+
+    ``checkout`` whose ``after`` equals ``after`` that no ``unit_reload``
+    receipt has yet cited — the id an operator's seal should name. Purely a
+    courtesy label on a no-op pull's result (never a gate on the pull
+    itself): read-only, and any ledger hiccup or missing method on
+    ``ledger`` returns ``None`` rather than raising."""
+    if ledger is None:
+        return None
+    try:
+        candidates = ledger.all_events("git_pull", match={"repo": repo, "checkout": checkout, "after": after})
+        reloads = ledger.all_events(_UNIT_RELOAD_EVENT, match={"repo": repo, "checkout": checkout})
+    except Exception:  # noqa: BLE001 — a label, not a fact this pull depends on
+        return None
+    consumed: set[str] = set()
+    for row in reloads:
+        content = row.get("content") or {}
+        rid = content.get("pull_receipt_id")
+        if rid:
+            consumed.add(rid)
+        consumed.update(content.get("pull_receipt_ids") or ())
+    for row in candidates:
+        rid = row.get("id")
+        if rid and rid not in consumed:
+            return rid
+    return None
 
 
 def execute_pull(
@@ -249,7 +293,21 @@ def execute_pull(
         # of exactly this. Nothing changed, so there is nothing to request a
         # restart onto: no receipt, no ink, just the fact reported.
         receipt["receipt_id"] = None
-        receipt["reason"] = f"no-op: already at {after}"
+        # V4 (Loki 797924DB, on 3df997ffe92b's own rework): a no-op result
+        # used to hand back nothing to confirm — if THIS was the desk's own
+        # "are we current" pull, there was no id left to name in a seal
+        # proposal, and the desk had to go read FRANK directly to find one.
+        # Best-effort, read-only, never a gate on the pull itself: the
+        # newest git_pull receipt already on file at this sha that no
+        # unit_reload has cited yet (the steward's earlier real pull, or an
+        # earlier desk pull) — the id an operator's seal should name.
+        confirm_id = _unconsumed_pull_receipt_id_at(ledger, repo=repo, checkout=str(path), after=after)
+        if confirm_id:
+            receipt["confirm_receipt_id"] = confirm_id
+            receipt["reason"] = f"no-op: already at {after}; confirm receipt {confirm_id}"
+        else:
+            receipt["confirm_receipt_id"] = None
+            receipt["reason"] = f"no-op: already at {after}"
     elif ledger is not None:
         try:
             rec = ledger.append(project, EVENT, {
