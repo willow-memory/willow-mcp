@@ -36,6 +36,16 @@ and no token touches the remote URL; plain fetch otherwise), ``checkout``
 the target branch if the tree is on another one, ``merge --ff-only``, and —
 only when asked — ``branch -d`` the named feature branches, which git itself
 refuses for anything unmerged.
+
+Fix (gap ``3df997ffe92b``, 2026-09-22): a no-op pull (``before == after`` —
+the checkout was already at ``remote/branch``, the common case for the
+steward's every-tick sweep) no longer appends a ``git_pull`` receipt.
+:mod:`reloader`'s confirm names a receipt by id; a no-op row minted seconds
+after an operator's seal was landing, silently displacing the sealed
+receipt from "newest" before the reloader's next tick could ever see it
+sealed. Nothing changed, so there is nothing to request a restart onto —
+``execute_pull`` reports ``changed: false``, ``receipt_id: None``, and
+``reason: "no-op: already at <sha>"`` instead.
 """
 from __future__ import annotations
 
@@ -228,7 +238,19 @@ def execute_pull(
         "auth_mode": auth_mode, "pruned": pruned, "kept": kept, "checkout": str(path),
         "changed": before != after,
     }
-    if ledger is not None:
+    if before == after:
+        # Gap 3df997ffe92b: a no-op pull (the checkout was already at
+        # remote/branch — the common case for the steward's every-tick
+        # sweep, and for the desk's own "confirm we're current" pull) used
+        # to mint a git_pull receipt identical in shape to a real one. The
+        # reloader's confirm matches a receipt by id, and a fresh no-op row
+        # landing seconds after an operator's seal displaced the sealed
+        # receipt from "newest" — three sealed restarts never fired because
+        # of exactly this. Nothing changed, so there is nothing to request a
+        # restart onto: no receipt, no ink, just the fact reported.
+        receipt["receipt_id"] = None
+        receipt["reason"] = f"no-op: already at {after}"
+    elif ledger is not None:
         try:
             rec = ledger.append(project, EVENT, {
                 "actor": app_id, "repo": repo, "branch": branch, "remote": remote,

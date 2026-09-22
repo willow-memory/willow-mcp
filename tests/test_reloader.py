@@ -77,6 +77,19 @@ class _FakeLedger:
                 return row
         return None
 
+    def all_events(self, event_type, *, match):
+        """Every matching row, newest first. Appended rows are already
+        stored newest-first (``append`` inserts at index 0); the single
+        fixed ``self.receipt`` fixture is treated as the oldest of the two
+        sources unless a test appends nothing else, matching how the real
+        ledger orders by ``created_at`` — this fake's ``self.receipt``
+        always predates anything a test appends during the run."""
+        out = list(self._rows.get(event_type, []))
+        if event_type == "git_pull" and self.receipt is not None:
+            if all(self.receipt["content"].get(k) == v for k, v in match.items()):
+                out.append(self.receipt)
+        return [row for row in out if all(row["content"].get(k) == v for k, v in match.items())]
+
     def append(self, project, event_type, content):
         self.appended.append((project, event_type, content))
         rid = f"reload-receipt-{len(self.appended)}" if event_type == urx.EVENT \
@@ -369,6 +382,64 @@ def test_all_conditions_met_is_act(tmp_path, checkout, ring_with_sean):
     assert out["ok"] and out["act"]
     assert out["seal"]["pair_id"] == "pair-1"
     assert git.restarts == []  # check never acts
+
+
+# ── gap 3df997ffe92b: match by what was confirmed, not by row ─────────────────
+
+def test_sealed_receipt_survives_two_later_no_op_rows_at_the_same_sha(tmp_path, checkout, ring_with_sean):
+    """The exact shape of the bug: an OLD receipt is sealed, then two more
+    git_pull rows land at the SAME sha (e.g. the steward's sweep re-pulling
+    an already-current tree) after the seal. Matching by "newest row" would
+    read ENOSEAL forever, since neither new row is sealed. Matching by
+    "unconsumed receipts at current HEAD" finds the sealed one regardless of
+    row order."""
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
+    git = _FakeSystemctlGit()
+    ledger = _FakeLedger(_receipt(checkout))
+    # Two later, unsealed rows at the same sha — appended AFTER the sealed
+    # receipt-7, so they sort newer under all_events().
+    ledger.append("willow-memory/willow-mcp", "git_pull",
+                   {"repo": "willow-memory/willow-mcp", "checkout": str(checkout), "before": "deadbeef",
+                    "after": "deadbeef"})
+    ledger.append("willow-memory/willow-mcp", "git_pull",
+                   {"repo": "willow-memory/willow-mcp", "checkout": str(checkout), "before": "deadbeef",
+                    "after": "deadbeef"})
+    out = reloader.check(_config(checkout, db), ledger=ledger, runner=git)
+    assert out["ok"] and out["act"], out
+    assert out["receipt_id"] == "receipt-7"
+    assert out["seal"]["pair_id"] == "pair-1"
+
+
+def test_consumed_receipt_is_not_re_offered_to_a_stray_later_seal(tmp_path, checkout, ring_with_sean):
+    """A receipt a prior restart already cited (`pull_receipt_id`) is not a
+    live candidate again — the unit's own ActiveEnterTimestamp already
+    reflects it (EALREADY), even if a mischievous later seal named it."""
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
+    git = _FakeSystemctlGit()  # active_enter (2026-09-15) predates receipt-7 (2026-09-16)
+    ledger = _FakeLedger(_receipt(checkout))
+    ledger.append("willow-memory/willow-mcp", urx.EVENT, {"pull_receipt_id": "receipt-7"})
+    out = reloader.check(_config(checkout, db), ledger=ledger, runner=git)
+    assert out["error"] == "EALREADY"
+    assert git.restarts == []
+
+
+# execute_pull's own no-op-suppression fix (before == after mints no
+# git_pull receipt at all) is proven in tests/test_pull_executor.py::
+# test_no_op_pull_mints_no_receipt, next to the rest of that module's real
+# fake-git plumbing rather than duplicated here.
+
+
+def test_real_pull_to_a_new_sha_leaves_the_old_sealed_receipt_as_drift(tmp_path, checkout, ring_with_sean):
+    """A receipt sealed at the old sha is not silently reused once the tree
+    has genuinely moved on to a sha with no receipt naming it yet — EDRIFT,
+    naming the newest receipt on file, not a false ENOSEAL/act on stale
+    data."""
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
+    git = _FakeSystemctlGit(head="cafef00d")  # HEAD moved past receipt-7's after="deadbeef"
+    ledger = _FakeLedger(_receipt(checkout))  # only the stale receipt is on file
+    out = reloader.check(_config(checkout, db), ledger=ledger, runner=git)
+    assert out["error"] == "EDRIFT"
+    assert out["receipt_id"] == "receipt-7" and out["head"] == "cafef00d"
 
 
 # ── the act ───────────────────────────────────────────────────────────────────

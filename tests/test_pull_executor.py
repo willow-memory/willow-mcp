@@ -155,6 +155,22 @@ def test_already_up_to_date_is_ok_but_not_pulled(checkout):
     assert ["checkout", "-q", "master"] not in git.mutations()
 
 
+def test_no_op_pull_mints_no_receipt(checkout):
+    """Gap 3df997ffe92b: a no-op pull (before == after) must not append a
+    git_pull receipt at all — a fresh receipt identical in shape to a real
+    one, minted every tick by the steward's sweep even when nothing moved,
+    used to displace an already-sealed reloader receipt from "newest"
+    before the reloader's next tick could ever see it sealed."""
+    git = _FakeGit(local_sha="bbb222", remote_sha="bbb222", ahead=0, behind=0, current="master")
+    ledger = _Ledger()
+    out = _pull(checkout, git, ledger)
+    assert out["ok"] and out["pulled"] is False and out["changed"] is False
+    assert out["before"] == out["after"] == "bbb222"
+    assert out["receipt_id"] is None
+    assert ledger.rows == []
+    assert "no-op" in out["reason"] and "bbb222" in out["reason"]
+
+
 def test_branch_defaults_to_the_remote_head(checkout):
     git = _FakeGit(remote_head="main", branches=("main",), current="main")
     out = _pull(checkout, git)
