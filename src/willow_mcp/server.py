@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 139 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 140 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -2440,15 +2440,39 @@ def gap_list(
     app_id: str,
     topic: Optional[str] = None,
     status: Optional[str] = None,
+    query: Optional[str] = None,
+    since: Optional[str] = None,
     limit: int = 50,
     cursor: Optional[str] = None,
+    brief: bool = True,
 ) -> dict:
     """List backlog gaps, most-asked first — the fleet's shared "what we don't
     know yet" queue.  Paginated: returns ``{items, next_cursor}`` — pass the
     returned ``next_cursor`` as ``cursor`` to fetch the next page.  Filter by
-    ``topic`` and/or ``status`` (open | resolved | promoted); asked_count shows
-    demand for each answer. Read-only."""
-    return gap_backlog.list_gaps(topic=topic, status=status, limit=limit, cursor=cursor)
+    ``topic`` (exact, or a namespace prefix — "a/b/c" is under "a/b"),
+    ``status`` (open | resolved | promoted), ``query`` (whitespace tokens,
+    AND, substring over topic+question), and/or ``since`` (an ISO timestamp,
+    filters on ``last_asked_at``); asked_count shows demand for each answer.
+    ``limit`` is capped at 25 regardless of what is asked for — a page can
+    never exceed the tool-result limit (gap 1477ebb2bc35). ``brief``
+    (default True) returns id/topic/status/asked_count/last_asked_at plus
+    the first 200 chars of the question per row; ``brief=False`` returns
+    full records. Read-only."""
+    return gap_backlog.list_gaps(
+        topic=topic, status=status, query=query, since=since,
+        limit=limit, cursor=cursor, brief=brief,
+    )
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("gap_get")
+def gap_get(app_id: str, gap_id: str) -> dict:
+    """One backlog gap's full record by id (gap 1477ebb2bc35) — the id-lookup
+    door the backlog was missing: ``store_get`` refuses ``gaps`` (outside
+    every seat's ``store_scope``), and ``gap_list`` has no id lookup and
+    always shows the ``brief`` shape unless asked otherwise. Returns the
+    record, or ``{error: not_found}``. Read-only, same group as gap_list."""
+    return gap_backlog.get_gap(gap_id)
 
 
 @mcp.tool(annotations=_ANNO_WRITE)

@@ -1739,6 +1739,26 @@ def test_gap_log_and_list_round_trip(app_id):
     assert any(r["question"] == "What is the accent color?" for r in result["items"])
 
 
+def test_gap_get_round_trip(app_id):
+    logged = server.gap_log(app_id=app_id, topic="t-server-get", question="What is the accent color?")
+    record = server.gap_get(app_id=app_id, gap_id=logged["id"])
+    assert record["question"] == "What is the accent color?"
+    assert record["topic"] == "t-server-get"
+
+
+def test_gap_get_not_found(app_id):
+    assert server.gap_get(app_id=app_id, gap_id="no-such-gap") == {"error": "not_found", "id": "no-such-gap"}
+
+
+def test_gap_get_denied_without_gap_read(tmp_path, monkeypatch):
+    apps_root = tmp_path / "mcp_apps"
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(apps_root))
+    app = _write_app(apps_root, "no_gap_read", {"permissions": ["store_read"]})
+    result = server.gap_get(app_id=app, gap_id="whatever")
+    assert "error" in result and "denied" in result["error"]
+
+
 def test_gap_resolve_marks_bookkeeping_status(app_id):
     logged = server.gap_log(app_id=app_id, topic="t-server-resolve", question="What is the border radius?")
     result = server.gap_resolve(app_id=app_id, gap_id=logged["id"], note="drafted")
@@ -1799,7 +1819,7 @@ def test_gap_promote_writes_knowledge_and_closes_gap(app_id, monkeypatch):
     insert_sql, params = fake.executed[-1]
     assert insert_sql.startswith("INSERT INTO knowledge")
 
-    gap_result = server.gap_list(app_id=app_id, topic="t-server-promote-3", status="promoted")
+    gap_result = server.gap_list(app_id=app_id, topic="t-server-promote-3", status="promoted", brief=False)
     assert gap_result["items"] and gap_result["items"][0]["promoted_to"] == result["id"]
 
 
@@ -2143,13 +2163,13 @@ def test_store_stats_requires_store_read(tmp_path, monkeypatch):
 def test_gap_delete_removes_from_list(app_id):
     logged = server.gap_log(app_id=app_id, topic="gd_uniq", question="junk fixture q")
     gid = logged["id"]
-    assert any(g.get("_id") == gid for g in server.gap_list(app_id=app_id, topic="gd_uniq")["items"])
+    assert any(g.get("id") == gid for g in server.gap_list(app_id=app_id, topic="gd_uniq")["items"])
 
     res = server.gap_delete(app_id=app_id, gap_id=gid)
     assert res["deleted"] is True
     assert res["id"] == gid
     # gone from the backlog view (soft-deleted, but invisible to list)
-    assert not any(g.get("_id") == gid for g in server.gap_list(app_id=app_id, topic="gd_uniq")["items"])
+    assert not any(g.get("id") == gid for g in server.gap_list(app_id=app_id, topic="gd_uniq")["items"])
 
 
 def test_gap_delete_not_found(app_id):
@@ -2184,7 +2204,7 @@ def test_gap_purge_topic_purges_and_protects_promoted(app_id):
     res = server.gap_purge_topic(app_id=app_id, topic="pt_uniq", confirm="pt_uniq")
     assert res["purged"] == 2
     assert res["skipped_promoted"] == 1
-    ids = {g.get("_id") for g in server.gap_list(app_id=app_id, topic="pt_uniq")["items"]}
+    ids = {g.get("id") for g in server.gap_list(app_id=app_id, topic="pt_uniq")["items"]}
     assert g1 not in ids and g2 not in ids   # junk gone
     assert gp in ids                          # promoted survives, protected
 

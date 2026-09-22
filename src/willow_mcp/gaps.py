@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .db import Store
+from .db import Store, decode_cursor, encode_cursor
 
 _COLLECTION = "gaps"
 _store = Store()
@@ -90,36 +90,126 @@ def log(topic: str, question: str) -> dict[str, Any]:
     return {"id": rid, "status": record["status"], "asked_count": record["asked_count"]}
 
 
+#: Hard ceiling on one gap_list page (gap 1477ebb2bc35): a full record can
+#: run over a KB, and the backlog's own operator flagged a 50-95 KB page as
+#: the reason the only working read door was also the worst one. Applied
+#: regardless of what `limit` asks for, and regardless of `brief`.
+MAX_LIST_LIMIT = 25
+
+
+def _matches_topic(row_topic: str, topic: str) -> bool:
+    """Exact match, or `row_topic` is namespaced under `topic` on a '/'
+    boundary -- "a/b/c" is under "a/b", but "a/bc" is not (gap 1477ebb2bc35:
+    `topic` used to be exact-only, so a caller filtering by a parent
+    namespace had to enumerate every child topic by hand)."""
+    return row_topic == topic or row_topic.startswith(topic + "/")
+
+
+def _matches_query(row: dict[str, Any], tokens: list[str]) -> bool:
+    """Whitespace tokens, AND, substring over topic+question -- the same
+    rule `Store.search` (db.py) uses, reimplemented here in Python because
+    this filter runs over `topic`+`question` together and alongside the
+    topic-prefix/since filters, neither of which a single SQL equality
+    filter (`query_paginated`'s `filters` dict) can express."""
+    haystack = f"{row.get('topic', '')} {row.get('question', '')}".lower()
+    return all(tok in haystack for tok in tokens)
+
+
+def _brief_view(row: dict[str, Any]) -> dict[str, Any]:
+    """id/topic/status/asked_count/last_asked_at + the first 200 chars of
+    the question -- everything a caller usually needs to decide whether to
+    `gap_get` the full record, at a fraction of its size."""
+    return {
+        "id": row.get("_id"),
+        "topic": row.get("topic"),
+        "status": row.get("status"),
+        "asked_count": row.get("asked_count"),
+        "last_asked_at": row.get("last_asked_at"),
+        "question": (row.get("question") or "")[:200],
+    }
+
+
 def list_gaps(
     topic: Optional[str] = None,
     status: Optional[str] = None,
+    query: Optional[str] = None,
+    since: Optional[str] = None,
     limit: int = 50,
     cursor: Optional[str] = None,
+    brief: bool = True,
 ) -> dict[str, Any]:
-    """Most-asked first. Filter by topic and/or status (open|resolved|promoted).
+    """Most-asked first. Filter by:
+
+    * ``topic`` — exact match, or namespace prefix (see `_matches_topic`).
+    * ``status`` — open | resolved | promoted, exact.
+    * ``query`` — whitespace tokens, AND, substring over topic+question
+      (see `_matches_query`) — the rule `Store.search` uses.
+    * ``since`` — an ISO timestamp; keeps rows whose ``last_asked_at`` is
+      ``>=`` it (string comparison, correct because ISO-8601 UTC timestamps
+      sort lexicographically the same as chronologically).
 
     Returns ``{items, next_cursor}`` — *next_cursor* is ``None`` when there
-    are no more pages.  Uses SQL-level filtering and keyset pagination via
-    json_extract — only the requested page is loaded from the database.
-    """
-    filters: dict[str, Any] = {}
-    if topic:
-        filters["topic"] = topic
-    if status:
-        filters["status"] = status
+    are no more pages. ``limit`` is capped at `MAX_LIST_LIMIT` (25)
+    regardless of what is asked for. ``brief`` (default ``True``) returns
+    `_brief_view` per row; ``brief=False`` returns the full record (gap
+    1477ebb2bc35).
 
-    items, next_cursor = _store.query_paginated(
-        _COLLECTION,
-        filters=filters,
-        sort=[("asked_count", "DESC"), ("_id", "ASC")],
-        limit=limit,
-        cursor=cursor,
-    )
+    Loads the collection once (`Store.all`, the same primitive
+    `purge_topic` already uses) rather than pushing these filters into SQL:
+    `query_paginated`'s `filters` dict is equality-only, and none of
+    `topic`-as-prefix, the `query` substring-over-two-fields match, or the
+    `since` threshold are a single equality comparison. The backlog is
+    meant to stay one small, fleet-shared queue (module docstring), not a
+    table that needs its own query planner -- and the page cap above keeps
+    what gets returned bounded either way. The cursor here is therefore a
+    plain offset into the filtered, sorted list (opaque via the same
+    `encode_cursor`/`decode_cursor` helpers `query_paginated` uses), not a
+    keyset into a sort key -- correct and stable as long as the underlying
+    rows are not being retired between pages of the SAME query, which for a
+    backlog a caller is actively paging through is the expected case.
+    """
+    limit = max(1, min(limit, MAX_LIST_LIMIT))
+    tokens = query.lower().split() if query else []
+
+    rows = _store.all(_COLLECTION)
+    if topic:
+        rows = [r for r in rows if _matches_topic(r.get("topic") or "", topic)]
+    if status:
+        rows = [r for r in rows if r.get("status") == status]
+    if since:
+        rows = [r for r in rows if (r.get("last_asked_at") or "") >= since]
+    if tokens:
+        rows = [r for r in rows if _matches_query(r, tokens)]
+
+    rows.sort(key=lambda r: (-(r.get("asked_count") or 0), r.get("_id") or ""))
+
+    offset = 0
+    if cursor:
+        try:
+            offset = int(decode_cursor(cursor))
+        except (ValueError, TypeError):
+            offset = 0
+    page = rows[offset:offset + limit]
+    next_cursor = encode_cursor(str(offset + limit)) if offset + limit < len(rows) else None
+
+    items = [_brief_view(r) for r in page] if brief else page
     return {"items": items, "next_cursor": next_cursor}
 
 
 def get(gap_id: str) -> Optional[dict[str, Any]]:
     return _store.get(_COLLECTION, gap_id)
+
+
+def get_gap(gap_id: str) -> dict[str, Any]:
+    """The full record for one gap by id -- the read door `list_gaps`'
+    query/topic/since filters can't substitute for (gap 1477ebb2bc35):
+    `store_get` refuses ``gaps`` (outside every seat's `store_scope`), and
+    `list_gaps` has no id lookup. Returns the record, or ``{error:
+    not_found}``."""
+    record = _store.get(_COLLECTION, gap_id)
+    if record is None:
+        return {"error": "not_found", "id": gap_id}
+    return record
 
 
 def resolve(gap_id: str, note: str = "") -> dict[str, Any]:

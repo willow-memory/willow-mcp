@@ -46,7 +46,7 @@ def test_retopic_moves_the_gap_and_records_history():
 def test_listed_under_the_new_topic_only():
     logged = gaps.log("t-retopic-old", "does the list find it?")
     gaps.retopic(logged["id"], "t-retopic-new", by="willow")
-    assert [r["_id"] for r in gaps.list_gaps(topic="t-retopic-new")["items"]] == [logged["id"]]
+    assert [r["id"] for r in gaps.list_gaps(topic="t-retopic-new")["items"]] == [logged["id"]]
     assert gaps.list_gaps(topic="t-retopic-old")["items"] == []
 
 
