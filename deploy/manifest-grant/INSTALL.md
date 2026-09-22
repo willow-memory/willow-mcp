@@ -47,10 +47,20 @@ will not stick — the pair needs a different home for `mcp_apps` (e.g.
 
 ## 1. Ownership, traversal, and the envelope-register migration
 
-    # F7: o+x on $H itself is traversal-only — it does not expose $H's own
-    # listing or contents, only lets a non-owner pass through to what is
-    # below it (mcp_apps/, manifest_grants/, constitutional/).
-    sudo -u willow-operator test -x $H || chmod o+x $H
+**Fixed (gap `035d287206e1`, 2026-09-22): traverse on `$H` itself is now an
+unconditional ACL, not a conditional `chmod o+x`.** The prior fix here
+(`sudo -u willow-operator test -x $H || chmod o+x $H`, Loki audit
+BFCC5C79 F7) measured as insufficient on the real box: after install.sh
+ran, `$H` was still `710` (group execute-only, `other` has no bits at
+all) — `test -x` must have passed for `willow-operator` via a group
+match, not because the trust owner genuinely had its own grant, so the
+conditional `chmod` branch never fired and nothing was actually proven
+for an unrelated uid. An ACL names the trust owner explicitly and is
+unconditional (idempotent to re-run):
+
+    # ACL, not chmod — grants EXACTLY the trust owner traverse-only ($H's
+    # own listing and contents stay exactly as private as they were).
+    setfacl -m u:willow-operator:x $H
 
     chown -R willow-operator:willow-operator $H/mcp_apps
     chmod -R u=rwX,g=rX,o=rX $H/mcp_apps          # broker (uid 1000) still reads manifests
@@ -105,6 +115,16 @@ already under `mcp_apps/`, already trust-owner-owned by the recursive chown
 above; a `_federation/` that does not exist yet is created on demand by the
 apply process itself (runs as `willow-operator` already), so it is born
 correctly owned, mode `0644`, no ACL — nothing extra to do for it here.
+
+**`nestor.db` (gap `035d287206e1`): read-only ACL, not a chown.** The apply
+half reads this directly and by name at apply time —
+`seal_handler._nestor_db_path()` resolves `WILLOW_NESTOR_DB`, which the
+unit's own `Environment=` already sets to `$H/nestor.db` — to RE-verify a
+sealed pair's actual bytes fresh (nothing a request already checked is
+trusted twice at apply time). This file stays operator-owned; it is
+Nestor's own ledger, not this queue's to take over:
+
+    setfacl -m u:willow-operator:r $H/nestor.db
 
 ## 2. Retire the --user unit
 

@@ -1656,6 +1656,26 @@ def manifest_grant_apply(
     from . import gate
     apps_root_p = apps_root if apps_root is not None else gate._apps_root()
 
+    # Gap 035d287206e1 (2026-09-22): `Path.is_dir()`/`.exists()` swallow
+    # EVERY `OSError` — including `PermissionError` — and return `False`,
+    # by design (pathlib's own documented behaviour). That means a genuinely
+    # UNREADABLE apps_root/grants_root (the trust-owner uid cannot traverse
+    # $WILLOW_HOME) used to read EXACTLY like "nothing pending, all done":
+    # `{"ok": true, "state": "empty"}`, every tick, forever — the silent
+    # false-positive is worse than a crash, because nothing ever surfaces
+    # it. Distinguish "genuinely absent" (a real, expected empty-install
+    # state) from "present but this uid cannot even stat it" up front, and
+    # refuse the second case by name, listing exactly which path failed.
+    for candidate in (apps_root_p.parent, apps_root_p):
+        try:
+            candidate.stat()
+        except FileNotFoundError:
+            break  # absent, not blocked — the normal "not installed yet" case
+        except OSError as exc:
+            return {"ok": False, "state": "refused", "error": "EACCES",
+                    "reason": f"cannot reach {candidate}: {type(exc).__name__}: {exc}",
+                    "unreadable_path": str(candidate), "processed": []}
+
     # Loki audit 3, finding 3: the unit template carried no User= and this
     # function made no uid check at all, so enabling it under the operator's
     # own session ran it as the broker's uid and got `eperm` on mcp_apps
@@ -1681,6 +1701,15 @@ def manifest_grant_apply(
 
     root = _grants_root(grants_root)
     pending_dir = root / "pending"
+    for candidate in (root.parent, root, pending_dir):
+        try:
+            candidate.stat()
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            return {"ok": False, "state": "refused", "error": "EACCES",
+                    "reason": f"cannot reach {candidate}: {type(exc).__name__}: {exc}",
+                    "unreadable_path": str(candidate), "processed": []}
     if not pending_dir.is_dir():
         return {"ok": True, "state": "empty", "processed": []}
     if pair_id:

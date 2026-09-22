@@ -139,13 +139,21 @@ say "plain $FSTYPE — ownership will stick; continuing"
 
 # --------------------------------------------------------- 1. ownership, ACLs
 say "== 1. ownership and traversal"
-# F7: the trust owner must be able to TRAVERSE $H itself to reach mcp_apps/,
-# manifest_grants/, constitutional/ below it — o+x on a directory grants
-# pass-through only, never read access to $H's own listing or contents.
-if ! sudo -u "$TRUST_OWNER" test -x "$H"; then
-  chmod o+x "$H"
-  say "  granted o+x traversal on $H (pass-through only — contents stay as they were)"
-fi
+# F7 (Loki audit BFCC5C79), tightened (gap 035d287206e1, 2026-09-22): the
+# trust owner must be able to TRAVERSE $H itself to reach mcp_apps/,
+# manifest_grants/, constitutional/, and nestor.db below it. The prior fix
+# here was conditional (`sudo -u $TRUST_OWNER test -x "$H" || chmod o+x
+# "$H"`) and world-executable when it did fire -- measured on the box:
+# after a real install, $H was STILL `710` (group execute-only, OTHER has
+# no bits at all), so `test -x` must have passed via a group match rather
+# than proving what a genuinely unrelated uid can do, and the conditional
+# chmod never ran. An ACL is what the seal actually asked for (pair
+# 1bd6fd29: "the operator's only keyboard act is the seal" -- not "and
+# hope the trust owner's group membership lines up"): unconditional,
+# idempotent, and grants EXACTLY the trust owner traverse-only, never
+# "other" broadly the way `chmod o+x` does.
+setfacl -m "u:$TRUST_OWNER:x" "$H"
+say "  granted setfacl u:$TRUST_OWNER:x on $H (traverse only — contents stay as they were)"
 chown -R "$TRUST_OWNER:$TRUST_OWNER" "$H/mcp_apps"
 chmod -R u=rwX,g=rX,o=rX "$H/mcp_apps"
 install -d -o "$OPERATOR" -g "$OPERATOR" -m 755 "$H/manifest_grants" "$H/manifest_grants/pending" "$H/manifest_grants/done" "$H/manifest_grants/failed"
@@ -221,6 +229,19 @@ fi
 # above; a _federation/ that does not exist yet is created on demand by the
 # apply process itself (runs as $TRUST_OWNER), so it is born correctly
 # owned, mode 0644, no ACL.
+
+# nestor.db (gap 035d287206e1): the apply half reads this directly and by
+# name — seal_handler._nestor_db_path() resolves WILLOW_NESTOR_DB, which
+# the unit's own Environment= sets to $H/nestor.db — to RE-verify a sealed
+# pair's actual bytes fresh at apply time (manifest_grant_executor's own
+# rule: nothing already checked at request time is trusted twice). This
+# file stays OPERATOR-owned (it is Nestor's own ledger, not this queue's to
+# take over) — an ACL grants read, never write; the apply half never writes
+# nestor.db.
+if [ -f "$H/nestor.db" ]; then
+  setfacl -m "u:$TRUST_OWNER:r" "$H/nestor.db"
+  say "  granted setfacl u:$TRUST_OWNER:r on $H/nestor.db (read-only)"
+fi
 
 # ---------------------------------------------------- 2. retire the --user unit
 say "== 2. retire the --user unit"
