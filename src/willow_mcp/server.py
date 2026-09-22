@@ -6928,10 +6928,11 @@ def _diag_env_stale() -> dict:
 
     unit = os.environ.get("WILLOW_RELOADER_UNIT", _reloader.DEFAULT_UNIT).strip() or _reloader.DEFAULT_UNIT
     try:
-        env_path = _envfp.resolve_env_file(unit)
+        src = _envfp.resolve_env_source(unit)
     except Exception:
-        env_path = _envfp.default_env_path()
-    live = _envfp.compute_fingerprint(env_path)
+        src = {"source": "fallback", "path": _envfp.default_env_path()}
+    live = _envfp.fingerprint_source(src)
+    out["env_source"] = live.get("env_source")
     if live["state"] == "unreachable":
         out["state"] = "unreachable"
         out["cause"] = live.get("cause")
@@ -6943,13 +6944,14 @@ def _diag_env_stale() -> dict:
     out["keys_changed"] = sorted(
         set(diff["keys_added"]) | set(diff["keys_removed"]) | set(diff["keys_changed"])
     )
+    env_path = live.get("env_ref") or ""
     try:
         pg = get_pg()
         if pg is None:
             return out
         from .governance_ledger import GovernanceLedger
         ledger = GovernanceLedger(pg)
-        receipt = ledger.latest_event(_reloader.ENV_EVENT, match={"unit": unit, "env_path": str(env_path)})
+        receipt = ledger.latest_event(_reloader.ENV_EVENT, match={"unit": unit, "env_path": env_path})
         if receipt is None:
             return out
         out["receipt_id"] = receipt.get("id")

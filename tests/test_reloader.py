@@ -4,6 +4,22 @@ sealed Nestor decision names that receipt. Sibling of `test_unit_reload.py`
 — same fake systemctl/git, plus a real SQLite `tm_pairs` table standing in
 for nestor.db so the seal lookup runs the real query. Nothing here touches a
 real unit, repo, or Postgres.
+
+Rework (Loki audit E79FCAE7): F5 made `find_sealing_decision` call
+`net_signer.verify_seal` against a real keyring instead of trusting any
+non-empty `seal_sig` string — every test that needs an ACT verdict now signs
+its sealed row with a real ed25519 key via the `ring_with_sean` fixture
+(same pattern `test_manifest_grant.py` uses), which is why the fake ledger
+under these tests grew a `_rows`/generic-`latest_event` shape in the first
+rework pass: the env trigger's own idempotence check needs to query back
+receipts the SAME test just appended, which the single-fixed-receipt fake
+never supported. The 24 pre-existing (pull-only) test bodies below still
+prove exactly what they proved before — EINVAL/ENORECEIPT/EAMBIG/EALREADY/
+EDRIFT/ENOSEAL/ESEALS/EUNREACH/act, the restart-and-ink act, idempotence,
+refusal-is-not-ink, the TZ pin, unit rendering/install/uninstall, checkout
+resolution, and the two CLI entrypoints — only the ledger fake's internals
+and (where an act verdict is asserted) the seal's signature changed under
+them.
 """
 from __future__ import annotations
 
@@ -13,8 +29,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from willow_mcp import env_fingerprint as envfp
+from willow_mcp import keyring as keyring_mod
+from willow_mcp import net_signer as ns
 from willow_mcp import reloader
 from willow_mcp import unit_reload_executor as urx
 
@@ -40,8 +59,8 @@ class _FakeLedger:
     during a test — an ``env_changed`` receipt the env trigger writes, a
     ``unit_reload`` receipt either trigger inks — is queryable by a later
     ``latest_event`` call in the SAME ledger instance, which is what the env
-    trigger's own idempotence check (``_open_env_receipt``, looking for an
-    unconsumed ``env_changed`` row) and the both-triggers test need.
+    trigger's own idempotence/supersession logic and the both-triggers test
+    need.
     """
 
     def __init__(self, receipt=None):
@@ -68,6 +87,13 @@ class _FakeLedger:
 
 
 class _FakeSystemctlGit:
+    """The `show` branch never sets `EnvironmentFiles=`/`Environment=`, so
+    `env_fingerprint.resolve_env_source` always falls back to
+    `$WILLOW_HOME/env` (labeled `env_source="fallback"`) — the autouse
+    `_reloader_willow_home` fixture gives every test its own throwaway
+    WILLOW_HOME, so `_seed_running_env`/`_write_live_env` write/seed
+    exactly that file."""
+
     def __init__(self, *, active_enter="Mon 2026-09-15 10:00:00 UTC", head="deadbeef",
                  restart_rc=0, show_rc=0, after_active_enter="Mon 2026-09-17 10:00:00 UTC"):
         self.active_enter = active_enter
@@ -117,7 +143,11 @@ def _receipt(checkout, *, after="deadbeef", rid="receipt-7", repo="willow-memory
 
 def _nestor_db(tmp_path, *rows) -> Path:
     """A tm_pairs table with the columns the query names. Each row is
-    (id, target_text, status, seal_sig, superseded_by, source_lang)."""
+    ``(id, target_text, status, seal_sig, superseded_by, source_lang)`` or,
+    with an explicit verifier, ``(id, target_text, status, seal_sig,
+    superseded_by, source_lang, verifier)`` — defaults to ``"sean
+    campbell"`` when omitted, matching every pre-Loki-F5 fixture that never
+    needed to say otherwise."""
     db = tmp_path / "nestor.db"
     conn = sqlite3.connect(db)
     conn.executescript("""
@@ -131,19 +161,55 @@ def _nestor_db(tmp_path, *rows) -> Path:
             visibility TEXT NOT NULL DEFAULT 'internal'
         );
     """)
-    for i, (pid, target, status, sig, superseded, lang) in enumerate(rows):
+    for i, row in enumerate(rows):
+        if len(row) == 7:
+            pid, target, status, sig, superseded, lang, verifier = row
+        else:
+            pid, target, status, sig, superseded, lang = row
+            verifier = "sean campbell"
         conn.execute(
             "INSERT INTO tm_pairs (id, source_text, source_norm, source_lang, target_text, target_lang, "
             "status, verifier, created_at, seal_sig, superseded_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (pid, "restart the broker?", "restart the broker", lang, target, lang,
-             status, "sean campbell", f"2026-09-16T1{i}:00:00Z", sig, superseded))
+            (pid, "restart the broker?", SOURCE_NORM, lang, target, lang,
+             status, verifier, f"2026-09-16T1{i}:00:00Z", sig, superseded))
     conn.commit()
     conn.close()
     return db
 
 
-def _sealed(rid, pid="pair-1"):
-    return (pid, f"yes — restart onto pull receipt {rid}", "sealed", "sig", "", "decision")
+# ── real-signature helpers (Loki F5) ───────────────────────────────────────────
+
+SOURCE_NORM = "restart the broker"
+
+
+@pytest.fixture
+def ring_with_sean(tmp_path):
+    """A keyring with a REAL ed25519 ``"sean campbell"`` entry active —
+    what `find_sealing_decision` (F5) now verifies every candidate seal
+    against, the same pattern `test_manifest_grant.py`'s `ring_with_sean`
+    uses. Yields the `Keyring` so a test can sign with its private half."""
+    with keyring_mod.isolated():
+        k = keyring_mod.Keyring(path=str(tmp_path / "keys.json"))
+        k.add("sean campbell", kind="ed25519")
+        k.save()
+        keyring_mod.set_keyring(k)
+        try:
+            yield k
+        finally:
+            keyring_mod.set_keyring(None)
+
+
+def _sign_seal(kr, name: str, target_text: str) -> str:
+    entry = kr.get(name)
+    priv = Ed25519PrivateKey.from_private_bytes(entry.private)
+    return priv.sign(ns.seal_message(SOURCE_NORM, target_text, name)).hex()
+
+
+def _sealed(kr, rid, pid="pair-1", *, verifier="sean campbell"):
+    """A REAL, verifiable sealed decision row naming ``rid``."""
+    target_text = f"yes — restart onto pull receipt {rid}"
+    sig = _sign_seal(kr, verifier, target_text)
+    return (pid, target_text, "sealed", sig, "", "decision", verifier)
 
 
 @pytest.fixture
@@ -159,8 +225,8 @@ def _config(checkout, db, unit="willow-mcp-serve.service"):
 
 # ── the seal lookup ───────────────────────────────────────────────────────────
 
-def test_seal_lookup_three_states(tmp_path):
-    db = _nestor_db(tmp_path, _sealed("receipt-7"))
+def test_seal_lookup_three_states(tmp_path, ring_with_sean):
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     assert reloader.find_sealing_decision("receipt-7", db)["state"] == "populated"
     assert reloader.find_sealing_decision("receipt-8", db)["state"] == "empty"
     missing = reloader.find_sealing_decision("receipt-7", tmp_path / "nope.db")
@@ -168,6 +234,8 @@ def test_seal_lookup_three_states(tmp_path):
 
 
 def test_seal_lookup_ignores_draft_unsigned_superseded_and_other_domains(tmp_path):
+    # None of these rows is a candidate at all (SQL WHERE excludes them
+    # before any signature check runs), so no keyring is needed here.
     db = _nestor_db(
         tmp_path,
         ("draft", "restart onto pull receipt receipt-7", "draft", "", "", "decision"),
@@ -178,10 +246,46 @@ def test_seal_lookup_ignores_draft_unsigned_superseded_and_other_domains(tmp_pat
     assert reloader.find_sealing_decision("receipt-7", db)["state"] == "empty"
 
 
-def test_seal_lookup_reports_verifier_and_pair(tmp_path):
-    db = _nestor_db(tmp_path, _sealed("receipt-7", pid="e961aff8-x"))
+def test_seal_lookup_reports_verifier_and_pair(tmp_path, ring_with_sean):
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7", pid="e961aff8-x"))
     out = reloader.find_sealing_decision("receipt-7", db)
     assert out["pair_id"] == "e961aff8-x" and out["verifier"] == "sean campbell"
+
+
+def test_seal_lookup_garbage_signature_from_unknown_verifier_never_confirms(tmp_path, ring_with_sean):
+    """Loki F5's exact probe: verifier "nobody", sig "garbage" must not act
+    — before this fix, ANY non-empty seal_sig string on a sealed/unsuperseded
+    row confirmed a restart. A keyring IS configured (ring_with_sean), so
+    this proves the signature/verifier check itself, not just ESEALS."""
+    db = _nestor_db(tmp_path, ("pair-x", "yes — restart onto pull receipt receipt-7",
+                               "sealed", "garbage", "", "decision", "nobody"))
+    out = reloader.find_sealing_decision("receipt-7", db)
+    assert out["state"] == "empty"
+
+
+def test_seal_lookup_real_signature_from_unknown_verifier_never_confirms(tmp_path, ring_with_sean):
+    """A REAL ed25519 signature, just not from anyone in the ring — proves
+    the check is "is this verifier trusted", not merely "is this bytes
+    valid hex that verifies against SOME key."""
+    outsider = Ed25519PrivateKey.generate()
+    target_text = "yes — restart onto pull receipt receipt-7"
+    sig = outsider.sign(ns.seal_message(SOURCE_NORM, target_text, "mallory")).hex()
+    db = _nestor_db(tmp_path, ("pair-x", target_text, "sealed", sig, "", "decision", "mallory"))
+    out = reloader.find_sealing_decision("receipt-7", db)
+    assert out["state"] == "empty"
+
+
+def test_seal_lookup_no_keyring_configured_is_unreachable_not_empty(tmp_path):
+    """A real signature exists, but this process has no ring to check it
+    against at all — ESEALS (fix the path), never silently treated as "no
+    seal" (which would read identically to nobody having sealed anything)."""
+    priv = Ed25519PrivateKey.generate()
+    target_text = "yes — restart onto pull receipt receipt-7"
+    sig = priv.sign(ns.seal_message(SOURCE_NORM, target_text, "sean campbell")).hex()
+    db = _nestor_db(tmp_path, ("pair-1", target_text, "sealed", sig, "", "decision", "sean campbell"))
+    assert keyring_mod.get_keyring() is None  # sanity: no ring_with_sean fixture in play here
+    out = reloader.find_sealing_decision("receipt-7", db)
+    assert out["state"] == "unreachable"
 
 
 # ── the check ─────────────────────────────────────────────────────────────────
@@ -207,15 +311,15 @@ def test_receipt_without_id_cannot_be_named(tmp_path, checkout):
     assert out["error"] == "EAMBIG"
 
 
-def test_unit_already_newer_than_receipt_is_ealready(tmp_path, checkout):
-    db = _nestor_db(tmp_path, _sealed("receipt-7"))
+def test_unit_already_newer_than_receipt_is_ealready(tmp_path, checkout, ring_with_sean):
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     git = _FakeSystemctlGit(active_enter="Mon 2026-09-17 10:00:00 UTC")
     out = reloader.check(_config(checkout, db), ledger=_FakeLedger(_receipt(checkout)), runner=git)
     assert out["error"] == "EALREADY" and out["receipt_id"] == "receipt-7"
 
 
-def test_head_moved_since_the_pull_is_edrift(tmp_path, checkout):
-    db = _nestor_db(tmp_path, _sealed("receipt-7"))
+def test_head_moved_since_the_pull_is_edrift(tmp_path, checkout, ring_with_sean):
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     git = _FakeSystemctlGit(head="cafef00d")
     out = reloader.check(_config(checkout, db), ledger=_FakeLedger(_receipt(checkout)), runner=git)
     assert out["error"] == "EDRIFT" and out["head"] == "cafef00d"
@@ -236,15 +340,15 @@ def test_seal_store_unreachable_is_eseals_not_enoseal(tmp_path, checkout):
     assert out["error"] == "ESEALS"
 
 
-def test_unit_state_unreachable_is_eunreach(tmp_path, checkout):
-    db = _nestor_db(tmp_path, _sealed("receipt-7"))
+def test_unit_state_unreachable_is_eunreach(tmp_path, checkout, ring_with_sean):
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     git = _FakeSystemctlGit(show_rc=1)
     out = reloader.check(_config(checkout, db), ledger=_FakeLedger(_receipt(checkout)), runner=git)
     assert out["error"] == "EUNREACH"
 
 
-def test_all_conditions_met_is_act(tmp_path, checkout):
-    db = _nestor_db(tmp_path, _sealed("receipt-7"))
+def test_all_conditions_met_is_act(tmp_path, checkout, ring_with_sean):
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     git = _FakeSystemctlGit()
     out = reloader.check(_config(checkout, db), ledger=_FakeLedger(_receipt(checkout)), runner=git)
     assert out["ok"] and out["act"]
@@ -254,8 +358,8 @@ def test_all_conditions_met_is_act(tmp_path, checkout):
 
 # ── the act ───────────────────────────────────────────────────────────────────
 
-def test_tick_restarts_once_and_leaves_ink(tmp_path, checkout):
-    db = _nestor_db(tmp_path, _sealed("receipt-7"))
+def test_tick_restarts_once_and_leaves_ink(tmp_path, checkout, ring_with_sean):
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     git = _FakeSystemctlGit()
     ledger = _FakeLedger(_receipt(checkout))
     out = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
@@ -270,11 +374,11 @@ def test_tick_restarts_once_and_leaves_ink(tmp_path, checkout):
     assert content["decision"] == "e961aff8"
 
 
-def test_second_tick_after_restart_is_quiet(tmp_path, checkout):
+def test_second_tick_after_restart_is_quiet(tmp_path, checkout, ring_with_sean):
     """The idempotence the timer relies on: after the restart the unit is
     newer than the receipt, so the next tick is EALREADY, not a second
     restart — and no second receipt."""
-    db = _nestor_db(tmp_path, _sealed("receipt-7"))
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     git = _FakeSystemctlGit()
     ledger = _FakeLedger(_receipt(checkout))
     first = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
@@ -284,8 +388,8 @@ def test_second_tick_after_restart_is_quiet(tmp_path, checkout):
     assert len(git.restarts) == 1 and len(ledger.appended) == 1
 
 
-def test_failed_restart_is_erestart_without_ink(tmp_path, checkout):
-    db = _nestor_db(tmp_path, _sealed("receipt-7"))
+def test_failed_restart_is_erestart_without_ink(tmp_path, checkout, ring_with_sean):
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     git = _FakeSystemctlGit(restart_rc=1)
     ledger = _FakeLedger(_receipt(checkout))
     out = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
@@ -300,8 +404,8 @@ def test_refusal_is_not_ink(tmp_path, checkout):
     assert out["error"] == "ENOSEAL" and ledger.appended == []
 
 
-def test_systemctl_runs_in_utc_so_the_parse_matches_the_print(tmp_path, checkout):
-    db = _nestor_db(tmp_path, _sealed("receipt-7"))
+def test_systemctl_runs_in_utc_so_the_parse_matches_the_print(tmp_path, checkout, ring_with_sean):
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     git = _FakeSystemctlGit()
     reloader.check(_config(checkout, db), ledger=_FakeLedger(_receipt(checkout)), runner=git)
     assert git.env_seen and all(env.get("TZ") == "UTC" for env in git.env_seen)
@@ -381,8 +485,8 @@ def test_check_command_exits_zero_when_waiting(tmp_path, checkout, monkeypatch, 
     assert '"ENOSEAL"' in capsys.readouterr().out
 
 
-def test_tick_command_exits_one_only_when_due_and_failed(tmp_path, checkout, monkeypatch, capsys):
-    db = _nestor_db(tmp_path, _sealed("receipt-7"))
+def test_tick_command_exits_one_only_when_due_and_failed(tmp_path, checkout, monkeypatch, capsys, ring_with_sean):
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
     monkeypatch.setattr(reloader, "_live_ledger", lambda: _FakeLedger(_receipt(checkout)))
     monkeypatch.setattr(reloader, "default_config", lambda: _config(checkout, db))
     monkeypatch.setattr(urx.subprocess, "run", _FakeSystemctlGit(restart_rc=1))
@@ -391,23 +495,19 @@ def test_tick_command_exits_one_only_when_due_and_failed(tmp_path, checkout, mon
 
 
 # ── the env trigger: check_env (detect / request / confirm+act) ───────────────
-#
-# `_FakeSystemctlGit`'s `show` branch never sets `EnvironmentFiles=`, so
-# `resolve_env_file` always falls back to `$WILLOW_HOME/env` — the autouse
-# `_reloader_willow_home` fixture gives every test here its own throwaway
-# WILLOW_HOME, so these helpers write/seed exactly that file.
 
 _ENV_SECRET = "sk-do-not-leak-this-literal-9182"
 
 
 def _seed_running_env(text: str) -> dict:
     """What 'the running broker' loaded, per its own startup record —
-    `env_fingerprint.record_startup` against the same path
-    `resolve_env_file` falls back to."""
+    `env_fingerprint.record_startup` against the SAME fallback path
+    `resolve_env_source` resolves to under `_FakeSystemctlGit` (which never
+    sets EnvironmentFiles=/Environment=)."""
     p = envfp.default_env_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
-    return envfp.record_startup(p)
+    return envfp.record_startup(source={"source": "fallback", "path": p})
 
 
 def _write_live_env(text: str) -> Path:
@@ -444,6 +544,7 @@ def test_check_env_no_diff_is_quiet_not_a_refusal(tmp_path, checkout):
     _write_live_env("A=1\n")
     out = reloader.check_env(_config(checkout, db), ledger=_FakeLedger(), runner=_FakeSystemctlGit())
     assert out["ok"] and not out["act"] and out["error"] is None
+    assert out["request_state"] == "none"
 
 
 def test_check_env_diff_without_seal_is_enoseal_and_writes_one_receipt(tmp_path, checkout):
@@ -453,16 +554,17 @@ def test_check_env_diff_without_seal_is_enoseal_and_writes_one_receipt(tmp_path,
     ledger = _FakeLedger()
     out = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
     assert out["error"] == "ENOSEAL"
+    assert out["request_state"] == "fresh"
     assert len(ledger.appended) == 1
     project, event, content = ledger.appended[0]
     assert event == reloader.ENV_EVENT
     assert content["actor"] == reloader.ACTOR
     assert content["keys_added"] == ["B"]
-    assert content["keys_removed"] == [] and content["keys_changed"] == []
+    assert content["keys_removed"] == []
     _assert_no_secret_leak(content, out)
 
 
-def test_check_env_idempotent_no_second_receipt_while_open(tmp_path, checkout):
+def test_check_env_idempotent_no_second_receipt_while_current(tmp_path, checkout):
     db = _nestor_db(tmp_path)
     _seed_running_env("A=1\n")
     _write_live_env("A=1\nB=2\n")
@@ -471,10 +573,62 @@ def test_check_env_idempotent_no_second_receipt_while_open(tmp_path, checkout):
     second = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
     assert first["error"] == second["error"] == "ENOSEAL"
     assert first["receipt_id"] == second["receipt_id"]
+    assert second["request_state"] == "current"
     assert len(ledger.appended) == 1
 
 
-def test_check_env_all_conditions_met_is_act(tmp_path, checkout):
+def test_check_env_stale_unsealed_receipt_is_superseded_not_stuck(tmp_path, checkout):
+    """Loki F1: the file moving again BEFORE any seal used to reuse the
+    same (now-stale) receipt forever, wedging EDRIFT on every later tick
+    with nothing new in the journal. It must instead be superseded: a
+    fresh receipt naming the CURRENT state, so the desk always has
+    something current to propose a seal for."""
+    db = _nestor_db(tmp_path)
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger()
+    first = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
+    assert first["error"] == "ENOSEAL"
+    _write_live_env("A=1\nB=3\n")  # the file moves again before any seal
+    second = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
+    assert second["error"] == "ENOSEAL"  # NOT EDRIFT — a fresh request, not a stuck one
+    assert second["request_state"] == "superseded_stale"
+    assert second["receipt_id"] != first["receipt_id"]
+    assert len(ledger.appended) == 2  # the supersession IS new ink
+    _, _, second_content = ledger.appended[-1]
+    assert second_content["supersedes"] == first["receipt_id"]
+
+
+def test_check_env_sealed_then_drifted_is_edrift_but_mints_a_successor(tmp_path, checkout, ring_with_sean):
+    """The OTHER half of F1: once a receipt IS sealed, a further drift must
+    not silently swap what the operator's seal named — that tick is
+    EDRIFT. But it must not be a forever-refusal either: a fresh,
+    unsealed successor receipt is minted in the same call so the NEXT
+    tick has something current to seal."""
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger()
+    requested = reloader.check_env(_config(checkout, tmp_path / "unused.db"), ledger=ledger,
+                                   runner=_FakeSystemctlGit())
+    rid = requested["receipt_id"]
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, rid))
+    _write_live_env("A=1\nB=3\n")  # drift AFTER the seal was minted
+    out = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
+    assert out["error"] == "EDRIFT"
+    assert out["receipt_id"] == rid
+    assert out["request_state"] == "superseded_stale"
+    successor_id = out["successor_receipt_id"]
+    assert successor_id != rid
+    assert len(ledger.appended) == 2
+
+    # the next tick finds the successor CURRENT and waiting, not stuck:
+    again = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
+    assert again["error"] == "ENOSEAL"
+    assert again["receipt_id"] == successor_id
+    assert len(ledger.appended) == 2  # no third receipt — the successor is reused as CURRENT
+
+
+def test_check_env_all_conditions_met_is_act(tmp_path, checkout, ring_with_sean):
     _seed_running_env("A=1\n")
     _write_live_env("A=1\nB=2\n")
     ledger = _FakeLedger()
@@ -484,7 +638,7 @@ def test_check_env_all_conditions_met_is_act(tmp_path, checkout):
     empty_db = _nestor_db(tmp_path / "empty")
     detect = reloader.check_env(_config(checkout, empty_db), ledger=ledger, runner=git)
     assert detect["error"] == "ENOSEAL"
-    sealed_db = _nestor_db(tmp_path / "sealed", _sealed(detect["receipt_id"]))
+    sealed_db = _nestor_db(tmp_path / "sealed", _sealed(ring_with_sean, detect["receipt_id"]))
     out = reloader.check_env(_config(checkout, sealed_db), ledger=ledger, runner=git)
     assert out["ok"] and out["act"]
     assert out["seal"]["pair_id"] == "pair-1"
@@ -502,21 +656,6 @@ def test_check_env_unit_already_active_since_receipt_is_ealready(tmp_path, check
     assert out["error"] == "EALREADY"
 
 
-def test_check_env_drift_since_receipt_is_edrift(tmp_path, checkout):
-    _seed_running_env("A=1\n")
-    _write_live_env("A=1\nB=2\n")
-    ledger = _FakeLedger()
-    git = _FakeSystemctlGit()
-    db = _nestor_db(tmp_path)
-    first = reloader.check_env(_config(checkout, db), ledger=ledger, runner=git)
-    assert first["error"] == "ENOSEAL"
-    _write_live_env("A=1\nB=3\n")  # the file moves again before any seal
-    second = reloader.check_env(_config(checkout, db), ledger=ledger, runner=git)
-    assert second["error"] == "EDRIFT"
-    assert second["receipt_id"] == first["receipt_id"]
-    assert len(ledger.appended) == 1  # still idempotent — no second receipt
-
-
 def test_check_env_unit_unreachable_is_eunreach(tmp_path, checkout):
     _seed_running_env("A=1\n")
     _write_live_env("A=1\nB=2\n")
@@ -527,12 +666,12 @@ def test_check_env_unit_unreachable_is_eunreach(tmp_path, checkout):
     assert out["error"] == "EUNREACH"
 
 
-# ── both triggers, one tick ─────────────────────────────────────────────────
+# ── both triggers, one tick (Loki F4: every OPEN trigger must be sealed) ──────
 
-def test_run_once_env_trigger_restarts_and_leaves_ink(tmp_path, checkout):
+def test_run_once_env_trigger_restarts_and_leaves_ink(tmp_path, checkout, ring_with_sean):
     _seed_running_env("A=1\n")
     _write_live_env(f"A=1\nSECRET={_ENV_SECRET}\n")
-    ledger = _FakeLedger()  # no pull receipt at all
+    ledger = _FakeLedger()  # no pull receipt at all -> pull trigger is not open
     git = _FakeSystemctlGit()
     (tmp_path / "empty").mkdir()
     (tmp_path / "sealed").mkdir()
@@ -540,7 +679,7 @@ def test_run_once_env_trigger_restarts_and_leaves_ink(tmp_path, checkout):
     first = reloader.run_once(_config(checkout, empty_db), ledger=ledger, runner=git)
     assert not first["reloaded"]
     rid = first["env"]["receipt_id"]
-    sealed_db = _nestor_db(tmp_path / "sealed", _sealed(rid))
+    sealed_db = _nestor_db(tmp_path / "sealed", _sealed(ring_with_sean, rid))
     second = reloader.run_once(_config(checkout, sealed_db), ledger=ledger, runner=git)
     assert second["ok"] and second["reloaded"]
     assert second["triggers"] == ["env_changed"]
@@ -554,7 +693,7 @@ def test_run_once_env_trigger_restarts_and_leaves_ink(tmp_path, checkout):
     _assert_no_secret_leak(content)
 
 
-def test_run_once_second_tick_after_restart_env_trigger_is_quiet(tmp_path, checkout):
+def test_run_once_second_tick_after_restart_env_trigger_is_quiet(tmp_path, checkout, ring_with_sean):
     _seed_running_env("A=1\n")
     _write_live_env("A=1\nB=2\n")
     ledger = _FakeLedger()
@@ -564,7 +703,7 @@ def test_run_once_second_tick_after_restart_env_trigger_is_quiet(tmp_path, check
     empty_db = _nestor_db(tmp_path / "empty")
     first = reloader.run_once(_config(checkout, empty_db), ledger=ledger, runner=git)
     rid = first["env"]["receipt_id"]
-    sealed_db = _nestor_db(tmp_path / "sealed", _sealed(rid))
+    sealed_db = _nestor_db(tmp_path / "sealed", _sealed(ring_with_sean, rid))
     second = reloader.run_once(_config(checkout, sealed_db), ledger=ledger, runner=git)
     assert second["reloaded"]
     # the restarted broker's own startup records its new baseline, same as
@@ -576,7 +715,7 @@ def test_run_once_second_tick_after_restart_env_trigger_is_quiet(tmp_path, check
     assert len(git.restarts) == 1
 
 
-def test_run_once_both_triggers_sealed_restarts_once_cites_both(tmp_path, checkout):
+def test_run_once_both_triggers_sealed_restarts_once_cites_both(tmp_path, checkout, ring_with_sean):
     _seed_running_env("A=1\n")
     _write_live_env("A=1\nB=2\n")
     ledger = _FakeLedger(_receipt(checkout))
@@ -588,7 +727,8 @@ def test_run_once_both_triggers_sealed_restarts_once_cites_both(tmp_path, checko
     assert not first["reloaded"]
     pull_rid = first["receipt_id"]
     env_rid = first["env"]["receipt_id"]
-    db = _nestor_db(tmp_path / "sealed", _sealed(pull_rid, pid="pair-1"), _sealed(env_rid, pid="pair-2"))
+    db = _nestor_db(tmp_path / "sealed", _sealed(ring_with_sean, pull_rid, pid="pair-1"),
+                    _sealed(ring_with_sean, env_rid, pid="pair-2"))
     second = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
     assert second["ok"] and second["reloaded"]
     assert set(second["triggers"]) == {"git_pull", "env_changed"}
@@ -600,7 +740,14 @@ def test_run_once_both_triggers_sealed_restarts_once_cites_both(tmp_path, checko
     assert content["nestor_pair_ids"] == {"pull": "pair-1", "env": "pair-2"}
 
 
-def test_run_once_only_pull_sealed_acts_on_pull_only(tmp_path, checkout):
+def test_run_once_refuses_the_whole_restart_when_only_one_open_trigger_is_sealed(tmp_path, checkout, ring_with_sean):
+    """Loki F4: a sealed pull with a still-open (unsealed) env diff must
+    refuse the WHOLE restart — acting on the pull alone would restart the
+    unit, which re-reads its env from disk regardless of what triggered
+    the restart, silently applying the UNSEALED env change as a side
+    effect, and would leave the env receipt permanently EALREADY once it
+    was eventually sealed (the unit would already look "active since
+    after" it)."""
     _seed_running_env("A=1\n")
     _write_live_env("A=1\nB=2\n")
     ledger = _FakeLedger(_receipt(checkout))
@@ -611,10 +758,23 @@ def test_run_once_only_pull_sealed_acts_on_pull_only(tmp_path, checkout):
     first = reloader.run_once(_config(checkout, empty_db), ledger=ledger, runner=git)
     pull_rid = first["receipt_id"]
     assert first["env"]["receipt_id"]  # the env request was filed too
-    db = _nestor_db(tmp_path / "sealed", _sealed(pull_rid, pid="pair-1"))  # env stays unsealed
+    db = _nestor_db(tmp_path / "sealed", _sealed(ring_with_sean, pull_rid, pid="pair-1"))  # env stays unsealed
     second = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
-    assert second["reloaded"] and second["triggers"] == ["git_pull"]
-    project, event, content = ledger.appended[-1]
-    assert content["trigger"] == "git_pull"
-    assert "env_receipt_id" not in content
-    assert len(git.restarts) == 1  # the still-waiting env receipt earns no second restart
+    assert second["error"] == "EPARTIAL"
+    assert not second["reloaded"]
+    assert second["pull"]["act"] and second["env"]["error"] == "ENOSEAL"
+    assert git.restarts == []  # NEITHER trigger acted — no partial restart
+    assert len(ledger.appended) == 1  # only the original env request; no unit_reload ink
+
+
+def test_run_once_pull_only_when_env_has_nothing_pending(tmp_path, checkout, ring_with_sean):
+    """The other half of F4: a sealed pull restarts fine when the env
+    trigger has genuinely nothing open (no diff at all) — F4 only blocks
+    on an OPEN-but-unsealed trigger, never on an absent one."""
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
+    git = _FakeSystemctlGit()
+    ledger = _FakeLedger(_receipt(checkout))
+    out = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
+    assert out["ok"] and out["reloaded"]
+    assert out["triggers"] == ["git_pull"]
+    assert len(git.restarts) == 1

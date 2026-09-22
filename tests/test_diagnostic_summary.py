@@ -631,7 +631,7 @@ def test_env_stale_no_diff_reports_populated_with_no_keys_changed(tmp_path, monk
     from willow_mcp import env_fingerprint as envfp
     env_path = tmp_path / "env"
     env_path.write_text("A=1\n", encoding="utf-8")
-    envfp.record_startup(env_path)
+    envfp.record_startup(source={"source": "fallback", "path": env_path})
     out = server._diag_env_stale()
     assert out["state"] == "populated" and out["keys_changed"] == []
     assert out["receipt_id"] is None and out["sealed"] is False
@@ -642,11 +642,15 @@ def test_env_stale_diff_names_keys_changed_never_a_value(tmp_path, monkeypatch):
     from willow_mcp import env_fingerprint as envfp
     env_path = tmp_path / "env"
     env_path.write_text("A=1\n", encoding="utf-8")
-    envfp.record_startup(env_path)
+    envfp.record_startup(source={"source": "fallback", "path": env_path})
     env_path.write_text("A=1\nSECRET=sk-do-not-leak-this-8675309\nB=2\n", encoding="utf-8")
     out = server._diag_env_stale()
     assert out["state"] == "populated"
-    assert set(out["keys_changed"]) == {"B", "SECRET"}
+    # F2: keys_added/removed are exact (B, SECRET); "A" is common to both
+    # sides but the whole-set digest differs, so it is reported too — over-
+    # inclusive on purpose, since a single digest cannot say A's value did
+    # NOT move (see env_fingerprint.diff_keys).
+    assert set(out["keys_changed"]) == {"A", "B", "SECRET"}
     assert "sk-do-not-leak-this-8675309" not in json.dumps(out)
     # no Postgres configured in this test env -> best-effort receipt/seal lookup
     # degrades to the empty default rather than raising.

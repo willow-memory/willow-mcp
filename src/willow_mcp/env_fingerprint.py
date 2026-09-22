@@ -1,29 +1,43 @@
-"""willow_mcp/env_fingerprint.py — a fingerprint of the broker's env file,
-never its values.
+"""willow_mcp/env_fingerprint.py — a fingerprint of the broker's env, never
+its values, read the way the unit actually carries it.
 
 Follow-on to decision ``1bd6fd29`` (2026-09-22, "operations are Willow's…
 the operator's only keyboard act is the seal") on the shape sealed
 ``e961aff8`` (:mod:`reloader`): today the reloader restarts the broker onto
-a sealed ``git_pull`` receipt only. A change to ``$WILLOW_HOME/env`` — a
+a sealed ``git_pull`` receipt only. A change to the broker's env — a
 rotated provider key, ``WILLOW_PGP_FINGERPRINT`` after the trust-owner key
 is generated, ``WILLOW_MCP_APPS_ROOT`` added — has no receipt, so the
 broker keeps running on stale env until someone types ``systemctl --user
 restart`` by hand. That keyboard act is what this module (paired with
 :mod:`reloader`'s env-trigger functions) removes.
 
-Env values are secrets. They can never ride in a pair, a receipt, or the
-journal, so a change has to be *detected*, never *declared*: this module
-never writes a raw env value anywhere. What it writes are:
+Rework (Loki audit E79FCAE7, findings F2/F3):
 
-* a SHA-256 **digest** over the sorted ``name=value`` lines of the file
-  (one hash for the whole file — this is what a FRANK receipt's
-  ``fingerprint_before``/``fingerprint_after`` carry), and
-* a per-key SHA-256 **digest of each value** (never the value itself),
-  kept only in the broker's own startup-state file so a later tick can
-  tell an added/removed key from a changed one by NAME, without ever
-  reading two copies of the file across process boundaries. A digest is
-  irreversible; nothing here is a value, however this dict is serialized,
-  logged, or grepped.
+**F2 — no per-key oracle.** The first cut of this module kept a per-key
+SHA-256 digest of each VALUE (``key_digests``) so a later tick could tell
+an added/removed key from a changed one by name. That digest is exactly
+the oracle the brief forbade: an unsalted hash of a short secret is a
+rainbow-table lookup, and it went into a 0600 file on the same box as
+everything else. It is gone. This module now keeps and writes exactly what
+the brief asked for — ONE digest over the whole sorted ``name=value`` set,
+key NAMES beside it, nothing keyed per value. The unavoidable cost: two
+fingerprints with the same key NAMES but a different overall digest cannot
+say WHICH name's value moved — see :func:`diff_keys`, which reports every
+name common to both sides as "changed" in that case rather than guessing,
+because guessing would mean deriving something from the values themselves.
+
+**F3 — read the unit the way the box actually has it.** The live
+``willow-mcp-serve.service`` and its drop-ins on this fleet carry no
+``EnvironmentFile=`` at all — env arrives as ``Environment=`` lines. The
+first cut always fell back to fingerprinting ``$WILLOW_HOME/env``, a file
+that unit never loads, and called the result "the unit's env." Read the
+same systemd output the box actually has (``EnvironmentFiles=`` when the
+unit does have one, ``Environment=`` lines otherwise, a real fallback file
+path only as a last resort when neither systemctl call nor the unit itself
+gives an answer) — see :func:`resolve_env_source`. Every fingerprint now
+carries ``env_source`` (``environment_file`` | ``unit_environment`` |
+``fallback``) so a mismatch is legible rather than silently comparing two
+different things.
 
 Three states, never collapsed (INVARIANTS §1), used in two different
 places for two different questions:
@@ -49,6 +63,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +72,15 @@ from typing import Callable, Optional
 from . import paths
 
 _SYSTEMCTL_TIMEOUT_S = 15
+
+#: Mirrors reloader.DEFAULT_UNIT/reloader._ENV_UNIT without importing
+#: reloader (which imports this module) — a plain constant, not policy.
+DEFAULT_UNIT = "willow-mcp-serve.service"
+_ENV_UNIT_VAR = "WILLOW_RELOADER_UNIT"
+
+
+def _default_unit() -> str:
+    return os.environ.get(_ENV_UNIT_VAR, DEFAULT_UNIT).strip() or DEFAULT_UNIT
 
 
 # ── locations ─────────────────────────────────────────────────────────────────
@@ -69,12 +93,17 @@ def state_path() -> Path:
     """Where the broker records the env fingerprint it loaded at startup —
     a sibling of where serve mode would keep other startup state, had one
     already existed (none did: `heartbeat.py` is per-worker, not per-broker).
-    0600 — this file holds per-key value digests, and a digest of a secret
-    is still worth keeping off a shared mode."""
+    0600 — belt and suspenders; this file holds only names and one digest,
+    never a value or anything keyed per value, but it is still not a file
+    that needs to be world-readable."""
     return state_dir() / "env_fingerprint.json"
 
 
 def default_env_path() -> Path:
+    """The last-resort fallback ONLY — used when systemctl cannot be asked
+    at all (missing, timeout, unit unknown) or answers with neither
+    ``EnvironmentFile=`` nor ``Environment=``. Never assumed to be what a
+    live unit actually loads; see :func:`resolve_env_source`."""
     return paths.willow_home() / "env"
 
 
@@ -99,18 +128,29 @@ def _parse_env_lines(text: str) -> list[tuple[str, str]]:
     return out
 
 
+def _fingerprint_pairs(pairs: list[tuple[str, str]]) -> dict:
+    """The one shape every source (file or ``Environment=`` lines) reduces
+    to: sorted key NAMES and ONE SHA-256 digest over the whole sorted
+    ``name=value`` set. Nothing per key — see the module docstring, F2."""
+    ordered = sorted(pairs, key=lambda kv: kv[0])
+    keys = [k for k, _ in ordered]
+    whole = hashlib.sha256()
+    for k, v in ordered:
+        whole.update(k.encode("utf-8"))
+        whole.update(b"=")
+        whole.update(v.encode("utf-8"))
+        whole.update(b"\n")
+    return {"state": "populated", "keys": keys, "digest": whole.hexdigest()}
+
+
 def compute_fingerprint(path: Path) -> dict:
-    """The three-state read of one env file.
+    """The three-state read of one env FILE.
 
     ``{"state": "empty"}`` — no such file.
     ``{"state": "unreachable", "cause": ...}`` — exists but could not be read.
-    ``{"state": "populated", "keys": [sorted names], "digest": sha256hex,
-    "key_digests": {name: sha256hex(value)}}`` on success. ``digest`` is
-    the single hash over every sorted ``name=value`` line — what a FRANK
-    receipt carries. ``key_digests`` never leaves this process except into
-    the 0600 state file: it exists only so two fingerprints computed in
-    different ticks (different processes, even) can be diffed key-by-key
-    without either one holding the other's raw values.
+    ``{"state": "populated", "keys": [sorted names], "digest": sha256hex}``
+    on success — the single hash over every sorted ``name=value`` line, and
+    nothing else; no per-key material of any kind survives this call.
     """
     try:
         if not path.is_file():
@@ -118,18 +158,15 @@ def compute_fingerprint(path: Path) -> dict:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}"}
-    pairs = sorted(_parse_env_lines(text), key=lambda kv: kv[0])
-    keys = [k for k, _ in pairs]
-    whole = hashlib.sha256()
-    key_digests: dict[str, str] = {}
-    for k, v in pairs:
-        whole.update(k.encode("utf-8"))
-        whole.update(b"=")
-        whole.update(v.encode("utf-8"))
-        whole.update(b"\n")
-        key_digests[k] = hashlib.sha256(v.encode("utf-8")).hexdigest()
-    return {"state": "populated", "keys": keys, "digest": whole.hexdigest(),
-            "key_digests": key_digests}
+    return _fingerprint_pairs(_parse_env_lines(text))
+
+
+def compute_fingerprint_from_pairs(pairs: list[tuple[str, str]]) -> dict:
+    """Same shape as :func:`compute_fingerprint`, for a unit's
+    ``Environment=`` lines (already parsed into ``(name, value)`` pairs) —
+    there is no file to report ``empty``/``unreachable`` for; an empty list
+    of pairs is simply a populated fingerprint of nothing."""
+    return _fingerprint_pairs(list(pairs))
 
 
 def summary(fp: dict) -> str:
@@ -142,20 +179,27 @@ def summary(fp: dict) -> str:
 
 def diff_keys(before: dict, after: dict) -> dict:
     """``{"keys_added", "keys_removed", "keys_changed"}`` — NAMES only,
-    never a value or a value's digest. Both ``before``/``after`` are
-    ``populated`` :func:`compute_fingerprint` results (or the equivalent
-    read back from :func:`read_state`); a key absent from one side's
-    ``key_digests`` is treated as absent from that side entirely, so this
-    degrades gracefully against an older state-file shape that predates
-    ``key_digests``."""
-    b = before.get("key_digests") or {}
-    a = after.get("key_digests") or {}
-    bset, aset = set(b), set(a)
-    return {
-        "keys_added": sorted(aset - bset),
-        "keys_removed": sorted(bset - aset),
-        "keys_changed": sorted(k for k in (bset & aset) if b[k] != a[k]),
-    }
+    never a value, never anything derived per-key from a value (F2: there
+    is no per-key digest left to consult).
+
+    ``keys_added``/``keys_removed`` come straight from the two ``keys``
+    name-sets — exact, no ambiguity. ``keys_changed`` cannot be exact: a
+    single whole-set digest cannot say WHICH common name's value moved,
+    only that at least one did (the two digests differ). Rather than guess
+    — which would mean deriving a claim from the values themselves, the
+    exact oracle F2 forbids — every name present on BOTH sides is reported
+    as ``keys_changed`` whenever the digests differ, over-inclusive on
+    purpose. A key that only appears on one side is already covered by
+    added/removed and is never double-counted here.
+    """
+    bkeys = set(before.get("keys") or [])
+    akeys = set(after.get("keys") or [])
+    added = sorted(akeys - bkeys)
+    removed = sorted(bkeys - akeys)
+    common = sorted(akeys & bkeys)
+    same_digest = before.get("digest") == after.get("digest") and before.get("state") == after.get("state")
+    changed = [] if same_digest else common
+    return {"keys_added": added, "keys_removed": removed, "keys_changed": changed}
 
 
 def fingerprints_equal(a: dict, b: dict) -> bool:
@@ -169,34 +213,96 @@ def fingerprints_equal(a: dict, b: dict) -> bool:
     return a.get("digest") == b.get("digest")
 
 
-# ── resolving which file the broker's unit actually loads ─────────────────────
+# ── resolving what the unit actually loads (F3) ────────────────────────────────
 
-def resolve_env_file(unit: str, *, runner: Optional[Callable] = None) -> Path:
-    """``EnvironmentFile=`` of ``unit`` per ``systemctl --user show``, or
-    ``$WILLOW_HOME/env`` when that cannot be read — no live unit to ask
-    (stdio, or a box with no user bus reachable from here), or the unit
-    carries no ``EnvironmentFile=`` at all. Never raises."""
+def _parse_show_props(stdout: str) -> dict:
+    out: dict[str, str] = {}
+    for line in (stdout or "").splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            out[k] = v
+    return out
+
+
+def _parse_environment_pairs(raw: str) -> list[tuple[str, str]]:
+    """systemd's ``Environment=`` show output: space-separated
+    ``NAME=VALUE`` tokens, shell-quoted the way systemd escapes them.
+    ``shlex`` handles the common cases (quoted values containing spaces);
+    this is a best-effort parse of systemd's own escaping grammar, which is
+    not a strict shell grammar, but is close enough for the values this
+    fleet actually sets. A token that fails to split cleanly is skipped
+    rather than guessed at."""
+    try:
+        tokens = shlex.split(raw or "")
+    except ValueError:
+        tokens = (raw or "").split()
+    out: list[tuple[str, str]] = []
+    for tok in tokens:
+        if "=" in tok:
+            name, _, value = tok.partition("=")
+            if name:
+                out.append((name, value))
+    return out
+
+
+def resolve_env_source(unit: str, *, runner: Optional[Callable] = None) -> dict:
+    """Where THIS unit's env actually comes from, read the way
+    ``systemctl --user show`` reports it — never assumed. Three shapes:
+
+    ``{"source": "environment_file", "path": Path}`` — the unit carries an
+    ``EnvironmentFile=``; fingerprint that file.
+
+    ``{"source": "unit_environment", "pairs": [(name, value), ...]}`` — no
+    ``EnvironmentFile=``, but ``Environment=`` lines are present (the shape
+    this fleet's live ``willow-mcp-serve.service`` and its drop-ins
+    actually use); fingerprint THOSE pairs directly, never a file.
+
+    ``{"source": "fallback", "path": $WILLOW_HOME/env}`` — systemctl is
+    unreachable/missing/times out, or the unit carries neither — the only
+    case where a guessed file path is used, and it is always labeled as
+    exactly that: a guess, not a read of the unit.
+
+    Never raises.
+    """
     run = runner or subprocess.run
     try:
         proc = run(
-            ["systemctl", "--user", "show", unit, "--property=EnvironmentFiles"],
+            ["systemctl", "--user", "show", unit, "--property=EnvironmentFiles,Environment"],
             capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT_S, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return default_env_path()
+        return {"source": "fallback", "path": default_env_path()}
     if proc.returncode != 0:
-        return default_env_path()
-    out = (proc.stdout or "").strip()
-    prefix = "EnvironmentFiles="
-    if not out.startswith(prefix):
-        return default_env_path()
-    value = out[len(prefix):].strip()
-    if not value:
-        return default_env_path()
-    # systemd prints e.g. "/home/x/.willow/env (ignore_errors=no)"; the path
-    # is the first whitespace-delimited token.
-    first = value.split()[0]
-    return Path(first) if first else default_env_path()
+        return {"source": "fallback", "path": default_env_path()}
+    props = _parse_show_props(proc.stdout)
+    env_files = (props.get("EnvironmentFiles") or "").strip()
+    if env_files:
+        first = env_files.split()[0]
+        if first:
+            return {"source": "environment_file", "path": Path(first)}
+    environment = (props.get("Environment") or "").strip()
+    if environment:
+        pairs = _parse_environment_pairs(environment)
+        if pairs:
+            return {"source": "unit_environment", "pairs": pairs}
+    return {"source": "fallback", "path": default_env_path()}
+
+
+def fingerprint_source(src: dict) -> dict:
+    """The ``{state, keys, digest}`` fingerprint of a
+    :func:`resolve_env_source` result, plus ``env_source``/``env_ref`` so a
+    caller (a receipt, the state file) can always say WHERE this reading
+    came from — ``env_ref`` is the file path for ``environment_file``/
+    ``fallback`` sources, ``None`` for ``unit_environment`` (there is no
+    single file to name)."""
+    if src.get("source") == "unit_environment":
+        fp = compute_fingerprint_from_pairs(src.get("pairs") or [])
+        ref = None
+    else:
+        path = src.get("path") or default_env_path()
+        fp = compute_fingerprint(path)
+        ref = str(path)
+    return {**fp, "env_source": src.get("source", "fallback"), "env_ref": ref}
 
 
 # ── the running broker's own record ────────────────────────────────────────────
@@ -224,23 +330,28 @@ def read_state() -> dict:
             "env_loaded_at": data.get("env_loaded_at")}
 
 
-def record_startup(env_path: Optional[Path] = None) -> dict:
-    """Called once at broker startup (serve mode): fingerprint the env file
-    this process loaded and record it as "what's running" — the baseline
-    :func:`reloader.check_env` compares the live file against on every
+def record_startup(*, unit: Optional[str] = None, runner: Optional[Callable] = None,
+                    source: Optional[dict] = None) -> dict:
+    """Called once at broker startup (serve mode): fingerprint the env this
+    process loaded and record it as "what's running" — the baseline
+    :func:`reloader.check_env` compares the live read against on every
     tick. Never raises: a failure to write telemetry must not block
     startup, so it is reported in the return value and swallowed.
 
-    ``env_path`` defaults to ``$WILLOW_HOME/env`` — the broker's own
-    process does not go through :func:`resolve_env_file` (that call needs
-    a live user-bus round trip the broker itself has no reason to make of
-    itself; it just knows the file it read to build its own environment)."""
-    path = Path(env_path) if env_path is not None else default_env_path()
-    fp = compute_fingerprint(path)
+    Resolves via the SAME :func:`resolve_env_source` the detect side uses
+    (F3) — not ``os.environ``, even though this process could read its own
+    environment directly, because ``os.environ`` also carries everything
+    systemd/the shell inherited (``PATH``, ``HOME``, ...) that
+    ``resolve_env_source`` never claims to fingerprint; comparing the two
+    would manufacture a permanent false diff. ``source`` lets a caller
+    (tests, or a future caller that already resolved it) skip the
+    systemctl round trip; production boot leaves it unset.
+    """
+    src = source if source is not None else resolve_env_source(unit or _default_unit(), runner=runner)
+    fp = fingerprint_source(src)
     record = {
         "env_fingerprint": fp,
         "env_loaded_at": datetime.now(timezone.utc).isoformat(),
-        "env_path": str(path),
     }
     p = state_path()
     try:
