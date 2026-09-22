@@ -22,18 +22,85 @@ def trusted_read(path: Path) -> None:
     a symlinked path or parent, foreign ownership, or a group/other-writable file
     or parent — the same trust-root shape ``consent_admin`` already enforces on
     the write side, now applied to reads of governance inputs.
+
+    Rework (sealed pair ``31f5d3af``, 2026-09-22): a file NOT owned by this
+    process's own euid is now ALSO trusted when (a) it is owned by the
+    trust owner (``trust_root_setup.default_trust_owner()``, resolved to a
+    uid by name — ``None`` when that user does not exist on this box, e.g.
+    Kart or any single-uid deployment with no distinct trust-owner
+    identity), (b) neither it nor its parent carries a group/other write
+    bit (checked exactly as before — no ACL can widen past this), and (c),
+    for the FILE itself only (never its parent directory — a directory has
+    no meaningful detached signature), its own ``<path>.sig`` verifies
+    under ``WILLOW_PGP_FINGERPRINT`` via the same ``pgp.verify_detached``
+    the gate already uses for seat manifests. This is the same trust shape
+    a seat manifest already carries; the active envelope register and the
+    federation registry now carry it too rather than needing broker
+    ownership at all.
+
+    The trust-owner branch and the euid branch are ALTERNATIVES, never a
+    fallback chain that gets more permissive on failure: a missing or
+    non-verifying signature on a trust-owner-owned file is a refusal, full
+    stop — it never falls through to being trusted on ownership alone.
     """
     if path.is_symlink() or path.parent.is_symlink():
         raise PermissionError(f"symlinked source path refused: {path}")
     euid = os.geteuid()
+    trust_owner_uid = _trust_owner_uid()
     for target in (path.parent, path):
         if not target.exists():
             raise PermissionError(f"source path missing: {target}")
         info = target.stat()
-        if info.st_uid != euid or stat.S_IMODE(info.st_mode) & 0o022:
+        if stat.S_IMODE(info.st_mode) & 0o022:
             raise PermissionError(
                 f"untrusted ownership or permissions on source path: {target}"
             )
+        if info.st_uid == euid:
+            continue
+        if trust_owner_uid is not None and info.st_uid == trust_owner_uid:
+            if target == path:
+                _require_trust_owner_signature(path)
+            continue
+        raise PermissionError(
+            f"untrusted ownership or permissions on source path: {target}"
+        )
+
+
+def _trust_owner_uid() -> "int | None":
+    """The trust owner's uid, resolved by name
+    (``trust_root_setup.default_trust_owner()``) — ``None`` when that user
+    does not exist on this box. Lazy imports throughout (``pwd``,
+    ``trust_root_setup``, ``pgp`` below) so this module — imported very
+    early, by almost everything — never risks a circular import at module
+    load time; the cost is paid once, on first trust-owner-owned read."""
+    import pwd
+
+    from . import trust_root_setup
+
+    try:
+        return pwd.getpwnam(trust_root_setup.default_trust_owner()).pw_uid
+    except KeyError:
+        return None
+
+
+def _require_trust_owner_signature(path: Path) -> None:
+    from . import pgp
+
+    fingerprint = pgp.expected_fingerprint()
+    if not fingerprint:
+        raise PermissionError(
+            f"{path} is trust-owner-owned but WILLOW_PGP_FINGERPRINT is unset — "
+            "a trust-owner-owned governance input needs PGP enforcement configured "
+            "to be trusted at all, never trusted on ownership alone"
+        )
+    ok, detail = pgp.verify_detached(path, fingerprint=fingerprint)
+    if not ok:
+        raise PermissionError(
+            f"{path} is trust-owner-owned but its detached signature does not "
+            f"verify under WILLOW_PGP_FINGERPRINT ({detail}) — refused, never a "
+            "fallback to trusting the file unsigned"
+        )
+
 
 _DISPATCH_ID_RE = re.compile(r"^[A-Z0-9]{8}$")
 _APP_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
@@ -45,7 +112,18 @@ _APP_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 #: this tree: `mcp_apps/schema_maps/` (2026-08-10, pre-B-50) and
 #: `schema_maps/schema_maps/` (2026-08-18, after the relocation). Neither is an
 #: app; both were discovered only by reading the directory.
-_CONTAINER_DIR_NAMES = frozenset({"mcp_apps", "schema_maps", "handoffs", "sessions"})
+#:
+#: `_retired` and `_federation` (Loki audit 54E3DFC0, F9) are the same shape
+#: one level down, inside `mcp_apps/` itself: manifest.retire moves a retired
+#: seat to `mcp_apps/_retired/<app_id>-<pair_id>/`, and federation.ratify
+#: writes `mcp_apps/_federation/servers.json` — neither is an app_id, and
+#: without a reserved-name guard `manifest.create` would happily create a
+#: seat literally named `_retired` or `_federation`, colliding with those
+#: directories the same way the container names above collide with
+#: themselves.
+_CONTAINER_DIR_NAMES = frozenset({
+    "mcp_apps", "schema_maps", "handoffs", "sessions", "_retired", "_federation",
+})
 
 
 def _validate_app_id(app_id: str) -> str:
@@ -500,6 +578,22 @@ def envelope_registry_path() -> Path:
     ``WILLOW_ENVELOPE_REGISTRY`` first.
     """
     return constitutional_dir() / "pre-approved.json"
+
+
+def envelope_proposals_dir() -> Path:
+    """Broker-owned sidecar directory for envelope ``proposals[]``/
+    ``archived[]`` (Loki audit 54E3DFC0, R1/R2 — the desk's reading of
+    sealed ``31f5d3af``): ``constitutional/`` (and the active register
+    inside it) is the TRUST OWNER's, 0755/0644, no ACLs; the broker's own
+    proposal queue cannot live inside a directory it cannot create files
+    in, so it gets a directory of its own, a sibling of ``constitutional/``
+    rather than a file inside it. Never touched by the trust-owner apply
+    half; ``envelope_authoring.propose``/``reject`` write ONLY here."""
+    return willow_home() / "proposals"
+
+
+def envelope_proposals_path() -> Path:
+    return envelope_proposals_dir() / "proposals.json"
 
 
 def dispatch_signing_key_path() -> Path:

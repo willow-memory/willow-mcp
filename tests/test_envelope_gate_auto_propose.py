@@ -70,6 +70,12 @@ def registry_with_demo_verb(tmp_path, monkeypatch):
     os.chmod(str(syscall_path), 0o600)
     monkeypatch.setenv("WILLOW_ENVELOPE_REGISTRY", str(registry_path))
     monkeypatch.setenv("WILLOW_SYSCALL_TABLE", str(syscall_path))
+    # The proposals sidecar is anchored to $WILLOW_HOME (pair 31f5d3af /
+    # Loki 54E3DFC0 R1/R2), independent of WILLOW_ENVELOPE_REGISTRY's own
+    # steering -- without this, every test using this fixture shared the
+    # session-wide default WILLOW_HOME's sidecar and accumulated proposals
+    # across tests.
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     return registry_path
 
 

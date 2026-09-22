@@ -37,8 +37,19 @@ def signing_blocked() -> tuple[bool, str]:
     return False, ""
 
 
-def sign_detached(file_path: Path) -> tuple[bool, str]:
-    """Create file_path.name.sig via gpg --detach-sign --armor (host-side only)."""
+def sign_detached(file_path: Path, *, local_user: str = "") -> tuple[bool, str]:
+    """Create file_path.name.sig via gpg --detach-sign --armor (host-side only).
+
+    ``local_user`` (Loki audit 54E3DFC0, R2): when given, passed as
+    ``--local-user <local_user>`` so the signature is minted under THAT
+    key specifically — never gpg's ambient default signing key, which may
+    belong to a different identity than the fingerprint a reader will
+    verify against. Every caller that signs a file another process trusts
+    BY FINGERPRINT (the envelope register, a seat manifest, the federation
+    registry) should pass ``pgp.expected_fingerprint()`` here; the empty
+    default preserves prior behavior for callers that never cared which
+    key signed (there are none left after R2, but the default keeps this
+    function's signature backward-compatible)."""
     blocked, reason = signing_blocked()
     if blocked:
         return False, reason
@@ -52,6 +63,7 @@ def sign_detached(file_path: Path) -> tuple[bool, str]:
                 "gpg",
                 "--batch",
                 "--yes",
+                *(["--local-user", local_user] if local_user else []),
                 "--detach-sign",
                 "--armor",
                 "-o",

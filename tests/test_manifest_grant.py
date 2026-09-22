@@ -1711,3 +1711,76 @@ def test_status_not_found_then_pending_then_done(
     status = mgx.manifest_grant_status("pair-mg-1", grants_root=grants_root)
     assert status["state"] == "done"
     assert status["result"]["granted"][0]["app_id"] == "kart"
+
+
+# ── U1 (Loki audit 42B3B46F): no doc or refusal string on this branch may
+# prescribe `sudo -u willow-operator ... envelope ratify` as if it worked —
+# measured: it fails reading the OTHER file that same ratify needs, the
+# broker-owned 0600 proposals sidecar. Ratifying an envelope is not
+# possible on the installed box until envelope.ratify (gap d3f79320ccb5)
+# lands. ──────────────────────────────────────────────────────────────────
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_RATIFY_PRESCRIPTION_FILES = (
+    _REPO_ROOT / "deploy" / "manifest-grant" / "INSTALL.md",
+    _REPO_ROOT / "deploy" / "manifest-grant" / "willow-mcp-manifest-grant.service",
+    _REPO_ROOT / "src" / "willow_mcp" / "envelope_authoring.py",
+    _REPO_ROOT / "src" / "willow_mcp" / "trust_owner_verbs.py",
+)
+
+
+def _prescribes_failing_ratify_command(text: str) -> bool:
+    """True when ``text`` contains the literal runnable CLI invocation the
+    original prescription carried — ``... willow_mcp envelope ratify
+    <proposal_id>`` — preceded (anywhere earlier in the same collapsed
+    text) by ``sudo -u willow-operator``. Deliberately narrow to the actual
+    command's own dotted-module syntax (``willow_mcp envelope ratify``),
+    not the bare English phrase "envelope ratify" — prose that WARNS
+    against the command (e.g. "a sudo -u willow-operator invocation is NOT
+    a working alternative... envelope ratify") must not itself trip this
+    scan. Whitespace, including a shell line-continuation backslash +
+    newline (exactly how the original prescription was formatted), is
+    collapsed to single spaces first so a command split across lines is
+    still caught."""
+    import re
+
+    collapsed = re.sub(r"\s+", " ", text)
+    if "sudo -u willow-operator" not in collapsed:
+        return False
+    return bool(re.search(r"willow_mcp envelope ratify\b", collapsed))
+
+
+def test_no_doc_prescribes_the_failing_ratify_command():
+    """Loki audit 42B3B46F, U1: earlier drafts of INSTALL.md and
+    _register_writable's own refusal text told the operator to run `sudo -u
+    willow-operator ... envelope ratify` as the fix — measured to fail
+    every time, on the proposals sidecar this same call also needs to read,
+    which that uid cannot. Every file that talks about ratifying on the
+    installed box must say plainly that it is not possible until
+    envelope.ratify (gap d3f79320ccb5) lands, never suggest a command that
+    fails."""
+    violations = [
+        str(path) for path in _RATIFY_PRESCRIPTION_FILES
+        if path.is_file() and _prescribes_failing_ratify_command(path.read_text(encoding="utf-8"))
+    ]
+    assert violations == [], (
+        f"these files still prescribe the failing `sudo -u willow-operator "
+        f"... envelope ratify` command: {violations}"
+    )
+
+
+def test_the_ratify_prescription_scan_catches_a_planted_violation():
+    """Planted: the exact two-line shape (command + backslash continuation)
+    the original prescription carried, proving the helper above is not
+    merely checking a single-line pattern that happens never to occur."""
+    planted = (
+        "Always:\n\n"
+        "    sudo -u willow-operator env WILLOW_HOME=$H WILLOW_PGP_FINGERPRINT=$FPR \\\n"
+        "      $H/venvs/willow-mcp/bin/python -m willow_mcp envelope ratify <proposal_id>\n"
+    )
+    assert _prescribes_failing_ratify_command(planted)
+    assert not _prescribes_failing_ratify_command(
+        "ratifying an envelope is not possible until envelope.ratify (gap "
+        "d3f79320ccb5) lands; a sudo -u willow-operator invocation is NOT "
+        "a working alternative"
+    )

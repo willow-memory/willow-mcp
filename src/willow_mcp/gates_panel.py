@@ -257,12 +257,16 @@ def _state_label(row_id: str, state: str) -> str:
 
 
 def list_app_ids() -> list[str]:
-    """Every app with a manifest directory — excludes the two reserved
-    non-app subtrees `lease.py`/`identity_binding.py` keep under the same root."""
+    """Every app with a manifest directory — excludes the reserved non-app
+    subtrees `lease.py`/`identity_binding.py` keep under the same root, plus
+    `_retired` (manifest.retire's destination) and `_federation`
+    (federation.ratify's registry) — Loki audit 54E3DFC0, F9: without this,
+    a retired-seats bucket or the federation registry directory was listed
+    as if it were itself a seat."""
     root = _apps_root()
     if not root.is_dir():
         return []
-    skip = {"_net_leases", "_identity_bindings", "_build_leases"}
+    skip = {"_net_leases", "_identity_bindings", "_build_leases", "_retired", "_federation"}
     return sorted(p.name for p in root.iterdir() if p.is_dir() and p.name not in skip)
 
 

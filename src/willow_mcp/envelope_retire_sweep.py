@@ -641,6 +641,40 @@ def sweep(
     path = _envelopes.registry_path()
     using_live_registry = registry is None
 
+    # Sealed pair 31f5d3af (2026-09-22, unblocked after Loki audit BFCC5C79
+    # F1/F2): the active register can now be trust-owner-owned. A live
+    # retirement through the DEFAULT write path (no injected
+    # write_registry — i.e. this call would really touch the on-disk
+    # register) must not attempt a write this process's own uid cannot
+    # make. Rather than build a queued "envelope.retire" verb through the
+    # trust-owner apply half (out of this packet's scope — the follow-on,
+    # named below), this sweep refuses live retirement outright when it is
+    # not running as the trust owner; `dry_run=True` is completely
+    # unaffected and keeps reporting what WOULD retire. Skipped entirely
+    # when no trust-owner identity exists on this box at all (single-uid /
+    # Kart) — live retirement there is unchanged from before this pair.
+    if not dry_run and using_live_registry and write_registry is None:
+        from . import paths as _paths
+
+        euid = os.geteuid()
+        trust_owner_uid = _paths._trust_owner_uid()
+        if trust_owner_uid is not None and euid != trust_owner_uid:
+            receipt.update(
+                state="unreachable",
+                reason=(
+                    "live retirement refused: the active register is trust-owner-"
+                    f"owned (sealed 31f5d3af) and this process is not running as "
+                    f"that uid (euid={euid}, trust_owner_uid={trust_owner_uid}) — "
+                    "dry_run=True still reports what WOULD retire; live retirement "
+                    "needs a trust-owner-run sweep. A queued envelope.retire verb "
+                    "through the trust-owner apply half (manifest.retire's own "
+                    "shape) is the follow-on this packet did not build."
+                ),
+                examined=0, retired=[], kept_standing=0,
+                kept_in_force=[], unreachable=[], truncated=False,
+            )
+            return receipt
+
     if using_live_registry:
         try:
             mismatch = _authoring.registry_mismatch()
