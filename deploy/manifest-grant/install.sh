@@ -101,6 +101,7 @@ GNUPGHOME_TO=/var/lib/willow-mcp/manifest-grant/gnupg
 ETC=/etc/willow-mcp
 KEY_UID='willow-mcp manifest-grant (trust owner) <manifest-grant@willow-operator-box>'
 HERE=$(cd "$(dirname "$0")" && pwd)
+CHECKOUT=$(cd "$HERE/../.." && pwd)   # deploy/manifest-grant/ -> checkout root
 CHECK_ONLY=${1:-}
 BROKER_PUBLIC_KEY_NAME=broker_public_key.pub   # manifest_grant_executor._broker_public_key_path
 BROKER_UNIT_CANDIDATES=(willow-mcp-serve.service willow-mcp.service)  # reloader.DEFAULT_UNIT / unit_reload_executor._BROKER_UNIT_STEMS
@@ -230,12 +231,16 @@ PYEOF
 else
   say "  no existing register at $REG — nothing to migrate; the trust-owner apply half creates one on first envelope.revoke or manifest.retire write"
 fi
-# Now the DIRECTORY itself, not just the file — R1's exact fix. Not -R: a
-# syscall-table.json living alongside the register can stay BROKER-owned
-# (paths.trusted_read's file-level check is euid-based, unaffected by its
-# parent's ownership — only the PARENT needs to resolve to euid-or-trust-
-# owner, which chowning the directory alone already gives it) and is
-# deliberately left untouched here.
+# Now the DIRECTORY itself, not just the file — R1's exact fix. Not -R:
+# syscall-table.json is handled on its own two steps down (gap
+# c1395b307421), synced from the checkout's bundle and chowned there —
+# chowning the directory alone would not touch its CONTENT, which is the
+# actual defect this step exists to fix. Nothing else under
+# constitutional/ is touched by this chown; review_queue.json and
+# frank_head_anchor.json (paths.trusted_read's file-level check is
+# euid-based, unaffected by their parent's ownership — only the PARENT
+# needs to resolve to euid-or-trust-owner, which chowning the directory
+# alone already gives it) are deliberately left as they were.
 install -d -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 755 "$H/constitutional"
 chown "$TRUST_OWNER:$TRUST_OWNER" "$H/constitutional"
 chmod 755 "$H/constitutional"
@@ -248,6 +253,34 @@ fi
 # above; a _federation/ that does not exist yet is created on demand by the
 # apply process itself (runs as $TRUST_OWNER), so it is born correctly
 # owned, mode 0644, no ACL.
+
+# ---- gap c1395b307421: sync syscall-table.json from the checkout's bundle
+# Nothing before this step ever copied the checkout's
+# src/willow_mcp/bundle/constitutional/syscall-table.json onto an installed
+# box, so a box could sit indefinitely on a stale table — measured
+# 2026-09-22: the box was missing row 24 (envelope.ratify, PR 628),
+# freezing every envelope ratification behind it because the verb could
+# never be governed at all (UnknownVerbError). Prior to this step
+# syscall-table.json was left BROKER-owned deliberately, since nothing
+# wrote it at install time; now that this step DOES write it, the same
+# governance-integrity shape pre-approved.json already has (sealed
+# 31f5d3af) applies to it too — synced, chowned, and re-signed as the
+# trust owner below (step 6), never a broker-owned write.
+# deploy/manifest-grant/sync_constitutional.py is an explicit ALLOWLIST
+# copy (currently exactly syscall-table.json): anything else the bundle
+# ships (e.g. its own seed copy of pre-approved.json) is skipped and
+# reported, never copied — an include list fails loudly on a missing name
+# instead of an exclude list growing wrong silently as new live state is
+# added beside the register. Runs as root (like the split script above),
+# so it can write regardless of current ownership; chown to the trust
+# owner happens immediately after, before this script does anything else
+# with the directory.
+say "== 1c. sync constitutional policy files from the checkout bundle"
+BUNDLE_CONSTITUTIONAL="$CHECKOUT/src/willow_mcp/bundle/constitutional"
+SYSCALL_TABLE="$H/constitutional/syscall-table.json"
+"$PY" "$HERE/sync_constitutional.py" "$BUNDLE_CONSTITUTIONAL" "$H/constitutional" \
+  || stop "constitutional bundle sync failed — see the STOP line above; the box's constitutional/ was left untouched"
+[ -f "$SYSCALL_TABLE" ] && chown "$TRUST_OWNER:$TRUST_OWNER" "$SYSCALL_TABLE" && chmod 644 "$SYSCALL_TABLE"
 
 # nestor.db (gap 035d287206e1, F1, rework per Loki audit B00BD43E): the
 # apply half no longer reads this at all — it is a WAL database, and a
@@ -330,7 +363,11 @@ done
 # moment the fingerprint changes. Missing the federation registry here was
 # exactly Loki's F3: the first post-install federation.ratify would otherwise
 # read "no ratified servers" and silently drop every existing entry.
-for f in "$REG" "$H/mcp_apps/_federation/servers.json"; do
+# gap c1395b307421: syscall-table.json joins them the moment step 1c starts
+# writing it — an edited-but-unsigned governance file locks the whole box
+# out under a denial that blames something else, and that has already
+# happened here once (this same file's own INSTALL.md note).
+for f in "$REG" "$SYSCALL_TABLE" "$H/mcp_apps/_federation/servers.json"; do
   [ -f "$f" ] || continue
   SIG_TMP=$(mktemp)
   as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" -o "$SIG_TMP" "$f"
@@ -338,6 +375,16 @@ for f in "$REG" "$H/mcp_apps/_federation/servers.json"; do
   rm -f "$SIG_TMP"
   say "  signed $(basename "$f")"
 done
+# gap c1395b307421: verify the syscall table's own signature right after
+# writing it — this is the file this PR newly writes, so it is the one an
+# unsigned-or-mis-signed governance file would lock the box out on. The
+# other two files in the loop above have carried this exact shape since
+# sealed 31f5d3af / the federation.ratify row and are not re-touched here.
+if [ -f "$SYSCALL_TABLE" ]; then
+  as_to gpg --batch --verify "$SYSCALL_TABLE.sig" "$SYSCALL_TABLE" \
+    || stop "syscall-table.json.sig does not verify under $FPR immediately after signing — refusing rather than leaving a governance file whose signature does not check"
+  say "  verified $(basename "$SYSCALL_TABLE").sig"
+fi
 
 # ------------------ 6b. guard: no request minted before this install may apply
 # Sealed 33654f35 (2026-09-22): d23a3726's pending request "is withdrawn, not
