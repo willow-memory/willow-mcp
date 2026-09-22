@@ -5,6 +5,15 @@
 # owns the cadence. A separate principal from the broker on purpose: the
 # broker's own unit_reload_execute refuses its own unit (EPERM), and this
 # unit is the hand that refusal points at.
+#
+# WILLOW_KEYRING points at the PUBLIC-only ring (net_signer.export_public_ring's
+# output, normally $WILLOW_HOME/config/verifiers.public.json) — never the
+# private config/verifiers.json. This unit only ever VERIFIES a seal
+# (find_sealing_decision -> net_signer.verify_seal); it never signs one, so
+# it has no legitimate use for a private half, and it runs unattended with
+# no operator at the keyboard to notice a leak. Loading the private ring
+# here would put every verifier's signing key on disk for a oneshot timer
+# unit for no capability this process needs (Loki audit 747B0C04, R1).
 [Unit]
 Description=willow-mcp reloader — restart @UNIT@ onto a sealed pull receipt
 
@@ -18,4 +27,5 @@ Environment="WILLOW_NESTOR_DB=@NESTOR_DB@"
 Environment="WILLOW_RELOADER_UNIT=@UNIT@"
 Environment="WILLOW_RELOADER_CHECKOUT=@CHECKOUT@"
 Environment="WILLOW_RELOADER_REPO=@REPO@"
+Environment="WILLOW_KEYRING=@KEYRING@"
 ExecStart=@PYTHON@ -m willow_mcp.reloader tick

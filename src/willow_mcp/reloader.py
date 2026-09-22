@@ -40,6 +40,91 @@ unreadable is ``unreachable``, no sealed pair naming the receipt is
 ``empty``, a match is ``populated``. Only the act leaves FRANK ink — a
 ``unit_reload`` receipt with ``actor=willow-mcp-reloader`` citing the pull
 receipt, the sealing pair and its verifier; refusals go to the journal.
+
+Follow-on (decision ``1bd6fd29``, 2026-09-22, "operations are Willow's… the
+operator's only keyboard act is the seal"): the SAME shape now also covers
+a change to the broker's env — read the way the unit actually carries it
+(:func:`env_fingerprint.resolve_env_source`: ``EnvironmentFile=`` when the
+unit has one, its ``Environment=`` lines otherwise, a labeled fallback
+file path only as a last resort) — a rotated provider key, a new
+``WILLOW_PGP_FINGERPRINT``, an added ``WILLOW_MCP_APPS_ROOT``. Today those
+have no FRANK receipt at all, so the broker runs on stale env until someone
+types the restart by hand; that keyboard act is what this follow-on
+removes. Request/confirm/act is identical to the pull path — a FRANK
+``env_changed`` receipt (:mod:`env_fingerprint` computes it: key NAMES and
+ONE SHA-256 digest, never a value, never anything keyed per value), a
+sealed decision naming that receipt's row id, then the one act — with its
+own preflight (:func:`check_env`) and its own errno for "nothing has
+changed since the broker's own startup record" or "no state file to
+compare against" (an older broker). A pull receipt and an env receipt may
+both be waiting in the same tick; :func:`run_once` restarts once and cites
+whichever of the two were sealed — but ONLY when every trigger that is
+actually pending (open) is sealed (Loki F4): a sealed pull with an
+unsealed, still-open env diff refuses the whole restart rather than
+loading the unsealed env as a side effect of the pull-triggered restart.
+See :mod:`env_fingerprint` for why a value, or anything derived per-key
+from one, never rides in the receipt, the journal, or this process's own
+persisted state.
+
+Rework (Loki audit E79FCAE7, 2026-09-22): F1 (a STALE env_changed receipt —
+the file moved again before any seal — was reused forever instead of
+superseded, wedging both EDRIFT and EALREADY into permanent refusals with
+nothing new in the journal; see :func:`_env_receipt_state`); F2 (a per-key
+value digest in the state file was exactly the rainbow-table oracle the
+brief forbade; gone, see :mod:`env_fingerprint`); F3 (the fallback env FILE
+was fingerprinted and called "the unit's env" even when the live unit
+carries no ``EnvironmentFile=`` at all — this fleet's actually doesn't; see
+:func:`env_fingerprint.resolve_env_source`); F4 (a restart could apply a
+sealed trigger while a second, unsealed trigger was also open, silently
+carrying the unsealed one along for the ride; see :func:`_is_open_trigger`);
+F5 (:func:`find_sealing_decision` accepted any non-empty ``seal_sig``
+string without ever calling :func:`net_signer.verify_seal` — a forged
+verifier/signature confirmed a restart exactly like a real seal; fixed for
+both triggers, since the pull path shared the same function).
+
+Rework 2 (Loki audit 747B0C04, 2026-09-22): R1 (F5's ring fix switched the
+DEPLOYED reloader off — ``bundle/deploy/willow-mcp-reloader.service.template``
+set no ``WILLOW_KEYRING``, so every seal read ``ESEALS``, silently, forever;
+the template now carries a ``WILLOW_KEYRING`` line naming the PUBLIC ring
+(:func:`net_signer.default_ring_path`, normally
+``$WILLOW_HOME/config/verifiers.public.json``) — never the private
+``config/verifiers.json``, because this oneshot only ever verifies, never
+signs, and has no legitimate use for a private half; the live installed unit
+must still be re-rendered — ``unit_install_execute``, row 17 — a desk act,
+this rework only fixes the template); R2 (a source FLAP — the baseline
+recorded via one ``env_source``, a tick reading a different one because
+``systemctl`` hiccuped — was diffed as if comparable, filing a receipt whose
+``keys_removed`` was every key the real source had; a source mismatch is now
+``EUNREACH``, not a diff); R3 (``keys_changed`` naming every common key
+"changed" was itself a false, if safe, claim; replaced with exact
+``keys_added``/``keys_removed`` plus one ``values_changed`` boolean that
+names no key — see :func:`env_fingerprint.diff_keys`); R4
+(:func:`_is_open_trigger` now treats the env side's ``EUNREACH`` as open too,
+so a corrupt env state file blocks a sealed pull's restart instead of
+silently letting it through onto unaudited env); F6 (a missing env file —
+populated to absent — is now its own refusal, ``EMISSING``, never filed as a
+diff naming ``'<empty>'`` as the target); F7 (partial: :func:`server._diag_env_stale`
+now names ``unit``/``describes`` so the desk can tell whose baseline it is
+reading; ``record_startup`` failure is still indistinguishable from an older
+broker — left open, gap ``ce9c914985d9``, see :func:`server._diag_env_stale`);
+R5 (``EPARTIAL`` now reports ``act=False`` — a waiting state, not a failure —
+so ``tick`` exits 0 while waiting on the second seal instead of reddening the
+journal every poll).
+
+Rework 3 (Loki audit BE590C53, 2026-09-22, narrow): T1 (blocking — rework 2's
+own fix was unreachable in practice: :func:`net_signer.default_ring_path`
+reads ``WILLOW_NET_SIGNER_RING`` from the RENDERER's own environment, which on
+a real box is set only inside the net-signer's installed system unit, never
+the desk/broker's — a row-17 render from the desk baked in a
+``WILLOW_KEYRING`` naming a file that was never staged. :func:`_resolve_keyring_path`
+now reads the net-signer unit's OWN ``Environment=`` line — the same fact its
+installer already baked in, not a second guess — falling back to
+``default_ring_path()`` only when that unit cannot be read at all; either way,
+:func:`render_units` now refuses to render when the resolved path is not an
+existing file, naming the path and how it was resolved); T2 (``get_keyring()``
+raising ``KeyringError`` for a configured-but-unusable ring was uncaught —
+:func:`find_sealing_decision` now catches it and maps it to ``unreachable``,
+the same three-state discipline an unset ring already got).
 """
 from __future__ import annotations
 
@@ -51,9 +136,11 @@ import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import env_fingerprint as envfp
 from . import paths
 from . import unit_reload_executor as urx
 
@@ -63,6 +150,9 @@ logger = logging.getLogger(__name__)
 #: tool surface — but a name the ledger can tell apart from the broker
 #: (``willow``) that wrote the pull receipt and the operator who sealed it.
 ACTOR = "willow-mcp-reloader"
+
+#: The env-trigger's own FRANK event type, sibling of :data:`unit_reload_executor.PULL_EVENT`.
+ENV_EVENT = "env_changed"
 
 #: The broker unit this fleet actually runs (`scripts/willow-serve install`
 #: writes it); the bare ``willow-mcp.service`` is the other spelling
@@ -122,22 +212,45 @@ def default_config() -> ReloaderConfig:
 
 # ── the confirm: a sealed decision naming the receipt ─────────────────────────
 
+def _ring_from_keyring(kr) -> dict[str, dict]:
+    """The ``verify_seal`` ring shape (``{name: {key, kind, revoked_at,
+    compromised}}``), built from the process's OWN keyring — the same shape
+    :func:`manifest_grant_executor._ring_from_keyring` builds, duplicated
+    here (a few lines) rather than imported, so this module carries no
+    dependency on a file another packet owns."""
+    return {
+        e.name: {"key": e.key, "kind": e.kind, "revoked_at": e.revoked_at, "compromised": e.compromised}
+        for e in kr.entries()
+    }
+
+
 def find_sealing_decision(receipt_id: str, db_path: Path) -> dict:
     """Look in Nestor's own database for a sealed ``decision`` pair whose
-    text names ``receipt_id``.
+    text names ``receipt_id`` AND whose ``seal_sig`` actually verifies.
 
     Returns ``{"state": "populated", "pair_id", "verifier", "sealed_at"}``,
-    ``{"state": "empty"}`` when no sealed pair names it, or
-    ``{"state": "unreachable", "cause": ...}`` when the database cannot be
-    read — three states, because "no seal" and "cannot see the seals" call
-    for different next moves (wait vs. fix the path) and a reloader that
-    reported both as "no" would restart nothing forever, silently.
+    ``{"state": "empty"}`` when no sealed pair names it (or none of the
+    candidates that do carries a signature that verifies), or
+    ``{"state": "unreachable", "cause": ...}`` when the database or the
+    verifier ring cannot be read — three states, because "no seal" and
+    "cannot see the seals" call for different next moves (wait vs. fix the
+    path) and a reloader that reported both as "no" would restart nothing
+    forever, silently.
 
-    A seal is a row with ``status = 'sealed'``, a non-empty ``seal_sig``, and
-    no ``superseded_by`` — the same three facts ``nestor serve`` requires
-    before it will serve a pair as verified. The ledger record alone is not
-    consulted: it carries the pair id and verifier but not the text, and the
-    text is where the receipt id lives.
+    Rework (Loki audit E79FCAE7, F5, gap 3df4bbb26cf0): this used to accept
+    ANY row with ``status='sealed'`` and a non-empty ``seal_sig`` string —
+    it never called :func:`net_signer.verify_seal`, so a row naming
+    verifier ``"nobody"`` and ``seal_sig="garbage"`` confirmed a restart
+    exactly as well as a real seal. This now loads the same per-verifier
+    keyring :func:`manifest_grant_executor._bind_to_seal` checks against
+    and calls :func:`net_signer.verify_seal` on every text-matching
+    candidate (newest first), returning the first that verifies. A
+    revoked/compromised/unknown verifier or a bad signature is treated
+    exactly like "no seal names it" — ``empty``, not an act. No keyring
+    configured at all is ``unreachable`` (``ESEALS``): a seal cannot be
+    trusted sight-unseen just because nothing was there to check it
+    against. This is the SAME function the pull path already used, so this
+    fix applies to both triggers, not only the env one.
     """
     rid = (receipt_id or "").strip()
     if not rid:
@@ -148,7 +261,7 @@ def find_sealing_decision(receipt_id: str, db_path: Path) -> dict:
         return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
     try:
         rows = conn.execute(
-            "SELECT id, verifier, created_at FROM tm_pairs "
+            "SELECT id, source_norm, target_text, verifier, seal_sig, created_at FROM tm_pairs "
             "WHERE source_lang = 'decision' AND status = 'sealed' "
             "AND seal_sig != '' AND superseded_by = '' "
             "AND (instr(source_text, ?) > 0 OR instr(target_text, ?) > 0) "
@@ -161,15 +274,292 @@ def find_sealing_decision(receipt_id: str, db_path: Path) -> dict:
         conn.close()
     if not rows:
         return {"state": "empty"}
-    pair_id, verifier, created_at = rows[0]
-    return {"state": "populated", "pair_id": pair_id, "verifier": verifier,
-            "sealed_at": created_at, "count": len(rows)}
+
+    from . import keyring as _keyring
+    from . import net_signer
+
+    # T2 (Loki BE590C53): get_keyring() RAISES KeyringError for a
+    # WILLOW_KEYRING that names a path with nothing readable at it (a
+    # missing file, malformed JSON, ...) — it does not return None the way
+    # "unset" does. Left uncaught, that traceback propagated out of
+    # main() on the first tick with a pending receipt: exactly the
+    # three-state collapse this function exists to prevent. Both "no ring
+    # configured" and "a ring is configured but unusable" are the SAME
+    # verdict from a caller's point of view — unreachable, fix the path —
+    # so both land here.
+    try:
+        ring_kr = _keyring.get_keyring()
+    except _keyring.KeyringError as exc:
+        return {"state": "unreachable",
+                "cause": f"WILLOW_KEYRING={_keyring.keyring_path()!r} is configured but could not "
+                         f"be loaded: {exc}",
+                "path": str(db_path)}
+    if ring_kr is None:
+        return {"state": "unreachable",
+                "cause": "no keyring configured (WILLOW_KEYRING) — a seal cannot be verified "
+                         "without a ring to verify it against",
+                "path": str(db_path)}
+    ring = _ring_from_keyring(ring_kr)
+
+    for pair_id, source_norm, target_text, verifier, seal_sig, created_at in rows:
+        sealed = {"source_norm": source_norm, "target_text": target_text,
+                  "verifier": verifier, "seal_sig": seal_sig, "created_at": created_at}
+        # max_age_s=None: a restart confirm is a standing governance decision
+        # (like manifest.grant's), not a one-shot task lease — it does not go
+        # stale on a calendar just because nobody happened to act on it
+        # within net_authority.SEAL_MAX_AGE_S. Revocation is supersession,
+        # already enforced by the superseded_by='' filter above.
+        ok, _reason, _field = net_signer.verify_seal(sealed, ring, max_age_s=None)
+        if ok:
+            return {"state": "populated", "pair_id": pair_id, "verifier": verifier,
+                    "sealed_at": created_at, "count": len(rows)}
+    return {"state": "empty"}
 
 
 # ── the check ─────────────────────────────────────────────────────────────────
 
 def _refuse(errno: str, reason: str, **extra) -> dict:
     return {"ok": False, "act": False, "error": errno, "reason": reason, **extra}
+
+
+# ── the env trigger: detect / request / confirm / act ─────────────────────────
+
+def _mint_env_receipt(ledger, *, unit: str, env_path: str, recorded: dict, live: dict,
+                      supersedes: Optional[str] = None) -> dict:
+    """Write ONE fresh ``env_changed`` receipt against the CURRENT live
+    fingerprint and return it in the same ``{"id", "content", "created_at"}``
+    shape :meth:`GovernanceLedger.latest_event` returns — so the caller
+    never has to special-case "just minted" vs. "read back from the
+    ledger." ``supersedes`` names the row this one replaces (F1: a STALE
+    receipt is superseded, not silently reused)."""
+    detected_at = datetime.now(timezone.utc).isoformat()
+    content = {
+        "actor": ACTOR, "unit": unit, "env_path": env_path,
+        "fingerprint_before": envfp.summary(recorded), "fingerprint_after": envfp.summary(live),
+        "env_source": live.get("env_source"), "detected_at": detected_at,
+        **envfp.diff_keys(recorded, live),
+    }
+    if supersedes:
+        content["supersedes"] = supersedes
+    receipt_id = ledger.append("willow-mcp", ENV_EVENT, content)
+    return {"id": receipt_id, "content": content, "created_at": detected_at}
+
+
+def _env_receipt_state(ledger, receipt: Optional[dict], *, live_summary: str) -> str:
+    """Classify the LATEST ``env_changed`` receipt found for this unit/path
+    against the file's CURRENT fingerprint. Four states (Loki F1):
+
+    ``none`` — no receipt at all.
+    ``consumed`` — a ``unit_reload`` receipt already cites this one's id;
+    its job is done regardless of what the file holds now.
+    ``stale`` — unconsumed, but its ``fingerprint_after`` no longer matches
+    the current live fingerprint: the file moved again since it was
+    written. NOT open — reusing it (the original bug) means the confirm
+    and act preflight run forever against a target the file has already
+    left behind.
+    ``current`` — unconsumed and still accurate: the one to reuse.
+    """
+    if receipt is None:
+        return "none"
+    rid = receipt.get("id")
+    if rid and ledger.latest_event(urx.EVENT, match={"env_receipt_id": rid}) is not None:
+        return "consumed"
+    if receipt["content"].get("fingerprint_after") != live_summary:
+        return "stale"
+    return "current"
+
+
+def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None) -> dict:
+    """Decide whether the restart is due because the broker's env has moved
+    out from under it. Never restarts, never writes a value.
+
+    Detect: :func:`env_fingerprint.read_state` (what the running broker
+    loaded) against a fresh :func:`env_fingerprint.resolve_env_source` +
+    :func:`env_fingerprint.fingerprint_source` read of what its unit
+    carries RIGHT NOW (F3 — a file the unit does not load is never
+    fingerprinted and called its env; ``Environment=`` lines are read
+    directly when there is no ``EnvironmentFile=``). ``ESTATEEMPTY`` — no
+    startup record at all: an older broker that predates this state file,
+    or one that has not restarted since it landed; nothing to compare
+    against, so this does nothing rather than guess. ``EUNREACH`` — the
+    state file or the live read exists but could not be completed. No
+    diff — ``ok=True, act=False`` quietly, the same "nothing due" shape a
+    pull check returns when there is no receipt to act on.
+
+    Request: a diff mints (or, when the latest receipt is still current,
+    reuses — idempotently) a FRANK ``env_changed`` receipt naming only key
+    NAMES, the two digests, and ``env_source``. A STALE latest receipt
+    (Loki F1: the file moved again before anyone sealed it) is
+    SUPERSEDED — a fresh receipt is minted citing it — rather than reused,
+    so the confirm/act preflight below is always run against a target that
+    still matches the file. A CONSUMED latest receipt (already restarted
+    past) is left alone and a fresh one is minted for whatever new diff
+    exists now, same as ``none``.
+
+    Confirm: :func:`find_sealing_decision` against the CURRENT receipt's
+    row id — ``ENOSEAL`` when nothing sealed names it yet.
+
+    Act preflight: the unit must not already be active since after the
+    receipt was written (``EALREADY`` — a previous tick already restarted
+    onto it), and the live fingerprint must still equal that receipt's
+    ``fingerprint_after`` at the moment of the check. Unlike the request
+    step above, THIS drift is checked against a receipt that IS sealed —
+    silently superseding a sealed receipt would let the reloader decide,
+    on its own, what the operator's seal actually confirmed. So a
+    sealed-but-now-stale receipt is NOT silently replaced here: it mints a
+    fresh successor receipt for the NEXT tick to pick up (so the desk has
+    something current to propose a new seal for) but returns ``EDRIFT``
+    for THIS one, naming both the stale (sealed) receipt and its
+    successor — never a silent forever-refusal with nothing new in the
+    journal (Loki F1's second complaint).
+
+    Every return carries ``request_state`` — ``none``/``fresh``/
+    ``superseded_stale``/``superseded_consumed``/``current`` — naming which
+    of the above happened, so a tick that found nothing actionable still
+    says which state it found.
+    """
+    unit = (config.unit or "").strip()
+    if not urx.is_broker_unit(unit):
+        return _refuse("EINVAL", f"{unit!r} is not the broker's unit — reload it "
+                                 f"through unit_reload_execute under a unit.reload envelope")
+    if ledger is None:
+        return _refuse("EAMBIG", "no governance ledger: a restart that cannot be matched to an "
+                                 "env_changed receipt is not performed")
+
+    state = envfp.read_state()
+    if state["state"] == "unreachable":
+        return _refuse("EUNREACH", f"env-fingerprint state file unreadable: {state.get('cause')}",
+                       request_state="none")
+    if state["state"] == "empty":
+        return _refuse("ESTATEEMPTY",
+                       "no env-fingerprint state file from the running broker — an older "
+                       "broker that predates this, or one that has not started since; "
+                       "nothing to compare the env against", request_state="none")
+    recorded = state["env_fingerprint"]
+
+    src = envfp.resolve_env_source(unit, runner=runner)
+    live = envfp.fingerprint_source(src)
+    if live["state"] == "unreachable":
+        return _refuse("EUNREACH", f"unit env ({live.get('env_source')}) unreadable: {live.get('cause')}",
+                       request_state="none")
+
+    # R2 (Loki 747B0C04): a source FLAP — the baseline was recorded via one
+    # env_source (e.g. unit_environment) and this read resolved a DIFFERENT
+    # one (e.g. fallback, because systemctl hiccuped) — is not a diff. Two
+    # readings from two different sources are not comparable; diffing them
+    # anyway files a receipt whose keys_removed is every key the baseline
+    # source had and keys_added is every key the fallback source has. Refuse
+    # as unreachable instead — no receipt, nothing in the journal but a
+    # refusal, exactly like a read that failed outright.
+    if recorded.get("env_source") != live.get("env_source"):
+        return _refuse("EUNREACH",
+                       f"running-broker baseline was recorded via env_source="
+                       f"{recorded.get('env_source')!r} but this read resolved env_source="
+                       f"{live.get('env_source')!r} — not comparable (a source flap, e.g. "
+                       f"systemctl briefly unreachable), not a diff",
+                       request_state="none")
+
+    if envfp.fingerprints_equal(recorded, live):
+        return {"ok": True, "act": False, "error": None, "reason": "env unchanged",
+                "unit": unit, "env_source": live.get("env_source"), "env_ref": live.get("env_ref"),
+                "request_state": "none"}
+
+    # F6 (E79FCAE7, still open at de3462a): the env file going from populated
+    # to MISSING is a state change, not a diff to request a restart onto —
+    # INVARIANTS §1, "empty" is its own state. (Only reachable for the
+    # environment_file/fallback sources; unit_environment has no file to
+    # remove.) Refuse rather than file a receipt naming '<empty>' as the
+    # target — restarting onto a genuinely absent env is not something this
+    # trigger should ever request on its own.
+    if live["state"] != "populated":
+        return _refuse("EMISSING",
+                       f"the unit's env ({live.get('env_source')}) is now {live['state']} — a state "
+                       f"change (the file was deleted or moved), not a diff to request a restart "
+                       f"onto; fix the env source, or if this is intentional, restart the broker by "
+                       f"hand so its own startup record reflects the new baseline",
+                       request_state="none")
+
+    env_path = live.get("env_ref") or ""
+    live_summary = envfp.summary(live)
+    existing = ledger.latest_event(ENV_EVENT, match={"unit": unit, "env_path": env_path})
+    rstate = _env_receipt_state(ledger, existing, live_summary=live_summary)
+
+    if rstate == "current":
+        receipt = existing
+        request_state = "current"
+    elif rstate == "stale":
+        existing_id = existing.get("id")
+        seal = find_sealing_decision(existing_id, config.nestor_db) if existing_id else {"state": "empty"}
+        if seal["state"] == "unreachable":
+            return _refuse("ESEALS", f"seal store unreachable: {seal.get('cause')}",
+                           receipt_id=existing_id, path=seal.get("path"), request_state="stale")
+        successor = _mint_env_receipt(ledger, unit=unit, env_path=env_path, recorded=recorded,
+                                      live=live, supersedes=existing_id)
+        if seal["state"] == "populated":
+            # Sealed but the file has moved on: refuse THIS tick (the seal
+            # names the stale receipt, not the current file) while leaving
+            # a fresh, unsealed successor in the journal for the next one.
+            return _refuse("EDRIFT",
+                           f"env_changed receipt {existing_id} was sealed but the unit's env has "
+                           f"moved again since — the seal names that receipt, not whatever it "
+                           f"holds now; a successor receipt {successor['id']} is waiting for a new seal",
+                           receipt_id=existing_id, receipt=existing["content"],
+                           successor_receipt_id=successor["id"], request_state="superseded_stale")
+        receipt = successor
+        request_state = "superseded_stale"
+    else:  # "none" or "consumed"
+        receipt = _mint_env_receipt(ledger, unit=unit, env_path=env_path, recorded=recorded, live=live)
+        request_state = "fresh" if rstate == "none" else "superseded_consumed"
+
+    receipt_id = receipt.get("id")
+    if not receipt_id:
+        return _refuse("EAMBIG", "the env_changed receipt carries no row id; a seal cannot name it",
+                       request_state=request_state)
+    content = receipt["content"]
+
+    state_unit = urx.show_unit(unit, runner=runner)
+    if not state_unit.get("ok"):
+        return _refuse("EUNREACH", f"unit state unreachable: {state_unit.get('cause')}",
+                       cause=state_unit.get("cause"), detail=state_unit.get("detail"),
+                       receipt_id=receipt_id, request_state=request_state)
+
+    active_enter = urx._parse_systemd_timestamp(state_unit.get("ActiveEnterTimestamp"))
+    receipt_at = urx._as_utc(receipt.get("created_at"))
+    if active_enter is not None and receipt_at is not None and active_enter >= receipt_at:
+        return _refuse("EALREADY",
+                       f"{unit} has been active since {state_unit.get('ActiveEnterTimestamp')!r}, "
+                       f"which is no older than env_changed receipt {receipt_id} — already restarted onto it",
+                       receipt_id=receipt_id, receipt=content, request_state=request_state)
+
+    live_again = envfp.fingerprint_source(envfp.resolve_env_source(unit, runner=runner))
+    if live_again["state"] == "unreachable":
+        return _refuse("EUNREACH", f"unit env unreadable: {live_again.get('cause')}",
+                       receipt_id=receipt_id, request_state=request_state)
+    if envfp.summary(live_again) != content.get("fingerprint_after"):
+        return _refuse("EDRIFT",
+                       f"the unit's env has moved again since env_changed receipt {receipt_id} was "
+                       f"written — the seal names that receipt, not whatever it holds now",
+                       receipt_id=receipt_id, receipt=content, request_state=request_state)
+
+    seal = find_sealing_decision(receipt_id, config.nestor_db)
+    if seal["state"] == "unreachable":
+        return _refuse("ESEALS", f"seal store unreachable: {seal.get('cause')}",
+                       receipt_id=receipt_id, path=seal.get("path"), request_state=request_state)
+    if seal["state"] == "empty":
+        added, removed = content.get("keys_added") or [], content.get("keys_removed") or []
+        summary_bits = [b for b in (
+            f"+{','.join(added)}" if added else "",
+            f"-{','.join(removed)}" if removed else "",
+            "values changed" if content.get("values_changed") and not (added or removed) else "",
+        ) if b]
+        return _refuse("ENOSEAL",
+                       f"env_changed receipt {receipt_id} ({'; '.join(summary_bits) or 'no key names changed'}) "
+                       f"is waiting for a sealed decision that names it — the desk proposes, the operator seals",
+                       receipt_id=receipt_id, receipt=content, request_state=request_state)
+
+    return {"ok": True, "act": True, "unit": unit, "env_path": env_path,
+            "receipt_id": receipt_id, "receipt": content, "seal": seal, "state_before": state_unit,
+            "request_state": request_state}
 
 
 def check(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None) -> dict:
@@ -245,38 +635,129 @@ def check(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None) 
 
 # ── the act ───────────────────────────────────────────────────────────────────
 
+def _is_open_trigger(verdict: dict) -> bool:
+    """True when ``verdict`` represents a pending change for its trigger
+    that a restart must not silently ride past — ready to act on
+    (``act=True``), waiting on a seal / blocked by drift
+    (``ENOSEAL``/``EDRIFT``), or a subsystem failure that means THIS
+    trigger's real state cannot be established at all (``EUNREACH``).
+    False for "nothing pending, confirmed" (``ENORECEIPT``,
+    ``ESTATEEMPTY``, no-diff, ``EMISSING``) and for genuine input errors
+    (``EINVAL``/``EAMBIG``/``ESEALS``) that are surfaced
+    (``diagnostic_summary``'s ``env_stale``, or the refusal itself) but do
+    not block the OTHER trigger.
+
+    Rework (Loki 747B0C04, R4): ``EUNREACH`` used to fall on the "not open"
+    side, so a corrupt/unreadable env state let a sealed pull restart onto
+    whatever env happened to be on disk — unaudited, exactly the side
+    effect F4 was meant to stop. "Cannot tell whether it's pending" is not
+    "confirmed not pending" (INVARIANTS §1); it now blocks the same way an
+    unsealed pending change does. The cost is symmetric and accepted: a
+    persistently broken env-fingerprint read also now blocks pull-only
+    restarts until fixed, rather than silently ignoring the env side."""
+    return bool(verdict.get("act")) or verdict.get("error") in ("ENOSEAL", "EDRIFT", "EUNREACH")
+
+
 def run_once(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None,
              project: str = "willow-mcp") -> dict:
-    """One tick: check, and when due, ``systemctl --user restart`` the
-    broker unit and write the FRANK ``unit_reload`` receipt. A refusal is
-    returned as-is (``reloaded=False``); it is not ink."""
-    verdict = check(config, ledger=ledger, runner=runner)
-    if not verdict.get("act"):
-        verdict["reloaded"] = False
-        return verdict
+    """One tick, both triggers: a sealed ``git_pull`` receipt (:func:`check`)
+    and a sealed ``env_changed`` receipt (:func:`check_env`) are both
+    checked; when either (or both) is due, ``systemctl --user restart`` the
+    broker unit ONCE and write ONE FRANK ``unit_reload`` receipt citing
+    whichever fired. Two due triggers never earn two restarts — one act
+    satisfies both, the same idempotence guarantee each trigger already
+    gives on its own.
 
-    unit = verdict["unit"]
+    Rework (Loki F4): a restart happens ONLY when every OPEN trigger is
+    sealed. Before this, a sealed pull with an unsealed-but-pending env
+    diff would restart onto the pull alone — loading the unsealed env
+    change too, as an accidental side effect of ANY restart re-reading the
+    unit's env from disk, and leaving the env receipt EALREADY forever
+    once the seal for it finally landed (the unit would already look
+    "active since after" that later receipt). Symmetrically for the
+    reverse. Now: if either trigger is open (a real pending change) but
+    not yet due (not sealed), the WHOLE restart is refused with
+    ``EPARTIAL``, naming both verdicts, rather than acting on only the
+    sealed one.
+
+    A refusal is returned as-is (``reloaded=False``); it is not ink. When
+    neither is due the *pull* verdict rides at the top level — unchanged
+    from this function's shape before the env trigger existed, so an
+    existing caller reading ``error``/``reason`` off the result keeps
+    seeing exactly what it saw before — with the env verdict alongside it
+    under ``env`` for a caller that wants both.
+    """
+    pull_verdict = check(config, ledger=ledger, runner=runner)
+    env_verdict = check_env(config, ledger=ledger, runner=runner)
+    due_pull = bool(pull_verdict.get("act"))
+    due_env = bool(env_verdict.get("act"))
+    open_pull = _is_open_trigger(pull_verdict)
+    open_env = _is_open_trigger(env_verdict)
+
+    if not (due_pull or due_env):
+        out = dict(pull_verdict)
+        out["reloaded"] = False
+        out["env"] = env_verdict
+        return out
+
+    if (open_pull and not due_pull) or (open_env and not due_env):
+        # R5 (Loki 747B0C04): act=False — this is a WAITING state (the same
+        # resting state ENOSEAL already is for a single trigger), not a
+        # failure. `act=True` here made main()'s `tick` exit 1 on every 60s
+        # poll until the operator sealed the second receipt, turning the
+        # intended "waiting for a seal" state red in the journal.
+        return {"ok": False, "act": False, "reloaded": False, "error": "EPARTIAL",
+                "reason": "not every open trigger is sealed — refusing to restart onto a "
+                          "partially-confirmed state; both triggers are named below",
+                "pull": pull_verdict, "env": env_verdict}
+
+    unit = pull_verdict["unit"] if due_pull else env_verdict["unit"]
     try:
         restarted = urx._run(["systemctl", "--user", "restart", unit], runner=runner,
                              timeout=_SYSTEMCTL_TIMEOUT_S)
     except FileNotFoundError:
-        return {**verdict, "ok": False, "reloaded": False, "error": "EUNREACH", "reason": "systemctl_missing"}
+        return {"ok": False, "act": True, "reloaded": False, "error": "EUNREACH",
+                "reason": "systemctl_missing", "unit": unit, "pull": pull_verdict, "env": env_verdict}
     except subprocess.TimeoutExpired:
-        return {**verdict, "ok": False, "reloaded": False, "error": "ETIMEDOUT",
-                "reason": f"systemctl restart exceeded {_SYSTEMCTL_TIMEOUT_S}s"}
+        return {"ok": False, "act": True, "reloaded": False, "error": "ETIMEDOUT",
+                "reason": f"systemctl restart exceeded {_SYSTEMCTL_TIMEOUT_S}s",
+                "unit": unit, "pull": pull_verdict, "env": env_verdict}
     if restarted.returncode != 0:
         tail = (restarted.stderr or restarted.stdout or "").strip()[-300:]
-        return {**verdict, "ok": False, "reloaded": False, "error": "ERESTART",
-                "reason": tail or f"systemctl restart exited {restarted.returncode}"}
+        return {"ok": False, "act": True, "reloaded": False, "error": "ERESTART",
+                "reason": tail or f"systemctl restart exited {restarted.returncode}",
+                "unit": unit, "pull": pull_verdict, "env": env_verdict}
 
-    out = {**verdict, "reloaded": True, "state_after": urx.show_unit(unit, runner=runner)}
-    try:
-        out["reload_receipt_id"] = ledger.append(project, urx.EVENT, {
-            "actor": ACTOR, "unit": unit, "repo": config.repo, "checkout": str(verdict["checkout"]),
-            "head": verdict["head"], "pull_receipt_id": verdict["receipt_id"],
-            "nestor_pair_id": verdict["seal"]["pair_id"], "nestor_verifier": verdict["seal"]["verifier"],
-            "decision": "e961aff8",
+    triggers = []
+    content = {"actor": ACTOR, "unit": unit, "decision": "e961aff8"}
+    if due_pull:
+        triggers.append("git_pull")
+        content.update({
+            "repo": config.repo, "checkout": str(pull_verdict["checkout"]),
+            "head": pull_verdict["head"], "pull_receipt_id": pull_verdict["receipt_id"],
         })
+    if due_env:
+        triggers.append("env_changed")
+        content.update({
+            "env_path": env_verdict["env_path"], "env_receipt_id": env_verdict["receipt_id"],
+        })
+    content["trigger"] = triggers[0] if len(triggers) == 1 else "both"
+    if due_pull and due_env:
+        content["nestor_pair_ids"] = {"pull": pull_verdict["seal"]["pair_id"],
+                                      "env": env_verdict["seal"]["pair_id"]}
+        content["nestor_verifiers"] = {"pull": pull_verdict["seal"]["verifier"],
+                                       "env": env_verdict["seal"]["verifier"]}
+    elif due_pull:
+        content["nestor_pair_id"] = pull_verdict["seal"]["pair_id"]
+        content["nestor_verifier"] = pull_verdict["seal"]["verifier"]
+    else:
+        content["nestor_pair_id"] = env_verdict["seal"]["pair_id"]
+        content["nestor_verifier"] = env_verdict["seal"]["verifier"]
+
+    out = {"ok": True, "act": True, "reloaded": True, "unit": unit, "triggers": triggers,
+           "pull": pull_verdict, "env": env_verdict, "state_after": urx.show_unit(unit, runner=runner)}
+    try:
+        out["reload_receipt_id"] = ledger.append(project, urx.EVENT, content)
     except Exception as exc:  # noqa: BLE001 — the restart happened; the receipt failing is reported, not hidden
         out["receipt_error"] = f"{type(exc).__name__}: {exc}"
     return out
@@ -303,12 +784,72 @@ def _safe(value: object, field: str) -> str:
     return text
 
 
+#: The net-signer's own SYSTEM unit — the one process on this box whose
+#: ``WILLOW_NET_SIGNER_RING`` is ever actually set, because it is the one
+#: that carries the public ring's real, installed location baked into its
+#: own ``Environment=`` line at render time (net_signer.render_unit).
+_NET_SIGNER_UNIT = "willow-mcp-net-signer.service"
+
+
+def _resolve_keyring_path(*, runner: Optional[Callable] = None) -> tuple[Path, str]:
+    """Where the reloader's rendered unit should point ``WILLOW_KEYRING`` —
+    resolved from the SAME place the net-signer's own installed unit
+    already resolved it, rather than a second, independent guess (Loki
+    BE590C53, T1). ``net_signer.default_ring_path()`` reads
+    ``WILLOW_NET_SIGNER_RING`` from THIS process's environment — which on
+    a real box is set inside the net-signer's system unit and nowhere
+    else, so calling it here (in the desk/broker's own environment) named
+    a file that was never staged there. Read the net-signer unit's own
+    ``Environment=`` line instead — ``systemctl show
+    willow-mcp-net-signer.service --property=Environment`` — a read of
+    the SAME fact the signer's own installer baked in, not an invented
+    third source.
+
+    Returns ``(path, source)`` — ``source`` is ``"net-signer-unit"`` when
+    read from there, ``"default"`` when that unit could not be read at
+    all (not installed, no system bus reachable) and
+    :func:`net_signer.default_ring_path` was used as a last resort.
+    """
+    from . import net_signer
+
+    run = runner or subprocess.run
+    try:
+        proc = run(["systemctl", "show", _NET_SIGNER_UNIT, "--property=Environment"],
+                   capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT_S, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("Environment="):
+                for name, value in envfp._parse_environment_pairs(line[len("Environment="):]):
+                    if name == net_signer.RING_ENV and value:
+                        return Path(value), "net-signer-unit"
+    return net_signer.default_ring_path(), "default"
+
+
 def render_units(config: ReloaderConfig, *, python: Optional[Path] = None,
-                 interval: str = DEFAULT_INTERVAL) -> dict[str, str]:
+                 interval: str = DEFAULT_INTERVAL, runner: Optional[Callable] = None) -> dict[str, str]:
     """The .service and .timer bodies, rendered together so the timer's
-    ``Unit=`` can never drift from the service it schedules."""
+    ``Unit=`` can never drift from the service it schedules.
+
+    Refuses (``ValueError``, the same ``ETEMPLATE``-shaped refusal an
+    unresolved ``@KEY@`` already gets) when the resolved keyring path is
+    not an existing file — Loki BE590C53 T1/T8: a unit rendered against a
+    ring that is not actually staged can never verify a real seal, and
+    that must fail at render time, loudly, naming the path and how it was
+    resolved, not at the first tick with a pending receipt.
+    """
     if config.checkout is None:
         raise ValueError(f"no broker checkout to render: set {_ENV_CHECKOUT}")
+
+    keyring_path, keyring_source = _resolve_keyring_path(runner=runner)
+    if not keyring_path.is_file():
+        raise ValueError(
+            f"WILLOW_KEYRING would render to {keyring_path} (resolved via {keyring_source}), "
+            f"which is not a file — refusing to render a reloader unit whose seal confirm can "
+            f"never succeed; stage the public ring first (`willow-mcp-net-signer export-ring` "
+            f"or `install`) or re-render from where {_NET_SIGNER_UNIT} is actually installed")
+
     values = {
         "PYTHON": python or Path(sys.executable),
         "WILLOW_HOME": paths.willow_home(),
@@ -320,6 +861,11 @@ def render_units(config: ReloaderConfig, *, python: Optional[Path] = None,
         "REPO": config.repo,
         "INTERVAL": interval,
         "SERVICE_UNIT": SERVICE_UNIT,
+        # The PUBLIC-only ring (never config/verifiers.json — see the
+        # template's own header comment, Loki 747B0C04 R1): this oneshot
+        # only ever verifies a seal, never signs one. Resolved above from
+        # the net-signer unit's own environment, not guessed (T1).
+        "KEYRING": keyring_path,
     }
     out: dict[str, str] = {}
     for unit, tmpl in ((SERVICE_UNIT, f"{UNIT_PREFIX}.service.template"),
@@ -440,7 +986,8 @@ def main(argv: Optional[list] = None) -> int:
             )
         ledger = _live_ledger()
         if args.command == "check":
-            out = check(config, ledger=ledger)
+            out = dict(check(config, ledger=ledger))
+            out["env"] = check_env(config, ledger=ledger)
         else:
             out = run_once(config, ledger=ledger)
         print(json.dumps(out, default=str, indent=2))
