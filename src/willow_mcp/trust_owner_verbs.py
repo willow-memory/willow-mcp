@@ -595,6 +595,15 @@ def manifest_create_request(
         name_error = _validate_seat_name(seat_id)
         if name_error:
             return mgx._refuse("EINVAL", f"{seat_id!r} is not a valid seat name: {name_error}")
+        if is_orchestrator_app(seat_id):
+            return mgx._refuse(
+                "EPERM",
+                f"{seat_id!r} collides case-insensitively with the orchestrator seat — "
+                f"{VERB_CREATE} can never name it, the same refusal manifest.retire "
+                "already makes the other direction (Loki audit BFCC5C79, F5: "
+                "is_orchestrator_app lowercases before comparing, but the seat "
+                "namespace is case-sensitive on disk)",
+            )
 
         escalating = sorted(set(parsed["permissions"]) & mgx.ESCALATION_GROUPS)
         if escalating:
@@ -671,6 +680,15 @@ def _apply_manifest_create(record: dict, path: Path, *, ledger, apps_root: Path,
             "EPERM",
             f"pair_id={pair_id!r} names escalation-class permission(s) {escalating!r} at apply time",
             escalating=escalating,
+        )
+
+    from .human_session import is_orchestrator_app
+
+    if is_orchestrator_app(seat_id):
+        return _fail(
+            "EPERM",
+            f"{seat_id!r} collides case-insensitively with the orchestrator seat at apply "
+            "time — refused regardless of what request-time checked (Loki audit BFCC5C79, F5)",
         )
 
     if (apps_root / seat_id / "manifest.json").is_file():
@@ -867,6 +885,28 @@ def _apply_federation_ratify(record: dict, path: Path, *, ledger, apps_root: Pat
         return _fail("edrift", f"command {target['command']!r} no longer exists or is not executable")
 
     from . import mcp_federation
+
+    # Loki audit BFCC5C79, F3: mcp_federation.ratify() reads the CURRENT
+    # registry via _read_registry_file() and, when its detached signature no
+    # longer verifies (the exact state right after install.sh re-signs every
+    # SEAT manifest under a fresh WILLOW_PGP_FINGERPRINT but forgets the
+    # federation registry itself), silently treats it as `{}` and starts the
+    # merge from empty — ratify() itself ignores that second return value.
+    # Refuse here, before ever reaching ratify(), rather than let the first
+    # post-fingerprint-change federation.ratify silently drop every other
+    # ratified server. install.sh step 6 now re-signs servers.json too (same
+    # commit), so this should never fire in the intended sequence; it is the
+    # backstop for every other way the registry's signature could go stale.
+    _existing_entries, _registry_ok = mcp_federation._read_registry_file()
+    if not _registry_ok:
+        return _fail(
+            "EACCES",
+            f"federation registry at {mcp_federation.registry_path()} does not verify "
+            "under the current WILLOW_PGP_FINGERPRINT (or is corrupt) — refusing to "
+            "ratify from what mcp_federation.ratify() would otherwise silently read as "
+            "an empty registry, dropping every other ratified entry",
+            path=str(mcp_federation.registry_path()),
+        )
 
     resolved = mcp_federation._resolved_command_path(target["command"])
     server_id = mcp_federation._stable_id(resolved, target["name"])

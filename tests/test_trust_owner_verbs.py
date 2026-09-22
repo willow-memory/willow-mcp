@@ -385,6 +385,50 @@ def test_create_already_exists_is_eexist(home, tmp_path, monkeypatch, store, rin
     assert out["error"] == "EEXIST"
 
 
+def test_create_seat_named_willow_case_insensitive_collision_is_refused(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit BFCC5C79, F5: `create seat Willow ...` used to pass —
+    human_session.is_orchestrator_app lowercases before comparing, but the
+    seat namespace on disk is case-sensitive, so 'Willow' and 'willow' were
+    treated as the same seat by every case-insensitive check elsewhere while
+    manifest.create let a manifest be created for the literal string
+    'Willow'. manifest.retire already refused the same collision (the
+    orchestrator seat itself can never be retired); create must agree."""
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=21,
+             bounds={"apps": ["Willow"], "groups": []})
+    _seal(home, store, pair_id="pair-cre-willow",
+          target_text="create seat Willow store_scope [] store_write [] permissions []",
+          kr=ring_with_sean)
+    out = _create_seat(store=store, pair_id="pair-cre-willow",
+                        apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EPERM"
+    assert not (home / "mcp_apps" / "Willow" / "manifest.json").exists()
+
+
+def test_create_apply_time_refuses_willow_collision_even_if_request_time_missed_it(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """The apply-side re-check (never trust what request-time already
+    verified) — same shape as the escalation-group re-check."""
+    pair_id = "pair-cre-willow-apply"
+    grants_root = home / "manifest_grants"
+    (grants_root / "pending").mkdir(parents=True, exist_ok=True)
+    target = {"app_id": "Willow", "store_scope": [], "store_write": [], "permissions": []}
+    record = {
+        "pair_id": pair_id, "verb": tov.VERB_CREATE, "envelope_id": "env-x", "citation_id": "cit-x",
+        "actor": "willow", "target": target, "project": "willow-mcp", "session": "",
+        "requested_at": "2026-01-01T00:00:00+00:00", "pre_state": {"Willow": {"exists": False}},
+        "call_args": {"apps": ["Willow"], "groups": []}, "broker_sig": "irrelevant",
+    }
+    (grants_root / "pending" / f"{pair_id}.json").write_text(json.dumps(record))
+    out = tov._apply_manifest_create(
+        record, grants_root / "pending" / f"{pair_id}.json",
+        ledger=None, apps_root=home / "mcp_apps", db_path=None, grants_root=grants_root,
+    )
+    assert out["error"] in ("EPERM", "eforged")  # eforged if the signature/citation check runs first
+
+
 def test_create_end_to_end_jeles_corpus(home, tmp_path, monkeypatch, store, ring_with_sean):
     _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=21,
              bounds={"apps": ["jeles-corpus"], "groups": []})
@@ -567,3 +611,217 @@ def test_unknown_verb_in_pending_file_is_enosys(home, tmp_path, store):
     )
     assert apply_out["processed"][0]["error"] == "ENOSYS"
     assert (grants_root / "failed" / "pair-unknown.json").is_file()
+
+
+# ── F6 (Loki audit BFCC5C79): the brief's own per-verb Prove list, missing
+# for all four verbs — EALREADY, apply-time eseal_mismatch, apply-time
+# EACCES receipt in failed/, and (one representative exemplar, since the
+# mechanism is verb-agnostic shared plumbing —
+# _verify_pending_signature_and_citation) apply-time eforged. Apply-time
+# edrift already has direct coverage for envelope.revoke, manifest.retire,
+# and federation.ratify in the end-to-end/refusal tests above; this section
+# does not repeat it.
+
+def test_revoke_second_request_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
+    active_extra = [{
+        "id": "env-x", "verb_id": 99, "verb": "some.other", "grantee": "jeles",
+        "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
+        "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+        "status": "active",
+    }]
+    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=19,
+             bounds={"envelope_ids": ["env-x"]}, extra=active_extra)
+    _seal(home, store, pair_id="pair-rev-ea", target_text="revoke envelope env-x: first", kr=ring_with_sean)
+    grants_root = home / "manifest_grants"
+    out1 = _revoke_env(store=store, pair_id="pair-rev-ea", grants_root=grants_root)
+    assert out1["ok"] is True
+    out2 = _revoke_env(store=store, pair_id="pair-rev-ea", grants_root=grants_root)
+    assert out2["error"] == "EALREADY"
+
+
+def test_revoke_apply_time_eseal_mismatch(home, tmp_path, monkeypatch, store, ring_with_sean):
+    active_extra = [{
+        "id": "env-x", "verb_id": 99, "verb": "some.other", "grantee": "jeles",
+        "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
+        "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+        "status": "active",
+    }]
+    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=19,
+             bounds={"envelope_ids": ["env-x", "env-y"]}, extra=active_extra)
+    _seal(home, store, pair_id="pair-rev-mismatch",
+          target_text="revoke envelope env-x: original reason", kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _revoke_env(store=store, ledger=ledger, pair_id="pair-rev-mismatch", grants_root=grants_root)
+    assert out["ok"] is True
+
+    # The sealed pair's own text changes after the request was recorded —
+    # re-sealed (same pair_id, INSERT OR REPLACE) with a different reason.
+    # Apply re-parses the CURRENT sealed text fresh and must refuse rather
+    # than trust the pending record's stale recorded target.
+    _seal(home, store, pair_id="pair-rev-mismatch",
+          target_text="revoke envelope env-x: a DIFFERENT reason", kr=ring_with_sean)
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["error"] == "eseal_mismatch"
+    assert (grants_root / "failed" / "pair-rev-mismatch.json").is_file()
+
+
+def test_revoke_apply_time_eforged_on_tampered_signature(home, tmp_path, monkeypatch, store, ring_with_sean):
+    active_extra = [{
+        "id": "env-x", "verb_id": 99, "verb": "some.other", "grantee": "jeles",
+        "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
+        "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+        "status": "active",
+    }]
+    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=19,
+             bounds={"envelope_ids": ["env-x"]}, extra=active_extra)
+    _seal(home, store, pair_id="pair-rev-forge", target_text="revoke envelope env-x: t", kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _revoke_env(store=store, ledger=ledger, pair_id="pair-rev-forge", grants_root=grants_root)
+    assert out["ok"] is True
+
+    pending_path = grants_root / "pending" / "pair-rev-forge.json"
+    record = json.loads(pending_path.read_text())
+    record["broker_sig"] = "00" * 64  # structurally valid hex, not this broker's signature
+    pending_path.write_text(json.dumps(record, indent=2))
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["error"] == "eforged"
+    assert (grants_root / "failed" / "pair-rev-forge.json").is_file()
+
+
+def test_revoke_apply_time_eacces_on_unwritable_registry(home, tmp_path, monkeypatch, store, ring_with_sean):
+    active_extra = [{
+        "id": "env-x", "verb_id": 99, "verb": "some.other", "grantee": "jeles",
+        "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
+        "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+        "status": "active",
+    }]
+    reg = _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=19,
+                    bounds={"envelope_ids": ["env-x"]}, extra=active_extra)
+    _seal(home, store, pair_id="pair-rev-eacces", target_text="revoke envelope env-x: t", kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _revoke_env(store=store, ledger=ledger, pair_id="pair-rev-eacces", grants_root=grants_root)
+    assert out["ok"] is True
+
+    reg.parent.chmod(0o500)  # the registry's own directory, no longer writable
+    try:
+        apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    finally:
+        reg.parent.chmod(0o700)  # restore so pytest's own tmp_path cleanup can remove it
+    processed = apply_out["processed"][0]
+    assert processed["error"] in ("EACCES", "eunexpected")
+    assert (grants_root / "failed" / "pair-rev-eacces.json").is_file()
+
+
+def test_retire_second_request_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=20, bounds={"apps": ["jeles"]})
+    _manifest(home, "jeles")
+    _seal(home, store, pair_id="pair-ret-ea", target_text="retire seat jeles: t", kr=ring_with_sean)
+    grants_root = home / "manifest_grants"
+    out1 = _retire_seat(store=store, pair_id="pair-ret-ea", apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out1["ok"] is True
+    out2 = _retire_seat(store=store, pair_id="pair-ret-ea", apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out2["error"] == "EALREADY"
+
+
+def test_retire_apply_time_eacces_on_unwritable_apps_root(home, tmp_path, monkeypatch, store, ring_with_sean):
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=20, bounds={"apps": ["jeles"]})
+    _manifest(home, "jeles")
+    _seal(home, store, pair_id="pair-ret-eacces", target_text="retire seat jeles: t", kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    apps_root = home / "mcp_apps"
+    out = _retire_seat(store=store, ledger=ledger, pair_id="pair-ret-eacces", apps_root=apps_root, grants_root=grants_root)
+    assert out["ok"] is True
+
+    apps_root.chmod(0o500)  # can no longer create _retired/ or rename into it
+    try:
+        apply_out = _apply(ledger=ledger, apps_root=apps_root, grants_root=grants_root)
+    finally:
+        apps_root.chmod(0o700)
+    processed = apply_out["processed"][0]
+    assert processed["error"] in ("EACCES", "eunexpected")
+    assert (grants_root / "failed" / "pair-ret-eacces.json").is_file()
+
+
+def test_create_second_request_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=21,
+             bounds={"apps": ["jeles-corpus"], "groups": []})
+    _seal(home, store, pair_id="pair-cre-ea",
+          target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
+          kr=ring_with_sean)
+    grants_root = home / "manifest_grants"
+    out1 = _create_seat(store=store, pair_id="pair-cre-ea", apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out1["ok"] is True
+    out2 = _create_seat(store=store, pair_id="pair-cre-ea", apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out2["error"] == "EALREADY"
+
+
+def test_create_apply_time_eacces_on_unwritable_apps_root(home, tmp_path, monkeypatch, store, ring_with_sean):
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=21,
+             bounds={"apps": ["jeles-corpus"], "groups": []})
+    _seal(home, store, pair_id="pair-cre-eacces",
+          target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
+          kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    apps_root = home / "mcp_apps"
+    apps_root.mkdir(parents=True, exist_ok=True)
+    out = _create_seat(store=store, ledger=ledger, pair_id="pair-cre-eacces", apps_root=apps_root, grants_root=grants_root)
+    assert out["ok"] is True
+
+    apps_root.chmod(0o500)  # manifest_admin.create_manifest cannot mkdir the new seat dir
+    try:
+        apply_out = _apply(ledger=ledger, apps_root=apps_root, grants_root=grants_root)
+    finally:
+        apps_root.chmod(0o700)
+    processed = apply_out["processed"][0]
+    assert processed["error"] in ("EACCES", "eunexpected")
+    assert (grants_root / "failed" / "pair-cre-eacces.json").is_file()
+
+
+def test_ratify_second_request_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
+    server = _fake_server(tmp_path)
+    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=22, bounds={"servers": ["jeles-corpus"]})
+    _seal(home, store, pair_id="pair-fed-ea",
+          target_text=f"ratify federation server jeles-corpus command {server} cwd {tmp_path} env_keys [WILLOW_HOME]",
+          kr=ring_with_sean)
+    grants_root = home / "manifest_grants"
+    out1 = _ratify(store=store, pair_id="pair-fed-ea", grants_root=grants_root)
+    assert out1["ok"] is True
+    out2 = _ratify(store=store, pair_id="pair-fed-ea", grants_root=grants_root)
+    assert out2["error"] == "EALREADY"
+
+
+def test_ratify_apply_time_eseal_mismatch(home, tmp_path, monkeypatch, store, ring_with_sean):
+    server = _fake_server(tmp_path)
+    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=22, bounds={"servers": ["jeles-corpus"]})
+    _seal(home, store, pair_id="pair-fed-mismatch",
+          target_text=f"ratify federation server jeles-corpus command {server} cwd {tmp_path} env_keys [WILLOW_HOME]",
+          kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _ratify(store=store, ledger=ledger, pair_id="pair-fed-mismatch", grants_root=grants_root)
+    assert out["ok"] is True
+
+    _seal(home, store, pair_id="pair-fed-mismatch",
+          target_text=f"ratify federation server jeles-corpus command {server} cwd {tmp_path} "
+                      "env_keys [WILLOW_HOME, WILLOW_STORE_ROOT]",
+          kr=ring_with_sean)
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["error"] == "eseal_mismatch"
+    assert (grants_root / "failed" / "pair-fed-mismatch.json").is_file()
