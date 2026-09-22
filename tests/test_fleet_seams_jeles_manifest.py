@@ -94,6 +94,19 @@ def test_provision_writes_manifest_at_the_path_manifest_scope_reads(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["store_scope"] == ["ask_jeles_corpus"]
     assert manifest["store_write"] == ["ask_jeles_corpus"]
+    # #619 fleet-seams leg, for real: "gate: empty permissions for
+    # 'jeles-corpus' (tool='gap_log') — denied" -- willow-mcp's own gate
+    # reads "permissions" from this same manifest file.
+    assert manifest["permissions"] == ["gap_write"]
+
+
+def test_provision_manifest_permissions_grant_gap_log_and_nothing_wider():
+    """Rework of #619: the fixture must carry the narrowest group that
+    includes gap_log (gate.PERMISSION_GROUPS['gap_write']), not full_access
+    or some other wider grant."""
+    from willow_mcp import gate
+
+    assert "gap_log" in gate.PERMISSION_GROUPS["gap_write"]
 
 
 def test_provision_writes_a_sibling_sig_that_looks_ascii_armored(
@@ -135,14 +148,25 @@ def test_sig_fixture_is_a_real_armor_block_not_prose_wearing_the_markers(fleet_s
     assert actual_crc == expected_crc
 
 
-def test_sig_fixture_passes_jeles_own_shape_check_when_jeles_is_installed(
+def test_sig_fixture_passes_jeles_own_manifest_scope_when_jeles_is_installed(
     fleet_seams, tmp_path, monkeypatch,
 ):
-    """The real proof: jeles' own `_looks_like_pgp_signature` (the function
-    `_manifest_scope` actually calls) accepts this fixture's shape. Skipped
-    when jeles is not installed in this venv -- co-install is a separate
-    seam, and this repo does not hard-depend on the sibling checkout."""
+    """The real proof, through the PUBLIC entry point rather than a named
+    private helper: #619's test-matrix leg failed with `AttributeError:
+    module 'jeles.corpus' has no attribute '_looks_like_pgp_signature'` --
+    CI co-installs jeles fresh from its real current state, which does not
+    match either local checkout this repo can read offline, and the
+    private shape-check function's exact name is exactly the kind of
+    internal detail a refactor is free to change without notice. Testing
+    through `_manifest_scope()` -- the function this fixture actually has
+    to satisfy, and the one gap 3cdeb177af78's whole design depends on --
+    is correct regardless of what it calls internally to judge the `.sig`.
+    Skipped when jeles is not installed in this venv -- co-install is a
+    separate seam, and this repo does not hard-depend on the sibling
+    checkout."""
     corpus = pytest.importorskip("jeles.corpus", reason="jeles not installed in this venv")
+    if not hasattr(corpus, "_manifest_scope"):
+        pytest.skip("this jeles install predates _manifest_scope (gap 3cdeb177af78 unmerged)")
 
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     monkeypatch.delenv("WILLOW_MCP_APPS_ROOT", raising=False)
@@ -150,8 +174,10 @@ def test_sig_fixture_passes_jeles_own_shape_check_when_jeles_is_installed(
 
     fleet_seams._provision_jeles_corpus_manifest()
 
-    sig_path = tmp_path / "mcp_apps" / "jeles-corpus" / "manifest.json.sig"
-    assert corpus._looks_like_pgp_signature(sig_path.read_text(encoding="utf-8"))
+    scope, write, error = corpus._manifest_scope()
+    assert error is None, f"_manifest_scope refused the fixture: {error}"
+    assert scope == ["ask_jeles_corpus"]
+    assert write == ["ask_jeles_corpus"]
 
 
 def test_provision_is_idempotent_across_repeated_runs(fleet_seams, tmp_path, monkeypatch):

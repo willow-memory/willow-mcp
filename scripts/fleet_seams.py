@@ -173,6 +173,15 @@ def _provision_jeles_corpus_manifest() -> None:
             {
                 "store_scope": list(_JELES_CORPUS_FIXTURE_COLLECTIONS),
                 "store_write": list(_JELES_CORPUS_FIXTURE_COLLECTIONS),
+                # willow-mcp's own gate reads "permissions" from this SAME
+                # manifest file (it is not jeles-side scope, a separate
+                # concept) -- an absent/empty list denies every tool call,
+                # which is what #619's fleet-seams leg measured for real:
+                # "gate: empty permissions for 'jeles-corpus' (tool=
+                # 'gap_log') — denied". gap_write is the narrowest
+                # PERMISSION_GROUPS entry that carries gap_log (gate.py) --
+                # not full_access, not a wider gap_* group.
+                "permissions": ["gap_write"],
             },
             indent=2,
         )
