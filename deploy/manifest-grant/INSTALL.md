@@ -132,12 +132,47 @@ proposals.json` now — never the register, at all, ever, regardless of which
 uid calls them. `ratify()` is the one broker-side act the sealed text names
 as touching the register; it writes both files and signs the register under
 `WILLOW_PGP_FINGERPRINT` via `--local-user` (never gpg's ambient default
-key — the other defect R2 measured). `syscall-table.json`, if it lives
-alongside the register, is deliberately left broker-owned: `trusted_read`'s
-file-level check is euid-based and does not care who owns the PARENT, so a
-broker-owned file in a trust-owner-owned directory still reads fine for the
-broker; only the register file itself needs to be trust-owner-owned and
-signed.
+key — the other defect R2 measured). `syscall-table.json` used to be
+deliberately left broker-owned here, since nothing wrote it at install time
+— see step 1c below for why that changed.
+
+## 1c. Sync constitutional policy files from the checkout bundle
+
+Gap `c1395b307421`: nothing ever copied the checkout's own
+`src/willow_mcp/bundle/constitutional/syscall-table.json` onto an installed
+box. Measured 2026-09-22: the box's table was 22 rows, stale by one row
+(`24 envelope.ratify`, shipped by PR 628 hours earlier) — one missing row
+froze every envelope ratification behind it, because the verb could never
+be governed at all (`UnknownVerbError`).
+
+    deploy/manifest-grant/sync_constitutional.py <checkout>/src/willow_mcp/bundle/constitutional $H/constitutional
+
+`constitutional/` holds POLICY (`syscall-table.json`) and LIVE STATE
+(`pre-approved.json`, the active envelope register; `review_queue.json`;
+`frank_head_anchor.json`) in the same directory — a sync that copied the
+whole bundle directory onto the box would destroy the register. So this
+step works from an explicit **ALLOWLIST**, currently exactly
+`syscall-table.json`:
+
+* every name on the allowlist that the bundle does NOT ship is a hard
+  failure — `install.sh` stops, `constitutional/` is untouched;
+* every name in the bundle NOT on the allowlist (the bundle's own seed copy
+  of `pre-approved.json`, for instance) is skipped and printed as skipped —
+  never copied, never touched;
+* for the one file it does sync, the script prints the box's row count and
+  mtime BEFORE, the checkout bundle's row count, and the box's row count
+  AFTER — so a stale table is visible in the installer's own output, not
+  something inferred later from a verb refusing `UnknownVerbError`;
+* running the step twice changes nothing the second time, and says so
+  (`... no-op`).
+
+`syscall-table.json` is chowned to `willow-operator` and re-signed in step
+6 below, alongside the register and the federation registry — the same
+governance-integrity shape `pre-approved.json` already has under sealed
+`31f5d3af`. It was left broker-owned before this step existed because
+nothing wrote it at install time; now that this step does, an
+edited-but-unsigned governance file would lock the whole box out under a
+denial that blames something else, so it gets the same treatment.
 
 `federation.ratify` (row 23) writes `mcp_apps/_federation/servers.json` —
 already under `mcp_apps/`, already trust-owner-owned by the recursive chown
@@ -220,7 +255,7 @@ own `$H/env` to match.
     # role's read grants on the FRANK tables plus INSERT
     sudo -u willow-operator psql -d $WILLOW_PG_DB -c 'select 1'   # must succeed
 
-## 6. Re-sign every seat manifest, the register, and the federation registry
+## 6. Re-sign every seat manifest, the register, the syscall table, and the federation registry
 
 The pre-state check refuses a manifest whose current signature does not
 verify under `WILLOW_PGP_FINGERPRINT`; after pair `31f5d3af`,
@@ -228,7 +263,8 @@ verify under `WILLOW_PGP_FINGERPRINT`; after pair `31f5d3af`,
 envelope register, and `mcp_federation._read_registry_file` does it for the
 federation registry. `install.sh` signs every `mcp_apps/*/manifest.json`
 under the fresh key as the trust owner, **and now also
-`constitutional/pre-approved.json` and `mcp_apps/_federation/servers.json`**
+`constitutional/pre-approved.json`, `constitutional/syscall-table.json`
+(gap `c1395b307421`, step 1c above), and `mcp_apps/_federation/servers.json`**
 — Loki audit BFCC5C79's F3: missing the federation registry here meant the
 first `federation.ratify` after any fingerprint change would read "no
 ratified servers" (`mcp_federation.ratify()` starts its merge from `{}` when
@@ -237,7 +273,10 @@ flag that says so) and silently drop every other entry.
 `trust_owner_verbs._apply_federation_ratify` also gained a defensive check
 refusing `EACCES` before ever reaching `mcp_federation.ratify()` if the
 registry does not verify, as a backstop for every other way its signature
-could go stale — but this step is the real fix.
+could go stale — but this step is the real fix. The syscall table's own
+signature is verified immediately after signing (`gpg --verify`) — an
+edited-but-unsigned governance file has already locked the whole box out
+once, under a denial that blamed something else.
 
 ## 6b. Withdraw every request minted before this install
 
@@ -307,18 +346,21 @@ trust-owner-owned, a plain broker-uid call to `ratify()` now refuses
 only at the register write itself, after already inking FRANK and deleting
 the proposal from the queue; fixed to refuse before touching either file).
 
-**On the installed box, ratifying an envelope is not possible until
-`envelope.ratify` (gap `d3f79320ccb5`) lands** (Loki audit 42B3B46F, U1). A
-`sudo -u willow-operator` invocation is NOT a working alternative — earlier
-drafts of this document said it was; that was wrong, measured wrong: that
-uid can write the register but then fails reading the OTHER file this same
-call needs, the broker-owned `0600` proposals sidecar. There is no uid on
-the box that can complete `ratify()` as written. A proposal sealed and
-ratify-attempted while this gap is open stays queued in
-`$H/proposals/proposals.json` — refused, not lost; nothing is half-applied.
-The fix is the same shape as the other four verbs — a trust-owner
-`envelope.ratify` apply-half verb, mirroring `manifest.grant`'s own
-request/apply split — not built in this packet.
+The desk's own `envelope_ratify` (the direct, sidecar-path act) still
+refuses `EACCES` on an installed box for the reason above — that refusal is
+unchanged and correct, and is not a shim onto the trust-owner path. The fix
+is `envelope.ratify` (gap `d3f79320ccb5`, trust-owner apply half, syscall
+table row 24, `envelope_ratify_request` on the desk) — the same
+request/apply shape as the other four verbs — and it already exists in code
+(`trust_owner_verbs.py`, PR 628). What blocked it on THIS box until step 1c
+above was narrower and easier to miss than the code gap: the box's own
+`syscall-table.json` did not carry row 24 at all, so `envelope_propose(verb=
+'envelope.ratify')` refused `UnknownVerbError` before an envelope over the
+verb could even be proposed, let alone ratified — the code existed and the
+box could not reach it. Confirm the table synced (`envelope_ratify_request`
+stops naming a real reason, not `UnknownVerbError`/`ENOENT`, if it still
+does not) before assuming a ratify failure is this gap rather than the
+ordinary sealed-pair/digest checks `envelope_ratify_request` itself makes.
 
 `propose()` and `reject()` are unaffected — they only ever touch the
 broker-owned `$H/proposals/` sidecar, never the register, from any uid, and

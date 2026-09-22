@@ -131,6 +131,45 @@ def _timer_missing(text: str) -> list[str]:
     return [r for r in required if r not in text]
 
 
+# dispatch A9BF01A9 (amending BD5843FD) markers below: the atomic sync+sign
+# (gap c1395b307421's real defect), the carried gpg fix (338bbdb), and the
+# envelope.ratify bootstrap seed (gap 18affe49e198).
+
+_GPG_PATH_OUTPUT_PATTERN = '-o "$SIG_TMP"'
+
+
+def _install_sh_gpg_writes_to_a_path_offenders(install_sh_text: str) -> list[str]:
+    """338bbdb: gpg must never be handed a path to open for writing (it runs
+    as a different uid than the one that created the temp file) — every
+    detached-sign call uses `--output -` into a shell redirection instead.
+    Returns the offending lines' count as a list so the assert reads like
+    the other scan helpers here (empty == clean)."""
+    body = _script_body(install_sh_text)
+    return [_GPG_PATH_OUTPUT_PATTERN for _ in body.split("\n") if _GPG_PATH_OUTPUT_PATTERN in _]
+
+
+_ONE_ACT_SYNC_SIGN_MARKERS = (
+    "sync_and_sign", "--sign-as", "seed_envelope_ratify.py",
+)
+
+
+def _install_sh_missing_one_act_markers(install_sh_text: str) -> list[str]:
+    """Dispatch A9BF01A9: step 1c's sync and sign must be one act
+    (sync_constitutional.py's --sign-as/sync_and_sign path), and the
+    envelope.ratify bootstrap envelope must be seeded."""
+    body = _script_body(install_sh_text)
+    return [marker for marker in _ONE_ACT_SYNC_SIGN_MARKERS if marker not in body]
+
+
+def _install_sh_syscall_table_double_signed(install_sh_text: str) -> bool:
+    """True if $SYSCALL_TABLE still appears in step 6's re-sign loop — it
+    must not: step 1c signs it atomically, in the same act as the sync;
+    step 6 re-signing it again is not just redundant, it reopens the
+    two-acts-not-one window this PR exists to close."""
+    body = _script_body(install_sh_text)
+    return '"$REG" "$SYSCALL_TABLE"' in body
+
+
 def _old_template_has_a_fixed_user_line(text: str) -> bool:
     """True only for an actual `User=<name>` CONFIG line with no template
     placeholder — never a comment mentioning `User=` in prose."""
@@ -196,6 +235,27 @@ def test_plant_every_deploy_scan_helper_catches_its_violation():
     ) is False
     assert _install_sh_6b_before_restart("neither marker present") is False
 
+    assert _install_sh_gpg_writes_to_a_path_offenders(
+        'set -euo pipefail\nas_to gpg --detach-sign -o "$SIG_TMP" "$f"\n'
+    ) == ['-o "$SIG_TMP"']
+    assert _install_sh_gpg_writes_to_a_path_offenders(
+        'set -euo pipefail\nas_to gpg --detach-sign --output - "$f" > "$SIG_TMP"\n'
+    ) == []
+
+    assert _install_sh_missing_one_act_markers("set -euo pipefail\nnothing here") == list(
+        _ONE_ACT_SYNC_SIGN_MARKERS
+    )
+    assert _install_sh_missing_one_act_markers(
+        "set -euo pipefail\nsync_and_sign --sign-as x seed_envelope_ratify.py"
+    ) == []
+
+    assert _install_sh_syscall_table_double_signed(
+        'set -euo pipefail\nfor f in "$REG" "$SYSCALL_TABLE" "$H/mcp_apps/_federation/servers.json"; do :; done'
+    ) is True
+    assert _install_sh_syscall_table_double_signed(
+        'set -euo pipefail\nfor f in "$REG" "$H/mcp_apps/_federation/servers.json"; do :; done'
+    ) is False
+
 
 def test_all_five_files_present():
     for name in (
@@ -260,6 +320,76 @@ def test_install_sh_shellcheck_clean_if_available():
         ["shellcheck", str(_DEPLOY / "install.sh")], capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_install_sh_never_hands_gpg_a_path_to_open_for_writing():
+    """338bbdb, carried onto this branch: gpg always runs as a DIFFERENT uid
+    than the one that created the temp file — a path handed to `-o` fails
+    with EACCES (measured on the box, first real two-uid run). Every sign
+    call uses `--output -` instead."""
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    assert _install_sh_gpg_writes_to_a_path_offenders(text) == []
+
+
+def test_install_sh_syncs_and_signs_syscall_table_as_one_act_and_seeds_the_bootstrap_envelope():
+    """Dispatch A9BF01A9: the real defect the operator's first live run
+    measured was step 1c (sync) and step 6 (sign) being TWO acts, with real
+    wall-clock time and several other steps in between — any interruption
+    in that window leaves an edited-but-unsigned governance file. Step 1c
+    must now sync and sign in one call (sync_and_sign, via --sign-as), and
+    step 6 must not re-sign syscall-table.json a second time. Also: the
+    envelope.ratify bootstrap envelope (gap 18affe49e198) must be seeded
+    somewhere in the script."""
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    assert _install_sh_missing_one_act_markers(text) == []
+    assert _install_sh_syscall_table_double_signed(text) is False
+
+
+def test_install_sh_key_setup_runs_before_the_atomic_sync_and_sign_step():
+    """$FPR must exist before step 1c calls sync_constitutional.py
+    --sign-as — the signing-key step was moved ahead of it for exactly this
+    reason (dispatch A9BF01A9)."""
+    body = _script_body((_DEPLOY / "install.sh").read_text(encoding="utf-8"))
+    idx_key = body.find("signing key owned by")
+    idx_sync_sign = body.find("sync + sign constitutional policy files")
+    assert idx_key != -1, "signing-key step not found"
+    assert idx_sync_sign != -1, "sync+sign step not found"
+    assert idx_key < idx_sync_sign
+
+
+_TRACKED_SHEBANG_SCRIPTS = (
+    _DEPLOY / "install.sh",
+    _DEPLOY / "sync_constitutional.py",
+    _DEPLOY / "seed_envelope_ratify.py",
+)
+
+
+def test_tracked_shebang_scripts_are_executable():
+    """`sudo <path>` (as opposed to `sudo bash <path>`) fails with
+    'Permission denied (os error 13)' on a tracked 0644 script — measured
+    on the box. Any tracked file whose first two bytes are `#!` must carry
+    at least one executable bit in git's own tree, not just on disk (a
+    worktree checkout can pick up the filesystem's umask; this checks the
+    mode git actually tracks)."""
+    import stat as _stat
+
+    for path in _TRACKED_SHEBANG_SCRIPTS:
+        assert path.is_file(), f"missing {path}"
+        first_bytes = path.read_bytes()[:2]
+        assert first_bytes == b"#!", f"{path} does not start with a shebang"
+        mode = path.stat().st_mode
+        assert mode & _stat.S_IXUSR, f"{path} is not executable (mode {oct(mode)})"
+
+    result = subprocess.run(
+        ["git", "ls-files", "-s", *(str(p) for p in _TRACKED_SHEBANG_SCRIPTS)],
+        cwd=_DEPLOY.parents[1], capture_output=True, text=True,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        for line in result.stdout.strip().splitlines():
+            git_mode = line.split()[0]
+            assert git_mode == "100755", f"git tracks a non-executable mode: {line}"
+    else:
+        pytest.skip("not inside the git checkout this test expects (git ls-files unavailable)")
 
 
 def test_bundle_manifest_grant_template_is_the_retired_user_unit_design():
