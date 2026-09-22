@@ -572,7 +572,11 @@ def manifest_create_request(
     same seat-name rule :mod:`gate` already enforces. First live use is the
     Jeles corpus organ (sealed ``ae23d366``): ``create seat jeles-corpus
     store_scope [ask_jeles_corpus, ask_jeles_corpus_gaps] store_write
-    [ask_jeles_corpus, ask_jeles_corpus_gaps] permissions []``."""
+    [ask_jeles_corpus, ask_jeles_corpus_gaps] permissions [gap_write]`` —
+    corrected, Loki audit 367C367A, T4: the live sealed line grants
+    ``gap_write`` (tonight's #619 red needs the organ able to forward gaps);
+    an empty permissions list here was documentary drift, not what was
+    actually sealed."""
     from .human_session import is_orchestrator_app
 
     if not is_orchestrator_app(app_id):

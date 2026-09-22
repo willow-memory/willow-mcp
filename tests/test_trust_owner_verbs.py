@@ -255,14 +255,14 @@ def test_revoke_end_to_end(home, tmp_path, monkeypatch, store, ring_with_sean):
     default_reg = home / "constitutional" / "pre-approved.json"
     default_reg.parent.mkdir(parents=True, exist_ok=True)
     active = [{
-        "id": "env-envelope.revoke-test", "verb_id": 19, "verb": "envelope.revoke",
+        "id": "env-envelope.revoke-test", "verb_id": 20, "verb": "envelope.revoke",
         "grantee": "willow", "bounds": {"envelope_ids": ["env-x"]},
         "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
         "max_count": None, "use_count_source": "frank", "status": "active",
     }] + active_extra
     default_reg.write_text(json.dumps({"active": active}))
     tab = home / "constitutional" / "syscall-table.json"
-    tab.write_text(json.dumps({"verbs": [{"id": 19, "verb": "envelope.revoke",
+    tab.write_text(json.dumps({"verbs": [{"id": 20, "verb": "envelope.revoke",
                                            "bounds": {"envelope_ids": "l"}}]}))
     monkeypatch.setenv("WILLOW_SYSCALL_TABLE", str(tab))
     _seal(home, store, pair_id="pair-rev-1",
@@ -379,7 +379,7 @@ def test_create_already_exists_is_eexist(home, tmp_path, monkeypatch, store, rin
              bounds={"apps": ["jeles-corpus"], "groups": []})
     _manifest(home, "jeles-corpus")
     _seal(home, store, pair_id="pair-cre-1",
-          target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
+          target_text="create seat jeles-corpus store_scope [] store_write [] permissions [gap_write]",
           kr=ring_with_sean)
     out = _create_seat(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
     assert out["error"] == "EEXIST"
@@ -756,9 +756,9 @@ def test_retire_apply_time_eacces_on_unwritable_apps_root(home, tmp_path, monkey
 
 def test_create_second_request_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
     _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
-             bounds={"apps": ["jeles-corpus"], "groups": []})
+             bounds={"apps": ["jeles-corpus"], "groups": ["gap_write"]})
     _seal(home, store, pair_id="pair-cre-ea",
-          target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
+          target_text="create seat jeles-corpus store_scope [] store_write [] permissions [gap_write]",
           kr=ring_with_sean)
     grants_root = home / "manifest_grants"
     out1 = _create_seat(store=store, pair_id="pair-cre-ea", apps_root=home / "mcp_apps", grants_root=grants_root)
@@ -769,9 +769,9 @@ def test_create_second_request_is_ealready(home, tmp_path, monkeypatch, store, r
 
 def test_create_apply_time_eacces_on_unwritable_apps_root(home, tmp_path, monkeypatch, store, ring_with_sean):
     _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
-             bounds={"apps": ["jeles-corpus"], "groups": []})
+             bounds={"apps": ["jeles-corpus"], "groups": ["gap_write"]})
     _seal(home, store, pair_id="pair-cre-eacces",
-          target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
+          target_text="create seat jeles-corpus store_scope [] store_write [] permissions [gap_write]",
           kr=ring_with_sean)
     pg = _FakeGovernancePg()
     ledger = _ledger(pg)
@@ -894,9 +894,9 @@ def test_create_apply_time_edrift_manifest_created_meanwhile(home, tmp_path, mon
     for the same seat landed first. Apply must refuse rather than clobber
     it."""
     _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
-             bounds={"apps": ["jeles-corpus"], "groups": []})
+             bounds={"apps": ["jeles-corpus"], "groups": ["gap_write"]})
     _seal(home, store, pair_id="pair-cre-edrift",
-          target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
+          target_text="create seat jeles-corpus store_scope [] store_write [] permissions [gap_write]",
           kr=ring_with_sean)
     pg = _FakeGovernancePg()
     ledger = _ledger(pg)
