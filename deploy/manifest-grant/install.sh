@@ -103,13 +103,13 @@ KEY_UID='willow-mcp manifest-grant (trust owner) <manifest-grant@willow-operator
 HERE=$(cd "$(dirname "$0")" && pwd)
 CHECK_ONLY=${1:-}
 BROKER_PUBLIC_KEY_NAME=broker_public_key.pub   # manifest_grant_executor._broker_public_key_path
-BROKER_UNIT_CANDIDATES="willow-mcp-serve.service willow-mcp.service"  # reloader.DEFAULT_UNIT / unit_reload_executor._BROKER_UNIT_STEMS
+BROKER_UNIT_CANDIDATES=(willow-mcp-serve.service willow-mcp.service)  # reloader.DEFAULT_UNIT / unit_reload_executor._BROKER_UNIT_STEMS
 PY="$H/venvs/willow-mcp/bin/python"
 
 say()  { printf '%s\n' "$*"; }
 stop() { printf 'STOP: %s\n' "$*" >&2; exit 2; }
-as_op() { sudo -u "$OPERATOR" XDG_RUNTIME_DIR=/run/user/$OPERATOR_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$OPERATOR_UID/bus "$@"; }
-as_to() { sudo -u "$TRUST_OWNER" GNUPGHOME=$GNUPGHOME_TO "$@"; }
+as_op() { sudo -u "$OPERATOR" XDG_RUNTIME_DIR="/run/user/$OPERATOR_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$OPERATOR_UID/bus" "$@"; }
+as_to() { sudo -u "$TRUST_OWNER" GNUPGHOME="$GNUPGHOME_TO" "$@"; }
 
 # ---------------------------------------------------------------- preflight
 [ "$(id -u)" = 0 ] || stop "run as root (sudo bash install.sh)"
@@ -362,13 +362,13 @@ REMAINING=$(find "$H/manifest_grants/pending" -maxdepth 1 -name '*.json' | wc -l
 # Said here rather than implied by this step's success.
 say "== broker restart (WILLOW_PGP_FINGERPRINT changed in $H/env)"
 RESTARTED=""
-for u in $BROKER_UNIT_CANDIDATES; do
+for u in "${BROKER_UNIT_CANDIDATES[@]}"; do
   if as_op systemctl --user list-unit-files --no-legend "$u" 2>/dev/null | grep -q "^$u"; then
     as_op systemctl --user restart "$u" && say "  restarted $u" && RESTARTED=1
     break
   fi
 done
-[ -n "$RESTARTED" ] || say "  no known willow-mcp --user service found ($BROKER_UNIT_CANDIDATES) — restart the broker by hand if it runs another way"
+[ -n "$RESTARTED" ] || say "  no known willow-mcp --user service found (${BROKER_UNIT_CANDIDATES[*]}) — restart the broker by hand if it runs another way"
 say "  NOTE: a stdio-attached desk (an editor/CLI session, not the --user unit)"
 say "  cannot be restarted by this script — it must reconnect (restart the"
 say "  session) by hand to pick up the new WILLOW_PGP_FINGERPRINT."
