@@ -1,15 +1,16 @@
-"""The four trust-owner verbs added alongside `manifest.grant` on the same
+"""The five trust-owner verbs added alongside `manifest.grant` on the same
 queue (:mod:`willow_mcp.trust_owner_verbs`, sealed `1bd6fd29`): `envelope.revoke`,
-`manifest.retire`, `manifest.create`, `federation.ratify`. Fixtures mirror
-`tests/test_manifest_grant.py` (same fake FRANK ledger, same real-ed25519
-sealed-pair machinery) since these verbs share that module's queue and
-signing key.
+`manifest.retire`, `manifest.create`, `federation.ratify`, `envelope.ratify`.
+Fixtures mirror `tests/test_manifest_grant.py` (same fake FRANK ledger, same
+real-ed25519 sealed-pair machinery) since these verbs share that module's
+queue and signing key.
 """
 from __future__ import annotations
 
 import json
 import stat
 from datetime import datetime, timezone
+from unittest import mock
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -1070,3 +1071,561 @@ def test_create_refuses_reserved_retired_seat_name_at_request_time(home, tmp_pat
     out = _create_seat(store=store, pair_id="pair-cre-reserved",
                         apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
     assert out["error"] == "EINVAL"
+
+
+# ── envelope.ratify ───────────────────────────────────────────────────────
+#
+# Gap d3f79320ccb5: the fifth trust-owner verb, measured live 2026-09-22 —
+# the desk's own envelope_ratify EACCES on the installed box, three
+# envelopes queued behind it. Unlike the other four verbs, the apply half
+# can never read the broker-owned proposals sidecar at all (Loki audits
+# 367C367A T1 / 42B3B46F U1) — the request half copies the proposal's full
+# row into the signed request at request time instead. `ratify_proposal_row`
+# (envelope_authoring.py, the apply half's own primitive) refuses EREGISTRY
+# unless the register resolves to $WILLOW_HOME/constitutional/pre-approved.json
+# — same as envelope.revoke's own end-to-end test — so only the end-to-end
+# test below skips `_charter`'s WILLOW_ENVELOPE_REGISTRY override.
+#
+# Rework, Loki audit BDC2B0F2: A2 (high) — the grammar now carries a
+# digest over the proposal's governing fields (`tov._proposal_digest`),
+# and both halves cross-check the copied row against FRANK's own
+# `envelope_proposed` event. A1 (high) — `ratify_proposal_row`/`revoke`
+# now load ONLY the active register, never the sidecar. A3 (medium) —
+# `_save_active` signs the tmp candidate before either rename.
+
+def _write_sidecar(home, proposals=None, archived=None):
+    d = home / "proposals"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "proposals.json").write_text(json.dumps({
+        "proposals": proposals or [], "archived": archived or [],
+    }))
+
+
+def _proposal_row(proposal_id="env-jeles-dispatch", verb="dispatch", verb_id=5,
+                   grantee="jeles", bounds=None):
+    return {
+        "id": proposal_id, "verb_id": verb_id, "verb": verb, "grantee": grantee,
+        "bounds": bounds or {}, "issued_by": "", "issued_at": "", "ratified_via": "",
+        "expires_at": None, "max_count": None, "use_count_source": "frank",
+        "status": "proposed", "notes": "test proposal",
+        "proposed_at": "2026-01-01T00:00:00Z",
+        "proposed_by": {"verifier": "sean", "session_id": "s1"}, "precedent_ids": [],
+    }
+
+
+def _digest_for(row):
+    return tov._proposal_digest(row)
+
+
+def _ratify_text(row, words="go ahead", digest=None):
+    return f"ratify envelope {row['id']} {digest or _digest_for(row)}: {words}"
+
+
+def _ink_proposed(ledger, row):
+    """Seed the FRANK `envelope_proposed` anchor `envelope_authoring.propose`
+    would have inked at propose time — the second independent check both
+    halves now run against (Loki audit BDC2B0F2, A2)."""
+    from willow_mcp import envelope_authoring as _ea
+
+    ledger.append("willow", _ea.FRANK_EVENT_PROPOSED, {
+        "envelope_id": row["id"], "verb": row["verb"], "verb_id": row["verb_id"],
+        "grantee": row["grantee"], "bounds_digest": _ea._bounds_digest(row.get("bounds") or {}),
+    })
+
+
+def _envelope_ratify(app_id="willow", *, pair_id="pair-envrat-1", envelope_id="", ledger=None,
+                      store=None, grants_root=None, db_path=None):
+    return tov.envelope_ratify_request(
+        app_id, envelope_id=envelope_id, pair_id=pair_id,
+        ledger=ledger or _ledger(_FakeGovernancePg()), store=store,
+        grants_root=grants_root, db_path=db_path,
+    )
+
+
+def test_envelope_ratify_non_orchestrator_is_eperm(home, tmp_path, store):
+    out = _envelope_ratify("hanuman", store=store)
+    assert out["error"] == "EPERM"
+
+
+def test_envelope_ratify_no_seal_ring_is_eacces(home, tmp_path, store):
+    """No keyring configured at all: `_verify_seal_only` refuses before the
+    grammar or the sidecar is ever consulted — the "no seal" leg."""
+    row = _proposal_row()
+    _seal(home, store, pair_id="pair-envrat-1", target_text=_ratify_text(row))
+    out = _envelope_ratify(store=store)
+    assert out["error"] == "EACCES"
+
+
+def test_envelope_ratify_grammar_miss_is_einval(home, tmp_path, store, ring_with_sean):
+    _seal(home, store, pair_id="pair-envrat-1", target_text="please ratify it", kr=ring_with_sean)
+    out = _envelope_ratify(store=store)
+    assert out["error"] == "EINVAL"
+
+
+def test_envelope_ratify_grammar_missing_digest_is_einval(home, tmp_path, store, ring_with_sean):
+    """The pre-rework grammar (`ratify envelope <id>: <words>`, no digest)
+    no longer matches — Loki audit BDC2B0F2, A2's own grammar change."""
+    _seal(home, store, pair_id="pair-envrat-1",
+          target_text="ratify envelope env-jeles-dispatch: go ahead", kr=ring_with_sean)
+    out = _envelope_ratify(store=store)
+    assert out["error"] == "EINVAL"
+
+
+def test_envelope_ratify_unknown_proposal_is_enoent(home, tmp_path, monkeypatch, store, ring_with_sean):
+    _charter(tmp_path, monkeypatch, verb="envelope.ratify", verb_id=24,
+             bounds={"proposal_ids": ["env-jeles-dispatch"]})
+    _write_sidecar(home, proposals=[])
+    row = _proposal_row()
+    _seal(home, store, pair_id="pair-envrat-1", target_text=_ratify_text(row), kr=ring_with_sean)
+    out = _envelope_ratify(store=store, grants_root=home / "manifest_grants")
+    assert out["error"] == "ENOENT"
+
+
+def test_envelope_ratify_already_active_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
+    already_active = [{
+        "id": "env-jeles-dispatch", "verb_id": 5, "verb": "dispatch", "grantee": "jeles",
+        "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
+        "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+        "status": "active",
+    }]
+    _charter(tmp_path, monkeypatch, verb="envelope.ratify", verb_id=24,
+             bounds={"proposal_ids": ["env-jeles-dispatch"]}, extra=already_active)
+    row = _proposal_row()
+    _write_sidecar(home, proposals=[row])
+    _seal(home, store, pair_id="pair-envrat-1", target_text=_ratify_text(row), kr=ring_with_sean)
+    out = _envelope_ratify(store=store, grants_root=home / "manifest_grants")
+    assert out["error"] == "EALREADY"
+
+
+def test_envelope_ratify_existing_request_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
+    _charter(tmp_path, monkeypatch, verb="envelope.ratify", verb_id=24,
+             bounds={"proposal_ids": ["env-jeles-dispatch"]})
+    row = _proposal_row()
+    _write_sidecar(home, proposals=[row])
+    _seal(home, store, pair_id="pair-envrat-1", target_text=_ratify_text(row), kr=ring_with_sean)
+    grants_root = home / "manifest_grants"
+    (grants_root / "pending").mkdir(parents=True, exist_ok=True)
+    (grants_root / "pending" / "pair-envrat-1.json").write_text(json.dumps({"pair_id": "pair-envrat-1"}))
+    out = _envelope_ratify(store=store, grants_root=grants_root)
+    assert out["error"] == "EALREADY"
+
+
+def test_envelope_ratify_tampered_sidecar_refused_at_request(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit BDC2B0F2, A2 — Loki's exact probe: the sidecar is edited
+    (grantee/bounds changed) AFTER the digest was sealed. The request half
+    refuses fast, before a citation is ever spent."""
+    _charter(tmp_path, monkeypatch, verb="envelope.ratify", verb_id=24,
+             bounds={"proposal_ids": ["env-jeles-dispatch"]})
+    original = _proposal_row()
+    sealed_digest = _digest_for(original)
+    _seal(home, store, pair_id="pair-envrat-1",
+          target_text=_ratify_text(original, digest=sealed_digest), kr=ring_with_sean)
+
+    # The broker's own sidecar is edited after the seal: grantee escalated,
+    # bounds widened to a wildcard.
+    tampered = {**original, "grantee": "attacker", "bounds": {"a": ["*"]}}
+    _write_sidecar(home, proposals=[tampered])
+
+    out = _envelope_ratify(store=store, grants_root=home / "manifest_grants")
+    assert out["error"] == "eseal_mismatch"
+    assert out["computed_digest"] != out["expected_digest"]
+
+
+def test_envelope_ratify_frank_disagreement_refused_at_request(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """The second anchor: even a row whose digest happens to match (a
+    forged digest, or a coincidence) is refused if it disagrees with
+    FRANK's own envelope_proposed event."""
+    _charter(tmp_path, monkeypatch, verb="envelope.ratify", verb_id=24,
+             bounds={"proposal_ids": ["env-jeles-dispatch"]})
+    row = _proposal_row()
+    _write_sidecar(home, proposals=[row])
+    _seal(home, store, pair_id="pair-envrat-1", target_text=_ratify_text(row), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    # FRANK's own record of what was actually proposed disagrees (different
+    # grantee) — no envelope_proposed event matches this row at all.
+    _ink_proposed(ledger, {**row, "grantee": "jeles-corpus"})
+
+    out = _envelope_ratify(store=store, ledger=ledger, grants_root=home / "manifest_grants")
+    assert out["error"] == "edrift"
+    assert "grantee" in out["fields"]
+
+
+def test_envelope_ratify_end_to_end(home, tmp_path, monkeypatch, store, ring_with_sean):
+    # Same reasoning as envelope.revoke's own end-to-end test: ratify_proposal_row
+    # (the apply half's own primitive) refuses EREGISTRY unless the register
+    # resolves to $WILLOW_HOME/constitutional/pre-approved.json, so this test
+    # writes the charter at the DEFAULT resolution and never sets
+    # WILLOW_ENVELOPE_REGISTRY.
+    default_reg = home / "constitutional" / "pre-approved.json"
+    default_reg.parent.mkdir(parents=True, exist_ok=True)
+    governing = {
+        "id": "env-envelope.ratify-test", "verb_id": 24, "verb": "envelope.ratify",
+        "grantee": "willow", "bounds": {"proposal_ids": ["env-jeles-dispatch"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }
+    default_reg.write_text(json.dumps({"active": [governing]}))
+    tab = home / "constitutional" / "syscall-table.json"
+    tab.write_text(json.dumps({"verbs": [{"id": 24, "verb": "envelope.ratify",
+                                           "bounds": {"proposal_ids": "l"}}]}))
+    monkeypatch.setenv("WILLOW_SYSCALL_TABLE", str(tab))
+
+    proposal = _proposal_row(bounds={"channel": "ops"})
+    _write_sidecar(home, proposals=[proposal])
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    _ink_proposed(ledger, proposal)
+
+    _seal(home, store, pair_id="pair-envrat-1",
+          target_text=_ratify_text(proposal, words="ratify all three"), kr=ring_with_sean)
+
+    grants_root = home / "manifest_grants"
+    out = _envelope_ratify(store=store, ledger=ledger, grants_root=grants_root)
+    assert out["ok"] is True
+    assert out["state"] == "requested"
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["ok"] is True
+    assert processed["envelope_id"] == "env-jeles-dispatch"
+
+    status = mgx.manifest_grant_status("pair-envrat-1", grants_root=grants_root)
+    assert status["state"] == "done"
+
+    registry = json.loads(default_reg.read_text())
+    row = next(r for r in registry["active"] if r["id"] == "env-jeles-dispatch")
+    assert row["status"] == "active"
+    assert row["issued_by"] == "root"
+    assert row["ratified_by"] == "sean"
+    assert row["ratified_via"].startswith("frank ledger entry")
+
+    assert _receipts(pg, tov.EVENT_ENVELOPE_RATIFIED)
+
+    # Sidecar reconciliation (packet item 3): the sidecar still physically
+    # carried the proposal (the apply half never touches it), but the
+    # broker's own next read drops it once the register carries the id
+    # active — the queue is truthful after the apply half acts.
+    from willow_mcp import envelope_authoring as _ea
+    pending = _ea.list_pending(include_precedents=False)
+    assert not any(r["id"] == "env-jeles-dispatch" for r in pending)
+    sidecar_doc = json.loads((home / "proposals" / "proposals.json").read_text())
+    assert not any(r["id"] == "env-jeles-dispatch" for r in sidecar_doc["proposals"])
+
+
+def test_envelope_ratify_apply_refuses_tampered_row_even_if_request_missed_it(
+    home, tmp_path, store,
+):
+    """Loki audit BDC2B0F2, A2 — the check that actually holds: even if a
+    hand-crafted pending/ record (never mind how) carries a row whose
+    digest disagrees with the sealed one, the apply half refuses before
+    ever calling ratify_proposal_row."""
+    default_reg = home / "constitutional" / "pre-approved.json"
+    default_reg.parent.mkdir(parents=True, exist_ok=True)
+    default_reg.write_text(json.dumps({"active": []}))
+    row = _proposal_row()
+    sealed_digest = _digest_for(row)
+    _seal(home, store, pair_id="pair-envrat-apply-tamper",
+          target_text=_ratify_text(row, digest=sealed_digest), kr=None)
+    # _seal without a ring writes a stub seal_sig — good enough here since
+    # _apply_envelope_ratify's own seal re-verify is exercised elsewhere;
+    # this test targets the digest re-check specifically, reached only
+    # after a valid citation, so drive it directly against the function.
+    tampered = {**row, "grantee": "attacker"}
+    record = {
+        "pair_id": "pair-envrat-apply-tamper", "verb": tov.VERB_ENVELOPE_RATIFY,
+        "target": {"proposal_id": row["id"], "digest": sealed_digest, "words": "go ahead",
+                    "proposal": tampered},
+        "actor": "willow", "project": "willow-mcp", "session": "",
+        "citation_id": "cit-x", "envelope_id": "env-x", "broker_sig": "irrelevant",
+    }
+    grants_root = home / "manifest_grants"
+    (grants_root / "pending").mkdir(parents=True, exist_ok=True)
+    path = grants_root / "pending" / "pair-envrat-apply-tamper.json"
+    path.write_text(json.dumps(record))
+
+    out = tov._apply_envelope_ratify(
+        record, path, ledger=None, apps_root=home / "mcp_apps",
+        db_path=None, grants_root=grants_root,
+    )
+    # eforged (signature check) or eseal_mismatch/edrift (seal/digest re-check)
+    # — whichever gate is reached first, never `ok: True`.
+    assert out.get("ok") is not True
+    assert out["error"] in ("eforged", "eseal_mismatch", "edrift", "EACCES", "EUNREACH")
+
+
+def test_ratify_and_revoke_never_read_the_sidecar(home, tmp_path, store, ring_with_sean):
+    """Loki audit BDC2B0F2, A1 — ratify_proposal_row/revoke used to call
+    _load_registry(), which opens the broker-owned sidecar too; as the
+    trust owner that read is refused before any register write happens.
+    Patch the sidecar path itself to blow up if touched, and confirm both
+    apply-half primitives still complete a real write."""
+    from willow_mcp import envelope_authoring as ea
+
+    def _boom():
+        raise AssertionError("apply-half primitives must never read the sidecar")
+
+    reg = home / "constitutional" / "pre-approved.json"
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    reg.write_text(json.dumps({"active": []}))
+
+    with mock.patch.object(ea, "_proposals_path", _boom):
+        row = _proposal_row(proposal_id="env-a1-test")
+        result = ea.ratify_proposal_row(
+            row, ratified_by="sean", ratified_via="frank ledger entry cit-1", ledger=None,
+        )
+        assert result["status"] == "active"
+        assert result["id"] == "env-a1-test"
+
+        revoked = ea.revoke("env-a1-test", verifier="sean", reason="cleanup", ledger=None)
+        assert revoked["envelope_id"] == "env-a1-test"
+
+    registry = json.loads(reg.read_text())
+    row_after = next(r for r in registry["active"] if r["id"] == "env-a1-test")
+    assert row_after.get("revoked") is True
+
+
+def test_save_active_signs_tmp_before_rename_and_gpg_failure_leaves_prior_state(
+    home, tmp_path, monkeypatch, store,
+):
+    """Loki audit BDC2B0F2, A3 — sign the tmp candidate BEFORE either
+    rename (same order manifest_admin.publish_signed_pair already uses).
+    A gpg failure must leave the prior register and its prior .sig
+    byte-for-byte untouched, never a half-written register with a stale
+    or missing signature."""
+    from willow_mcp import envelope_authoring as ea
+    from willow_mcp import pgp
+
+    reg = home / "constitutional" / "pre-approved.json"
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    prior_active = [{
+        "id": "env-prior", "verb_id": 1, "verb": "dispatch", "grantee": "jeles",
+        "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
+        "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+        "status": "active",
+    }]
+    reg.write_text(json.dumps({"active": prior_active}))
+    reg_sig = pgp.detached_sig_path(reg)
+    reg_sig.write_bytes(b"-----BEGIN PGP SIGNATURE-----\nprior-sig\n-----END PGP SIGNATURE-----\n")
+    prior_reg_bytes = reg.read_bytes()
+    prior_sig_bytes = reg_sig.read_bytes()
+
+    monkeypatch.setenv("WILLOW_PGP_FINGERPRINT", "ABCD1234ABCD1234ABCD1234ABCD1234ABCD1234")
+    monkeypatch.setattr(pgp, "sign_detached", lambda *a, **kw: (False, "simulated gpg failure"))
+
+    with pytest.raises(ea.EnvelopeAuthoringError):
+        ea._save_active({"active": prior_active + [{
+            "id": "env-new", "verb_id": 2, "verb": "dispatch", "grantee": "jeles",
+            "bounds": {}, "issued_by": "root", "issued_at": "2026-02-01",
+            "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+            "status": "active",
+        }]})
+
+    assert reg.read_bytes() == prior_reg_bytes
+    assert reg_sig.read_bytes() == prior_sig_bytes
+    assert not (reg.parent / f"{reg.name}.tmp").exists()
+    assert not pgp.detached_sig_path(reg.parent / f"{reg.name}.tmp").exists()
+
+
+def test_envelope_ratify_apply_refuses_edrift_when_already_ratified(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """The apply-side re-check (never trust what request-time already
+    verified) — same shape as the other three verbs' drift re-checks."""
+    default_reg = home / "constitutional" / "pre-approved.json"
+    default_reg.parent.mkdir(parents=True, exist_ok=True)
+    governing = {
+        "id": "env-envelope.ratify-test", "verb_id": 24, "verb": "envelope.ratify",
+        "grantee": "willow", "bounds": {"proposal_ids": ["env-jeles-dispatch"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }
+    default_reg.write_text(json.dumps({"active": [governing]}))
+    tab = home / "constitutional" / "syscall-table.json"
+    tab.write_text(json.dumps({"verbs": [{"id": 24, "verb": "envelope.ratify",
+                                           "bounds": {"proposal_ids": "l"}}]}))
+    monkeypatch.setenv("WILLOW_SYSCALL_TABLE", str(tab))
+    proposal = _proposal_row(bounds={"channel": "ops"})
+    _write_sidecar(home, proposals=[proposal])
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    _ink_proposed(ledger, proposal)
+
+    _seal(home, store, pair_id="pair-envrat-1",
+          target_text=_ratify_text(proposal, words="ratify all three"), kr=ring_with_sean)
+
+    grants_root = home / "manifest_grants"
+    out = _envelope_ratify(store=store, ledger=ledger, grants_root=grants_root)
+    assert out["ok"] is True
+
+    # Drift: something else already ratified this proposal id between
+    # request and apply.
+    registry = json.loads(default_reg.read_text())
+    registry["active"].append({**proposal, "issued_by": "root", "issued_at": "2026-02-01",
+                                "status": "active", "ratified_via": "hand-edit", "ratified_by": "someone-else"})
+    default_reg.write_text(json.dumps(registry))
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["error"] == "edrift"
+
+    status = mgx.manifest_grant_status("pair-envrat-1", grants_root=grants_root)
+    assert status["state"] == "failed"
+
+
+# ── R3 (Loki audit 229BE2C1): no verb's apply path opens nestor.db ─────────
+#
+# fix/apply-half-receipt-log converted the first four trust-owner verbs to
+# the carried sealed row (gap 035d287206e1, F1): the request half embeds
+# `sealed_row` (covered by `broker_sig`), the apply half re-verifies with
+# `sealed_row=` and never opens nestor.db. envelope.ratify was added to
+# this branch AFTER that conversion and was left on the old `db_path=`
+# path — `git merge-tree` reported no conflict, so nothing would have
+# warned anyone; converted in the same commit as this test. Parametrised
+# over all five verbs so a SIXTH verb added later without this conversion
+# fails this test instead of going dark (EUNREACH every tick) on the box.
+# Proven the direct way test_manifest_grant.py's own
+# test_apply_succeeds_when_nestor_db_is_gone_after_request already uses
+# for manifest.grant: delete nestor.db ENTIRELY between request and apply.
+
+def _nestor_gone_setup_revoke(home, tmp_path, monkeypatch, store, ring_with_sean):
+    # envelope_authoring.revoke() refuses EREGISTRY unless the register
+    # resolves to $WILLOW_HOME/constitutional/pre-approved.json — same
+    # reasoning as test_revoke_end_to_end: never set WILLOW_ENVELOPE_REGISTRY
+    # (what _charter does) for this verb.
+    default_reg = home / "constitutional" / "pre-approved.json"
+    default_reg.parent.mkdir(parents=True, exist_ok=True)
+    active = [
+        {
+            "id": "env-envelope.revoke-nestor-gone", "verb_id": 20, "verb": "envelope.revoke",
+            "grantee": "willow", "bounds": {"envelope_ids": ["env-nestor-gone"]},
+            "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+            "max_count": None, "use_count_source": "frank", "status": "active",
+        },
+        {
+            "id": "env-nestor-gone", "verb_id": 99, "verb": "some.other", "grantee": "jeles",
+            "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
+            "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+            "status": "active",
+        },
+    ]
+    default_reg.write_text(json.dumps({"active": active}))
+    tab = home / "constitutional" / "syscall-table.json"
+    tab.write_text(json.dumps({"verbs": [{"id": 20, "verb": "envelope.revoke",
+                                           "bounds": {"envelope_ids": "l"}}]}))
+    monkeypatch.setenv("WILLOW_SYSCALL_TABLE", str(tab))
+    _seal(home, store, pair_id="pair-nestor-gone",
+          target_text="revoke envelope env-nestor-gone: t", kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _revoke_env(store=store, ledger=ledger, pair_id="pair-nestor-gone", grants_root=grants_root)
+    assert out["ok"] is True, out
+    return ledger, grants_root
+
+
+def _nestor_gone_setup_retire(home, tmp_path, monkeypatch, store, ring_with_sean):
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=21, bounds={"apps": ["jeles"]})
+    _manifest(home, "jeles")
+    _seal(home, store, pair_id="pair-nestor-gone", target_text="retire seat jeles: t", kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _retire_seat(store=store, ledger=ledger, pair_id="pair-nestor-gone",
+                        apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["ok"] is True, out
+    return ledger, grants_root
+
+
+def _nestor_gone_setup_create(home, tmp_path, monkeypatch, store, ring_with_sean):
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
+             bounds={"apps": ["jeles-corpus"], "groups": []})
+    _seal(home, store, pair_id="pair-nestor-gone",
+          target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
+          kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _create_seat(store=store, ledger=ledger, pair_id="pair-nestor-gone",
+                        apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["ok"] is True, out
+    return ledger, grants_root
+
+
+def _nestor_gone_setup_federation_ratify(home, tmp_path, monkeypatch, store, ring_with_sean):
+    server = _fake_server(tmp_path)
+    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=23, bounds={"servers": ["jeles-corpus"]})
+    _seal(home, store, pair_id="pair-nestor-gone",
+          target_text=f"ratify federation server jeles-corpus command {server} cwd {tmp_path} env_keys [WILLOW_HOME]",
+          kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _ratify(store=store, ledger=ledger, pair_id="pair-nestor-gone", grants_root=grants_root)
+    assert out["ok"] is True, out
+    return ledger, grants_root
+
+
+def _nestor_gone_setup_envelope_ratify(home, tmp_path, monkeypatch, store, ring_with_sean):
+    # ratify_proposal_row() also refuses EREGISTRY off the default
+    # resolution — same reasoning as test_envelope_ratify_end_to_end.
+    default_reg = home / "constitutional" / "pre-approved.json"
+    default_reg.parent.mkdir(parents=True, exist_ok=True)
+    governing = {
+        "id": "env-envelope.ratify-nestor-gone", "verb_id": 24, "verb": "envelope.ratify",
+        "grantee": "willow", "bounds": {"proposal_ids": ["env-jeles-dispatch"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }
+    default_reg.write_text(json.dumps({"active": [governing]}))
+    tab = home / "constitutional" / "syscall-table.json"
+    tab.write_text(json.dumps({"verbs": [{"id": 24, "verb": "envelope.ratify",
+                                           "bounds": {"proposal_ids": "l"}}]}))
+    monkeypatch.setenv("WILLOW_SYSCALL_TABLE", str(tab))
+    proposal = _proposal_row(bounds={"channel": "ops"})
+    _write_sidecar(home, proposals=[proposal])
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    _ink_proposed(ledger, proposal)
+    _seal(home, store, pair_id="pair-nestor-gone",
+          target_text=_ratify_text(proposal, words="ratify all three"), kr=ring_with_sean)
+    grants_root = home / "manifest_grants"
+    out = _envelope_ratify(store=store, ledger=ledger, pair_id="pair-nestor-gone", grants_root=grants_root)
+    assert out["ok"] is True, out
+    return ledger, grants_root
+
+
+_NESTOR_GONE_SETUPS = {
+    "envelope.revoke": _nestor_gone_setup_revoke,
+    "manifest.retire": _nestor_gone_setup_retire,
+    "manifest.create": _nestor_gone_setup_create,
+    "federation.ratify": _nestor_gone_setup_federation_ratify,
+    "envelope.ratify": _nestor_gone_setup_envelope_ratify,
+}
+
+
+@pytest.mark.parametrize("verb", sorted(_NESTOR_GONE_SETUPS))
+def test_apply_never_opens_nestor_db(verb, home, tmp_path, monkeypatch, store, ring_with_sean):
+    """Parametrised over all five trust-owner verbs on this queue (gap
+    035d287206e1, F1 + Loki audit 229BE2C1, R3): after a successful
+    request, nestor.db is deleted ENTIRELY before apply runs. If apply
+    still opened it, every one of these would refuse EUNREACH; instead
+    each must grant cleanly using only the `sealed_row` bytes the request
+    half already embedded (and signed) in the pending record. A verb
+    missing from `_NESTOR_GONE_SETUPS` above is a verb this test cannot
+    cover — the assignment (add a sixth verb here too) is on whoever adds
+    one, not a silent pass."""
+    ledger, grants_root = _NESTOR_GONE_SETUPS[verb](home, tmp_path, monkeypatch, store, ring_with_sean)
+
+    (home / "nestor.db").unlink()
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["ok"] is True, processed

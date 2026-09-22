@@ -327,34 +327,23 @@ def _load_registry() -> dict:
     }
 
 
-def _maybe_sign(path: Path) -> None:
-    """Re-sign ``path`` under ``WILLOW_PGP_FINGERPRINT`` when PGP is
-    enforced — the active register's own trust shape after pair 31f5d3af:
-    ``trusted_read``'s trust-owner branch refuses a trust-owner-owned file
-    whose detached signature does not verify, so a write that lands
-    unsigned (or signed under the wrong key) is unreadable to every OTHER
-    process on the box even though it wrote successfully here.
-
-    Rework (Loki audit 54E3DFC0, R2): signs with ``--local-user
-    WILLOW_PGP_FINGERPRINT`` explicitly — never gpg's ambient default
-    signing key, which the prior draft used unqualified and which may
-    belong to a different identity than the fingerprint every reader
-    verifies against (measured: the broker's default key, not the trust
-    owner's). Never called for the broker-owned proposals sidecar, which
-    stays on the euid-ownership trust rail exactly as the whole registry
-    did before this split."""
-    from . import pgp
-
-    if not pgp.pgp_enabled():
-        return
-    fingerprint = pgp.expected_fingerprint()
-    ok, detail = pgp.sign_detached(path, local_user=fingerprint)
-    if not ok:
-        raise EnvelopeAuthoringError(
-            f"{path} was written but could not be re-signed under "
-            f"WILLOW_PGP_FINGERPRINT ({detail}) — the write already landed; "
-            "every other reader will refuse it as unsigned until this is fixed"
-        )
+def _load_active_register() -> dict:
+    """Read ONLY the active register's ``active[]`` — via
+    :func:`envelopes._load` (``trusted_read``), the same trust rail every
+    other reader of the trust-owner-owned register uses — and NEVER the
+    broker-owned proposals sidecar. Loki audit BDC2B0F2, A1:
+    :func:`_load_registry` opens BOTH files whenever the sidecar exists;
+    as the trust owner, that second open is refused before the register
+    write it was meant to guard ever happens — :func:`ratify_proposal_row`
+    and :func:`revoke` (the two functions this codebase reaches ONLY
+    through the trust-owner apply half) call this instead. Neither needs
+    anything from the sidecar: ``ratify_proposal_row`` receives its row
+    from the caller (the request half already copied it, running as the
+    broker, which CAN read the sidecar); ``revoke`` only ever mutates
+    ``active[]``. Making the docstrings' "never looks the proposal up
+    itself" literally true, not just intended."""
+    active_doc = _envelopes._load(_envelopes.registry_path())
+    return {"active": active_doc.get("active") or []}
 
 
 def _save_proposals(registry: dict) -> None:
@@ -397,14 +386,17 @@ def _register_writable() -> tuple[bool, str, dict]:
         owner = str(d.stat().st_uid)
     reason = (
         f"{d} is not writable by this process (uid {os.geteuid()}) — owned "
-        f"by {owner!r}. On the installed box, ratifying an envelope is not "
-        "possible until envelope.ratify (gap d3f79320ccb5) lands: a "
-        f"sudo -u {owner} run of this same function fails too, on the "
-        "OTHER file this ratify would need to touch (the broker-owned, "
-        "0600 proposals sidecar it cannot read as this uid) — there is no "
-        "uid on the box that can complete ratify() as written. The "
-        "proposal named here queues in $WILLOW_HOME/proposals/ and is not "
-        "lost; nothing was touched by this refusal."
+        f"by {owner!r}. This process (the desk, via the envelope_ratify MCP "
+        f"tool) cannot complete ratify() as written — a sudo -u {owner} run "
+        "of this same function fails too, on the OTHER file this call would "
+        "need to touch (the broker-owned, 0600 proposals sidecar it cannot "
+        "read as this uid). Use envelope_ratify_request instead: it verifies "
+        "a human-sealed Nestor pair, writes one signed request, and the "
+        "trust-owner apply half (envelope.ratify, gap d3f79320ccb5) moves "
+        "the proposal into the register from there — the same request/apply "
+        "split manifest.grant and envelope.revoke already use. The proposal "
+        "named here queues in $WILLOW_HOME/proposals/ and is not lost; "
+        "nothing was touched by this refusal."
     )
     return False, reason, {"error": "EACCES", "path": str(d), "owner": owner}
 
@@ -422,36 +414,73 @@ def _save_active(registry: dict) -> None:
     special-casing, the write simply fails the way any other-uid write
     into a 0755 directory fails.
 
-    Signing (:func:`_maybe_sign`): under ``--local-user
-    WILLOW_PGP_FINGERPRINT`` when PGP enforcement is on
-    (``pgp.pgp_enabled()``) — **corrected, Loki audit 367C367A, T3: this
-    does NOT refuse when the fingerprint is unset.** It writes the register
-    UNSIGNED and returns, the same "unsigned atomic write when PGP is not
-    enforced" posture every other write in this codebase takes (e.g.
-    ``manifest_admin.create_manifest``) — a prior draft of this docstring
-    claimed the opposite ("refusing when unset"), which was never true of
-    the code. This matters for :func:`trust_owner_verbs`'s ``revoke`` apply
-    half, which DOES run as the trust owner successfully and DOES need
-    ``WILLOW_PGP_FINGERPRINT`` present in that process's own environment to
-    sign — an unsigned (or stale-signed) register is refused by every OTHER
-    reader via ``paths.trusted_read``'s signature branch, a clean-looking
-    apply followed by a fleet-wide ``EUNREACH``. Not hardened into a hard
-    refusal in this pass (an unconditional refusal would also break every
-    existing test and CLI invocation on a box that has not opted into PGP
-    enforcement at all) — named here so the next reader does not repeat the
-    prior draft's false claim.
+    Signing order — **rework, Loki audit BDC2B0F2, A3**: the prior draft
+    wrote the register (rename) and signed AFTERWARDS, over the file
+    already at its live path. Two defects that shape produced: (1) between
+    the content rename and gpg's write of the new ``.sig``, every OTHER
+    reader's ``trusted_read`` sees a live register whose signature does
+    not yet match — a stale-``.sig`` window on every single write, refused
+    ``EUNREACH`` by the fail-closed gate; (2) if signing fails altogether
+    (agent down, key gone) the register is left with the NEW ``active[]``
+    and the OLD ``.sig`` permanently — unsigned-looking to every reader
+    from then on, with no path in this module to repair it (a retry finds
+    the id already active and refuses). Mirrors
+    :func:`manifest_admin.publish_signed_pair`'s own order instead: sign a
+    TMP candidate first, verify nothing about the rename can be observed
+    half-done, then rename the ``.sig`` into place BEFORE the content —
+    "signature first is fail-closed even for a non-cooperating reader."
+    A ``sign_detached`` failure now raises before either rename, leaving
+    the prior register and its prior ``.sig`` byte-for-byte untouched.
 
-    **``ratify()`` itself is a separate case, Loki audit 42B3B46F, U1: no
-    uid on an installed box can complete it at all** (:func:`_register_writable`
-    refuses before reaching this function; see its own docstring) — a
-    ``sudo -u willow-operator`` invocation was never a working alternative,
-    since that uid then fails reading the OTHER file, the broker-owned
-    0600 proposals sidecar. Tracked as gap ``d3f79320ccb5``
-    (``envelope.ratify`` apply-half verb, not built in this packet);
-    nothing in this codebase should suggest a ``sudo -u willow-operator
-    ... envelope ratify`` command as if it worked."""
-    _atomic_write(_envelopes.registry_path(), {"active": registry.get("active") or []})
-    _maybe_sign(_envelopes.registry_path())
+    Under ``--local-user WILLOW_PGP_FINGERPRINT`` when PGP enforcement is
+    on (``pgp.pgp_enabled()``) — Loki audit 367C367A, T3 still holds: this
+    does NOT refuse when the fingerprint is unset, it writes the register
+    UNSIGNED, the same "unsigned atomic write when PGP is not enforced"
+    posture every other write in this codebase takes.
+
+    **``ratify()`` (the sidecar-reading path) is a separate case, Loki
+    audit 42B3B46F, U1: no uid on an installed box can complete it at
+    all** (:func:`_register_writable` refuses before reaching this
+    function). The trust-owner apply half (:mod:`trust_owner_verbs`'s
+    ``envelope.ratify``, gap ``d3f79320ccb5``) is the path that actually
+    reaches this write there, via :func:`ratify_proposal_row`."""
+    from . import pgp
+
+    path = _envelopes.registry_path()
+    doc = {"active": registry.get("active") or []}
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        os.chmod(path.parent, 0o755)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.chmod(tmp, stat.S_IMODE(os.stat(tmp).st_mode) & ~0o022)
+
+    tmp_sig = None
+    if pgp.pgp_enabled():
+        fingerprint = pgp.expected_fingerprint()
+        ok, detail = pgp.sign_detached(tmp, local_user=fingerprint)
+        if not ok:
+            tmp.unlink(missing_ok=True)
+            raise EnvelopeAuthoringError(
+                f"{path} could not be signed under WILLOW_PGP_FINGERPRINT "
+                f"({detail}) — refused before any write; the live register "
+                "and its .sig are untouched"
+            )
+        tmp_sig = pgp.detached_sig_path(tmp)
+
+    # Signature first is fail-closed even for a non-cooperating reader
+    # (manifest_admin.publish_signed_pair's own comment, same shape here):
+    # a reader that races in between these two renames sees either the OLD
+    # content with the NEW (matching, once both land) or OLD signature —
+    # trusted_read's own re-check on each read makes either state refuse
+    # cleanly rather than accept a mismatched pair.
+    live_sig = pgp.detached_sig_path(path)
+    if tmp_sig is not None:
+        os.replace(tmp_sig, live_sig)
+    os.replace(tmp, path)
 
 
 def _load_syscall_table() -> dict[int, dict]:
@@ -834,6 +863,103 @@ def ratify(
     return result
 
 
+def ratify_proposal_row(
+    row: dict,
+    *,
+    ratified_by: str,
+    ratified_via: str,
+    citation_id: Optional[str] = None,
+    ledger: Optional[Any] = None,
+) -> dict:
+    """Move an ALREADY-KNOWN proposal ROW into ``active[]`` — the
+    sidecar-free sibling of :func:`ratify`, built for
+    :mod:`trust_owner_verbs`'s ``envelope.ratify`` apply half (gap
+    ``d3f79320ccb5``). On an installed box the apply half runs AS the
+    trust owner, which can write the register (:func:`_register_writable`
+    holds) but cannot read the broker-owned 0600 proposals sidecar at all
+    (that function's own docstring, Loki audit 42B3B46F, U1) — so unlike
+    :func:`ratify`, this never looks the proposal up itself. The caller
+    (the ``envelope.ratify`` request half, running as the broker, which
+    CAN read its own sidecar) copies the full row into the signed request
+    at request time; this function only ever receives that copy.
+
+    Same register-write discipline as :func:`ratify`: refuses
+    :class:`RegisterUnwritableError` up front via
+    :func:`_register_writable`, before anything is touched; refuses when
+    ``row['id']`` is already in ``active[]`` (the caller re-checks this
+    itself too, immediately before calling — the check here is the one
+    that actually holds under a race, since it runs right before the
+    write it guards); writes ``active[]`` via :func:`_save_active`
+    (atomic write + re-sign under ``WILLOW_PGP_FINGERPRINT`` when PGP
+    enforcement is on); and appends ``envelope_ratified`` to FRANK — the
+    SAME event name :func:`ratify` inks, so a reader filtering FRANK for
+    "what did the operator say yes to" sees both paths identically.
+    ``citation_id``, when given, rides in the FRANK payload so
+    :func:`manifest_grant_executor._verify_pending_signature_and_citation`
+    can use this same event as its own replay guard — no second event
+    name to keep in sync. Unlike :func:`ratify`, ``ratified_by`` (the
+    sealed row's own verifier, read by the caller — this function does
+    not touch the keyring) is stamped onto the row as its own field,
+    alongside ``ratified_via``; the caller composes ``ratified_via`` (the
+    packet's own shape: ``"frank ledger entry <citation_id>"``) rather
+    than this function guessing at it."""
+    _refuse_registry_mismatch("ratify")
+    writable, writable_reason, writable_detail = _register_writable()
+    if not writable:
+        raise RegisterUnwritableError(writable_reason, writable_detail)
+
+    # Loki audit BDC2B0F2, A1: _load_registry() opens the broker-owned
+    # sidecar too whenever it exists -- refused for the trust owner before
+    # this write ever happens. Nothing below needs proposals[]/archived[],
+    # only active[].
+    registry = _load_active_register()
+    active = list(registry.get("active") or [])
+    proposal_id = row.get("id")
+    if any(r.get("id") == proposal_id for r in active):
+        raise EnvelopeAuthoringError(
+            f"envelope {proposal_id!r} is already active — nothing to ratify"
+        )
+
+    ratified_at = _now_iso()
+    ratified: dict = {
+        **{k: v for k, v in row.items() if not k.startswith("_")},
+        "issued_by": "root",
+        "issued_at": ratified_at,
+        "status": "active",
+        "ratified_via": ratified_via,
+        "ratified_by": ratified_by,
+    }
+    active.append(ratified)
+    _save_active({"active": active})
+
+    ledger_record_id = None
+    ledger_error = None
+    if ledger is not None:
+        try:
+            ledger_record_id = ledger.append(
+                "willow",
+                FRANK_EVENT_RATIFIED,
+                {
+                    "envelope_id": proposal_id,
+                    "verb": row.get("verb"),
+                    "verb_id": row.get("verb_id"),
+                    "grantee": row.get("grantee"),
+                    "bounds_digest": _bounds_digest(row.get("bounds") or {}),
+                    "verifier": ratified_by,
+                    "ratified_at": ratified_at,
+                    "citation_id": citation_id,
+                },
+            )
+        except Exception as exc:  # pragma: no cover — ledger is optional
+            ledger_error = str(exc)
+
+    result = dict(ratified)
+    result["_ledger_record_id"] = ledger_record_id
+    if ledger_error:
+        result["_ledger_error"] = ledger_error
+    return result
+
+
 def reject(
     proposal_id: str,
     *,
@@ -1020,7 +1146,12 @@ def revoke(
         raise EnvelopeAuthoringError("revoke requires a reason")
     _refuse_registry_mismatch("revoke")
 
-    registry = _load_registry()
+    # Loki audit BDC2B0F2, A1: same defect as ratify_proposal_row's, and
+    # pre-existing since #623 -- _load_registry() opens the broker-owned
+    # sidecar too, refused for the trust owner (the only identity that
+    # ever reaches this function in this codebase,
+    # trust_owner_verbs._apply_envelope_revoke) before this write happens.
+    registry = _load_active_register()
     rows = registry.get("active") or []
     matches = [row for row in rows if row.get("id") == envelope_id]
     if not matches:
@@ -1102,6 +1233,36 @@ def list_archived(
     return rows
 
 
+def _reconcile_pending_against_active(registry: dict) -> dict:
+    """Drop any sidecar ``proposals[]`` row whose id is already in the
+    register's ``active[]`` — the trust-owner ``envelope.ratify`` apply
+    half (:mod:`trust_owner_verbs`) moves a proposal into ``active[]`` but
+    can never touch the broker-owned sidecar at all (it cannot even read
+    it, let alone write it), so without this the sidecar keeps showing a
+    proposal as pending long after it became a real, active grant. Called
+    from the broker's own read paths (:func:`list_pending`,
+    :func:`envelope_pending_read`'s underlying call) — reading ``active[]``
+    here is the same ``trusted_read`` signature-verified branch every other
+    reader of the trust-owner-owned register already takes; WRITING the
+    trimmed sidecar back is safe because the broker (not the apply half)
+    is the one calling this, and the broker owns that file. A write
+    failure here (read-only mount, race, whatever) never breaks the read
+    itself — the stale rows are filtered out of what this call returns
+    regardless of whether the on-disk cleanup could complete."""
+    proposals = registry.get("proposals") or []
+    active_ids = {row.get("id") for row in (registry.get("active") or [])}
+    if not any(row.get("id") in active_ids for row in proposals):
+        return registry
+    remaining = [row for row in proposals if row.get("id") not in active_ids]
+    try:
+        _save_proposals({"proposals": remaining, "archived": registry.get("archived") or []})
+    except OSError:
+        pass
+    registry = dict(registry)
+    registry["proposals"] = remaining
+    return registry
+
+
 def list_pending(
     *,
     oldest_first: bool = True,
@@ -1125,6 +1286,7 @@ def list_pending(
     actually still on record. Empty list on a row with no precedents.
     """
     registry = _load_registry()
+    registry = _reconcile_pending_against_active(registry)
     rows = list(registry.get("proposals") or [])
     rows.sort(key=lambda r: r.get("proposed_at") or "", reverse=not oldest_first)
     rows = rows[: max(0, int(limit))]

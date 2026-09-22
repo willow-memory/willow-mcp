@@ -386,12 +386,22 @@ def _load_sealed_ruling(pair_id: str, *, db_path: Optional[Path] = None) -> dict
     """The pair's own sealed bytes from ``nestor.db`` — the artifact the
     seal signature covers — three-state, never raises. Reuses
     :func:`net_authority.read_sealed_pair`, which is already generic over
-    any sealed decision pair keyed by id, not net-authority-specific."""
+    any sealed decision pair keyed by id, not net-authority-specific.
+
+    Loki audit 229BE2C1, R2: ``read_sealed_pair`` returns the row's own
+    sealed bytes but never the ``pair_id`` it was read BY (that id is the
+    caller's input, not a column the query selects) — folded in here so
+    every caller downstream (:func:`_sealed_row_fields` included) sees it
+    as an ordinary field of the ``sealed`` dict, never a second parameter
+    to thread through separately."""
     from . import seal_handler
     from .net_authority import read_sealed_pair
 
     resolved = db_path if db_path is not None else seal_handler._nestor_db_path()
-    return read_sealed_pair(pair_id, resolved)
+    sealed = read_sealed_pair(pair_id, resolved)
+    if sealed.get("state") == "populated":
+        sealed = {**sealed, "pair_id": pair_id}
+    return sealed
 
 
 def _ring_from_keyring(kr) -> dict[str, dict]:
@@ -584,7 +594,16 @@ def _verify_request_signature(record: dict, grants_root: Path) -> tuple[bool, st
 #: minutes, and this narrows (does not remove) that window; the desk chose
 #: this over widening ProtectHome or granting the trust owner nestor.db's
 #: WAL sidecars.
-_SEALED_ROW_FIELDS = ("source_norm", "target_text", "verifier", "seal_sig", "created_at")
+# Loki audit 229BE2C1, R2: `pair_id` added. `seal_message` (net_signer.py)
+# covers only `(source_norm, target_text, verifier)` -- never `pair_id` --
+# so a genuinely-signed sealed row presented under a DIFFERENT pair_id
+# passed `_verify_seal_only` before this: the pair<->row binding rested
+# solely on `broker_sig`, one signature where there used to be two
+# (before gap 035d287206e1, the row was READ from nestor.db BY pair_id,
+# so it structurally could not be another pair's). Restoring the second
+# binding here, cheaply, rather than touching `seal_message` itself
+# (which would invalidate every already-sealed pair on disk).
+_SEALED_ROW_FIELDS = ("source_norm", "target_text", "verifier", "seal_sig", "created_at", "pair_id")
 
 
 def _sealed_row_fields(sealed: dict) -> dict:
@@ -634,6 +653,15 @@ def _verify_seal_only(pair_id: str, *, db_path: Optional[Path] = None,
                 f"pending record's embedded sealed_row is missing {missing!r} — not "
                 "written by a request half that stashes the sealed bytes (gap "
                 "035d287206e1), or corrupted after the fact",
+            ), None
+        if sealed_row.get("pair_id") != pair_id:
+            return _refuse(
+                "eseal_mismatch",
+                f"pending record's embedded sealed_row was sealed under pair_id="
+                f"{sealed_row.get('pair_id')!r}, not this request's pair_id={pair_id!r} — "
+                "a genuinely-signed row from a DIFFERENT pair can never authorize this one "
+                "(Loki audit 229BE2C1, R2: seal_message covers source_norm/target_text/"
+                "verifier, never pair_id, so this binding is not implied by seal_sig alone)",
             ), None
         sealed = {"state": "populated", **{k: sealed_row.get(k) for k in _SEALED_ROW_FIELDS}}
     else:

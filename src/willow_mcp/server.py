@@ -194,7 +194,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 144 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 145 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -5834,6 +5834,50 @@ def federation_ratify_request(
 
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("envelope_apply")
+def envelope_ratify_request(
+    app_id: str,
+    envelope_id: str,
+    pair_id: str,
+) -> dict:
+    """Verify a human-sealed Nestor pair against every precondition for
+    `envelope.ratify` (gap `d3f79320ccb5`) and, if every one holds, write
+    ONE signed request under `$WILLOW_HOME/manifest_grants/pending/<pair_id>.json`
+    — orchestrator-only. `pair_id` names a sealed decision whose
+    `target_text` is `ratify envelope <proposal_id>: <the operator's
+    verbatim words>` (one line) — the operator's own ratification words ARE
+    the sealed text, so the seal itself is the ratification; there is no
+    second act. Request pre-state: the named proposal exists in the
+    broker's own sidecar and is not already active (`ENOENT` / `EALREADY`).
+    This is the working path on an installed box where the desk's own
+    `envelope_ratify` refuses `EACCES` — the register is trust-owner-owned
+    and the broker holds proposals only (sealed `31f5d3af`), and no single
+    uid can complete the old sidecar-read-then-register-write in one call
+    (Loki audits 367C367A/42B3B46F). `manifest_grant_apply` (the same
+    trust-owner unit as `manifest.grant` and the other three trust-owner
+    verbs, dispatching on the pending record's own `verb` field) re-verifies
+    fresh and moves the proposal into `active[]`, re-signed. Same queue,
+    same `manifest_grant_status`/`manifest_grant_retry` surface as the
+    other four verbs. On a single-uid box the desk's own `envelope_ratify`
+    keeps working exactly as before this verb existed; use whichever the
+    box's own uid layout supports."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import trust_owner_verbs
+        from .governance_ledger import GovernanceLedger
+
+        return trust_owner_verbs.envelope_ratify_request(
+            app_id, envelope_id=envelope_id, pair_id=pair_id,
+            project="willow-mcp", session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"envelope_ratify_request_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
 def pr_update_execute(
     app_id: str,
     repo: str,
@@ -6071,7 +6115,16 @@ def envelope_ratify(proposal_id: str) -> dict:
     """Move a proposal from proposals[] to active[]. Operator-only; requires
     the current orchestrator session's verifier to pass the keyring check.
     Writes envelope_ratified to the FRANK ledger. issued_by is stamped as
-    'root' (invariant preserved from pre-PR5)."""
+    'root' (invariant preserved from pre-PR5).
+
+    On an installed box where constitutional/ is trust-owner-owned (sealed
+    31f5d3af), this refuses EACCES before touching anything — no single uid
+    can both read the broker-owned proposals sidecar and write the
+    trust-owner-owned register (Loki audits 367C367A/42B3B46F). The refusal
+    message names envelope_ratify_request as the working path there (gap
+    d3f79320ccb5): it writes a signed request instead, and the trust-owner
+    apply half completes the move. On a single-uid box this tool keeps
+    working exactly as it always has."""
     ctx = _envelope_authoring_session()
     if isinstance(ctx, dict):
         return ctx
