@@ -205,10 +205,43 @@ def test_classify_future_expires_at_is_not_expired():
     assert out == {"class": "standing"}
 
 
-def test_classify_unparseable_expires_at_does_not_crash_and_is_not_expired():
+def test_classify_unparseable_expires_at_is_unreachable_not_standing():
+    """Rework of Loki's F2 (23CAD2B4): a malformed expires_at used to fall
+    through to standing and be counted in the bare kept_standing total --
+    but envelopes.permitted refuses these rows EAMBIG, so the register
+    must not claim they are in force. classify() now surfaces them as
+    unreachable with why, never silently standing."""
     row = _row(verb="envelope.apply", bounds={}, expires_at="not-a-timestamp")
     out = sweep_mod.classify(row)
+    assert out["class"] == "unreachable"
+    assert "expires_at unparseable" in out["why"]
+    assert "not-a-timestamp" in out["why"]
+
+
+def test_classify_empty_string_expires_at_is_treated_as_absent():
+    """An empty string is falsy -- `not value` -- so it is "no expiry", the
+    same as the key being absent entirely, not a parse failure."""
+    row = _row(verb="envelope.apply", bounds={}, expires_at="")
+    out = sweep_mod.classify(row)
     assert out == {"class": "standing"}
+
+
+def test_classify_non_string_expires_at_is_unreachable():
+    row = _row(verb="envelope.apply", bounds={}, expires_at=12345)
+    out = sweep_mod.classify(row)
+    assert out["class"] == "unreachable"
+    assert "expires_at unparseable" in out["why"]
+
+
+def test_sweep_malformed_expires_at_row_is_unreachable_not_kept_standing():
+    row = _row(verb="envelope.apply", bounds={}, expires_at="not-a-timestamp")
+    reg = _registry([row])
+    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}))
+    assert receipt["kept_standing"] == 0
+    assert receipt["retired"] == []
+    assert len(receipt["unreachable"]) == 1
+    assert receipt["unreachable"][0]["id"] == "env-1"
+    assert "expires_at unparseable" in receipt["unreachable"][0]["why"]
 
 
 def test_classify_standing_row_has_no_expires_at():

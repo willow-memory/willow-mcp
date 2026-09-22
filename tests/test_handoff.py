@@ -160,7 +160,8 @@ def test_handoff_write_v4_success(tmp_path):
          patch("willow_mcp.handoff.dispatch_set_status"):
         result = handoff_write_v4(
             app_id, dispatch_id,
-            findings=[{"id": "F1", "text": "Found bug", "severity": "high"}],
+            findings=[{"id": "F1", "text": "Found bug", "severity": "high",
+                       "evidence": ["12 passed"]}],
             narrative="Fixed the issue.",
         )
     assert result["status"] == "complete"
@@ -663,7 +664,7 @@ def test_write_accepts_empty_findings_with_reason_and_records_it(tmp_path):
     dispatch_id = "d-no-findings"
     result = _write(
         tmp_path, dispatch_id=dispatch_id,
-        narrative="Investigated; nothing to report.",
+        narrative="Investigated; 0 violations, nothing to report.",
         no_findings_reason="pure read-only audit, no issues found",
     )
     assert result["status"] == "complete"
@@ -704,3 +705,44 @@ def test_valid_write_then_passes_verify_handoff(tmp_path):
          patch("willow_mcp.handoff.dispatch_set_status"):
         verified = verify_handoff(dispatch_id)
     assert verified["verified"] is True
+
+
+# ── the writer pre-flights the verifier's own completion-evidence and lint
+# checks (rework of Loki's F3, 23CAD2B4; gap 34c8e60f4260 fully closed) ──────
+
+def test_write_refuses_checklist_resolved_with_no_completion_evidence(tmp_path):
+    """The exact split Loki measured: a finding with a statement but no
+    evidence, and a narrative with no counted result, used to write fine
+    and only fail later at verify_handoff. Now refused at write time with
+    verify_handoff's own reason string."""
+    result = _write(
+        tmp_path,
+        findings=[{"id": "F1", "text": "Found it"}],
+        narrative="done",
+    )
+    assert result["error"] == "EINVAL"
+    assert "no evidence backs it" in result["message"]
+
+
+def test_write_accepts_checklist_resolved_false_without_evidence(tmp_path):
+    """An honest blocker/partial report is not a completion claim -- the
+    evidence gate must not fire when checklist_resolved=False (same
+    exemption verify_handoff itself grants)."""
+    result = _write(
+        tmp_path,
+        findings=[{"id": "F1", "text": "Blocked: missing credentials"}],
+        narrative="Could not proceed past the auth step.",
+        checklist_resolved=False,
+    )
+    assert result["status"] == "complete"
+
+
+def test_write_accepts_checklist_resolved_with_narrative_count_and_no_finding_evidence(tmp_path):
+    """The narrative-count path alone is enough -- matches
+    _has_completion_evidence's OR, not an AND."""
+    result = _write(
+        tmp_path,
+        findings=[{"id": "F1", "text": "Docs updated"}],
+        narrative="Ran the suite: 17/17 tests passing.",
+    )
+    assert result["status"] == "complete"

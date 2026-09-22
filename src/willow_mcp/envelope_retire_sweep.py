@@ -281,29 +281,39 @@ def _single_branch(bounds: dict, verb: str) -> Optional[str]:
     return branch
 
 
-def _row_expiry(row: dict) -> Optional[datetime]:
-    """The row's parsed ``expires_at`` deadline, or ``None`` when absent or
-    unparseable. Reuses :func:`envelopes._deadline` — the SAME parser the
-    gate itself uses to decide ``EEXPIRED`` (module docstring's own rule:
-    this sweep and the gate must never disagree about which file is "the"
-    registry, or, here, about what "expired" means). An unparseable value
-    is treated as "no expiry this sweep can act on" rather than raised —
-    a malformed ``expires_at`` is a shape problem for the authoring path,
-    not a reason for the sweep to crash mid-pass."""
+def _row_expiry(row: dict) -> tuple[Optional[datetime], Optional[str]]:
+    """``(deadline, error)`` for the row's ``expires_at``. Reuses
+    :func:`envelopes._deadline` — the SAME parser the gate itself uses to
+    decide ``EEXPIRED`` (module docstring's own rule: this sweep and the
+    gate must never disagree about what "expired" means).
+
+    ``(None, None)`` — no ``expires_at`` at all: a genuinely standing row as
+    far as expiry is concerned. ``(None, <message>)`` — present but
+    unparseable: rework of Loki's finding F2 (23CAD2B4). The first cut
+    treated this the same as absent, so a row whose ``expires_at`` was
+    ``"not-a-date"``, ``""``, or a bare int fell through to ``standing`` and
+    was folded into the bare ``kept_standing`` count — but
+    :func:`envelopes.permitted` refuses every one of those the same way
+    (``EAMBIG`` on the same ``ValueError``), so the register was reporting
+    "in force" for a row the gate would never actually honour. That is
+    exactly the register/gate disagreement this module's own docstring
+    forbids. :func:`classify` now surfaces the error so :func:`sweep`
+    reports the row ``unreachable`` with why, never silently ``standing``."""
     value = row.get("expires_at")
     if not value:
-        return None
+        return None, None
     try:
-        return _envelopes._deadline(value)
-    except ValueError:
-        return None
+        return _envelopes._deadline(value), None
+    except ValueError as exc:
+        return None, f"expires_at unparseable: {value!r} ({exc})"
 
 
 def classify(row: dict) -> dict:
-    """``{class: "expired"|"branch_bound"|"counted"|"standing", ...}`` for
-    one active row. Pure — reads only the row, no network, no ledger.
-    ``expired`` carries ``expires_at``; ``branch_bound`` carries
-    ``repo``/``branch``; ``counted`` carries ``max_count``.
+    """``{class: "expired"|"branch_bound"|"counted"|"standing"|"unreachable",
+    ...}`` for one active row. Pure — reads only the row, no network, no
+    ledger. ``expired`` carries ``expires_at``; ``branch_bound`` carries
+    ``repo``/``branch``; ``counted`` carries ``max_count``; ``unreachable``
+    carries ``why`` (a malformed ``expires_at`` — see :func:`_row_expiry`).
 
     ``expires_at`` is checked FIRST, ahead of ``max_count``/branch-bound
     (gap b7a4ccdc8bbb, second half): a row whose deadline has already
@@ -312,7 +322,11 @@ def classify(row: dict) -> dict:
     counted/branch-bound row that has also expired should not wait on a
     network or FRANK round trip just to be reported ``kept_in_force`` for
     the wrong reason. The comparison is ``<=`` now, matching
-    :func:`envelopes.permitted`'s own ``EEXPIRED`` check exactly.
+    :func:`envelopes.permitted`'s own ``EEXPIRED`` check exactly. A row
+    whose ``expires_at`` does not even PARSE is ``unreachable`` (Loki
+    23CAD2B4 F2) rather than falling through to ``standing`` — the gate
+    refuses those rows EAMBIG, so the register must not claim they are in
+    force.
 
     ``max_count`` is checked next: it is a universal per-row metering
     field (set by the proposer independently of which bounds keys the
@@ -323,7 +337,9 @@ def classify(row: dict) -> dict:
     :func:`sweep` reports it ``unreachable`` rather than trusting a source
     this module cannot verify. A row with no expiry, no max_count, and no
     single-literal branch (bounds absent, empty, or a glob) is standing."""
-    expiry = _row_expiry(row)
+    expiry, expiry_error = _row_expiry(row)
+    if expiry_error:
+        return {"class": "unreachable", "why": expiry_error}
     if expiry is not None and expiry <= datetime.now(timezone.utc):
         return {"class": "expired", "expires_at": row.get("expires_at")}
     verb = row.get("verb") or ""
@@ -695,9 +711,10 @@ def sweep(
         # to complete honestly. Gap 274baba06418 (T1): this used to guard
         # ``branch_bound`` only, so a ``counted`` row's FRANK count ran
         # UNCLIPPED past the budget — the same floor now applies to both
-        # of this sweep's round-trip classes. ``expired`` and ``standing``
-        # need no round trip (a pure in-memory comparison / no-op) and are
-        # correctly exempt from this check.
+        # of this sweep's round-trip classes. ``expired``, ``standing``, and
+        # ``unreachable`` (a malformed ``expires_at``) need no round trip (a
+        # pure in-memory comparison / no-op) and are correctly exempt from
+        # this check.
         if shape["class"] in ("branch_bound", "counted") and _clipped_timeout(deadline) == 0:
             truncated = True
             break
@@ -724,6 +741,13 @@ def sweep(
                 else:
                     kept_in_force.append({"id": envelope_id, "verb": verb,
                                           "why": outcome["why"]})
+            continue
+
+        if shape["class"] == "unreachable":
+            # A malformed expires_at (Loki 23CAD2B4 F2): never fold into
+            # kept_standing -- the gate refuses these rows EAMBIG, so the
+            # register must not claim they are in force either.
+            unreachable.append({"id": envelope_id, "verb": verb, "why": shape["why"]})
             continue
 
         if shape["class"] == "standing":

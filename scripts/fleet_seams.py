@@ -93,16 +93,56 @@ _JELES_CORPUS_APP_ID = "jeles-corpus"
 #: fail-closed, declared-list model.
 _JELES_CORPUS_FIXTURE_COLLECTIONS = ["ask_jeles_corpus"]
 
-#: Shape-only fixture signature (Jeles#87, Loki J3/R1: `_looks_like_pgp_
-#: signature` checks the ASCII-armored markers are present and the payload
-#: is non-empty -- never a real signature, and `_manifest_scope` never
-#: verifies one; only willow-mcp's gate does that, and only for the real
-#: manifest-signing path, not this test fixture).
-_JELES_CORPUS_FIXTURE_SIG = (
-    "-----BEGIN PGP SIGNATURE-----\n"
-    "\n"
-    "fleet-seams test fixture -- shape only, verifies nothing.\n"
-    "-----END PGP SIGNATURE-----\n"
+#: RFC 4880 §6.1 CRC-24 ("Radix-64"), the checksum line every real
+#: ASCII-armored PGP block carries after its base64 body. Implemented here
+#: (rather than importing a PGP library willow-mcp does not otherwise
+#: depend on) purely so the fixture below is a real armor block, not prose
+#: wearing the markers (Loki 23CAD2B4 F5: the prior fixture had no base64
+#: body and no CRC, which happened to still pass jeles'
+#: `_looks_like_pgp_signature` shape check today, but would break the
+#: instant that check -- or any real armor parser -- got stricter).
+_CRC24_INIT = 0xB704CE
+_CRC24_POLY = 0x1864CFB
+
+
+def _crc24(data: bytes) -> int:
+    crc = _CRC24_INIT
+    for byte in data:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= _CRC24_POLY
+    return crc & 0xFFFFFF
+
+
+def _fake_armored_pgp_signature(payload: bytes) -> str:
+    """A syntactically real ASCII-armored PGP signature block wrapping
+    `payload` -- base64 body (64-char lines, per RFC 4880 §6.3) plus its
+    CRC-24 checksum line. `payload` is arbitrary filler, never a real
+    signature over anything; nothing here signs or verifies -- this is a
+    test fixture, and `jeles/corpus.py`'s own `_manifest_scope` docstring
+    is explicit that it checks shape only, never validity."""
+    import base64
+
+    b64 = base64.b64encode(payload).decode("ascii")
+    lines = [b64[i:i + 64] for i in range(0, len(b64), 64)]
+    crc = _crc24(payload)
+    crc_b64 = base64.b64encode(crc.to_bytes(3, "big")).decode("ascii")
+    body = "\n".join(lines)
+    return (
+        "-----BEGIN PGP SIGNATURE-----\n"
+        "\n"
+        f"{body}\n"
+        f"={crc_b64}\n"
+        "-----END PGP SIGNATURE-----\n"
+    )
+
+
+#: The fixture's fake "signed" content -- never a real signature over
+#: anything, just filler bytes wrapped in a real armor shape.
+_JELES_CORPUS_FIXTURE_SIG = _fake_armored_pgp_signature(
+    b"fleet-seams test fixture -- shape only, verifies nothing."
 )
 
 

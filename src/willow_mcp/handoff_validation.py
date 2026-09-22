@@ -13,19 +13,21 @@ shape itself: both handoff_write_v4 and verify_handoff now call the exact
 same `invalid_findings`/`empty_findings_reason_missing` here, rather than
 each carrying its own drifted copy of "what makes a finding valid."
 
-NOT closed by this module (named, not faked): verify_handoff's
-`_has_completion_evidence`/`_judge_lint_claims` in handoff.py still run
-only at verify time, after the write already happened -- a specialist can
-still see `verified: false` on a packet it believed done, with no earlier
-signal for THAT specific claim. Pre-flighting those two checks in the
-writer too is real, separately-scoped work: `_has_completion_evidence`
-would refuse today's `test_handoff_write_v4_success` fixture (narrative
-"Fixed the issue." carries no counted test result, and its one finding
-carries no `evidence`), and `_judge_lint_claims` needs a `repo_root` the
-writer does not always have -- both are call-site changes across several
-existing tests, not a shape check like the two this module does add. Left
-for a follow-on rather than bundled into a refusal that would silently
-change what dozens of already-passing tests must now supply.
+Closed since (Loki 23CAD2B4 F3, gap 34c8e60f4260 fully): `handoff.handoff_write_v4`
+now pre-flights `_has_completion_evidence`/`_judge_lint_claims` -- the exact
+functions `verify_handoff` runs, not a second copy -- whenever
+`checklist_resolved=True`, and refuses with the identical reason string
+before ever writing. That pre-flight lives in handoff.py (it needs
+`_judge_lint_claims`, which needs `ci_lint_pin`, which this module does not
+import, to keep this module's own dependency surface small), not here; this
+module still owns the shape checks (`invalid_findings`,
+`empty_findings_reason_missing`) both the writer and verifier call. Landing
+this did break the existing `test_handoff_write_v4_success` fixture (its
+narrative "Fixed the issue." carried no counted test result, and its one
+finding carried no `evidence`) and ~10 other call sites across the test
+suite that asserted `checklist_resolved=True` with nothing checkable behind
+it -- fixed at each site by adding real evidence, per Loki's instruction
+("fix the call sites, do not weaken the rule").
 
 KNOWN LIMIT (named, not faked): `write_refusal`'s unknown-key check only
 sees kwargs that actually reach `handoff.handoff_write_v4` -- a direct

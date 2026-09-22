@@ -49,7 +49,7 @@ def test_handoff_write_v4_emits_handoff_v1_format_intentional(home):
     sent = ds.dispatch_send("willow", "loki", "# Task\n", summary="task")
     did = sent["dispatch_id"]
     ho.handoff_write_v4(
-        "loki", did, narrative="Done.",
+        "loki", did, narrative="Done: 1 passed.",
         no_findings_reason="test fixture: format-marker test",
     )
     handoff = json.loads((home / "dispatch" / did / "handoff.json").read_text())
@@ -65,7 +65,7 @@ def test_handoff_write_v4_closeout_is_proper_mai(home):
     ho.handoff_write_v4(
         "loki",
         did,
-        findings=[{"id": "f1", "text": "note", "severity": "low", "evidence": []}],
+        findings=[{"id": "f1", "text": "note", "severity": "low", "evidence": ["a.py:1"]}],
         narrative="Shipped.",
     )
     closeout = (home / "dispatch" / did / "closeout.md").read_text(encoding="utf-8")

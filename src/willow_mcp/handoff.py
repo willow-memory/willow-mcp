@@ -66,6 +66,40 @@ def handoff_write_v4(
     if refusal:
         return refusal
 
+    # Rework of Loki's F3 (23CAD2B4; gap 34c8e60f4260): verify_handoff refused
+    # a checklist_resolved=True claim backed by nothing checkable, but the
+    # writer wrote it anyway and left the specialist to discover the refusal
+    # later. These are the EXACT SAME checks verify_handoff runs below
+    # (_has_completion_evidence, _judge_lint_claims) -- not a second, drifted
+    # copy -- called here, before the write, with the same reason strings, so
+    # a doomed handoff is refused at write time instead of round-tripping
+    # through complete -> verify_handoff -> false.
+    if checklist_resolved:
+        draft = {"narrative": narrative, "findings": findings_list}
+        if not _has_completion_evidence(draft):
+            return {
+                "error": "EINVAL",
+                "message": (
+                    "checklist_resolved claims completion but no evidence backs it: "
+                    "narrative carries no counted test/check result (e.g. '42 "
+                    "passed', '0 violations') and no finding carries an `evidence` "
+                    "field — a bare assertion is not evidence"
+                ),
+            }
+        lint_verdicts = _judge_lint_claims(draft, findings_list)
+        lint_refusals = [v for v in lint_verdicts if v["verdict"] == "refuse"]
+        if lint_refusals:
+            return {
+                "error": "EINVAL",
+                "message": (
+                    f"{len(lint_refusals)} lint claim(s) not measured against the CI pin: "
+                    + "; ".join(
+                        f"finding {v['finding_index']}: {v['reason']}" for v in lint_refusals
+                    )
+                ),
+                "lint_claims": lint_verdicts,
+            }
+
     root = dispatch_dir(dispatch_id)
     handoff = {
         # BC504427: format handoff_v1 is intentional — tool name reflects call-signature gen.
@@ -218,9 +252,13 @@ def _finding_evidence(f: dict) -> list[str]:
 
 
 def _invalid_findings(findings: list) -> list[dict]:
-    """Every finding that carries no statement under any accepted key, or no
-    `evidence`, with its index and the keys it did carry, so verified:false
-    names its cause."""
+    """Every finding that carries no statement under any accepted key, with
+    its index and the keys it did carry, so verified:false names its cause.
+    This is a SHAPE check only (does the finding say anything) -- whether a
+    checklist_resolved=True claim is actually BACKED by evidence is a
+    separate, whole-handoff question `_has_completion_evidence`/
+    `_judge_lint_claims` answer below (and that handoff_write_v4 now
+    pre-flights identically -- Loki 23CAD2B4 F3)."""
     return hv.invalid_findings(findings)
 
 
@@ -345,8 +383,8 @@ def verify_handoff(dispatch_id: str) -> dict:
         reasons.append("envelope not clean")
     if invalid:
         reasons.append(
-            f"{len(invalid)} finding(s) missing a required field (statement under one "
-            f"of {'/'.join(_FINDING_TEXT_KEYS)}, or `evidence`): indexes "
+            f"{len(invalid)} finding(s) carry no statement under any of "
+            f"{'/'.join(_FINDING_TEXT_KEYS)}: indexes "
             f"{', '.join(str(b['index']) for b in invalid)}"
         )
     if checklist and not _has_completion_evidence(handoff):

@@ -112,6 +112,29 @@ def test_provision_writes_a_sibling_sig_that_looks_ascii_armored(
     assert text.endswith("-----END PGP SIGNATURE-----")
 
 
+def test_sig_fixture_is_a_real_armor_block_not_prose_wearing_the_markers(fleet_seams):
+    """Rework of Loki's F5 (23CAD2B4): the prior fixture was a prose string
+    between the BEGIN/END markers with no base64 body and no CRC-24 --
+    happened to pass jeles' substring shape check, but was not a real armor
+    block. Decode the body and verify the CRC-24 checksum line matches, the
+    same way a real armor parser would."""
+    import base64
+
+    text = fleet_seams._JELES_CORPUS_FIXTURE_SIG.strip()
+    lines = text.splitlines()
+    assert lines[0] == "-----BEGIN PGP SIGNATURE-----"
+    assert lines[-1] == "-----END PGP SIGNATURE-----"
+    assert lines[1] == ""  # armor header/body blank-line separator
+    checksum_line = lines[-2]
+    assert checksum_line.startswith("=")
+    body_lines = lines[2:-2]
+    assert body_lines  # a real base64 body, not empty
+    payload = base64.b64decode("".join(body_lines))
+    expected_crc = fleet_seams._crc24(payload)
+    actual_crc = int.from_bytes(base64.b64decode(checksum_line[1:]), "big")
+    assert actual_crc == expected_crc
+
+
 def test_sig_fixture_passes_jeles_own_shape_check_when_jeles_is_installed(
     fleet_seams, tmp_path, monkeypatch,
 ):

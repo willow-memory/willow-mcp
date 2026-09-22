@@ -101,7 +101,8 @@ def test_b53_willow_can_accept_and_complete_with_human_env(home, monkeypatch):
     assert accepted["status"]["status"] == "working"
 
     completed = server.handoff_write_v4(
-        "willow", did, narrative="done", no_findings_reason="test fixture: lifecycle smoke test",
+        "willow", did, narrative="done: 1 passed",
+        no_findings_reason="test fixture: lifecycle smoke test",
     )
     assert completed["status"] == "complete"
 
@@ -117,7 +118,7 @@ def test_b51_builder_cannot_verify_its_own_forged_lifecycle(home):
     assert accepted["status"]["status"] == "working"
 
     closed = server.handoff_write_v4(
-        "loki", did, narrative="done", findings=[],
+        "loki", did, narrative="done: 1 passed", findings=[],
         no_findings_reason="test fixture: lifecycle smoke test",
     )
     assert closed["status"] == "complete"
@@ -391,7 +392,7 @@ def test_b52_symlinked_handoff_is_refused_by_handoff_read(home, monkeypatch):
     did = sent["dispatch_id"]
     server.dispatch_accept("loki", did)
     server.handoff_write_v4(
-        "loki", did, narrative="done",
+        "loki", did, narrative="done: 1 passed",
         no_findings_reason="test fixture: lifecycle smoke test",
     )
 

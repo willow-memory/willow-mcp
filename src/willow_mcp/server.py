@@ -1795,12 +1795,17 @@ def envelope_retire_sweep(app_id: str, dry_run: bool = True, max_rows: int = 0) 
     """One pass over the active envelope register (sealed decision 83faa340;
     gap 4c7512c57a7e): an envelope whose bounds name a branch is retired
     when that branch is merged and deleted on the remote; an envelope with
-    `max_count` is retired when FRANK shows the count consumed. Retirement
-    is a revoke with `revoked_reason=branch_gone` or `=spent` and a FRANK
-    `envelope_revoked` row per envelope — the grant and its uses stay
-    auditable, it is just no longer listed as in force. Standing envelopes
-    (no branch bound, no `max_count` — the planting, the per-class dispatch
-    envelopes, `envelope.apply`) are untouched.
+    `max_count` is retired when FRANK shows the count consumed; an envelope
+    whose `expires_at` has passed is retired outright (gap b7a4ccdc8bbb).
+    Retirement is a revoke with `revoked_reason=branch_gone`, `=spent`, or
+    `=expired` and a FRANK `envelope_revoked` row per envelope — the grant
+    and its uses stay auditable, it is just no longer listed as in force.
+    Standing envelopes (no branch bound, no `max_count`, no `expires_at` —
+    the planting, the per-class dispatch envelopes, `envelope.apply`) are
+    untouched. A row whose `expires_at` does not even parse is reported
+    `unreachable` with why, never folded into standing (gap b7a4ccdc8bbb):
+    the gate refuses those rows outright, so the register must not claim
+    they are in force.
 
     Orchestrator-scoped like `net_authority_drain` / `seal_drain`: this
     mints no new authority and changes nothing the gate enforces (a
@@ -4595,16 +4600,30 @@ def handoff_write_v4(
     The accepted keyword fields are exactly: `findings`, `narrative`,
     `checklist_resolved`, `envelope_clean`, `no_findings_reason` (plus the
     positional `app_id`/`dispatch_id`). There is no `summary` or `details`
-    field — those are refused by name (`EINVAL`), never silently dropped
-    (gap 21f80b2b348a).
+    field. A direct/test caller passing one is refused by name (`EINVAL`,
+    gap 21f80b2b348a); a real MCP client is not — the SDK's own argument
+    validation drops an unrecognized top-level key before this tool ever
+    sees it (Loki 23CAD2B4 F1, probed against the real stdio boundary), so
+    `summary`/`details` are silently discarded there and this call then
+    proceeds as if `findings`/`narrative` were never given. In that case the
+    empty-`findings` refusal below still catches it (nothing was written),
+    but its message names "no `no_findings_reason`", not the mistyped
+    field — closing THAT gap needs a `ServerMiddleware` reading the raw
+    pre-validation arguments (the pattern `request_context.py`'s
+    `RequestContextMiddleware` establishes), which does not exist yet.
 
     Each finding is an object with a one-line statement (`text`, or one of
-    `title`/`finding`/`summary`) and `evidence`: a list of non-empty strings
-    naming what backs it (a test count, a commit sha, a diff reviewed) —
-    both this tool and verify_handoff refuse a finding missing either
-    (gap 34c8e60f4260, same validator both ways). An empty `findings` list
-    is refused unless `no_findings_reason` explains why there is nothing to
-    report (e.g. a genuine blocker); the reason is recorded in the closeout."""
+    `title`/`finding`/`summary`); that much both this tool and verify_handoff
+    refuse identically if missing. `evidence` (a list of non-empty strings
+    naming what backs it — a test count, a commit sha, a diff reviewed) is
+    NOT required on every finding, but when `checklist_resolved=True` this
+    tool now refuses the handoff up front unless SOME evidence exists
+    somewhere — a counted result in `narrative` (e.g. "42 passed") or an
+    `evidence` field on at least one finding — the exact same check
+    verify_handoff runs (gap 34c8e60f4260; Loki 23CAD2B4 F3). An empty
+    `findings` list is refused unless `no_findings_reason` explains why
+    there is nothing to report (e.g. a genuine blocker); the reason is
+    recorded in the closeout."""
     return handoff_stack.handoff_write_v4(
         app_id,
         dispatch_id,
