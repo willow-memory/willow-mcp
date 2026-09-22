@@ -116,6 +116,13 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         "context_list", "knowledge_search", "kb_ingest", "store_get", "store_search",
         "specialist_list", "specialist_get", "agent_seed_mirror",
         "exposure_config_get", "exposure_slice",
+        # gitsync_sweep / git_pull_execute used to ride the shared
+        # `envelope_apply` gate name; pair 163b9a70 split them onto their
+        # own names (see server.py's git_pull_execute docstring) so the new
+        # steward_sweep group can grant them without also granting envelope
+        # authoring. Listed here too so the human orchestrator seat (which
+        # held them via `envelope_apply` above) is unaffected by the split.
+        "gitsync_sweep", "git_pull_execute",
     }),
     "fleet_read": frozenset({
         "fleet_status", "fleet_health", "frank_read", "frank_verify",
@@ -391,6 +398,103 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     "human_loop_write": frozenset({
         "human_required_enqueue", "human_required_resolve", "human_attestation_create",
     }),
+    # The steward as its own principal (sealed 163b9a70, dispatch 4326FDFE;
+    # reworked per Loki's audit 207B3590 dispatch D7BD9FE2, which re-derived
+    # the steward's real call list from the live tick.py/heartbeat.py/
+    # deposits.py — 13 distinct tools across 17 call sites — after the first
+    # cut's group set was built from a wrong verb list). app_id willow-bot,
+    # never willow, never WILLOW_HUMAN_ORCHESTRATOR, never full_access, never
+    # grove_relay, never envelope authoring. Narrow groups, one per verb
+    # class, mirroring the split this repo already uses everywhere else
+    # (store_read/write, envelope_read/write, ...) so a future steward
+    # capability can be granted without regranting the rest.
+    #
+    # steward_sweep: the tick-time maintenance verbs that mirror a human's
+    # own prior seal/action and mint no new authority — same standing as
+    # governance_sync above. `git_pull_execute` was here in the first cut;
+    # Loki F2 found no willow-bot call site for it (gitsync_sweep reaches
+    # pull_executor.sweep_triggers directly, server-side, never through
+    # git_pull_execute as a caller) — dropped. It stays reachable via
+    # `orchestrator`/`full_access` for the human seat, unchanged.
+    "steward_sweep": frozenset({
+        "seal_drain", "net_authority_drain", "envelope_retire_sweep",
+        "gitsync_sweep",
+    }),
+    # steward_read: every read-only tool the tick calls. human_required_list
+    # (the steward checks what is already open before ever asking to add to
+    # it) plus, per Loki F1e, fleet_health and commitment_surface
+    # (heartbeat.py:28-29 — every heartbeat tick, not just steward_audit).
+    # Deliberately narrower than human_loop_read/fleet_read/commitment_read
+    # (each of which carries siblings — human_attestation_list, frank_read/
+    # frank_verify/bot_status/pr_checks_read, commitment_list — the steward
+    # has no tick-path use for).
+    "steward_read": frozenset({
+        "human_required_list", "fleet_health", "commitment_surface",
+    }),
+    # steward_human_loop: file AND clear a human-required ask. The first
+    # cut's `steward_enqueue` only covered filing; Loki F1b found three live
+    # call sites (tick.py: `_remember`, `run_ci_legacy_clear`,
+    # `_backfill_stuck_items`) where the steward RESOLVES the CI-red items
+    # it filed once the head re-runs green, is superseded, or the PR closes
+    # — refusing that left every CI-red item open forever and the desk's
+    # queue filling with stale asks. Deliberately excludes
+    # human_attestation_create (human_loop_write's third member) — the
+    # steward raises and clears its own hand, it does not attest on
+    # anyone's behalf.
+    "steward_human_loop": frozenset({
+        "human_required_enqueue", "human_required_resolve",
+    }),
+    # steward_store_write: the two SOIL writes the tick makes — run_mirror's
+    # store_put/store_delete on `willow_bot_ci_deposits` (deposits.py:33,
+    # tick.py:442-465, deposits.py:518) and run_resolve's store_put on
+    # `idea_landings` (tick.py:2914). Narrower than the general `store_write`
+    # group (which also carries store_update/store_purge_collection/
+    # agent_seed_mirror, none of which the steward calls) — collection
+    # confinement to exactly those two names is the manifest's own
+    # `store_scope`, not this group; the two together are what "narrowest
+    # group that fits" means here (Loki F1c, F3).
+    "steward_store_write": frozenset({
+        "store_put", "store_delete",
+    }),
+    # steward_gap_resolve: run_resolve resolves the backlog gap a merged PR
+    # named (tick.py:2932, Loki F1d). Its own line rather than folded into
+    # gap_write (which also carries gap_log/gap_delete/gap_purge_topic/
+    # gap_retopic) — same reasoning as gap_promote/schema_admin staying off
+    # gap_write.
+    "steward_gap_resolve": frozenset({
+        "gap_resolve",
+    }),
+    # steward_dispatch — POLICY QUESTION FOR THE DESK, NOT DECIDED HERE.
+    # Loki F4: dispatch_send IS a verb the steward ticks today (run_audit,
+    # tick.py:295/311, to_app=loki, role=auditor, under an auditor envelope)
+    # — sealed 163b9a70's "the orchestrator-scoped verbs it ticks accept
+    # willow-bot ... each under its own permission group" covers it on a
+    # plain reading. The first cut's "a machine may not dispatch" was this
+    # builder's policy, not the seal's text (dispatch 4326FDFE's handoff,
+    # item 5) — that was an overreach; this group exists so the verb is not
+    # silently unreachable while the desk decides.
+    #
+    # What this group does NOT do: bound the call to the audit shape
+    # (to_app in {loki}, role=auditor) the brief asks for. gate.permitted()
+    # is a per-verb boolean with no argument-level bounds — enforcing
+    # "willow-bot may only dispatch_send(to_app='loki', role='auditor')"
+    # needs either a dedicated check inside dispatch_send keyed on the
+    # caller's identity (unbuilt), or an envelope-style bounds record
+    # (dispatch_send is not envelope-gated today). Granting this group
+    # today is UNBOUNDED beyond "may call dispatch_send at all".
+    #
+    # THE QUESTION FOR THE DESK (Loki F4, restated): should a machine
+    # principal hold dispatch authority at all — even bounded to one
+    # auditor target — or should `run_audit` be changed to
+    # `human_required_enqueue(kind="dispatch", ...)` instead, with the
+    # human/desk doing the actual dispatch_send? Until the desk seals an
+    # answer, this group is a capability that EXISTS but whose grant is
+    # itself the open question — do not wire it into a live willow-bot
+    # manifest as settled policy; the sealed pair that grants (or revokes)
+    # it should cite this comment and dispatch D7BD9FE2.
+    "steward_dispatch": frozenset({
+        "dispatch_send",
+    }),
     # MarkdownAI (mai) tools — #153/#161. Registration is already opt-in via
     # WILLOW_MCP_MARKDOWNAI; these groups add per-app authorization on top,
     # because a registered tool surface with no gate is exactly the #161 hole.
@@ -448,6 +552,10 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # shows spent — same standing as net_authority_drain, no new
         # authority, the gate does not depend on it.
         "envelope_retire_sweep",
+        # gitsync_sweep / git_pull_execute (split off the shared
+        # `envelope_apply` name by pair 163b9a70 — see "orchestrator" above
+        # and server.py's git_pull_execute docstring).
+        "gitsync_sweep", "git_pull_execute",
         # Grove — the fleet's shared messaging room (read + write; no egress
         # concern like web_net/integration_net/mcp_federation, so unlike those
         # this rides full_access, same reasoning as knowledge_read/write above)

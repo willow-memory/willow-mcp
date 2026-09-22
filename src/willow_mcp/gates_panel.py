@@ -132,6 +132,12 @@ FRIENDLY_LABELS: dict[str, str] = {
     "tool_oracle_seal": "Teach it which tool a phrase means",
     "governance_propose": "Propose a recorded decision as a draft for a human to seal",
     "governance_sync": "Mirror a human's Nestor seal onto its recorded decision",
+    "steward_sweep": "Run the steward's tick-time maintenance (seal watch, network authority, envelope sweep, git sync)",
+    "steward_read": "See the human-required queue and fleet/commitment status",
+    "steward_human_loop": "Flag work for a human and clear items it filed",
+    "steward_store_write": "Write its own CI-deposit and idea-landing records",
+    "steward_gap_resolve": "Resolve a backlog gap a merged PR named",
+    "steward_dispatch": "Dispatch an audit packet (open policy question — see dispatch D7BD9FE2)",
     "envelope_apply": "Apply a pre-approved authority envelope",
     "envelope_read": "See pre-approved authority envelopes and pending proposals",
     "envelope_write": "Propose, ratify, and reject authority envelopes",
@@ -676,6 +682,24 @@ PERM_NEVER_REQUESTABLE = frozenset({
     INTEGRATION_NET_PERMISSION,
     WEB_NET_PERMISSION,
     MCP_FEDERATION_PERMISSION,
+    # The steward's own narrow groups (pair 163b9a70, reworked D7BD9FE2):
+    # each names ONE seat (willow-bot), not a general capability class, and
+    # several are strictly narrower than an existing general group for the
+    # same tool (steward_store_write ⊂ store_write, steward_read ⊂
+    # fleet_read, steward_human_loop ⊂ human_loop_write, steward_gap_resolve
+    # ⊂ gap_write, steward_dispatch ⊂ dispatch_write). Left requestable,
+    # narrowest_requestable_perm_scope would recommend "steward_store_write"
+    # to ANY app denied store_put — a seat-named group handed to an unrelated
+    # caller. Excluded so the ask queue falls through to the general group
+    # (or the literal tool name) instead; a steward grant stays a deliberate,
+    # out-of-band operator act (manifest.create / manifest_grant_request),
+    # never something the ask queue surfaces.
+    "steward_sweep",
+    "steward_read",
+    "steward_human_loop",
+    "steward_store_write",
+    "steward_gap_resolve",
+    "steward_dispatch",
 })
 
 

@@ -5362,7 +5362,7 @@ def pr_open_execute(
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
-@_guarded("envelope_apply")
+@_guarded("git_pull_execute")
 def git_pull_execute(
     app_id: str,
     checkout: str,
@@ -5381,7 +5381,13 @@ def git_pull_execute(
     a symlink — a pull never loses work. Takes no envelope: a fast-forward
     creates no history and publishes none (the desk hook already treats it
     as repo maintenance); it leaves a FRANK `git_pull` receipt instead, so
-    the act has ink. Gated as envelope_apply beside the push and the PR."""
+    the act has ink. Gated on its OWN name (`git_pull_execute`), not shared
+    with `envelope_apply` (pair 163b9a70): the steward seat (willow-bot)
+    holds `steward_sweep`, which grants exactly this and `gitsync_sweep` —
+    granting the old shared `envelope_apply` group would have also unlocked
+    envelope authoring, unit.install/reload, and PR open/update for a
+    seat that must never author envelopes. `orchestrator` and `full_access`
+    carry this name too, so the human seat is unaffected."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
@@ -5663,7 +5669,7 @@ def pr_update_execute(
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
-@_guarded("envelope_apply")
+@_guarded("gitsync_sweep")
 def gitsync_sweep(app_id: str, project: str = "") -> dict:
     """Consume willow-bot's gitsync triggers: for every
     `$WILLOW_HOME/gitsync/trigger-<owner>-<repo>.flag` the bridge wrote on a
@@ -5672,7 +5678,9 @@ def gitsync_sweep(app_id: str, project: str = "") -> dict:
     executor, and remove the flag on success. A refusal (dirty, diverged, no
     clone) leaves the flag for the next sweep and is reported in `swept`,
     never swallowed. An absent trigger dir is reported as `present: false`,
-    not as an empty success."""
+    not as an empty success. Gated on its OWN name, not the shared
+    `envelope_apply` group (pair 163b9a70) — see `git_pull_execute`'s
+    docstring for why."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
