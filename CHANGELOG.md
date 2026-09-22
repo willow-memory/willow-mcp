@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.78.0](https://github.com/willow-memory/willow-mcp/compare/v2.77.0...v2.78.0) (2026-09-22)
+
+
+### Added
+
+* **trust-owner:** four more apply-half verbs — envelope.revoke, manifest.retire, manifest.create, federation.ratify — a signature-trusted envelope register, and the manifest-grant installer in-repo ([5a7b097](https://github.com/willow-memory/willow-mcp/commit/5a7b097b6cfb5fc3c581ef37bf30bcbc7ac35856))
+
+
+### Fixed
+
+* **deploy:** quote install.sh's remaining unquoted expansions (SC2086) ([b23728d](https://github.com/willow-memory/willow-mcp/commit/b23728d9846bfd77fc23295682f8c80412f45837))
+
 ## [2.77.0](https://github.com/willow-memory/willow-mcp/compare/v2.76.0...v2.77.0) (2026-09-22)
 
 
