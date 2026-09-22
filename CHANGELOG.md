@@ -31,6 +31,24 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.79.0](https://github.com/willow-memory/willow-mcp/compare/v2.78.0...v2.79.0) (2026-09-22)
+
+
+### Added
+
+* **envelope:** add envelope.ratify trust-owner verb (gap d3f79320ccb5) ([0ee7ef1](https://github.com/willow-memory/willow-mcp/commit/0ee7ef1654d801bf1ad9aaf1c97216694d31ae15))
+
+
+### Fixed
+
+* **envelope:** convert envelope.ratify to the carried sealed row; bind pair_id (Loki 229BE2C1 R2+R3) ([0dbcacd](https://github.com/willow-memory/willow-mcp/commit/0dbcacdce16a500596353bd5d9250864ba84f25b))
+* **server:** apply half stops reading nestor.db; fix pending/ listing swallow ([1f2747e](https://github.com/willow-memory/willow-mcp/commit/1f2747e66dba44247e2e9318de7cb4d9897411c2))
+* **envelope:** bind the seal to the grant's content, not just its name (Loki BDC2B0F2) ([0098b41](https://github.com/willow-memory/willow-mcp/commit/0098b418e2825d1edf96c3b0fa78ddaf72ae7662))
+* **server:** the apply half must not inherit the broker's uid assumptions at import ([4d35055](https://github.com/willow-memory/willow-mcp/commit/4d3505537cc59b04b41f6cfab9a8590c8f4cc9a9))
+* **envelope:** update tool-count prose and row-density test for row 24 ([ee27385](https://github.com/willow-memory/willow-mcp/commit/ee273853fb521cd9c12055bc493c6735dcc74194))
+* **reloader:** exhaust the at-HEAD scan, name stale seals, consume all sealed candidates at a sha ([6c6a5ec](https://github.com/willow-memory/willow-mcp/commit/6c6a5ec3c5c9ae374d04baa619eca07c7d35a99f))
+* **reloader:** match a seal to what was confirmed, not the newest row ([3013146](https://github.com/willow-memory/willow-mcp/commit/3013146786028455e32d85c046174f49b0488b9e))
+
 ## [2.78.0](https://github.com/willow-memory/willow-mcp/compare/v2.77.0...v2.78.0) (2026-09-22)
 
 
