@@ -1002,7 +1002,7 @@ def test_counted_row_skipped_when_budget_already_under_the_floor_before_it_start
     assert receipt["truncated"] is True
 
 
-def test_counted_row_after_deadline_mid_sweep_is_clipped_and_reported_truncated():
+def test_counted_row_after_deadline_mid_sweep_is_clipped_and_reported_truncated(monkeypatch):
     """A mixed register where the budget runs out partway through: the
     counted row that would have needed a FRANK call after the deadline is
     reported via `truncated`, never folded into `kept_in_force` -- it was
@@ -1013,9 +1013,6 @@ def test_counted_row_after_deadline_mid_sweep_is_clipped_and_reported_truncated(
     counted = _row(id="env-b-counted", max_count=1)
     reg = _registry([standing, counted])
 
-    import willow_mcp.envelope_retire_sweep as sweep_mod_local
-
-    clock = {"t": 0.0}
     # First call is `started`; the between-rows check must not yet trip
     # (so the standing row is examined), but by the time the counted row's
     # per-row clipped-timeout check runs, the budget must look spent.
@@ -1025,15 +1022,10 @@ def test_counted_row_after_deadline_mid_sweep_is_clipped_and_reported_truncated(
         calls["n"] += 1
         return 0.0 if calls["n"] <= 2 else 100.0
 
-    import willow_mcp.envelope_retire_sweep as _mod
-    orig = _mod.time.monotonic
-    _mod.time.monotonic = fake_monotonic
-    try:
-        ledger = _FakeLedger(counts={"env-b-counted": 1})
-        receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}),
-                                  ledger=ledger, time_budget_s=1.0)
-    finally:
-        _mod.time.monotonic = orig
+    monkeypatch.setattr(sweep_mod.time, "monotonic", fake_monotonic)
+    ledger = _FakeLedger(counts={"env-b-counted": 1})
+    receipt = sweep_mod.sweep(dry_run=True, registry=reg, api=_fake_api({}),
+                              ledger=ledger, time_budget_s=1.0)
 
     assert receipt["kept_standing"] == 1
     assert receipt["retired"] == []

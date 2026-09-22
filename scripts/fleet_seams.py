@@ -60,6 +60,89 @@ def _require_env() -> None:
         )
 
 
+# ── the organ's manifest (gap 3cdeb177af78, willow-mcp half) ────────────────
+#
+# CI fleet-seams went red at #617/528ef68 after Jeles#87 (jeles/corpus.py's
+# `_manifest_scope`, sealed ae23d366 "Jeles is the organ"): the probe
+# co-installs Jeles master, and `_conn`/`_validate_collection` now refuse
+# every store-backed call — put_nugget, search_nuggets — unless
+# `$WILLOW_MCP_APPS_ROOT/<JELES_CORPUS_APP_ID>/manifest.json` exists, has a
+# sibling `manifest.json.sig` that at least LOOKS like an ASCII-armored PGP
+# signature (`_looks_like_pgp_signature` — shape only, `_manifest_scope`'s
+# own docstring is explicit that this module holds no keyring and verifies
+# nothing cryptographic; that is willow-mcp's gate's job, unreachable from
+# here for the same "no reverse channel from a spawned stdio child" reason
+# named in corpus.py), and declares `store_scope`/`store_write` as lists.
+#
+# `JELES_CORPUS_APP_ID` is the organ's OWN seat id, never the retired Ask
+# Jeles specialist seat `jeles` — an explicit `jeles` is refused outright by
+# `_manifest_scope` before any manifest is even looked up (ae23d366). This
+# probe's fixture always uses `jeles-corpus` (Jeles' own hardcoded default
+# when the env var is unset), named explicitly here rather than left to that
+# default, so a future default change cannot silently point this fixture at
+# the wrong seat without this file also going red.
+_JELES_CORPUS_APP_ID = "jeles-corpus"
+
+#: The exact collections this probe exercises through the corpus store —
+#: `seam_shared_store` (put_nugget: write, then a read-back through
+#: willow-mcp's own Store) and `seam_nugget_bridge` (search_nuggets: read).
+#: Nothing else in this script touches jeles' corpus store directly —
+#: `seam_gap_forward` calls willow-mcp's own `gap_log` tool over MCP, never
+#: jeles' local `corpus.log_gap`/GAPS_COLLECTION — so the fixture's reach is
+#: exactly this one collection, not "everything," matching the organ's own
+#: fail-closed, declared-list model.
+_JELES_CORPUS_FIXTURE_COLLECTIONS = ["ask_jeles_corpus"]
+
+#: Shape-only fixture signature (Jeles#87, Loki J3/R1: `_looks_like_pgp_
+#: signature` checks the ASCII-armored markers are present and the payload
+#: is non-empty -- never a real signature, and `_manifest_scope` never
+#: verifies one; only willow-mcp's gate does that, and only for the real
+#: manifest-signing path, not this test fixture).
+_JELES_CORPUS_FIXTURE_SIG = (
+    "-----BEGIN PGP SIGNATURE-----\n"
+    "\n"
+    "fleet-seams test fixture -- shape only, verifies nothing.\n"
+    "-----END PGP SIGNATURE-----\n"
+)
+
+
+def _provision_jeles_corpus_manifest() -> None:
+    """Write the organ's fixture manifest + sibling `.sig` under
+    `$WILLOW_MCP_APPS_ROOT/jeles-corpus/`, and set `JELES_CORPUS_APP_ID`/
+    `WILLOW_MCP_APPS_ROOT` in this process's own env before any seam runs.
+
+    Idempotent (overwrites on every run, same as `fleet-standup.sh` treats
+    the rest of the fleet env) and side-effect-free if jeles is not even
+    installed here -- `seam_coinstall` reports that as its own FAIL/SKIP;
+    this function only ever writes files under `$WILLOW_HOME`, it never
+    imports jeles.
+    """
+    import pathlib
+
+    home = pathlib.Path(os.environ["WILLOW_HOME"]).expanduser()
+    apps_root_override = os.environ.get("WILLOW_MCP_APPS_ROOT", "").strip()
+    apps_root = pathlib.Path(apps_root_override) if apps_root_override else home / "mcp_apps"
+    os.environ["WILLOW_MCP_APPS_ROOT"] = str(apps_root)
+    os.environ["JELES_CORPUS_APP_ID"] = _JELES_CORPUS_APP_ID
+
+    app_dir = apps_root / _JELES_CORPUS_APP_ID
+    app_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = app_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "store_scope": list(_JELES_CORPUS_FIXTURE_COLLECTIONS),
+                "store_write": list(_JELES_CORPUS_FIXTURE_COLLECTIONS),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    sig_path = manifest_path.with_name(manifest_path.name + ".sig")
+    sig_path.write_text(_JELES_CORPUS_FIXTURE_SIG, encoding="utf-8")
+
+
 # ── seam 1: the three packages co-install and resolve to the checkouts ────────
 
 def seam_coinstall() -> Result:
@@ -344,6 +427,7 @@ def main() -> int:
     args = ap.parse_args()
 
     _require_env()
+    _provision_jeles_corpus_manifest()
 
     results: list[Result] = []
     for name, fn in SEAMS:
