@@ -682,6 +682,24 @@ PERM_NEVER_REQUESTABLE = frozenset({
     INTEGRATION_NET_PERMISSION,
     WEB_NET_PERMISSION,
     MCP_FEDERATION_PERMISSION,
+    # The steward's own narrow groups (pair 163b9a70, reworked D7BD9FE2):
+    # each names ONE seat (willow-bot), not a general capability class, and
+    # several are strictly narrower than an existing general group for the
+    # same tool (steward_store_write ⊂ store_write, steward_read ⊂
+    # fleet_read, steward_human_loop ⊂ human_loop_write, steward_gap_resolve
+    # ⊂ gap_write, steward_dispatch ⊂ dispatch_write). Left requestable,
+    # narrowest_requestable_perm_scope would recommend "steward_store_write"
+    # to ANY app denied store_put — a seat-named group handed to an unrelated
+    # caller. Excluded so the ask queue falls through to the general group
+    # (or the literal tool name) instead; a steward grant stays a deliberate,
+    # out-of-band operator act (manifest.create / manifest_grant_request),
+    # never something the ask queue surfaces.
+    "steward_sweep",
+    "steward_read",
+    "steward_human_loop",
+    "steward_store_write",
+    "steward_gap_resolve",
+    "steward_dispatch",
 })
 
 

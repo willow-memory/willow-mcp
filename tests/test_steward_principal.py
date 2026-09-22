@@ -430,10 +430,14 @@ def test_manifest_create_fixture_line_parses_under_the_create_grammar():
     assert "dispatch_send" not in perms
 
 
-def test_shipped_manifest_json_matches_the_create_fixture_line_exactly():
+def test_shipped_manifest_json_permissions_match_the_create_fixture_permissions():
     """The JSON template's permissions/store_scope/store_write must be the
-    SAME set the create fixture line names — one drifting from the other
-    is exactly the F3 defect this rework fixes."""
+    SAME set the create fixture line names — one drifting from the other is
+    exactly the F3 defect this rework fixes. Compared as plain data (no
+    regex re-parse of file content — that shape is what test_scans_fire.py's
+    inline-scan house rule flags as needing a planted helper, and a second
+    parse of self-built text from the same dict is circular anyway; the
+    grammar itself is already exercised on a hand-written line above)."""
     import pathlib
 
     manifest_path = (
@@ -441,15 +445,12 @@ def test_shipped_manifest_json_matches_the_create_fixture_line_exactly():
         / "src" / "willow_mcp" / "bundle" / "config" / "seats" / "willow-bot.manifest.json"
     )
     data = json.loads(manifest_path.read_text())
-    line = (
-        "create seat willow-bot "
-        f"store_scope [{', '.join(data['store_scope'])}] "
-        f"store_write [{', '.join(data['store_write'])}] "
-        f"permissions [{', '.join(data['permissions'])}]"
-    )
-    m = _CREATE_RE_COPY.match(line)
-    assert m is not None
-    assert _parse_list(m.group("permissions")) == data["permissions"]
+    assert set(data["permissions"]) == {
+        "steward_sweep", "steward_read", "steward_human_loop",
+        "steward_store_write", "steward_gap_resolve", "grove_read", "grove_write",
+    }
+    assert set(data["store_scope"]) == {"willow_bot_ci_deposits", "idea_landings"}
+    assert set(data["store_write"]) == {"willow_bot_ci_deposits", "idea_landings"}
 
 
 # ── item 5 / F4: dispatch_send is absent from the settled steward groups ─
