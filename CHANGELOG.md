@@ -31,6 +31,20 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.77.0](https://github.com/willow-memory/willow-mcp/compare/v2.76.0...v2.77.0) (2026-09-22)
+
+
+### Added
+
+* **reloader:** restart the broker on an env change, not only a pull ([5f9933c](https://github.com/willow-memory/willow-mcp/commit/5f9933c5a5890e8be9713e6cd8af52338e155789))
+
+
+### Fixed
+
+* **reloader:** rework 3 for Loki BE590C53 — resolve WILLOW_KEYRING from the net-signer unit's own environment, refuse to render an unstaged ring, catch KeyringError as unreachable ([2a11d76](https://github.com/willow-memory/willow-mcp/commit/2a11d767aafe0252f392d3e694ed18190f0327d5))
+* **reloader:** rework 2 for Loki 747B0C04 — reloader unit names a public keyring, source-flap and missing-env are unreachable not diffs, no per-key change claim, EUNREACH blocks a sealed pull, EPARTIAL waits ([ff19dc2](https://github.com/willow-memory/willow-mcp/commit/ff19dc23590ab16e94b7481a46eabf6948675a4a))
+* **reloader:** rework 1 for Loki E79FCAE7 — no per-key oracle, real seal verification, stale-not-stuck, all-open-triggers-sealed ([eacdd15](https://github.com/willow-memory/willow-mcp/commit/eacdd1519d06ac3a624955cc1f090b0e9178719a))
+
 ## [2.76.0](https://github.com/willow-memory/willow-mcp/compare/v2.75.0...v2.76.0) (2026-09-22)
 
 
