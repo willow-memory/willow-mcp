@@ -48,9 +48,11 @@ def test_row_17_note_names_the_seal_for_the_live_table_sync():
 
 def test_row_ids_are_dense_and_17_is_not_the_last_anymore():
     """Row 18 (manifest.grant, tests/test_manifest_grant.py) landed after this
-    row — dense ids still hold, 17 is just no longer the tail."""
+    row, and rows 19-22 (envelope.revoke, manifest.retire, manifest.create,
+    federation.ratify — tests/test_trust_owner_verbs.py, pair 1bd6fd29) landed
+    after that — dense ids still hold, 17 is just no longer the tail."""
     ids = sorted(_rows())
-    assert ids == list(range(1, 19))
+    assert ids == list(range(1, 23))
     assert 17 in ids
 
 

@@ -381,6 +381,90 @@ def _signed_candidate(
         publish(manifest_bytes, signature.read_bytes())
 
 
+def publish_signed_create(
+    path: Path,
+    manifest_bytes: bytes,
+    signature_bytes: bytes,
+    fingerprint: str,
+    public_key: bytes | None = None,
+) -> None:
+    """Verify and publish a BRAND-NEW manifest+signature pair as one logical
+    unit — the create-time sibling of :func:`publish_signed_pair`, which is
+    built around a single-permission toggle on an EXISTING manifest and
+    cannot itself express "there was nothing here before." Refuses
+    (``RuntimeError``) if a manifest has appeared at ``path`` since the
+    candidate was staged — a create never overwrites, mirroring
+    ``publish_signed_pair``'s own previous-digest check for the mutate case.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = f"{os.getpid()}-{os.urandom(6).hex()}"
+    candidate = path.parent / f".{path.name}.candidate-{token}"
+    candidate_sig = pgp.detached_sig_path(candidate)
+    live_sig = pgp.detached_sig_path(path)
+
+    with pgp.signed_pair_lock(path, exclusive=True):
+        if path.is_file():
+            raise RuntimeError(
+                f"manifest appeared at {path} while the create was being signed; "
+                "nothing was published — a create never overwrites"
+            )
+        try:
+            candidate.write_bytes(manifest_bytes)
+            candidate_sig.write_bytes(signature_bytes)
+            os.chmod(candidate, 0o644)
+            os.chmod(candidate_sig, 0o644)
+            ok, detail = pgp.verify_detached(candidate, fingerprint=fingerprint, public_key=public_key)
+            if not ok:
+                raise RuntimeError(
+                    f"signed manifest candidate failed verification; nothing was "
+                    f"published ({detail})"
+                )
+            os.replace(candidate_sig, live_sig)
+            os.replace(candidate, path)
+        finally:
+            candidate.unlink(missing_ok=True)
+            candidate_sig.unlink(missing_ok=True)
+
+
+def create_manifest(
+    app_id: str,
+    *,
+    store_scope: list[str],
+    store_write: list[str],
+    permissions: list[str],
+) -> dict:
+    """Create a BRAND-NEW seat manifest — ``manifest.create``'s own staged,
+    signed publish path, never a bare ``Path.write_text``. Refuses
+    (``FileExistsError``) if a manifest already exists at this app_id: this
+    function only ever creates; extending an EXISTING seat's permissions is
+    ``manifest.grant``'s job (:func:`set_permission`), not this one's. When
+    PGP enforcement is off (no ``WILLOW_PGP_FINGERPRINT``), writes the
+    manifest atomically, unsigned — the same posture ``set_permission``
+    takes for its first grant on an unenforced box.
+    """
+    app_id = _validate_app_id(app_id)
+    for perm in permissions:
+        validate_permission(perm)
+    path = manifest_path(app_id)
+    if path.is_file():
+        raise FileExistsError(f"manifest already exists at {path}")
+    manifest = {
+        "store_scope": list(store_scope),
+        "store_write": list(store_write),
+        "permissions": list(permissions),
+    }
+    fingerprint = pgp.expected_fingerprint()
+    if not fingerprint:
+        _write_json_atomic(path, manifest)
+        return manifest
+
+    def _publish(manifest_bytes: bytes, signature_bytes: bytes) -> None:
+        publish_signed_create(path, manifest_bytes, signature_bytes, fingerprint)
+
+    _signed_candidate(manifest, fingerprint, _publish)
+    return manifest
+
+
 def publish_via_trust_owner(
     path: Path,
     manifest_bytes: bytes,

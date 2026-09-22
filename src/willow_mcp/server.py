@@ -133,7 +133,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 140 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 144 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -5615,6 +5615,148 @@ def manifest_grant_retry(
         )
     except Exception as exc:
         return {"ok": False, "error": f"manifest_grant_retry_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def envelope_revoke_request(
+    app_id: str,
+    envelope_id: str,
+    pair_id: str,
+) -> dict:
+    """Verify a human-sealed Nestor pair against every precondition for
+    `envelope.revoke` and, if every one holds, write ONE signed request
+    under `$WILLOW_HOME/manifest_grants/pending/<pair_id>.json` —
+    orchestrator-only. `pair_id` names a sealed decision whose `target_text`
+    is `revoke envelope <envelope_id>: <reason>` (one line) — the envelope
+    to revoke and the reason are read from THAT sealed text, never from
+    free arguments to this tool. Refuses `EPERM` (not orchestrator),
+    `EALREADY`, `ENOENT` (no governance record, or no active envelope with
+    that id), `EACCES` (pair not sealed, seal does not verify, or the named
+    envelope is already revoked), `EINVAL` (grammar miss). Signs nothing;
+    `manifest_grant_apply` (the trust-owner unit, never Kart, never this
+    process) drains `pending/` and does the actual
+    `envelope_authoring.revoke`. Same queue as `manifest.grant`, same
+    `manifest_grant_status`/`manifest_grant_retry` surface — distinguished
+    by the record's own `verb` field. Built to retire the Jeles seat's
+    `env-dispatch-301fa3b93732` (sealed `ae23d366`) without a keyboard."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import trust_owner_verbs
+        from .governance_ledger import GovernanceLedger
+
+        return trust_owner_verbs.envelope_revoke_request(
+            app_id, envelope_id=envelope_id, pair_id=pair_id,
+            project="willow-mcp", session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"envelope_revoke_request_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def manifest_retire_request(
+    app_id: str,
+    envelope_id: str,
+    pair_id: str,
+) -> dict:
+    """Verify a human-sealed Nestor pair against every precondition for
+    `manifest.retire` and, if every one holds, write ONE signed request
+    under `$WILLOW_HOME/manifest_grants/pending/<pair_id>.json` —
+    orchestrator-only. `pair_id` names a sealed decision whose `target_text`
+    is `retire seat <app_id>: <reason>` (one line). Request pre-state: the
+    seat's manifest exists and its signature verifies; refuses `EBUSY`
+    naming any ACTIVE envelope that still grants that seat (revoke first —
+    sealed `ae23d366` ordering). The orchestrator seat itself can never be
+    named. `manifest_grant_apply` moves `mcp_apps/<app_id>/` to
+    `mcp_apps/_retired/<app_id>-<pair_id>/` — kept, never deleted."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import trust_owner_verbs
+        from .governance_ledger import GovernanceLedger
+
+        return trust_owner_verbs.manifest_retire_request(
+            app_id, envelope_id=envelope_id, pair_id=pair_id,
+            project="willow-mcp", session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"manifest_retire_request_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def manifest_create_request(
+    app_id: str,
+    envelope_id: str,
+    pair_id: str,
+) -> dict:
+    """Verify a human-sealed Nestor pair against every precondition for
+    `manifest.create` and, if every one holds, write ONE signed request
+    under `$WILLOW_HOME/manifest_grants/pending/<pair_id>.json` —
+    orchestrator-only. `pair_id` names a sealed decision whose `target_text`
+    is `create seat <app_id> store_scope [a, b] store_write [c] permissions
+    [g1, g2]` (one line; each list may be empty, `[]`). Request pre-state:
+    no manifest exists yet for the named seat; no permission is on the
+    escalation list; the seat name passes the same rule `gate` enforces
+    elsewhere. `manifest_grant_apply` writes the manifest through
+    `manifest_admin.create_manifest` — the same staged, signed publish path
+    `manifest.grant` uses, never a bare write. First live use: the Jeles
+    corpus organ (sealed `ae23d366`)."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import trust_owner_verbs
+        from .governance_ledger import GovernanceLedger
+
+        return trust_owner_verbs.manifest_create_request(
+            app_id, envelope_id=envelope_id, pair_id=pair_id,
+            project="willow-mcp", session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"manifest_create_request_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def federation_ratify_request(
+    app_id: str,
+    envelope_id: str,
+    pair_id: str,
+) -> dict:
+    """Verify a human-sealed Nestor pair against every precondition for
+    `federation.ratify` and, if every one holds, write ONE signed request
+    under `$WILLOW_HOME/manifest_grants/pending/<pair_id>.json` —
+    orchestrator-only. `pair_id` names a sealed decision whose `target_text`
+    is `ratify federation server <name> command <abs path> cwd <abs path>
+    env_keys [K1, K2]` (one line; `args [...]` optional). Request pre-state:
+    the command path exists and is executable, every env key is a bare NAME
+    (values are never in a pair). `manifest_grant_apply` calls
+    `mcp_federation.ratify` — never reachable from this tool call itself,
+    per that function's own 'never call this from an MCP tool' docstring;
+    only the trust-owner apply unit calls it. First live use: entry
+    `8cae3d1dcdf4` (`jeles-corpus`)."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import trust_owner_verbs
+        from .governance_ledger import GovernanceLedger
+
+        return trust_owner_verbs.federation_ratify_request(
+            app_id, envelope_id=envelope_id, pair_id=pair_id,
+            project="willow-mcp", session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"federation_ratify_request_failed: {exc}"}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
