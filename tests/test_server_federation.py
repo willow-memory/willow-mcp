@@ -102,16 +102,53 @@ def test_federation_call_full_round_trip(home, monkeypatch):
     assert server_id in detail_blob and "tool=echo" in detail_blob
 
 
-def test_federation_call_drops_rows_above_the_callers_exposure_tier_and_says_so_in_the_receipt(
+def test_federation_call_unconfigured_stdio_caller_sees_its_own_corpus_and_says_so_in_the_receipt(
     home, monkeypatch
 ):
-    """Sealed ae23d366 clause 3, end to end through the guarded MCP tool,
-    ceiling model (REWORK, Loki 8AA7CBE7 HIGH): an unconfigured caller
-    resolves to the narrowest tier, "public" (fail closed to the LEAST, not
-    the most) — calling the fixture's corpus_hits tool gets only the
-    public-visibility row back, and receipts_tail names how many were
-    dropped and at which tier."""
+    """Sealed ae23d366 clause 3, end to end through the guarded MCP tool.
+    REWORK 2 (Loki 24242675, finding 2): an unconfigured caller over stdio
+    (this test's default transport — federation_call's own _serve_mode()
+    is not stubbed here) is NOT "public" — its tier IS the transport
+    ceiling, "internal". Nothing is dropped; receipts_tail says so."""
     from willow_mcp import lease
+
+    server_id = _ratify_echo_fixture(home)
+    perm = gate.federated_tool_permission(server_id, "corpus_hits")
+    _manifest(home, "caller", [gate.MCP_FEDERATION_PERMISSION, perm, "federation_call",
+                               "receipts_tail"])
+    monkeypatch.setattr("willow_mcp.consent.federation_permitted", lambda: True)
+    lease.grant("caller", 1800, issuer="operator", reason="test")
+
+    out = server.federation_call(app_id="caller", server_id=server_id,
+                                 tool="corpus_hits", arguments={})
+    assert "error" not in out
+    assert out["visibility_tier"] == "internal"
+    assert out["visibility_dropped"] == 0
+    body = json.loads(out["content_text"])
+    ids = {r["id"] for r in body["hits"]}
+    assert ids == {"nugget-1", "nugget-2", "nugget-3", "nugget-4"}
+
+    receipts = server.receipts_tail(app_id="caller", limit=10)["receipts"]
+    detail_blob = " ".join(r.get("detail") or "" for r in receipts)
+    assert "visibility_tier=internal" in detail_blob
+    assert "visibility_dropped=0" in detail_blob
+
+
+def test_federation_call_an_explicit_public_override_drops_rows_above_public_and_says_so_in_the_receipt(
+    home, monkeypatch
+):
+    """A caller can still narrow itself explicitly to "public" via a
+    per-agent override — the ceiling model still enforces that request
+    even over trusted stdio, end to end through the guarded MCP tool."""
+    from willow_mcp import exposure as exp
+    from willow_mcp import home_init as hi
+    from willow_mcp import lease
+    from willow_mcp import paths
+
+    hi.ensure_home_layout()
+    cfg = exp.load_exposure_config()
+    cfg["agents"]["caller"] = {"defaults": {"federation_call": "public"}}
+    paths.exposure_config_path().write_text(json.dumps(cfg), encoding="utf-8")
 
     server_id = _ratify_echo_fixture(home)
     perm = gate.federated_tool_permission(server_id, "corpus_hits")

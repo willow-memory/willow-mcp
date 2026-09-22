@@ -83,6 +83,17 @@ def _scan_text(text: str) -> tuple[str, list[dict]]:
     return external_guard.verdict(hits), hits
 
 
+def _withheld(row_visibility: str | None) -> dict:
+    """What a withheld SINGLETON row becomes — never `None` (Loki 24242675,
+    finding 4): a `None` rewrites the shape into something a caller can
+    still index into, turning a withheld-content signal into a confusing
+    `TypeError` deep in caller code instead of here. This marker names the
+    tier the row actually required, so a caller can tell "content existed
+    and was withheld" from "this field was empty" — and, unlike `None`, it
+    is never confused for real row data."""
+    return {"withheld": exposure.row_tier(row_visibility)}
+
+
 def _filter_by_visibility(parsed: Any, caller_tier: str) -> tuple[Any, int]:
     """Sealed ae23d366 clause 3: drop rows whose `visibility` is not
     visible to `caller_tier` (`exposure.visible_to`) — never rewrite a
@@ -92,33 +103,33 @@ def _filter_by_visibility(parsed: Any, caller_tier: str) -> tuple[Any, int]:
     REWORK (Loki 8AA7CBE7, finding: "filter covers a top-level list of
     dicts only"): the original pass only looked at `parsed`'s own top-level
     values, so a nested shape like `{"result": {"hits": [...]}}` went
-    through unfiltered. This version recurses to ANY depth for two row
-    shapes, neither of which assumes which key a downstream server names
-    its rows under:
+    through unfiltered. This version recurses to ANY depth, and — REWORK 2
+    (Loki 24242675, finding 1) — applies ONE rule to a row whether it
+    arrives as a list member or a singleton:
 
     * a homogeneous LIST of dicts — every item is treated as a row even
       without its own `visibility` key (missing -> `internal`, the
       narrowest default — same rule `exposure.visible_to` applies), and
       every SURVIVING row is itself walked afterward so a row that nests
-      another row-list inside it (e.g. `{"hits": [{"id": .., "sub": [...]}]}`)
-      is filtered all the way down;
-    * a single dict value that itself explicitly carries a `visibility`
-      key, wherever it lives (e.g. a corpus's singleton top-hit row, not
-      wrapped in a list with siblings) — withheld (replaced with `None`,
-      never rewritten in place) when not visible. A bare dict WITHOUT a
-      `visibility` key is never treated as a row on its own — only list
-      membership or an explicit marker identifies one; otherwise an
-      ordinary wrapper/metadata dict (this whole result included) would
-      itself be read as an unmarked row and could be wiped out for any
-      caller below `internal`, which is not this filter's job.
-
-    That second rule means a real corpus's singleton row (jeles's `nugget`
-    field, for one — see the handoff for how that shape carries no
-    `visibility` field today at all) is NOT yet caught by the missing-marker
-    default the way list rows are: there is no sibling list to signal "this
-    dict is a row" for a standalone value. The filter is structurally ready
-    for it the moment the field exists; until then it is a documented no-op
-    against that one shape, not a silent gap.
+      another row-list inside it is filtered all the way down. A dropped
+      list row is simply omitted (the list shortens) — no marker needed,
+      there is no index a caller can misread as data.
+    * a dict value is ALSO treated as a row — same missing-visibility
+      default — when it either carries an explicit `visibility` key
+      itself, OR shares a parent dict with at least one sibling key whose
+      own value is a row-list. jeles's real top-hit shape is exactly this:
+      `{"nugget": {...no visibility...}, "candidates": [...]}` — detecting
+      "candidates" as a row-list is enough to know "nugget" is a row too,
+      without this module ever assuming either key's name. The FIRST
+      REWORK's version required an explicit `visibility` key for a
+      singleton, which is exactly how an unmarked `nugget` escaped
+      unfiltered to a "public" caller (Loki 24242675, finding 1) — the row
+      most likely to be quoted was the one built to skip this check. A
+      plain dict with NEITHER an explicit `visibility` key NOR a sibling
+      row-list (ordinary wrapper/metadata, e.g. `{"meta": {"source": ..}}`
+      with nothing else nearby) is left untouched — it has nothing to say
+      it is row-shaped at all, and this filter does not guess. A withheld
+      singleton dict is replaced with `_withheld(...)`, never `None`.
 
     Returns `(filtered, dropped_count)`; `filtered is parsed` (or, for an
     unchanged nested value, that value's own original object) when nothing
@@ -138,15 +149,20 @@ def _filter_by_visibility(parsed: Any, caller_tier: str) -> tuple[Any, int]:
                 return kept
             return [walk(item) for item in node]
         if isinstance(node, dict):
+            has_sibling_row_list = any(
+                isinstance(v, list) and v and all(isinstance(i, dict) for i in v)
+                for v in node.values()
+            )
             changed = False
             out: dict = {}
             for key, val in node.items():
-                if (isinstance(val, dict) and "visibility" in val
-                        and not exposure.visible_to(caller_tier, val.get("visibility"))):
-                    out[key] = None
-                    dropped += 1
-                    changed = True
-                    continue
+                if isinstance(val, dict):
+                    is_row = "visibility" in val or has_sibling_row_list
+                    if is_row and not exposure.visible_to(caller_tier, val.get("visibility")):
+                        out[key] = _withheld(val.get("visibility"))
+                        dropped += 1
+                        changed = True
+                        continue
                 new_val = walk(val)
                 out[key] = new_val
                 if new_val is not val:
@@ -460,9 +476,16 @@ class _ServerConnection:
         # from the caller (server.federation_call passes its own
         # `_serve_mode()`) — this module has no transport of its own to
         # report, so it defaults to False (stdio) rather than guessing.
+        # An empty/omitted app_id is not special-cased to the narrowest
+        # tier anymore (Loki 24242675, finding 2 applies here too):
+        # resolve_exposure_tier already treats "no configured override"
+        # (which an empty app_id trivially has) as "use the transport
+        # ceiling", not "use DEFAULT_VISIBILITY_TIER" — bypassing it here
+        # for a falsy app_id would silently re-introduce the same
+        # blind-desk bug for exactly the caller shape (no app_id at all)
+        # most likely to hit it.
         dropped = 0
-        caller_tier = (exposure.resolve_exposure_tier(app_id, serve_mode=serve_mode)
-                       if app_id else exposure.DEFAULT_VISIBILITY_TIER)
+        caller_tier = exposure.resolve_exposure_tier(app_id, serve_mode=serve_mode)
         parsed = signing._result_dict(result)
         filtered, dropped = _filter_by_visibility(parsed, caller_tier)
         if dropped:
@@ -548,8 +571,9 @@ def call_tool(server_id: str, tool: str, arguments: Optional[dict[str, Any]] = N
 
     `app_id` resolves the CALLER's exposure tier (sealed ae23d366 clause
     3) for filtering the downstream result's rows by `visibility` before
-    they are guard-scanned; omitted, the narrowest (fail-closed) tier
-    applies. `serve_mode` is the caller's own transport ceiling (Loki
+    they are guard-scanned; omitted, the caller's tier is this call's own
+    transport ceiling (Loki 24242675 finding 2 — "unconfigured" is not
+    "public"). `serve_mode` is the caller's own transport ceiling (Loki
     8AA7CBE7 finding 3) — pass `server._serve_mode()` from a caller that
     has one; defaults to False (stdio, the more permissive ceiling)."""
     return _get_connection(server_id).call_tool(

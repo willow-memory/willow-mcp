@@ -169,12 +169,15 @@ def test_default_exposure_config_carries_federation_call_destination():
     assert cfg["defaults"]["federation_call"] == "public"
 
 
-def test_resolve_exposure_tier_defaults_to_public_when_unconfigured(home):
-    """REWORK (Loki 8AA7CBE7, HIGH): fail-closed means an unconfigured
-    caller sees the LEAST by default -- "public" -- not "internal", the
-    most sensitive bucket."""
+def test_resolve_exposure_tier_defaults_to_the_transport_ceiling_when_unconfigured(home):
+    """REWORK 2 (Loki 24242675, finding 2): an unconfigured caller is NOT
+    "public" -- its tier IS this process's transport ceiling. Over stdio
+    (the default) that is "internal": an unconfigured stdio desk must see
+    its own corpus, not nothing."""
     hi.ensure_home_layout()
-    assert exp.resolve_exposure_tier("reader") == "public"
+    assert exp.resolve_exposure_tier("reader") == "internal"
+    assert exp.resolve_exposure_tier("reader", serve_mode=False) == "internal"
+    assert exp.resolve_exposure_tier("reader", serve_mode=True) == "serve"
 
 
 def test_resolve_exposure_tier_honors_a_per_agent_override(home):
@@ -205,17 +208,22 @@ def test_resolve_exposure_tier_caps_at_serve_over_the_serve_transport_even_with_
     assert exp.resolve_exposure_tier("reader", serve_mode=True) == "serve"
 
 
-def test_resolve_exposure_tier_falls_back_to_public_on_an_unrecognized_value(home):
-    """An on-disk exposure.json written before this destination existed
-    resolves federation_call through the "*" wildcard ("voice_only", a
-    seed preset, not a visibility tier) — that must never widen what a
-    caller sees. Falls back to the narrowest tier ("public") instead of
-    passing an invalid value through."""
+def test_resolve_exposure_tier_falls_back_to_public_on_an_unrecognized_explicit_override(home):
+    """An EXPLICIT per-agent override whose value is not one of the three
+    visibility tiers (e.g. an old "voice_only" seed preset, left over from
+    before this destination existed) must never widen what a caller sees
+    -- falls back to the narrowest tier ("public") rather than passing an
+    invalid value through. This is distinct from having no override at
+    all (see test_resolve_exposure_tier_defaults_to_the_transport_ceiling_
+    when_unconfigured, Loki 24242675 finding 2) -- an explicit-but-garbled
+    value must not accidentally grant the (wider) transport ceiling
+    either."""
     hi.ensure_home_layout()
     cfg = exp.load_exposure_config()
-    del cfg["defaults"]["federation_call"]
+    cfg["agents"]["reader"] = {"defaults": {"federation_call": "voice_only"}}
     paths.exposure_config_path().write_text(json.dumps(cfg), encoding="utf-8")
     assert exp.resolve_exposure_tier("reader") == "public"
+    assert exp.resolve_exposure_tier("reader", serve_mode=True) == "public"
 
 
 def test_transport_ceiling_stdio_is_internal_serve_mode_is_serve():
@@ -235,6 +243,17 @@ def test_visible_to_serve_caller_sees_serve_and_public_not_internal():
     assert exp.visible_to("serve", "serve") is True
     assert exp.visible_to("serve", "public") is True
     assert exp.visible_to("serve", "internal") is False
+
+
+def test_row_tier_normalizes_missing_or_unrecognized_to_internal():
+    """Loki 24242675, finding 4: the withheld-row marker names WHICH tier
+    a row required, using this same normalization `visible_to` applies
+    internally."""
+    assert exp.row_tier("serve") == "serve"
+    assert exp.row_tier("public") == "public"
+    assert exp.row_tier(None) == "internal"
+    assert exp.row_tier("") == "internal"
+    assert exp.row_tier("voice_only") == "internal"
 
 
 def test_visible_to_public_caller_sees_public_only():
