@@ -47,10 +47,49 @@ will not stick — the pair needs a different home for `mcp_apps` (e.g.
 
 ## 1. Ownership, traversal, and the envelope-register migration
 
-    # F7: o+x on $H itself is traversal-only — it does not expose $H's own
-    # listing or contents, only lets a non-owner pass through to what is
-    # below it (mcp_apps/, manifest_grants/, constitutional/).
-    sudo -u willow-operator test -x $H || chmod o+x $H
+**Fixed (gap `035d287206e1`, 2026-09-22): traverse on `$H` itself is now an
+unconditional ACL, not a conditional `chmod o+x`.** The prior fix here
+(`sudo -u willow-operator test -x $H || chmod o+x $H`, Loki audit
+BFCC5C79 F7) measured as insufficient on the real box: after install.sh
+ran, `$H` was still `710` (group execute-only, `other` has no bits at
+all) — `test -x` must have passed for `willow-operator` via a group
+match, not because the trust owner genuinely had its own grant, so the
+conditional `chmod` branch never fired and nothing was actually proven
+for an unrelated uid. An ACL names the trust owner explicitly and is
+unconditional (idempotent to re-run).
+
+**Widening, named honestly (Loki audit B00BD43E, F3):** the traverse ACL on
+`$H` lets `willow-operator` open BY NAME anything world-readable beneath it
+— not only `mcp_apps/`, `manifest_grants/`, `constitutional/` (the paths
+the apply half actually reads). Measured on the box, what becomes
+name-reachable once `$H` is traversable:
+
+* world-readable directly under `$H`: `nestor.db.ledger.jsonl` (664, Nestor's
+  own ledger in the clear), `consent.json` (644), `settings.global.json`
+  (644);
+* enterable + listable (755/775) subtrees: `handoffs/` (every seat's
+  handoffs), `dispatch/` (every packet), `deposits/`, `gitsync/`,
+  `willow-bot/`, `upstream_steward/`, `worker_heartbeat/`, plus the
+  intended `mcp_apps/` and `constitutional/`;
+* NOT reachable (700/600, or granted read only where actually needed):
+  `config/`, `store/`, `venvs/`, `mcp_receipt.db`, `vault.db`, `nestor.db`
+  itself (never read by the apply half at all now — see the note below).
+
+`$H/env` carries every provider key and is read by this unit only as root
+(`EnvironmentFile=`), never directly by `willow-operator` — but the SAME
+traverse ACL that lets the trust owner reach `mcp_apps/` by name would also
+let it open `$H/env` by name if that file's own mode ever slipped. The
+installer checks this itself and stops rather than assume:
+
+    ENV_MODE=$(stat -c %a "$H/env")
+    [ "$ENV_MODE" = "600" ] || stop "..."
+
+If this ever stops the install: `chmod 600 $H/env` and rerun — `install.sh`
+never widens `$H/env`'s own mode itself, only checks it.
+
+    # ACL, not chmod — grants EXACTLY the trust owner traverse-only ($H's
+    # own listing and contents stay exactly as private as they were).
+    setfacl -m u:willow-operator:x $H
 
     chown -R willow-operator:willow-operator $H/mcp_apps
     chmod -R u=rwX,g=rX,o=rX $H/mcp_apps          # broker (uid 1000) still reads manifests
@@ -105,6 +144,40 @@ already under `mcp_apps/`, already trust-owner-owned by the recursive chown
 above; a `_federation/` that does not exist yet is created on demand by the
 apply process itself (runs as `willow-operator` already), so it is born
 correctly owned, mode `0644`, no ACL — nothing extra to do for it here.
+
+**`nestor.db`: no ACL at all now (gap `035d287206e1`, F1 — reworked per
+Loki audit B00BD43E).** The apply half used to open this directly at apply
+time to RE-verify a sealed pair's bytes fresh. Measured on the box:
+`nestor.db` is a WAL database, and every permission shape the trust owner
+can be given under this unit's `ProtectHome=read-only` either refuses
+outright or silently hides rows still sitting in the WAL —
+
+* sidecars (`nestor.db-wal`/`-shm`) present but unreadable: `unable to open
+  database file`;
+* sidecars absent (the idle, checkpointed state — they come and go with
+  Nestor's own writer) and the directory read-only: `attempt to write a
+  readonly database`, because a WAL reader must create `-shm` even to read;
+* `immutable=1` on the db file dodges the sidecar problem but hides any row
+  still sitting in the WAL — an un-checkpointed seal reads as absent
+  (`no such table` in Loki's probe);
+* it only ever worked with both sidecars present AND readable, which
+  `install.sh` never arranges and `ProtectHome=read-only` would not allow
+  even if it tried.
+
+The fix moves the read to the side that can actually do it: the REQUEST
+half (the broker, uid 1000, unconstrained by `ProtectHome`) reads
+`nestor.db` as it always did, and now embeds the sealed row's own verified
+bytes — `source_norm`, `target_text`, `verifier`, `seal_sig`, `created_at`
+— in the signed pending record (`manifest_grant_executor._sealed_row_fields`,
+covered by `broker_sig`). The APPLY half re-runs `net_signer.verify_seal`
+against those embedded bytes and the public ring; it never opens
+`nestor.db`, so no ACL on it is needed or granted. `WILLOW_NESTOR_DB` is
+gone from the unit file. Trade-off named honestly, not hidden: a pair
+superseded after its request but before its apply is no longer caught at
+apply time — supersession is checked only where `nestor.db` is actually
+read, which is now request time only. A pending request can already sit
+for minutes before the next tick; this narrows, but does not remove, that
+window.
 
 ## 2. Retire the --user unit
 

@@ -76,8 +76,69 @@ from . import postgres_lifecycle
 from . import secret_scan
 from . import split_brain
 
-_store = Store()
-_receipt_log = ReceiptLog()
+class _LazySingleton:
+    """Defers a side-effecting constructor until the first real attribute
+    access — never at import time. Gap `035d287206e1` (2026-09-22): `_store
+    = Store()` and `_receipt_log = ReceiptLog()` used to run unconditionally
+    as MODULE-LEVEL side effects, which assume the BROKER's uid and a
+    broker-writable `$WILLOW_HOME` — `Store.__init__` does `self.root.mkdir
+    (...)`, `ReceiptLog.__init__` does that AND `sqlite3.connect(...)`.
+    Measured on the box: the trust-owner apply unit's first live tick died
+    at IMPORT, inside `ReceiptLog()`'s `sqlite3.connect`, before ever
+    reaching any code that could refuse cleanly — `willow-operator` could
+    not even traverse `$WILLOW_HOME` (`710 sean-campbell:sean-campbell`).
+    Any process that merely IMPORTS this module now pays nothing for
+    either constructor; the cost (and the failure, if the uid genuinely
+    cannot use it) lands on the first call that actually needs it, same as
+    every other lazy resource in this codebase, and is attributable to a
+    real call rather than a traceback with no calling context. Forwards
+    every attribute get/set to the real object transparently — every
+    existing `_store.foo(...)` / `_receipt_log.foo(...)` call site (and
+    `_receipt_log.on_record = ...` below) needs no change.
+
+    `_lineage = Lineage(_store)` / `_friction = FrictionWatcher(_store)`
+    right after this are unaffected: both constructors only store the
+    reference (`self.store = store`), never touch it — passing this proxy
+    through costs them nothing extra and defers exactly the same way.
+    `_binder = SessionBinder()` builds a `Path` but opens nothing at
+    construction (`paths.gate_dir() / "used_checkin_nonces"`, read lazily
+    by `_load_used()`) — already safe, listed here for the audit trail
+    constraint asked for, not because it needed a fix."""
+
+    def __init__(self, factory):
+        object.__setattr__(self, "_factory", factory)
+        object.__setattr__(self, "_obj", None)
+        # Attribute sets BEFORE construction (e.g. `_receipt_log.on_record =
+        # _announce_hook`, still a module-level statement below) must not
+        # themselves force construction — that would silently reintroduce
+        # the exact import-time side effect this class exists to remove.
+        # Queued here and replayed onto the real object the moment it is
+        # actually built, in the order they arrived.
+        object.__setattr__(self, "_pending", {})
+        object.__setattr__(self, "_construct_lock", threading.Lock())
+
+    def _get(self):
+        if self._obj is None:
+            with self._construct_lock:
+                if self._obj is None:
+                    obj = self._factory()
+                    for name, value in self._pending.items():
+                        setattr(obj, name, value)
+                    object.__setattr__(self, "_obj", obj)
+        return self._obj
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+    def __setattr__(self, name, value):
+        if self._obj is None:
+            self._pending[name] = value
+        else:
+            setattr(self._obj, name, value)
+
+
+_store = _LazySingleton(Store)
+_receipt_log = _LazySingleton(ReceiptLog)
 
 # Move one: joules per tool call, into the same hash chain as everything else.
 # WILLOW_MCP_METER = inference (default) | all | off. "inference" meters only
@@ -9248,74 +9309,20 @@ def _cmd_sign_manifest(args) -> None:
 
 
 def _cmd_manifest_grant(args) -> None:
-    """`willow-mcp manifest-grant {request,apply,status,retry}` — the CLI
-    wrapper around the split `manifest.grant` verb (verb 18; pair
-    `b74019ac`, amending `d5504878`: the broker never publishes;
-    unit-honesty rework pair `6bd11def`). `request`, `status` and `retry`
-    run the same code path as their MCP tools and are operator-terminal
-    only, same non-forgeable tty-ownership guard `allow-permission`/
-    `deny-permission` use (an env-only Kart check is not enough here either
-    — this wrapper adds no separate authority, it is a keyboard door onto
-    the same broker call, so it needs the same presence proof those
-    sibling permission commands require). `apply` is what
-    `willow-mcp-manifest-grant.timer` runs as the BROKER's own uid, in the
-    broker's own `--user` manager (no distinct trust-owner identity on this
-    box, gap `85716b25d9a8`) — not from an operator terminal, so it does
-    not call `require_operator_terminal`, the same shape `reloader.py`'s
-    `tick` subcommand takes."""
-    from . import manifest_grant_executor
+    """`willow-mcp manifest-grant {request,apply,status,retry}` — propagates
+    cli_manifest_grant's exit code, same pattern as `_cmd_envelope` /
+    `_cmd_keys`. Split out (gap `035d287206e1`) so `apply` — what
+    `willow-mcp-manifest-grant.timer` runs, as the TRUST OWNER's own uid
+    (no distinct broker identity for it since pair `1bd6fd29`'s system-unit
+    rework) — can be reached by `__main__.py` without ever importing this
+    module (`server.py`), whose own import-time side effects assume the
+    broker's uid and a broker-writable `$WILLOW_HOME`. `request` and
+    `status`/`retry` still require the same non-forgeable tty-ownership
+    presence proof `allow-permission`/`deny-permission` use — enforced
+    inside `cli_manifest_grant.cmd_manifest_grant` itself, not here."""
+    from . import cli_manifest_grant as _cli_manifest_grant
 
-    if args.mg_action == "apply":
-        from .db import get_pg as _get_pg
-        from .governance_ledger import GovernanceLedger
-
-        pg = _get_pg()
-        ledger = GovernanceLedger(pg) if pg else None
-        result = manifest_grant_executor.manifest_grant_apply(pair_id=args.pair_id, ledger=ledger)
-        print(json.dumps(result, indent=2, default=str))
-        if not result.get("ok"):
-            raise SystemExit(1)
-        return
-
-    from .human_session import require_operator_terminal
-
-    require_operator_terminal()
-
-    if args.mg_action == "status":
-        result = manifest_grant_executor.manifest_grant_status(args.pair_id)
-        print(json.dumps(result, indent=2, default=str))
-        if result.get("state") in ("not_found", "unreachable"):
-            raise SystemExit(1)
-        return
-
-    if args.mg_action == "retry":
-        from .governance_ledger import GovernanceLedger
-
-        pg = get_pg()
-        ledger = GovernanceLedger(pg) if pg else None
-        result = manifest_grant_executor.manifest_grant_retry(
-            args.app_id, args.pair_id, ledger=ledger, project="willow-mcp",
-        )
-        print(json.dumps(result, indent=2, default=str))
-        if not result.get("ok"):
-            raise SystemExit(1)
-        return
-
-    # request
-    from .governance_ledger import GovernanceLedger
-
-    pg = get_pg()
-    ledger = GovernanceLedger(pg) if pg else None
-    result = manifest_grant_executor.manifest_grant_request(
-        args.app_id,
-        envelope_id=args.envelope or "",
-        pair_id=args.pair_id,
-        project="willow-mcp",
-        ledger=ledger,
-    )
-    print(json.dumps(result, indent=2, default=str))
-    if not result.get("ok"):
-        raise SystemExit(1)
+    sys.exit(_cli_manifest_grant.cmd_manifest_grant(args))
 
 
 def _cmd_attest_session(args) -> None:
@@ -10802,57 +10809,17 @@ def _build_parser():
     )
     sign_manifest_p.add_argument("app_id", help="whose manifest to sign")
 
-    manifest_grant_p = subparsers.add_parser(
-        "manifest-grant",
-        help="manifest.grant (verb 18): request (broker, verify+write pending), "
-             "apply (broker's own --user unit, sign+publish), "
-             "status (read pending/done/failed), retry (requeue a transient failure)",
-    )
-    mg_sub = manifest_grant_p.add_subparsers(dest="mg_action", required=True)
-
-    mg_request_p = mg_sub.add_parser(
-        "request",
-        help="Broker side: verify a sealed pair against every precondition and "
-             "write one pending request — signs nothing, cites the envelope only "
-             "after the request is durable on disk",
-    )
-    mg_request_p.add_argument("pair_id", help="sealed Nestor pair id to request")
-    mg_request_p.add_argument(
-        "--envelope", dest="envelope", default="",
-        help="which active manifest.grant envelope to cite (required if more than one governs 'willow')",
-    )
-    mg_request_p.add_argument(
-        "--app-id", dest="app_id", default=os.environ.get("WILLOW_APP_ID", "willow"),
-        help="orchestrator identity to run as (default $WILLOW_APP_ID or 'willow')",
-    )
-
-    mg_apply_p = mg_sub.add_parser(
-        "apply",
-        help="Apply side: drain pending/ (or one pair_id), re-verify "
-             "the seal and pre-state fresh, sign and publish under signed_pair_lock, "
-             "roll back through the same staged path on any failure. What "
-             "willow-mcp-manifest-grant.timer runs, as the broker's own uid.",
-    )
-    mg_apply_p.add_argument("pair_id", nargs="?", default=None,
-                            help="apply only this pending pair_id (default: drain all of pending/)")
-
-    mg_status_p = mg_sub.add_parser(
-        "status", help="Read which of pending/ done/ failed/ holds a pair_id's request",
-    )
-    mg_status_p.add_argument("pair_id")
-
-    mg_retry_p = mg_sub.add_parser(
-        "retry",
-        help="Requeue a failed/<pair_id> request back to pending/, but only when "
-             "the recorded failure reason is transient (EUNREACH/ecorrupt/"
-             "eunexpected/eperm_pending); refuses eforged/eseal_mismatch/"
-             "escalation/edrift by name.",
-    )
-    mg_retry_p.add_argument("pair_id", help="failed pair_id to requeue")
-    mg_retry_p.add_argument(
-        "--app-id", dest="app_id", default=os.environ.get("WILLOW_APP_ID", "willow"),
-        help="orchestrator identity to run as (default $WILLOW_APP_ID or 'willow')",
-    )
+    # Split out to its own module (gap 035d287206e1, 2026-09-22): the request/
+    # apply/status/retry queue this registers is shared with the four
+    # trust-owner verbs, and `apply` is the one subcommand a DIFFERENT uid
+    # (the trust owner) runs routinely — __main__.py routes straight to
+    # cli_manifest_grant for that path WITHOUT importing this module at all,
+    # since server.py's own import-time side effects (_receipt_log = ...
+    # chief among them) assume the broker's uid. This registration here
+    # keeps the full CLI tree (and server.main()'s own dispatch table,
+    # _cmd_manifest_grant below) working for every OTHER invocation.
+    from . import cli_manifest_grant as _cli_manifest_grant
+    _cli_manifest_grant.register(subparsers)
 
     attest_session_p = subparsers.add_parser(
         "attest-session",

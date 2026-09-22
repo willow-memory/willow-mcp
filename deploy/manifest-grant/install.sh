@@ -139,13 +139,40 @@ say "plain $FSTYPE — ownership will stick; continuing"
 
 # --------------------------------------------------------- 1. ownership, ACLs
 say "== 1. ownership and traversal"
-# F7: the trust owner must be able to TRAVERSE $H itself to reach mcp_apps/,
-# manifest_grants/, constitutional/ below it — o+x on a directory grants
-# pass-through only, never read access to $H's own listing or contents.
-if ! sudo -u "$TRUST_OWNER" test -x "$H"; then
-  chmod o+x "$H"
-  say "  granted o+x traversal on $H (pass-through only — contents stay as they were)"
-fi
+# Rework (Loki audit B00BD43E, F3, 2026-09-22): the traverse ACL on $H lets
+# the trust owner open BY NAME anything world-readable beneath it, not just
+# mcp_apps/manifest_grants/constitutional/ — nestor.db.ledger.jsonl (664),
+# consent.json, settings.global.json, and the 755 trees handoffs/,
+# dispatch/, deposits/, gitsync/, willow-bot/, upstream_steward/,
+# worker_heartbeat/ are all reachable by name once $H itself is
+# traversable. $H/env carries every provider key and is read by this unit
+# only as root (EnvironmentFile=), never directly by uid 994 — but if its
+# mode is not 600, the SAME traverse ACL that lets the trust owner reach
+# mcp_apps/ would also let it open $H/env by name. Stop rather than assume
+# (Loki: "the operator must stat it before rerunning the installer").
+ENV_MODE=$(stat -c %a "$H/env")
+[ "$ENV_MODE" = "600" ] || stop "$H/env is mode $ENV_MODE, not 600 — the traverse ACL below (F3, gap 035d287206e1) would let $TRUST_OWNER open it by name once granted. chmod 600 $H/env and rerun."
+say "  $H/env is 600 — safe to grant traverse"
+# F7 (Loki audit BFCC5C79), tightened (gap 035d287206e1, 2026-09-22): the
+# trust owner must be able to TRAVERSE $H itself to reach mcp_apps/,
+# manifest_grants/, constitutional/ below it. The prior fix here was
+# conditional (`sudo -u $TRUST_OWNER test -x "$H" || chmod o+x "$H"`) and
+# world-executable when it did fire -- measured on the box: after a real
+# install, $H was STILL `710` (group execute-only, OTHER has no bits at
+# all), so `test -x` must have passed via a group match rather than
+# proving what a genuinely unrelated uid can do, and the conditional chmod
+# never ran. An ACL is what the seal actually asked for (pair 1bd6fd29:
+# "the operator's only keyboard act is the seal" -- not "and hope the
+# trust owner's group membership lines up"): unconditional, idempotent,
+# and grants EXACTLY the trust owner traverse-only, never "other" broadly
+# the way `chmod o+x` does. nestor.db itself is NOT read by the apply half
+# any more (Loki audit B00BD43E, F1: it is a WAL database a read-only
+# opener under ProtectHome=read-only cannot open — the request half now
+# embeds the sealed row's own bytes in the signed pending record instead;
+# no ACL on nestor.db is granted here any more).
+setfacl -m "u:$TRUST_OWNER:x" "$H"
+say "  granted setfacl u:$TRUST_OWNER:x on $H (traverse only — contents stay as they were; see"
+say "  INSTALL.md for the full list of what becomes name-reachable beneath it)"
 chown -R "$TRUST_OWNER:$TRUST_OWNER" "$H/mcp_apps"
 chmod -R u=rwX,g=rX,o=rX "$H/mcp_apps"
 install -d -o "$OPERATOR" -g "$OPERATOR" -m 755 "$H/manifest_grants" "$H/manifest_grants/pending" "$H/manifest_grants/done" "$H/manifest_grants/failed"
@@ -221,6 +248,19 @@ fi
 # above; a _federation/ that does not exist yet is created on demand by the
 # apply process itself (runs as $TRUST_OWNER), so it is born correctly
 # owned, mode 0644, no ACL.
+
+# nestor.db (gap 035d287206e1, F1, rework per Loki audit B00BD43E): the
+# apply half no longer reads this at all — it is a WAL database, and a
+# read-only opener under this unit's ProtectHome=read-only cannot create
+# the -shm sidecar a WAL reader needs (measured: every permission shape
+# gives either "unable to open database file" or "attempt to write a
+# readonly database", or silently hides rows still sitting in the WAL under
+# immutable=1). The request half (broker, uid 1000, which CAN read
+# nestor.db without any of these constraints) now embeds the sealed row's
+# own verified bytes in the signed pending record instead; the apply half
+# re-verifies the ed25519 signature over those embedded bytes. No ACL on
+# nestor.db is granted here any more — the prior `setfacl u:$TRUST_OWNER:r
+# nestor.db` line is gone.
 
 # ---------------------------------------------------- 2. retire the --user unit
 say "== 2. retire the --user unit"
