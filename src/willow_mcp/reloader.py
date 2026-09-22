@@ -40,6 +40,25 @@ unreadable is ``unreachable``, no sealed pair naming the receipt is
 ``empty``, a match is ``populated``. Only the act leaves FRANK ink — a
 ``unit_reload`` receipt with ``actor=willow-mcp-reloader`` citing the pull
 receipt, the sealing pair and its verifier; refusals go to the journal.
+
+Follow-on (decision ``1bd6fd29``, 2026-09-22, "operations are Willow's… the
+operator's only keyboard act is the seal"): the SAME shape now also covers
+a change to the broker's env file (``$WILLOW_HOME/env`` or whatever
+``EnvironmentFile=`` its unit names) — a rotated provider key, a new
+``WILLOW_PGP_FINGERPRINT``, an added ``WILLOW_MCP_APPS_ROOT``. Today those
+have no FRANK receipt at all, so the broker runs on stale env until someone
+types the restart by hand; that keyboard act is what this follow-on
+removes. Request/confirm/act is identical to the pull path — a FRANK
+``env_changed`` receipt (:mod:`env_fingerprint` computes it: key NAMES and
+a SHA-256 digest, never a value), a sealed decision naming that receipt's
+row id, then the one act — with its own preflight (:func:`check_env`) and
+its own errno for "nothing has changed since the broker's own startup
+record" or "no state file to compare against" (an older broker). A pull
+receipt and an env receipt may both be waiting in the same tick;
+:func:`run_once` restarts once and cites whichever of the two (or both)
+were sealed, never twice for one restart. See :mod:`env_fingerprint` for
+why a value never rides in the receipt, the journal, or this process's own
+persisted state.
 """
 from __future__ import annotations
 
@@ -51,9 +70,11 @@ import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import env_fingerprint as envfp
 from . import paths
 from . import unit_reload_executor as urx
 
@@ -63,6 +84,9 @@ logger = logging.getLogger(__name__)
 #: tool surface — but a name the ledger can tell apart from the broker
 #: (``willow``) that wrote the pull receipt and the operator who sealed it.
 ACTOR = "willow-mcp-reloader"
+
+#: The env-trigger's own FRANK event type, sibling of :data:`unit_reload_executor.PULL_EVENT`.
+ENV_EVENT = "env_changed"
 
 #: The broker unit this fleet actually runs (`scripts/willow-serve install`
 #: writes it); the bare ``willow-mcp.service`` is the other spelling
@@ -172,6 +196,136 @@ def _refuse(errno: str, reason: str, **extra) -> dict:
     return {"ok": False, "act": False, "error": errno, "reason": reason, **extra}
 
 
+# ── the env trigger: detect / request / confirm / act ─────────────────────────
+
+def _open_env_receipt(ledger, *, unit: str, env_path: str) -> Optional[dict]:
+    """The most recent ``env_changed`` receipt for ``unit``/``env_path`` that
+    no ``unit_reload`` receipt has yet cited — the idempotence guard: while
+    one is open, :func:`check_env` reuses it rather than writing a second
+    one, exactly as the pull path never re-requests a restart already on
+    file. ``None`` when there is no receipt, or the one that exists has
+    already been consumed by a restart."""
+    receipt = ledger.latest_event(ENV_EVENT, match={"unit": unit, "env_path": env_path})
+    if receipt is None:
+        return None
+    rid = receipt.get("id")
+    if not rid:
+        return receipt
+    consumed = ledger.latest_event(urx.EVENT, match={"env_receipt_id": rid})
+    return None if consumed is not None else receipt
+
+
+def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None) -> dict:
+    """Decide whether the restart is due because the broker's env file has
+    moved out from under it. Never restarts, never writes a value.
+
+    Detect: :func:`env_fingerprint.read_state` (what the running broker
+    loaded) against :func:`env_fingerprint.compute_fingerprint` of the file
+    its unit's ``EnvironmentFile=`` names right now. ``ESTATEEMPTY`` — no
+    startup record at all: an older broker that predates this state file,
+    or one that has not restarted since it landed; nothing to compare
+    against, so this does nothing rather than guess. ``EUNREACH`` — the
+    state file or the env file exists but could not be read. No diff —
+    ``ok=True, act=False`` quietly, the same "nothing due" shape a pull
+    check returns when there is no receipt to act on.
+
+    Request: a diff opens (or reuses, idempotently) a FRANK ``env_changed``
+    receipt naming only key NAMES plus the two digests.
+
+    Confirm: :func:`find_sealing_decision` against that receipt's row id —
+    the identical Nestor lookup the pull path uses, because the confirm is
+    the same shape regardless of what is being restarted onto: ``ENOSEAL``
+    when the receipt has no sealed decision naming it yet.
+
+    Act preflight, mirroring the pull path's ``EALREADY``/``EDRIFT``: the
+    unit must not already be active since after the receipt was written
+    (``EALREADY`` — a previous tick already restarted onto it), and the env
+    file's fingerprint must still equal the receipt's ``fingerprint_after``
+    (``EDRIFT`` — the file moved again since the seal named that receipt).
+    """
+    unit = (config.unit or "").strip()
+    if not urx.is_broker_unit(unit):
+        return _refuse("EINVAL", f"{unit!r} is not the broker's unit — reload it "
+                                 f"through unit_reload_execute under a unit.reload envelope")
+    if ledger is None:
+        return _refuse("EAMBIG", "no governance ledger: a restart that cannot be matched to an "
+                                 "env_changed receipt is not performed")
+
+    state = envfp.read_state()
+    if state["state"] == "unreachable":
+        return _refuse("EUNREACH", f"env-fingerprint state file unreadable: {state.get('cause')}")
+    if state["state"] == "empty":
+        return _refuse("ESTATEEMPTY",
+                       "no env-fingerprint state file from the running broker — an older "
+                       "broker that predates this, or one that has not started since; "
+                       "nothing to compare the env file against")
+    recorded = state["env_fingerprint"]
+
+    env_path = envfp.resolve_env_file(unit, runner=runner)
+    live = envfp.compute_fingerprint(env_path)
+    if live["state"] == "unreachable":
+        return _refuse("EUNREACH", f"env file {env_path} unreadable: {live.get('cause')}")
+
+    if envfp.fingerprints_equal(recorded, live):
+        return {"ok": True, "act": False, "error": None, "reason": "env unchanged",
+                "unit": unit, "env_path": str(env_path)}
+
+    existing = _open_env_receipt(ledger, unit=unit, env_path=str(env_path))
+    if existing is not None:
+        receipt = existing
+    else:
+        detected_at = datetime.now(timezone.utc).isoformat()
+        content = {
+            "actor": ACTOR, "unit": unit, "env_path": str(env_path),
+            "fingerprint_before": envfp.summary(recorded), "fingerprint_after": envfp.summary(live),
+            "detected_at": detected_at,
+            **envfp.diff_keys(recorded, live),
+        }
+        receipt_id = ledger.append("willow-mcp", ENV_EVENT, content)
+        receipt = {"id": receipt_id, "content": content, "created_at": detected_at}
+    receipt_id = receipt.get("id")
+    if not receipt_id:
+        return _refuse("EAMBIG", "the env_changed receipt carries no row id; a seal cannot name it")
+    content = receipt["content"]
+
+    state_unit = urx.show_unit(unit, runner=runner)
+    if not state_unit.get("ok"):
+        return _refuse("EUNREACH", f"unit state unreachable: {state_unit.get('cause')}",
+                       cause=state_unit.get("cause"), detail=state_unit.get("detail"),
+                       receipt_id=receipt_id)
+
+    active_enter = urx._parse_systemd_timestamp(state_unit.get("ActiveEnterTimestamp"))
+    receipt_at = urx._as_utc(receipt.get("created_at"))
+    if active_enter is not None and receipt_at is not None and active_enter >= receipt_at:
+        return _refuse("EALREADY",
+                       f"{unit} has been active since {state_unit.get('ActiveEnterTimestamp')!r}, "
+                       f"which is no older than env_changed receipt {receipt_id} — already restarted onto it",
+                       receipt_id=receipt_id, receipt=content)
+
+    live_again = envfp.compute_fingerprint(env_path)
+    if live_again["state"] == "unreachable":
+        return _refuse("EUNREACH", f"env file {env_path} unreadable: {live_again.get('cause')}",
+                       receipt_id=receipt_id)
+    if envfp.summary(live_again) != content.get("fingerprint_after"):
+        return _refuse("EDRIFT",
+                       f"{env_path} has moved again since env_changed receipt {receipt_id} was "
+                       f"written — the seal names that receipt, not whatever the file holds now",
+                       receipt_id=receipt_id, receipt=content)
+
+    seal = find_sealing_decision(receipt_id, config.nestor_db)
+    if seal["state"] == "unreachable":
+        return _refuse("ESEALS", f"seal store unreachable: {seal.get('cause')}",
+                       receipt_id=receipt_id, path=seal.get("path"))
+    if seal["state"] == "empty":
+        return _refuse("ENOSEAL",
+                       f"env_changed receipt {receipt_id} ({', '.join(content.get('keys_changed') or []) or 'no key names changed'}) "
+                       f"is waiting for a sealed decision that names it — the desk proposes, the operator seals",
+                       receipt_id=receipt_id, receipt=content)
+
+    return {"ok": True, "act": True, "unit": unit, "env_path": str(env_path),
+            "receipt_id": receipt_id, "receipt": content, "seal": seal, "state_before": state_unit}
+
+
 def check(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None) -> dict:
     """Decide whether the restart is due. Never restarts anything.
 
@@ -247,36 +401,79 @@ def check(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None) 
 
 def run_once(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None,
              project: str = "willow-mcp") -> dict:
-    """One tick: check, and when due, ``systemctl --user restart`` the
-    broker unit and write the FRANK ``unit_reload`` receipt. A refusal is
-    returned as-is (``reloaded=False``); it is not ink."""
-    verdict = check(config, ledger=ledger, runner=runner)
-    if not verdict.get("act"):
-        verdict["reloaded"] = False
-        return verdict
+    """One tick, both triggers: a sealed ``git_pull`` receipt (:func:`check`)
+    and a sealed ``env_changed`` receipt (:func:`check_env`) are both
+    checked; when either (or both) is due, ``systemctl --user restart`` the
+    broker unit ONCE and write ONE FRANK ``unit_reload`` receipt citing
+    whichever fired. Two due triggers never earn two restarts — one act
+    satisfies both, the same idempotence guarantee each trigger already
+    gives on its own.
 
-    unit = verdict["unit"]
+    A refusal is returned as-is (``reloaded=False``); it is not ink. When
+    neither is due the *pull* verdict rides at the top level — unchanged
+    from this function's shape before the env trigger existed, so an
+    existing caller reading ``error``/``reason`` off the result keeps
+    seeing exactly what it saw before — with the env verdict alongside it
+    under ``env`` for a caller that wants both.
+    """
+    pull_verdict = check(config, ledger=ledger, runner=runner)
+    env_verdict = check_env(config, ledger=ledger, runner=runner)
+    due_pull = bool(pull_verdict.get("act"))
+    due_env = bool(env_verdict.get("act"))
+
+    if not (due_pull or due_env):
+        out = dict(pull_verdict)
+        out["reloaded"] = False
+        out["env"] = env_verdict
+        return out
+
+    unit = pull_verdict["unit"] if due_pull else env_verdict["unit"]
     try:
         restarted = urx._run(["systemctl", "--user", "restart", unit], runner=runner,
                              timeout=_SYSTEMCTL_TIMEOUT_S)
     except FileNotFoundError:
-        return {**verdict, "ok": False, "reloaded": False, "error": "EUNREACH", "reason": "systemctl_missing"}
+        return {"ok": False, "act": True, "reloaded": False, "error": "EUNREACH",
+                "reason": "systemctl_missing", "unit": unit, "pull": pull_verdict, "env": env_verdict}
     except subprocess.TimeoutExpired:
-        return {**verdict, "ok": False, "reloaded": False, "error": "ETIMEDOUT",
-                "reason": f"systemctl restart exceeded {_SYSTEMCTL_TIMEOUT_S}s"}
+        return {"ok": False, "act": True, "reloaded": False, "error": "ETIMEDOUT",
+                "reason": f"systemctl restart exceeded {_SYSTEMCTL_TIMEOUT_S}s",
+                "unit": unit, "pull": pull_verdict, "env": env_verdict}
     if restarted.returncode != 0:
         tail = (restarted.stderr or restarted.stdout or "").strip()[-300:]
-        return {**verdict, "ok": False, "reloaded": False, "error": "ERESTART",
-                "reason": tail or f"systemctl restart exited {restarted.returncode}"}
+        return {"ok": False, "act": True, "reloaded": False, "error": "ERESTART",
+                "reason": tail or f"systemctl restart exited {restarted.returncode}",
+                "unit": unit, "pull": pull_verdict, "env": env_verdict}
 
-    out = {**verdict, "reloaded": True, "state_after": urx.show_unit(unit, runner=runner)}
-    try:
-        out["reload_receipt_id"] = ledger.append(project, urx.EVENT, {
-            "actor": ACTOR, "unit": unit, "repo": config.repo, "checkout": str(verdict["checkout"]),
-            "head": verdict["head"], "pull_receipt_id": verdict["receipt_id"],
-            "nestor_pair_id": verdict["seal"]["pair_id"], "nestor_verifier": verdict["seal"]["verifier"],
-            "decision": "e961aff8",
+    triggers = []
+    content = {"actor": ACTOR, "unit": unit, "decision": "e961aff8"}
+    if due_pull:
+        triggers.append("git_pull")
+        content.update({
+            "repo": config.repo, "checkout": str(pull_verdict["checkout"]),
+            "head": pull_verdict["head"], "pull_receipt_id": pull_verdict["receipt_id"],
         })
+    if due_env:
+        triggers.append("env_changed")
+        content.update({
+            "env_path": env_verdict["env_path"], "env_receipt_id": env_verdict["receipt_id"],
+        })
+    content["trigger"] = triggers[0] if len(triggers) == 1 else "both"
+    if due_pull and due_env:
+        content["nestor_pair_ids"] = {"pull": pull_verdict["seal"]["pair_id"],
+                                      "env": env_verdict["seal"]["pair_id"]}
+        content["nestor_verifiers"] = {"pull": pull_verdict["seal"]["verifier"],
+                                       "env": env_verdict["seal"]["verifier"]}
+    elif due_pull:
+        content["nestor_pair_id"] = pull_verdict["seal"]["pair_id"]
+        content["nestor_verifier"] = pull_verdict["seal"]["verifier"]
+    else:
+        content["nestor_pair_id"] = env_verdict["seal"]["pair_id"]
+        content["nestor_verifier"] = env_verdict["seal"]["verifier"]
+
+    out = {"ok": True, "act": True, "reloaded": True, "unit": unit, "triggers": triggers,
+           "pull": pull_verdict, "env": env_verdict, "state_after": urx.show_unit(unit, runner=runner)}
+    try:
+        out["reload_receipt_id"] = ledger.append(project, urx.EVENT, content)
     except Exception as exc:  # noqa: BLE001 — the restart happened; the receipt failing is reported, not hidden
         out["receipt_error"] = f"{type(exc).__name__}: {exc}"
     return out
@@ -440,7 +637,8 @@ def main(argv: Optional[list] = None) -> int:
             )
         ledger = _live_ledger()
         if args.command == "check":
-            out = check(config, ledger=ledger)
+            out = dict(check(config, ledger=ledger))
+            out["env"] = check_env(config, ledger=ledger)
         else:
             out = run_once(config, ledger=ledger)
         print(json.dumps(out, default=str, indent=2))

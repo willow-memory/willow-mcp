@@ -595,3 +595,59 @@ def test_degraded_rings_probe_moves_verdict_via_severity_pipeline():
     rp = [p for p in problems if p["check"] == "rings"]
     assert len(rp) == 1 and rp[0]["severity"] == "warn"
     assert server._derive_verdict(problems) == "degraded"
+
+
+# ── env_stale: the reloader's env-trigger surfaced without reading the journal ─
+#
+# Decision 1bd6fd29's follow-on. `_diag_env_stale` is a READ-ONLY mirror of
+# `reloader.check_env`'s detect+confirm halves — it must never write a FRANK
+# receipt on its own, so these tests assert `get_pg` is never even reached
+# for the no-Postgres-needed states, and that the informational wiring
+# (`_VERDICT_INFORMATIONAL_SUBCHECKS`) actually covers it.
+
+def test_env_stale_is_informational_not_severity():
+    assert "env_stale" in server._VERDICT_INFORMATIONAL_SUBCHECKS
+    assert "env_stale" not in server._VERDICT_INLINE_SUBCHECKS
+    assert "env_stale" not in server._VERDICT_SEVERITY_SUBCHECKS
+
+
+def test_env_stale_no_state_file_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    out = server._diag_env_stale()
+    assert out == {"state": "empty", "keys_changed": [], "receipt_id": None, "sealed": False}
+
+
+def test_env_stale_unreadable_state_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    from willow_mcp import env_fingerprint as envfp
+    envfp.state_path().parent.mkdir(parents=True, exist_ok=True)
+    envfp.state_path().write_text("not json{{{", encoding="utf-8")
+    out = server._diag_env_stale()
+    assert out["state"] == "unreachable" and "cause" in out
+
+
+def test_env_stale_no_diff_reports_populated_with_no_keys_changed(tmp_path, monkeypatch):
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    from willow_mcp import env_fingerprint as envfp
+    env_path = tmp_path / "env"
+    env_path.write_text("A=1\n", encoding="utf-8")
+    envfp.record_startup(env_path)
+    out = server._diag_env_stale()
+    assert out["state"] == "populated" and out["keys_changed"] == []
+    assert out["receipt_id"] is None and out["sealed"] is False
+
+
+def test_env_stale_diff_names_keys_changed_never_a_value(tmp_path, monkeypatch):
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    from willow_mcp import env_fingerprint as envfp
+    env_path = tmp_path / "env"
+    env_path.write_text("A=1\n", encoding="utf-8")
+    envfp.record_startup(env_path)
+    env_path.write_text("A=1\nSECRET=sk-do-not-leak-this-8675309\nB=2\n", encoding="utf-8")
+    out = server._diag_env_stale()
+    assert out["state"] == "populated"
+    assert set(out["keys_changed"]) == {"B", "SECRET"}
+    assert "sk-do-not-leak-this-8675309" not in json.dumps(out)
+    # no Postgres configured in this test env -> best-effort receipt/seal lookup
+    # degrades to the empty default rather than raising.
+    assert out["receipt_id"] is None and out["sealed"] is False

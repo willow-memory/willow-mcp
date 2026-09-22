@@ -6897,6 +6897,69 @@ def _diag_env() -> dict:
     return {k: os.environ.get(k) for k in keys}
 
 
+def _diag_env_stale() -> dict:
+    """Read-only mirror of the detect+confirm halves of `reloader.check_env`
+    — never the request half, since a diagnostic READ must never write
+    FRANK ink on its own (that stays the reloader's tick, and only when a
+    diff is real). Lets the desk see "broker is on stale env, confirm
+    pending" from `diagnostic_summary` without going to read the journal,
+    per decision 1bd6fd29's follow-on.
+
+    `state` is env_fingerprint's own three-state contract on reading what
+    the running broker loaded: `empty` (no startup record — an older
+    broker, or one that has not restarted since this landed), `unreachable`
+    (the state file or the live env file could not be read), `populated`
+    (compared). `keys_changed` names every key added, removed, OR changed
+    — NAMES only, never a value. `receipt_id`/`sealed` are best-effort: no
+    Postgres, no `env_changed` receipt yet, or the seal lookup failing all
+    leave them at their empty defaults rather than raising — this is a
+    diagnostic, not a gate."""
+    from . import env_fingerprint as _envfp
+    from . import reloader as _reloader
+
+    out = {"state": "empty", "keys_changed": [], "receipt_id": None, "sealed": False}
+    state = _envfp.read_state()
+    out["state"] = state["state"]
+    if state["state"] != "populated":
+        if state["state"] == "unreachable":
+            out["cause"] = state.get("cause")
+        return out
+    recorded = state["env_fingerprint"]
+
+    unit = os.environ.get("WILLOW_RELOADER_UNIT", _reloader.DEFAULT_UNIT).strip() or _reloader.DEFAULT_UNIT
+    try:
+        env_path = _envfp.resolve_env_file(unit)
+    except Exception:
+        env_path = _envfp.default_env_path()
+    live = _envfp.compute_fingerprint(env_path)
+    if live["state"] == "unreachable":
+        out["state"] = "unreachable"
+        out["cause"] = live.get("cause")
+        return out
+    if _envfp.fingerprints_equal(recorded, live):
+        return out
+
+    diff = _envfp.diff_keys(recorded, live)
+    out["keys_changed"] = sorted(
+        set(diff["keys_added"]) | set(diff["keys_removed"]) | set(diff["keys_changed"])
+    )
+    try:
+        pg = get_pg()
+        if pg is None:
+            return out
+        from .governance_ledger import GovernanceLedger
+        ledger = GovernanceLedger(pg)
+        receipt = ledger.latest_event(_reloader.ENV_EVENT, match={"unit": unit, "env_path": str(env_path)})
+        if receipt is None:
+            return out
+        out["receipt_id"] = receipt.get("id")
+        seal = _reloader.find_sealing_decision(receipt.get("id"), _reloader.default_config().nestor_db)
+        out["sealed"] = seal.get("state") == "populated"
+    except Exception:
+        pass  # best-effort — a diagnostic read never raises
+    return out
+
+
 def _diag_keyring() -> dict:
     """Per-verifier keyring (WILLOW_KEYRING) reachability — gap 37d44bfa1f4c.
 
@@ -7048,7 +7111,11 @@ _VERDICT_SEVERITY_SUBCHECKS: dict[str, dict[str, str]] = {
 # bare env snapshot is not a defect. Nor is a count of security events the guards
 # already CAUGHT — a blocked SSRF/boundary-forge/vuln-install is the system
 # working, so `security_signals` informs the operator without moving the verdict.
-_VERDICT_INFORMATIONAL_SUBCHECKS = frozenset({"build_leases", "env", "security_signals"})
+# `env_stale` joins them for the same reason: a broker waiting on a seal to pick
+# up a rotated key is not broken (the reloader's ENOSEAL wait is the intended
+# resting state, decision 1bd6fd29/e961aff8) — this just makes it visible here
+# instead of only in the journal a desk would otherwise have to go read.
+_VERDICT_INFORMATIONAL_SUBCHECKS = frozenset({"build_leases", "env", "security_signals", "env_stale"})
 
 
 def _diag_security_signals(app_id: str) -> dict:
@@ -7648,6 +7715,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
     split_brain_check = _diag_split_brain()
     env = _diag_env()
     security_signals_check = _diag_security_signals(eff)
+    env_stale = _diag_env_stale()
 
     checks = {"store": store, "postgres": postgres, "rings": rings,
               "schema": schema, "manifest": manifest, "identity_bindings": bindings,
@@ -7656,7 +7724,8 @@ def diagnostic_summary(app_id: str = "") -> dict:
               "severance": severance, "uid_separation": uid_separation,
               "store_db_perms": store_db_perms, "keyring": keyring,
               "envelope_registry": envelope_registry, "split_brain": split_brain_check,
-              "security_signals": security_signals_check, "env": env}
+              "security_signals": security_signals_check, "env": env,
+              "env_stale": env_stale}
     # Construction-time completeness guard: every computed sub-check must be
     # wired into the verdict (or explicitly exempt) — gap 37d44bfa1f4c.
     _assert_verdict_considers(checks)
@@ -11013,6 +11082,18 @@ def _main():
         except instance_lock.InstanceLockError as e:
             print(f"willow-mcp: refusing to start.\n{e}", file=sys.stderr)
             raise SystemExit(1)
+        # Reloader env-trigger follow-on (decision 1bd6fd29 on shape e961aff8):
+        # record what env this process actually loaded, once, right here at
+        # boot — the baseline `reloader.check_env` compares the live env file
+        # against on every tick. Fail-soft, like the syscall-table sync above:
+        # a failure to write this telemetry must never block startup, and a
+        # broker that cannot record it just means the reloader sees `empty`
+        # (an older broker, from its point of view) and does nothing.
+        try:
+            from . import env_fingerprint as _env_fingerprint
+            _env_fingerprint.record_startup()
+        except Exception as exc:  # noqa: BLE001 — never block startup on this
+            print(f"willow-mcp: env-fingerprint startup record failed: {exc}", file=sys.stderr)
         # SDK 2.x: host/port moved off the constructor onto the transport,
         # which is the stateless core making "where this instance listens" a
         # property of the run rather than of the server object.

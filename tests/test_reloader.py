@@ -14,30 +14,57 @@ from pathlib import Path
 
 import pytest
 
+from willow_mcp import env_fingerprint as envfp
 from willow_mcp import reloader
 from willow_mcp import unit_reload_executor as urx
+
+
+@pytest.fixture(autouse=True)
+def _reloader_willow_home(tmp_path, monkeypatch):
+    """Every test in this module gets its own throwaway WILLOW_HOME so
+    `env_fingerprint.state_path()` (which resolves off WILLOW_HOME) never
+    touches the real operator box. A pull-only test that never mentions the
+    env trigger at all must not accidentally read a real
+    ``~/.willow/serve/env_fingerprint.json`` and have its behavior depend
+    on whatever happens to be sitting there."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "willow_home_default"))
 
 
 # ── fakes ─────────────────────────────────────────────────────────────────────
 
 class _FakeLedger:
-    """Only the two methods the reloader uses."""
+    """The two methods the reloader uses — generic enough for both triggers.
+
+    ``receipt`` is the original single git_pull fixture every pre-existing
+    test seeds directly (unchanged shape/behavior). Anything ``append()``ed
+    during a test — an ``env_changed`` receipt the env trigger writes, a
+    ``unit_reload`` receipt either trigger inks — is queryable by a later
+    ``latest_event`` call in the SAME ledger instance, which is what the env
+    trigger's own idempotence check (``_open_env_receipt``, looking for an
+    unconsumed ``env_changed`` row) and the both-triggers test need.
+    """
 
     def __init__(self, receipt=None):
         self.receipt = receipt
         self.appended = []
+        self._rows: dict[str, list[dict]] = {}
 
     def latest_event(self, event_type, *, match):
-        assert event_type == "git_pull"
-        if self.receipt is None:
-            return None
-        if all(self.receipt["content"].get(k) == v for k, v in match.items()):
-            return self.receipt
+        if event_type == "git_pull" and self.receipt is not None:
+            if all(self.receipt["content"].get(k) == v for k, v in match.items()):
+                return self.receipt
+        for row in self._rows.get(event_type, []):
+            if all(row["content"].get(k) == v for k, v in match.items()):
+                return row
         return None
 
     def append(self, project, event_type, content):
         self.appended.append((project, event_type, content))
-        return f"reload-receipt-{len(self.appended)}"
+        rid = f"reload-receipt-{len(self.appended)}" if event_type == urx.EVENT \
+            else f"{event_type}-receipt-{len(self.appended)}"
+        self._rows.setdefault(event_type, []).insert(
+            0, {"id": rid, "content": content, "created_at": datetime.now(timezone.utc)})
+        return rid
 
 
 class _FakeSystemctlGit:
@@ -361,3 +388,233 @@ def test_tick_command_exits_one_only_when_due_and_failed(tmp_path, checkout, mon
     monkeypatch.setattr(urx.subprocess, "run", _FakeSystemctlGit(restart_rc=1))
     assert reloader.main(["tick"]) == 1
     assert '"ERESTART"' in capsys.readouterr().out
+
+
+# ── the env trigger: check_env (detect / request / confirm+act) ───────────────
+#
+# `_FakeSystemctlGit`'s `show` branch never sets `EnvironmentFiles=`, so
+# `resolve_env_file` always falls back to `$WILLOW_HOME/env` — the autouse
+# `_reloader_willow_home` fixture gives every test here its own throwaway
+# WILLOW_HOME, so these helpers write/seed exactly that file.
+
+_ENV_SECRET = "sk-do-not-leak-this-literal-9182"
+
+
+def _seed_running_env(text: str) -> dict:
+    """What 'the running broker' loaded, per its own startup record —
+    `env_fingerprint.record_startup` against the same path
+    `resolve_env_file` falls back to."""
+    p = envfp.default_env_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    return envfp.record_startup(p)
+
+
+def _write_live_env(text: str) -> Path:
+    p = envfp.default_env_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def _assert_no_secret_leak(*blobs) -> None:
+    import json
+    for blob in blobs:
+        text = blob if isinstance(blob, str) else json.dumps(blob, default=str)
+        assert _ENV_SECRET not in text
+
+
+def test_check_env_missing_state_file_is_estateempty(tmp_path, checkout):
+    db = _nestor_db(tmp_path)
+    out = reloader.check_env(_config(checkout, db), ledger=_FakeLedger(), runner=_FakeSystemctlGit())
+    assert out["error"] == "ESTATEEMPTY" and not out["act"]
+
+
+def test_check_env_unreachable_state_file_is_eunreach(tmp_path, checkout):
+    db = _nestor_db(tmp_path)
+    envfp.state_path().parent.mkdir(parents=True, exist_ok=True)
+    envfp.state_path().write_text("not json{{{", encoding="utf-8")
+    out = reloader.check_env(_config(checkout, db), ledger=_FakeLedger(), runner=_FakeSystemctlGit())
+    assert out["error"] == "EUNREACH"
+
+
+def test_check_env_no_diff_is_quiet_not_a_refusal(tmp_path, checkout):
+    db = _nestor_db(tmp_path)
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\n")
+    out = reloader.check_env(_config(checkout, db), ledger=_FakeLedger(), runner=_FakeSystemctlGit())
+    assert out["ok"] and not out["act"] and out["error"] is None
+
+
+def test_check_env_diff_without_seal_is_enoseal_and_writes_one_receipt(tmp_path, checkout):
+    db = _nestor_db(tmp_path)
+    _seed_running_env(f"A=1\nSECRET={_ENV_SECRET}\n")
+    _write_live_env(f"A=1\nSECRET={_ENV_SECRET}\nB=2\n")
+    ledger = _FakeLedger()
+    out = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
+    assert out["error"] == "ENOSEAL"
+    assert len(ledger.appended) == 1
+    project, event, content = ledger.appended[0]
+    assert event == reloader.ENV_EVENT
+    assert content["actor"] == reloader.ACTOR
+    assert content["keys_added"] == ["B"]
+    assert content["keys_removed"] == [] and content["keys_changed"] == []
+    _assert_no_secret_leak(content, out)
+
+
+def test_check_env_idempotent_no_second_receipt_while_open(tmp_path, checkout):
+    db = _nestor_db(tmp_path)
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger()
+    first = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
+    second = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
+    assert first["error"] == second["error"] == "ENOSEAL"
+    assert first["receipt_id"] == second["receipt_id"]
+    assert len(ledger.appended) == 1
+
+
+def test_check_env_all_conditions_met_is_act(tmp_path, checkout):
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger()
+    git = _FakeSystemctlGit()
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "sealed").mkdir()
+    empty_db = _nestor_db(tmp_path / "empty")
+    detect = reloader.check_env(_config(checkout, empty_db), ledger=ledger, runner=git)
+    assert detect["error"] == "ENOSEAL"
+    sealed_db = _nestor_db(tmp_path / "sealed", _sealed(detect["receipt_id"]))
+    out = reloader.check_env(_config(checkout, sealed_db), ledger=ledger, runner=git)
+    assert out["ok"] and out["act"]
+    assert out["seal"]["pair_id"] == "pair-1"
+    assert git.restarts == []  # check never acts
+    assert len(ledger.appended) == 1  # still just the one request
+
+
+def test_check_env_unit_already_active_since_receipt_is_ealready(tmp_path, checkout):
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger()
+    git = _FakeSystemctlGit(active_enter="Mon 2030-01-01 10:00:00 UTC")
+    db = _nestor_db(tmp_path)
+    out = reloader.check_env(_config(checkout, db), ledger=ledger, runner=git)
+    assert out["error"] == "EALREADY"
+
+
+def test_check_env_drift_since_receipt_is_edrift(tmp_path, checkout):
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger()
+    git = _FakeSystemctlGit()
+    db = _nestor_db(tmp_path)
+    first = reloader.check_env(_config(checkout, db), ledger=ledger, runner=git)
+    assert first["error"] == "ENOSEAL"
+    _write_live_env("A=1\nB=3\n")  # the file moves again before any seal
+    second = reloader.check_env(_config(checkout, db), ledger=ledger, runner=git)
+    assert second["error"] == "EDRIFT"
+    assert second["receipt_id"] == first["receipt_id"]
+    assert len(ledger.appended) == 1  # still idempotent — no second receipt
+
+
+def test_check_env_unit_unreachable_is_eunreach(tmp_path, checkout):
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger()
+    git = _FakeSystemctlGit(show_rc=1)
+    db = _nestor_db(tmp_path)
+    out = reloader.check_env(_config(checkout, db), ledger=ledger, runner=git)
+    assert out["error"] == "EUNREACH"
+
+
+# ── both triggers, one tick ─────────────────────────────────────────────────
+
+def test_run_once_env_trigger_restarts_and_leaves_ink(tmp_path, checkout):
+    _seed_running_env("A=1\n")
+    _write_live_env(f"A=1\nSECRET={_ENV_SECRET}\n")
+    ledger = _FakeLedger()  # no pull receipt at all
+    git = _FakeSystemctlGit()
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "sealed").mkdir()
+    empty_db = _nestor_db(tmp_path / "empty")
+    first = reloader.run_once(_config(checkout, empty_db), ledger=ledger, runner=git)
+    assert not first["reloaded"]
+    rid = first["env"]["receipt_id"]
+    sealed_db = _nestor_db(tmp_path / "sealed", _sealed(rid))
+    second = reloader.run_once(_config(checkout, sealed_db), ledger=ledger, runner=git)
+    assert second["ok"] and second["reloaded"]
+    assert second["triggers"] == ["env_changed"]
+    assert len(git.restarts) == 1 and git.restarts[0][-1] == "willow-mcp-serve.service"
+    project, event, content = ledger.appended[-1]
+    assert event == urx.EVENT
+    assert content["trigger"] == "env_changed"
+    assert content["env_receipt_id"] == rid
+    assert "pull_receipt_id" not in content
+    assert content["nestor_pair_id"] == "pair-1"
+    _assert_no_secret_leak(content)
+
+
+def test_run_once_second_tick_after_restart_env_trigger_is_quiet(tmp_path, checkout):
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger()
+    git = _FakeSystemctlGit()
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "sealed").mkdir()
+    empty_db = _nestor_db(tmp_path / "empty")
+    first = reloader.run_once(_config(checkout, empty_db), ledger=ledger, runner=git)
+    rid = first["env"]["receipt_id"]
+    sealed_db = _nestor_db(tmp_path / "sealed", _sealed(rid))
+    second = reloader.run_once(_config(checkout, sealed_db), ledger=ledger, runner=git)
+    assert second["reloaded"]
+    # the restarted broker's own startup records its new baseline, same as
+    # `env_fingerprint.record_startup()` really would on the next boot.
+    _seed_running_env("A=1\nB=2\n")
+    third = reloader.run_once(_config(checkout, sealed_db), ledger=ledger, runner=git)
+    assert not third["reloaded"]
+    assert third["env"]["act"] is False and third["env"]["error"] is None
+    assert len(git.restarts) == 1
+
+
+def test_run_once_both_triggers_sealed_restarts_once_cites_both(tmp_path, checkout):
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger(_receipt(checkout))
+    git = _FakeSystemctlGit()
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "sealed").mkdir()
+    empty_db = _nestor_db(tmp_path / "empty")
+    first = reloader.run_once(_config(checkout, empty_db), ledger=ledger, runner=git)
+    assert not first["reloaded"]
+    pull_rid = first["receipt_id"]
+    env_rid = first["env"]["receipt_id"]
+    db = _nestor_db(tmp_path / "sealed", _sealed(pull_rid, pid="pair-1"), _sealed(env_rid, pid="pair-2"))
+    second = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
+    assert second["ok"] and second["reloaded"]
+    assert set(second["triggers"]) == {"git_pull", "env_changed"}
+    assert len(git.restarts) == 1  # one restart satisfies both
+    project, event, content = ledger.appended[-1]
+    assert content["trigger"] == "both"
+    assert content["pull_receipt_id"] == pull_rid
+    assert content["env_receipt_id"] == env_rid
+    assert content["nestor_pair_ids"] == {"pull": "pair-1", "env": "pair-2"}
+
+
+def test_run_once_only_pull_sealed_acts_on_pull_only(tmp_path, checkout):
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger(_receipt(checkout))
+    git = _FakeSystemctlGit()
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "sealed").mkdir()
+    empty_db = _nestor_db(tmp_path / "empty")
+    first = reloader.run_once(_config(checkout, empty_db), ledger=ledger, runner=git)
+    pull_rid = first["receipt_id"]
+    assert first["env"]["receipt_id"]  # the env request was filed too
+    db = _nestor_db(tmp_path / "sealed", _sealed(pull_rid, pid="pair-1"))  # env stays unsealed
+    second = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
+    assert second["reloaded"] and second["triggers"] == ["git_pull"]
+    project, event, content = ledger.appended[-1]
+    assert content["trigger"] == "git_pull"
+    assert "env_receipt_id" not in content
+    assert len(git.restarts) == 1  # the still-waiting env receipt earns no second restart
