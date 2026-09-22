@@ -31,6 +31,28 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.76.0](https://github.com/willow-memory/willow-mcp/compare/v2.75.0...v2.76.0) (2026-09-22)
+
+
+### Added
+
+* **gate:** the steward as its own principal (willow-bot) ([2fbfd4e](https://github.com/willow-memory/willow-mcp/commit/2fbfd4ea7061daa06fc3693a772cbc91ef9a012c))
+* **gaps:** gap_get and gap_list query/since/topic-prefix/brief (gap 1477ebb2bc35) ([d93a677](https://github.com/willow-memory/willow-mcp/commit/d93a6779104617ad19cbcab05ade804d8907b03d))
+
+
+### Fixed
+
+* **fleet-seams:** CI fix for #619 -- manifest permissions + robust sig test ([b302927](https://github.com/willow-memory/willow-mcp/commit/b302927cd88fbecdf541a043f19b0c35a0024fa3))
+* **gate:** steward groups excluded from the ask-queue's narrowest-scope pick ([2958fa9](https://github.com/willow-memory/willow-mcp/commit/2958fa959db3ca613667b44eba6c3325321580c9))
+* **gate:** rework steward groups against the real tick.py verb list ([246b1d1](https://github.com/willow-memory/willow-mcp/commit/246b1d1a8398be724acd6125ba1d5a6bc77d87dd))
+* **gaps,envelope,handoff:** rework 2 per Loki EB30E84F ([e535301](https://github.com/willow-memory/willow-mcp/commit/e5353018453c42ae0194ad4e50dbd2d3fe7429a8))
+* **gate:** steward_sweep/steward_enqueue recognized by the self-grant regex ([0f128f9](https://github.com/willow-memory/willow-mcp/commit/0f128f9d8a8aa053f9c338af9ce5f7ff728fff94))
+* **gate:** classify gitsync_sweep/git_pull_execute drift from the split ([60ded52](https://github.com/willow-memory/willow-mcp/commit/60ded52592fde38b479593ff3767c2216ae52cf4))
+* **handoff,envelope,fleet-seams:** rework per Loki 23CAD2B4 ([9f425c5](https://github.com/willow-memory/willow-mcp/commit/9f425c5086c5ec2247a089a552452014bc0b9972))
+* **fleet-seams:** provision the jeles-corpus organ manifest fixture ([bd88842](https://github.com/willow-memory/willow-mcp/commit/bd888422fcb907e3003196be468b0817daefc967))
+* **envelope:** retire_sweep retires on expires_at, clips counted rows to budget ([93423f0](https://github.com/willow-memory/willow-mcp/commit/93423f0f40d0567df26c1b5904e907f120f5a6de))
+* **handoff:** handoff_write_v4 refuses unknown fields and empty findings by name ([a967f0f](https://github.com/willow-memory/willow-mcp/commit/a967f0f62e739538fa82ce4fc61b49f44338ba4c))
+
 ## [2.75.0](https://github.com/willow-memory/willow-mcp/compare/v2.74.0...v2.75.0) (2026-09-22)
 
 
