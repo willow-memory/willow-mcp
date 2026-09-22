@@ -31,6 +31,20 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.75.0](https://github.com/willow-memory/willow-mcp/compare/v2.74.0...v2.75.0) (2026-09-22)
+
+
+### Added
+
+* **federation:** filter federated results by the caller's exposure tier; dispatch to the retired jeles seat refuses ESEATRETIRED ([6276b4c](https://github.com/willow-memory/willow-mcp/commit/6276b4caaf6c17410f56ebb6ef6feddd3b02f72f))
+* **federation:** filter federation_call rows by caller exposure tier; refuse dispatch to retired jeles seat ([1799da6](https://github.com/willow-memory/willow-mcp/commit/1799da63b8670592a38c35bb8d2d94231174aba5))
+
+
+### Fixed
+
+* **federation:** exposure tier is a ceiling with public as fail-closed default, transport-capped, filter recurses to any depth ([a2922e4](https://github.com/willow-memory/willow-mcp/commit/a2922e4e5cfb5290288c76cde069fa1974a5d69f))
+* **federation:** unmarked singletons are rows too, unconfigured tier is the transport ceiling, withheld marker names its tier ([528ef68](https://github.com/willow-memory/willow-mcp/commit/528ef68754257ad9127b57b6253ca578543e873b))
+
 ## [2.74.0](https://github.com/willow-memory/willow-mcp/compare/v2.73.0...v2.74.0) (2026-09-21)
 
 
