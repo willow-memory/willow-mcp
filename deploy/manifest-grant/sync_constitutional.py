@@ -283,17 +283,25 @@ def _make_sign_fn(trust_owner: str, gnupg_home: str, fingerprint: str) -> "Calla
     `--output -` writes the detached signature to gpg's own stdout, so gpg
     (running as the trust owner via `sudo -u`) never opens a path this
     process (root) created — the child uid's permission on any temp path
-    never matters, because none is ever handed to it."""
+    never matters, because none is ever handed to it.
+
+    GNUPGHOME is passed INSIDE the sudo argv, not in this process's `env`:
+    sudo resets the environment (env_reset), so an exported GNUPGHOME never
+    reaches gpg, which then reads the trust owner's default home, finds no
+    secret key, and exits 2. Measured on the box 2026-09-22 — the shell's
+    own `as_to()` has always passed it this way (install.sh:143) and works;
+    the first Python port of the same call set it in `env` and failed. Any
+    variable gpg needs must go in the argv for the same reason."""
 
     def sign_fn(path: Path) -> bytes:
-        env = {**os.environ, "GNUPGHOME": gnupg_home}
         proc = subprocess.run(
             [
-                "sudo", "-u", trust_owner, "gpg", "--batch", "--yes",
+                "sudo", "-u", trust_owner, f"GNUPGHOME={gnupg_home}",
+                "gpg", "--batch", "--yes",
                 "--detach-sign", "--armor", "--local-user", fingerprint,
                 "--output", "-", str(path),
             ],
-            env=env, capture_output=True, check=True,
+            capture_output=True, check=True,
         )
         return proc.stdout
 
@@ -307,10 +315,12 @@ def _make_verify_fn(trust_owner: str, gnupg_home: str) -> "Callable[[Path, bytes
     discipline `_make_sign_fn` uses, for the same reason."""
 
     def verify_fn(path: Path, sig_bytes: bytes) -> bool:
-        env = {**os.environ, "GNUPGHOME": gnupg_home}
         proc = subprocess.run(
-            ["sudo", "-u", trust_owner, "gpg", "--batch", "--verify", "-", str(path)],
-            input=sig_bytes, env=env, capture_output=True,
+            [
+                "sudo", "-u", trust_owner, f"GNUPGHOME={gnupg_home}",
+                "gpg", "--batch", "--verify", "-", str(path),
+            ],
+            input=sig_bytes, capture_output=True,
         )
         return proc.returncode == 0
 

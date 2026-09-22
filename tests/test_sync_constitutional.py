@@ -330,3 +330,45 @@ def test_sync_and_sign_propagates_sync_failures_before_signing_anything(tmp_path
         sync_constitutional.sync_and_sign(bundle_dir, box_dir, signer.sign_fn, signer.verify_fn)
     assert signer.sign_calls == []
     assert signer.verify_calls == []
+
+
+def test_gnupghome_is_passed_inside_the_sudo_argv_not_the_environment(tmp_path, monkeypatch):
+    """The defect the operator's SECOND live run measured (2026-09-22).
+
+    `sudo` resets the environment (env_reset), so exporting GNUPGHOME in
+    this process's `env=` never reaches gpg: it reads the trust owner's
+    default home, finds no secret key, and exits 2 —
+
+        STOP: signing failed for syscall-table.json: Command '['sudo', '-u',
+        'willow-operator', 'gpg', ...]' returned non-zero exit status 2
+
+    install.sh's own `as_to()` has always passed it as a sudo ARGUMENT
+    (install.sh:143) and works; the first Python port of the same call set
+    it in `env` and did not. A genuine two-uid gpg run is not possible in
+    Kart, but the argv this module builds is — and the argv is where the
+    bug lived."""
+    captured = []
+
+    class _Proc:
+        returncode = 0
+        stdout = b"SIG"
+
+    def fake_run(argv, **kwargs):
+        captured.append((argv, kwargs))
+        return _Proc()
+
+    monkeypatch.setattr(sync_constitutional.subprocess, "run", fake_run)
+
+    sign_fn = sync_constitutional._make_sign_fn("willow-operator", "/var/lib/gnupg-x", "FPR123")
+    assert sign_fn(tmp_path / "f.json") == b"SIG"
+
+    verify_fn = sync_constitutional._make_verify_fn("willow-operator", "/var/lib/gnupg-x")
+    assert verify_fn(tmp_path / "f.json", b"SIG") is True
+
+    assert len(captured) == 2
+    for argv, kwargs in captured:
+        # The assignment rides in the argv, immediately before the program.
+        assert "GNUPGHOME=/var/lib/gnupg-x" in argv
+        assert argv.index("GNUPGHOME=/var/lib/gnupg-x") == argv.index("gpg") - 1
+        # ...and is NOT relied on through the parent environment, which sudo discards.
+        assert "env" not in kwargs
