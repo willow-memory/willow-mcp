@@ -167,3 +167,52 @@ def test_server_module_level_singletons_are_lazy():
     )
     assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert result.stdout.strip() == "ok"
+
+
+def test_apply_refuses_named_when_pending_dir_is_unlistable(tmp_path):
+    """Gap `035d287206e1`, F2 (Loki audit B00BD43E, rework 1 on 6743E7AD):
+    the `.stat()` probes added for constraint 4 catch "cannot TRAVERSE"
+    (needs only `x` on the parent) but `Path.glob()` still swallows "cannot
+    LIST" (needs `r` on `pending_dir` itself) exactly the way
+    `is_dir()`/`.exists()` used to for the outer directories — a
+    traversable but UNREADABLE `pending/` (mode 111: `x` but no `r`) used
+    to read as `{ok: true, state: "empty"}`, exit 0, silently, forever
+    (measured, Kart SAX46GFP — on the real box `pending/` is 755 + an ACL
+    so this does not fire today, but the fix distinguishes 'cannot list'
+    from 'empty' regardless of what currently happens to be granted).
+    `os.listdir` raises on a mode-111 directory; `Path.glob` does not."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores mode bits — this test needs a genuinely unlistable dir")
+    home = tmp_path / "wh"
+    (home / "mcp_apps").mkdir(parents=True)
+    grants_root = home / "manifest_grants"
+    pending = grants_root / "pending"
+    pending.mkdir(parents=True)
+    (grants_root / "done").mkdir()
+    (grants_root / "failed").mkdir()
+    pending.chmod(0o111)  # traversable (x), NOT listable (no r)
+    try:
+        full_env = dict(os.environ)
+        full_env.pop("WILLOW_IN_KART", None)
+        full_env.pop("KART_TASK_ID", None)
+        full_env["WILLOW_HOME"] = str(home)
+        full_env["PYTHONPATH"] = _REPO_SRC
+        result = subprocess.run(
+            [sys.executable, "-m", "willow_mcp", "manifest-grant", "apply"],
+            env=full_env, capture_output=True, text=True, timeout=30,
+        )
+    finally:
+        pending.chmod(0o700)
+
+    assert "Traceback (most recent call last)" not in result.stderr, (
+        f"apply raised instead of refusing by name:\n{result.stderr}"
+    )
+    assert result.returncode != 0, "an unlistable pending/ must not read as success"
+    payload = json.loads(result.stdout)
+    assert payload.get("ok") is False
+    assert payload.get("state") != "empty", (
+        "cannot-list must never read the same as 'nothing pending' — "
+        f"got {payload}"
+    )
+    assert payload.get("error") == "EACCES"
+    assert str(pending) in json.dumps(payload), f"refusal does not name pending/: {payload}"

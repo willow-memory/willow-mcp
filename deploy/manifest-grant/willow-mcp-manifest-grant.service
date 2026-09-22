@@ -43,6 +43,17 @@
 #     the broker role's read grants on the FRANK tables plus INSERT — the
 #     apply confirms its citation in FRANK and inks the per-verb `<verb>_applied`
 #     event there; with no ledger every apply refuses EUNREACH.
+#
+# Rework (gap 035d287206e1, F1 — Loki audit B00BD43E, 2026-09-22): this unit
+# used to also set WILLOW_NESTOR_DB and the apply half opened nestor.db
+# directly to re-verify a sealed pair fresh. nestor.db is a WAL database; a
+# read-only opener here cannot create the -shm sidecar a WAL reader needs
+# under ProtectHome=read-only, and every permission shape tried either
+# refused outright or silently hid rows still sitting in the WAL. The
+# request half (broker, which CAN read nestor.db) now embeds the sealed
+# row's own verified bytes in the signed pending record; this unit
+# re-verifies the ed25519 signature over those embedded bytes instead — it
+# never opens nestor.db, and WILLOW_NESTOR_DB is gone from this file.
 [Unit]
 Description=willow-mcp manifest-grant — apply sealed permission grants (trust owner)
 After=network.target postgresql.service
@@ -55,7 +66,6 @@ Group=willow-operator
 UMask=0027
 EnvironmentFile=/etc/willow-mcp/manifest-grant.env
 Environment="WILLOW_HOME=/home/sean-campbell/sean-data-vault/willow-operator-box"
-Environment="WILLOW_NESTOR_DB=/home/sean-campbell/sean-data-vault/willow-operator-box/nestor.db"
 Environment="GNUPGHOME=/var/lib/willow-mcp/manifest-grant/gnupg"
 ExecStart=/home/sean-campbell/sean-data-vault/willow-operator-box/venvs/willow-mcp/bin/python -m willow_mcp manifest-grant apply
 # The gpg-agent for GNUPGHOME above is started on demand by gpg itself; the key
