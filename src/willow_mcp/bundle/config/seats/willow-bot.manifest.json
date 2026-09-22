@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Template for mcp_apps/willow-bot/manifest.json — the steward as its own",
+    "principal (sealed 163b9a70, dispatch 4326FDFE). Not consumed by any code",
+    "path directly: manifest.create (verb 18 / manifest_grant_request,",
+    "42DF2EA1) writes the LIVE manifest under a sealed Nestor pair naming",
+    "these exact seats/groups, then signs it — this file is the reference",
+    "copy an operator/auditor reads to see what that sealed pair should say.",
+    "",
+    "Groups, and why each is here (none is full_access, none is orchestrator,",
+    "grove_relay is never granted):",
+    "  steward_sweep   — seal_drain, net_authority_drain, envelope_retire_sweep,",
+    "                    gitsync_sweep, git_pull_execute (gate.py). Tick-time",
+    "                    maintenance that mirrors a human's own prior seal or",
+    "                    action; mints no new authority.",
+    "  steward_read    — human_required_list. Read the queue before deciding",
+    "                    whether to add to it.",
+    "  steward_enqueue — human_required_enqueue only (never resolve, never",
+    "                    human_attestation_create). The steward raises a hand;",
+    "                    it does not clear its own queue item.",
+    "  grove_read      — the 13 Grove read tools (channel/message/thread/",
+    "                    flag/bus/agent listing).",
+    "  grove_write     — the 7 Grove write tools, GRANTED SEPARATELY by pair",
+    "                    f46474ee, not baked into this template — the steward",
+    "                    joins receive_dispatch's grove_read+grove_write grant",
+    "                    as the seventh seat. Listed here so the shape is",
+    "                    complete once that pair lands; the group name alone",
+    "                    carries no authority until a signed manifest holds it.",
+    "",
+    "Deliberately absent:",
+    "  full_access, orchestrator, dispatch_write/dispatch_send (any group",
+    "  naming dispatch_send) — see dispatch 4326FDFE's handoff, item 5: the",
+    "  steward enqueues a human_required ask for the desk to dispatch instead",
+    "  of dispatching itself. grove_relay — a message a human reads on #willow",
+    "  from the steward says willow-bot, never a relayed identity.",
+    "",
+    "Fixture text for the sealed pair (willow-manifest-grant-v1 grammar,",
+    "manifest_grant_executor.py):",
+    "  willow-manifest-grant-v1 seats=willow-bot groups=steward_sweep,steward_read,steward_enqueue,grove_read,grove_write"
+  ],
+  "permissions": [
+    "steward_sweep",
+    "steward_read",
+    "steward_enqueue",
+    "grove_read",
+    "grove_write"
+  ],
+  "store_scope": [
+    "willow-bot_*"
+  ]
+}

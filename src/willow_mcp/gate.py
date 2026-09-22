@@ -116,6 +116,13 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         "context_list", "knowledge_search", "kb_ingest", "store_get", "store_search",
         "specialist_list", "specialist_get", "agent_seed_mirror",
         "exposure_config_get", "exposure_slice",
+        # gitsync_sweep / git_pull_execute used to ride the shared
+        # `envelope_apply` gate name; pair 163b9a70 split them onto their
+        # own names (see server.py's git_pull_execute docstring) so the new
+        # steward_sweep group can grant them without also granting envelope
+        # authoring. Listed here too so the human orchestrator seat (which
+        # held them via `envelope_apply` above) is unaffected by the split.
+        "gitsync_sweep", "git_pull_execute",
     }),
     "fleet_read": frozenset({
         "fleet_status", "fleet_health", "frank_read", "frank_verify",
@@ -386,6 +393,42 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     "human_loop_write": frozenset({
         "human_required_enqueue", "human_required_resolve", "human_attestation_create",
     }),
+    # The steward as its own principal (sealed 163b9a70, dispatch 4326FDFE):
+    # app_id willow-bot, never willow, never WILLOW_HUMAN_ORCHESTRATOR, never
+    # full_access, never grove_relay, never envelope authoring. Three narrow
+    # groups instead of one wide one, mirroring the split this repo already
+    # uses everywhere else (store_read/write, envelope_read/write, ...) so a
+    # future steward capability can be granted without regranting the rest.
+    #
+    # steward_sweep: the tick-time maintenance verbs that mirror a human's
+    # own prior seal/action and mint no new authority — same standing as
+    # governance_sync above, plus the two pull verbs split off the shared
+    # `envelope_apply` name (git_pull_execute's docstring) so this group
+    # never also unlocks envelope_apply/unit.install/unit.reload/PR
+    # open/update the way granting `envelope_apply` itself would have.
+    "steward_sweep": frozenset({
+        "seal_drain", "net_authority_drain", "envelope_retire_sweep",
+        "gitsync_sweep", "git_pull_execute",
+    }),
+    # steward_read: the human-required queue, read-only — the steward's
+    # steward_audit step checks what is already open before ever asking to
+    # add to it. Deliberately narrower than human_loop_read (which also
+    # carries human_attestation_list — an attestation-review surface the
+    # steward has no tick-path use for).
+    "steward_read": frozenset({
+        "human_required_list",
+    }),
+    # steward_enqueue: file a human-required ask. Deliberately excludes
+    # human_required_resolve and human_attestation_create (human_loop_write's
+    # other two members) — the steward raises a hand, it does not clear its
+    # own queue item or attest on anyone's behalf. This is also the verb the
+    # steward's steward_audit step is expected to use INSTEAD of dispatch_send
+    # once it runs as willow-bot rather than willow — see dispatch 4326FDFE's
+    # handoff for why dispatch_send itself is deliberately not in any
+    # steward group.
+    "steward_enqueue": frozenset({
+        "human_required_enqueue",
+    }),
     # MarkdownAI (mai) tools — #153/#161. Registration is already opt-in via
     # WILLOW_MCP_MARKDOWNAI; these groups add per-app authorization on top,
     # because a registered tool surface with no gate is exactly the #161 hole.
@@ -443,6 +486,10 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # shows spent — same standing as net_authority_drain, no new
         # authority, the gate does not depend on it.
         "envelope_retire_sweep",
+        # gitsync_sweep / git_pull_execute (split off the shared
+        # `envelope_apply` name by pair 163b9a70 — see "orchestrator" above
+        # and server.py's git_pull_execute docstring).
+        "gitsync_sweep", "git_pull_execute",
         # Grove — the fleet's shared messaging room (read + write; no egress
         # concern like web_net/integration_net/mcp_federation, so unlike those
         # this rides full_access, same reasoning as knowledge_read/write above)

@@ -20,6 +20,21 @@ import os
 
 ORCHESTRATOR_APP_ID = "willow"
 
+# The steward's own identity (sealed 163b9a70, dispatch 4326FDFE): a named
+# SECOND principal, never a synonym for the orchestrator. willow-bot has its
+# own signed manifest (mcp_apps/willow-bot/manifest.json), its own Grove
+# sender, and its own FRANK actor — it never enters as ORCHESTRATOR_APP_ID
+# and never carries WILLOW_HUMAN_ORCHESTRATOR. Mirrors reloader.ACTOR
+# (src/willow_mcp/reloader.py) and the sweep's DEFAULT_ACTOR convention
+# (Loki BAA43543): a plain constant so no call site hand-spells the string.
+# `is_orchestrator_app` deliberately has no `is_steward_app` counterpart —
+# there is no dedicated attestation wall for this identity the way
+# `orchestrator_write_denial` exists for `willow` (see its docstring): the
+# steward's authority is entirely manifest/group driven through the normal
+# `gate.permitted` path (steward_sweep / steward_read / steward_enqueue,
+# gate.py), not a second copy of the orchestrator's human-attestation gate.
+STEWARD_APP_ID = "willow-bot"
+
 # Tools that advance fleet work on behalf of the operator — never agent-autonomous.
 # frank_append and envelope_apply mutate the shared governance chain; a process
 # claiming app_id=willow must be a human-attested orchestrator host to run them,
