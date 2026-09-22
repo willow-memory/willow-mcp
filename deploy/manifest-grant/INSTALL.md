@@ -233,26 +233,21 @@ trust-owner-owned, a plain broker-uid call to `ratify()` now refuses
 `EACCES` UP FRONT (Loki audit 367C367A, T1 — a prior draft discovered this
 only at the register write itself, after already inking FRANK and deleting
 the proposal from the queue; fixed to refuse before touching either file).
-Until a trust-owner `envelope.ratify` verb exists (mirroring
-`manifest.grant`'s own request/apply split — tracked via `gap_log`, topic
-`envelope.ratify apply-half verb`), ratifying a proposal for real needs
-`sudo -u willow-operator` from the operator's own terminal, exactly like
-the signing key operations this script itself performs (`as_to gpg ...`).
 
-**`sudo -u willow-operator` strips `WILLOW_PGP_FINGERPRINT` from the
-environment unless re-exported** (Loki audit 367C367A, T3): `ratify()`
-signs the register when PGP enforcement is on, but does NOT refuse when
-the fingerprint is unset — it writes the register unsigned and returns
-(the same posture every other write in this codebase takes when PGP is
-not enforced). A `sudo -u willow-operator` ratify run without re-exporting
-the fingerprint silently produces an unsigned register that every OTHER
-reader then refuses via `trusted_read`'s signature branch — a clean-looking
-ratify followed by a fleet-wide `EUNREACH`. Always:
-
-    sudo -u willow-operator env WILLOW_HOME=$H WILLOW_PGP_FINGERPRINT=$FPR \
-      $H/venvs/willow-mcp/bin/python -m willow_mcp envelope ratify <proposal_id>
+**On the installed box, ratifying an envelope is not possible until
+`envelope.ratify` (gap `d3f79320ccb5`) lands** (Loki audit 42B3B46F, U1). A
+`sudo -u willow-operator` invocation is NOT a working alternative — earlier
+drafts of this document said it was; that was wrong, measured wrong: that
+uid can write the register but then fails reading the OTHER file this same
+call needs, the broker-owned `0600` proposals sidecar. There is no uid on
+the box that can complete `ratify()` as written. A proposal sealed and
+ratify-attempted while this gap is open stays queued in
+`$H/proposals/proposals.json` — refused, not lost; nothing is half-applied.
+The fix is the same shape as the other four verbs — a trust-owner
+`envelope.ratify` apply-half verb, mirroring `manifest.grant`'s own
+request/apply split — not built in this packet.
 
 `propose()` and `reject()` are unaffected — they only ever touch the
-broker-owned `$H/proposals/` sidecar, never the register, from any uid.
-Named honestly here rather than implied solved by the register's ownership
-change alone.
+broker-owned `$H/proposals/` sidecar, never the register, from any uid, and
+work exactly as before. Named honestly here rather than implied solved by
+the register's ownership change alone.

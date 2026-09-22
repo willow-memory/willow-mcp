@@ -129,11 +129,13 @@ class RegisterUnwritableError(EnvelopeAuthoringError):
     from the sidecar and ``envelope_ratified`` already appended: the
     proposal was lost and FRANK said something that never happened. On an
     installed box where ``constitutional/`` is trust-owner-owned (sealed
-    31f5d3af), the desk's own uid can never write it — ``ratify()`` is a
-    trust-owner act there until a trust-owner ``envelope.ratify`` apply-half
-    verb exists (tracked, not built in this packet — see the ``gap_log``
-    entry this module's docstring cites). ``detail`` names the path and the
-    uid that owns it."""
+    31f5d3af), the desk's own uid can never write it — and, Loki audit
+    42B3B46F, U1: NO uid can, since the trust owner's own uid then fails
+    reading the OTHER file this same ratify needs (the broker-owned 0600
+    proposals sidecar). Ratifying an envelope is not possible at all until
+    a trust-owner ``envelope.ratify`` apply-half verb exists — gap
+    ``d3f79320ccb5``, tracked, not built in this packet. ``detail`` names
+    the path and the uid that owns it."""
 
     def __init__(self, message: str, detail: dict):
         super().__init__(message)
@@ -395,9 +397,14 @@ def _register_writable() -> tuple[bool, str, dict]:
         owner = str(d.stat().st_uid)
     reason = (
         f"{d} is not writable by this process (uid {os.geteuid()}) — owned "
-        f"by {owner!r}. Once constitutional/ is trust-owner-owned, ratify() "
-        f"is a trust-owner act (sudo -u {owner} ...) until a trust-owner "
-        "envelope.ratify apply-half verb exists."
+        f"by {owner!r}. On the installed box, ratifying an envelope is not "
+        "possible until envelope.ratify (gap d3f79320ccb5) lands: a "
+        f"sudo -u {owner} run of this same function fails too, on the "
+        "OTHER file this ratify would need to touch (the broker-owned, "
+        "0600 proposals sidecar it cannot read as this uid) — there is no "
+        "uid on the box that can complete ratify() as written. The "
+        "proposal named here queues in $WILLOW_HOME/proposals/ and is not "
+        "lost; nothing was touched by this refusal."
     )
     return False, reason, {"error": "EACCES", "path": str(d), "owner": owner}
 
@@ -423,19 +430,26 @@ def _save_active(registry: dict) -> None:
     enforced" posture every other write in this codebase takes (e.g.
     ``manifest_admin.create_manifest``) — a prior draft of this docstring
     claimed the opposite ("refusing when unset"), which was never true of
-    the code. This matters operationally: a trust-owner CLI run via ``sudo
-    -u willow-operator`` strips ``WILLOW_PGP_FINGERPRINT`` from the
-    environment unless the operator re-exports it, so an un-thought-through
-    ``sudo`` invocation silently produces an unsigned (or stale-signed)
-    register that every OTHER reader then refuses via
-    ``paths.trusted_read``'s signature branch — a clean-looking ratify
-    followed by a fleet-wide ``EUNREACH``. Not hardened into a hard refusal
-    in this pass (an unconditional refusal would also break every existing
-    test and CLI invocation on a box that has not opted into PGP
-    enforcement at all) — named here so the next reader does not repeat
-    the prior draft's false claim, and so INSTALL.md's operator-facing
-    ``sudo -u willow-operator`` examples carry an explicit
-    ``WILLOW_PGP_FINGERPRINT=$FPR`` re-export."""
+    the code. This matters for :func:`trust_owner_verbs`'s ``revoke`` apply
+    half, which DOES run as the trust owner successfully and DOES need
+    ``WILLOW_PGP_FINGERPRINT`` present in that process's own environment to
+    sign — an unsigned (or stale-signed) register is refused by every OTHER
+    reader via ``paths.trusted_read``'s signature branch, a clean-looking
+    apply followed by a fleet-wide ``EUNREACH``. Not hardened into a hard
+    refusal in this pass (an unconditional refusal would also break every
+    existing test and CLI invocation on a box that has not opted into PGP
+    enforcement at all) — named here so the next reader does not repeat the
+    prior draft's false claim.
+
+    **``ratify()`` itself is a separate case, Loki audit 42B3B46F, U1: no
+    uid on an installed box can complete it at all** (:func:`_register_writable`
+    refuses before reaching this function; see its own docstring) — a
+    ``sudo -u willow-operator`` invocation was never a working alternative,
+    since that uid then fails reading the OTHER file, the broker-owned
+    0600 proposals sidecar. Tracked as gap ``d3f79320ccb5``
+    (``envelope.ratify`` apply-half verb, not built in this packet);
+    nothing in this codebase should suggest a ``sudo -u willow-operator
+    ... envelope ratify`` command as if it worked."""
     _atomic_write(_envelopes.registry_path(), {"active": registry.get("active") or []})
     _maybe_sign(_envelopes.registry_path())
 
@@ -703,20 +717,23 @@ def ratify(
     Returns the ratified envelope row. Appends ``envelope_ratified`` to the
     FRANK ledger when one is available.
 
-    **Honest state as of Loki audit 367C367A, T1:** once ``constitutional/``
-    is trust-owner-owned (sealed 31f5d3af, an installed box), the desk's own
-    uid cannot write the register — this function now refuses ``EACCES``
-    UP FRONT (:func:`_register_writable`, :class:`RegisterUnwritableError`)
-    rather than half-executing (inking FRANK and deleting the proposal
-    before discovering the register write cannot succeed, which is what the
-    prior draft did — measured, not theoretical). On an installed box,
-    ratifying for real is a trust-owner act (``sudo -u willow-operator
-    ... envelope ratify``) until a trust-owner ``envelope.ratify``
-    apply-half verb exists, mirroring ``manifest.grant``'s request/apply
-    split for the other four verbs — tracked as a gap (``gap_log``, topic
-    ``envelope.ratify apply-half verb``), not built in this packet. The
-    desk's ``envelope_ratify`` MCP tool will refuse ``EACCES`` there rather
-    than run partway.
+    **Honest state as of Loki audits 367C367A (T1) and 42B3B46F (U1):** once
+    ``constitutional/`` is trust-owner-owned (sealed 31f5d3af, an installed
+    box), the desk's own uid cannot write the register — this function now
+    refuses ``EACCES`` UP FRONT (:func:`_register_writable`,
+    :class:`RegisterUnwritableError`) rather than half-executing (inking
+    FRANK and deleting the proposal before discovering the register write
+    cannot succeed, which is what the prior draft did — measured, not
+    theoretical). **On the installed box, ratifying an envelope is not
+    possible until ``envelope.ratify`` (gap ``d3f79320ccb5``) lands** — a
+    ``sudo -u willow-operator`` invocation is NOT a working alternative
+    (measured, 42B3B46F): that uid then fails reading the OTHER file this
+    same call needs, the broker-owned 0600 proposals sidecar. Proposals
+    queue in ``$WILLOW_HOME/proposals/`` and are not lost while this gap is
+    open. Mirroring ``manifest.grant``'s request/apply split for the other
+    four verbs is the tracked fix, not built in this packet. The desk's
+    ``envelope_ratify`` MCP tool will refuse ``EACCES`` here rather than run
+    partway.
     """
     if not _keyring_verifier_active(verifier):
         raise OperatorVerifierRequired(
@@ -760,14 +777,18 @@ def ratify(
         "ratified_via": f"keyring verifier {verifier}",
     }
 
-    # Rework (Loki audit 54E3DFC0, R2 / 367C367A, T1): ratify is the ONE
-    # broker-side act the sealed text names as touching the trust-owner-owned
-    # active register at all. On an installed box where constitutional/ is
-    # trust-owner-owned, this call needs to run AS the trust owner (sudo -u
-    # willow-operator) for the register write to succeed at the OS level --
-    # _register_writable() above already refused before anything was
-    # touched if that is not the case, so reaching this point means the
-    # write below is expected to succeed.
+    # Rework (Loki audit 54E3DFC0, R2 / 367C367A, T1 / 42B3B46F, U1): ratify
+    # is the ONE broker-side act the sealed text names as touching the
+    # trust-owner-owned active register at all. On an installed box where
+    # constitutional/ is trust-owner-owned, the register write below needs
+    # this process to run AS the trust owner for the OS-level write to
+    # succeed -- _register_writable() above already refused before anything
+    # was touched if that is not the case, so reaching this point means
+    # THIS write is expected to succeed. That is not the same as "ratify()
+    # as a whole works as the trust owner": running this whole function as
+    # the trust owner still fails on the OTHER file it touches, the
+    # broker-owned 0600 proposals sidecar (measured, 42B3B46F) -- gap
+    # d3f79320ccb5 is the real fix, not a uid change.
     #
     # Order matters (T1's fix): the REGISTER write happens FIRST, while the
     # proposal is still sitting untouched in the sidecar and FRANK is still

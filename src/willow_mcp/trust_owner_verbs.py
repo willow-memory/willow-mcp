@@ -480,7 +480,16 @@ def _apply_manifest_retire(record: dict, path: Path, *, ledger, apps_root: Path,
     src = apps_root / app_id
     dest = retired_dir / f"{app_id}-{pair_id}"
     try:
-        retired_dir.mkdir(parents=True, exist_ok=True)
+        # Loki audit 42B3B46F, U2: explicit mode, not left to the calling
+        # process's umask -- the same fix _atomic_write needed for the
+        # proposals sidecar directory (T2, 367C367A). A freshly-created
+        # _retired/ at whatever a permissive umask allows (e.g. 0o775 under
+        # 0002) would carry group/other-write bits nothing here intends.
+        if not retired_dir.exists():
+            retired_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
+            os.chmod(retired_dir, 0o755)
+        else:
+            retired_dir.mkdir(parents=True, exist_ok=True)
         if dest.exists():
             return _fail("eunexpected", f"retirement destination {dest} already exists")
         os.rename(src, dest)
