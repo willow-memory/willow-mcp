@@ -218,10 +218,32 @@ def test_classify_unparseable_expires_at_is_unreachable_not_standing():
     assert "not-a-timestamp" in out["why"]
 
 
-def test_classify_empty_string_expires_at_is_treated_as_absent():
-    """An empty string is falsy -- `not value` -- so it is "no expiry", the
-    same as the key being absent entirely, not a parse failure."""
+def test_classify_empty_string_expires_at_is_unreachable_not_absent():
+    """Rework of Loki's F2, second pass (EB30E84F): `""` is not the same as
+    the key being absent -- envelopes._deadline("") raises ("Invalid
+    isoformat string: ''"), so the gate refuses it EAMBIG the same as any
+    other unparseable value. Only `None` (the gate's own null test) is
+    genuinely "no expiry"."""
     row = _row(verb="envelope.apply", bounds={}, expires_at="")
+    out = sweep_mod.classify(row)
+    assert out["class"] == "unreachable"
+    assert "expires_at unparseable" in out["why"]
+
+
+def test_classify_zero_expires_at_is_unreachable_not_absent():
+    """Same disagreement for `0`/`False`: envelopes._deadline(0) raises
+    ("must be a timestamp/date or null") because it is not a string and
+    not None -- the gate refuses it EAMBIG, so this must not be standing."""
+    row = _row(verb="envelope.apply", bounds={}, expires_at=0)
+    out = sweep_mod.classify(row)
+    assert out["class"] == "unreachable"
+    assert "expires_at unparseable" in out["why"]
+
+
+def test_classify_none_expires_at_is_genuinely_absent():
+    """The one falsy value that IS standing: None, matching the gate's own
+    null test in envelopes.permitted."""
+    row = _row(verb="envelope.apply", bounds={}, expires_at=None)
     out = sweep_mod.classify(row)
     assert out == {"class": "standing"}
 

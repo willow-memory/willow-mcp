@@ -23,6 +23,27 @@ def _write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+# Shared reason strings (Loki EB30E84F F5): _has_completion_evidence and
+# _judge_lint_claims were already the SAME functions handoff_write_v4's
+# write-time pre-flight and verify_handoff's post-hoc check both call --
+# but the MESSAGE text describing why each refused was two independently
+# typed literals, exactly the drifted-copy risk repair 1 (this validator
+# module) exists to end. One constant / one formatter, used by both.
+_NO_COMPLETION_EVIDENCE_REASON = (
+    "checklist_resolved claims completion but no evidence backs it: "
+    "narrative carries no counted test/check result (e.g. '42 "
+    "passed', '0 violations') and no finding carries an `evidence` "
+    "field — a bare assertion is not evidence"
+)
+
+
+def _lint_refusal_reason(lint_refusals: list) -> str:
+    return (
+        f"{len(lint_refusals)} lint claim(s) not measured against the CI pin: "
+        + "; ".join(f"finding {v['finding_index']}: {v['reason']}" for v in lint_refusals)
+    )
+
+
 def handoff_write_v4(
     app_id: str,
     dispatch_id: str,
@@ -79,24 +100,14 @@ def handoff_write_v4(
         if not _has_completion_evidence(draft):
             return {
                 "error": "EINVAL",
-                "message": (
-                    "checklist_resolved claims completion but no evidence backs it: "
-                    "narrative carries no counted test/check result (e.g. '42 "
-                    "passed', '0 violations') and no finding carries an `evidence` "
-                    "field — a bare assertion is not evidence"
-                ),
+                "message": _NO_COMPLETION_EVIDENCE_REASON,
             }
         lint_verdicts = _judge_lint_claims(draft, findings_list)
         lint_refusals = [v for v in lint_verdicts if v["verdict"] == "refuse"]
         if lint_refusals:
             return {
                 "error": "EINVAL",
-                "message": (
-                    f"{len(lint_refusals)} lint claim(s) not measured against the CI pin: "
-                    + "; ".join(
-                        f"finding {v['finding_index']}: {v['reason']}" for v in lint_refusals
-                    )
-                ),
+                "message": _lint_refusal_reason(lint_refusals),
                 "lint_claims": lint_verdicts,
             }
 
@@ -388,20 +399,12 @@ def verify_handoff(dispatch_id: str) -> dict:
             f"{', '.join(str(b['index']) for b in invalid)}"
         )
     if checklist and not _has_completion_evidence(handoff):
-        reasons.append(
-            "checklist_resolved claims completion but no evidence backs it: "
-            "narrative carries no counted test/check result (e.g. '42 "
-            "passed', '0 violations') and no finding carries an `evidence` "
-            "field — a bare assertion is not evidence"
-        )
+        reasons.append(_NO_COMPLETION_EVIDENCE_REASON)
     lint_verdicts = _judge_lint_claims(handoff, findings)
     lint_refusals = [v for v in lint_verdicts if v["verdict"] == "refuse"]
     lint_advisories = [v for v in lint_verdicts if v["verdict"] == "advisory"]
     if checklist and lint_refusals:
-        reasons.append(
-            f"{len(lint_refusals)} lint claim(s) not measured against the CI pin: "
-            + "; ".join(f"finding {v['finding_index']}: {v['reason']}" for v in lint_refusals)
-        )
+        reasons.append(_lint_refusal_reason(lint_refusals))
     verified = not reasons
 
     if verified:

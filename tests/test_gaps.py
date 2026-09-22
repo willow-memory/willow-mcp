@@ -187,4 +187,64 @@ def test_list_gaps_brief_false_returns_full_record():
     row = rows[0]
     assert "first_asked_at" in row
     assert "_id" in row
-    assert row["question"] == "a full record question"
+
+
+# ── page byte budget in both modes (Loki EB30E84F F1) ────────────────────────
+# 25 rows x ~5 KB questions used to measure 134,233 bytes (~33.5k tokens) for
+# brief=False -- over a real MCP client's ~25k-token tool-result cap by a
+# third, even though the docstring claimed the page "can never exceed the
+# tool-result limit". brief=False is now capped at MAX_LIST_LIMIT_FULL (5)
+# rather than MAX_LIST_LIMIT (25).
+
+_APPROX_CLIENT_TOKEN_CAP = 25_000
+_BYTES_PER_TOKEN_FLOOR = 3  # conservative: real tokenizers average ~4 bytes/token
+
+
+def test_list_gaps_brief_false_page_stays_under_client_budget():
+    import json as _json
+
+    for i in range(30):
+        gaps.log(f"t-bytebudget/{i:03d}", ("x" * 5000) + f" unique{i:03d}")
+    rows = gaps.list_gaps(topic="t-bytebudget", limit=1000, brief=False)["items"]
+    assert len(rows) <= gaps.MAX_LIST_LIMIT_FULL
+    page_bytes = len(_json.dumps(rows).encode("utf-8"))
+    approx_tokens = page_bytes / _BYTES_PER_TOKEN_FLOOR
+    assert approx_tokens < _APPROX_CLIENT_TOKEN_CAP, (
+        f"brief=False page was {page_bytes} bytes (~{approx_tokens:.0f} tokens), "
+        f"over the client budget of {_APPROX_CLIENT_TOKEN_CAP}"
+    )
+
+
+def test_list_gaps_brief_true_page_stays_under_client_budget_at_same_rows():
+    import json as _json
+
+    for i in range(30):
+        gaps.log(f"t-bytebudget2/{i:03d}", ("x" * 5000) + f" unique{i:03d}")
+    rows = gaps.list_gaps(topic="t-bytebudget2", limit=1000, brief=True)["items"]
+    assert len(rows) <= gaps.MAX_LIST_LIMIT
+    page_bytes = len(_json.dumps(rows).encode("utf-8"))
+    approx_tokens = page_bytes / _BYTES_PER_TOKEN_FLOOR
+    assert approx_tokens < _APPROX_CLIENT_TOKEN_CAP
+
+
+# ── since is parsed, not string-compared (Loki EB30E84F F4) ─────────────────
+
+def test_list_gaps_since_z_suffix_same_second_still_matches():
+    """The old string compare excluded a later, microsecond-bearing row
+    because '.' < 'Z'. Parsed comparison must not repeat that."""
+    logged = gaps.log("t-since-z", "a question asked just now")
+    from datetime import datetime, timedelta, timezone
+    last_asked = gaps.get_gap(logged["id"])["last_asked_at"]
+    same_second_z = last_asked.split(".")[0] + "Z"
+    rows = gaps.list_gaps(topic="t-since-z", since=same_second_z)["items"]
+    assert len(rows) == 1
+
+    future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    assert gaps.list_gaps(topic="t-since-z", since=future)["items"] == []
+
+
+def test_list_gaps_since_malformed_refuses_einval():
+    gaps.log("t-since-bad", "a question")
+    result = gaps.list_gaps(topic="t-since-bad", since="yesterday")
+    assert result["error"] == "EINVAL"
+    assert "since" in result["message"]

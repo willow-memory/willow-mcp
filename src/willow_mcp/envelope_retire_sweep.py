@@ -287,20 +287,24 @@ def _row_expiry(row: dict) -> tuple[Optional[datetime], Optional[str]]:
     decide ``EEXPIRED`` (module docstring's own rule: this sweep and the
     gate must never disagree about what "expired" means).
 
-    ``(None, None)`` — no ``expires_at`` at all: a genuinely standing row as
-    far as expiry is concerned. ``(None, <message>)`` — present but
-    unparseable: rework of Loki's finding F2 (23CAD2B4). The first cut
-    treated this the same as absent, so a row whose ``expires_at`` was
-    ``"not-a-date"``, ``""``, or a bare int fell through to ``standing`` and
-    was folded into the bare ``kept_standing`` count — but
-    :func:`envelopes.permitted` refuses every one of those the same way
-    (``EAMBIG`` on the same ``ValueError``), so the register was reporting
-    "in force" for a row the gate would never actually honour. That is
-    exactly the register/gate disagreement this module's own docstring
-    forbids. :func:`classify` now surfaces the error so :func:`sweep`
-    reports the row ``unreachable`` with why, never silently ``standing``."""
+    ``(None, None)`` — no ``expires_at`` at all (``None``, the gate's own
+    null test — :func:`envelopes.permitted` reads ``envelope.get(
+    "expires_at")`` and treats exactly ``None`` as absent): a genuinely
+    standing row as far as expiry is concerned. ``(None, <message>)`` —
+    present but unparseable: rework of Loki's finding F2, twice
+    (23CAD2B4, then EB30E84F). The first cut treated ``"not-a-date"`` and a
+    bare int as unparseable but used a truthiness test (`if not value`)
+    that ALSO caught ``""`` and ``0``/``False`` as "absent" — silently
+    re-enshrining the same disagreement one level down: ``envelopes.
+    _deadline("")`` raises (``Invalid isoformat string: ''``) and
+    ``_deadline(0)`` raises (``must be a timestamp/date or null``), so the
+    gate refuses both ``EAMBIG`` while this sweep folded them into the bare
+    ``kept_standing`` count. The test is now the gate's own — ``value is
+    None`` — so every value the gate would raise on reaches
+    :func:`envelopes._deadline` here too and comes back ``unreachable``
+    with why, never silently ``standing``."""
     value = row.get("expires_at")
-    if not value:
+    if value is None:
         return None, None
     try:
         return _envelopes._deadline(value), None

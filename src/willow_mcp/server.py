@@ -2456,13 +2456,17 @@ def gap_list(
     returned ``next_cursor`` as ``cursor`` to fetch the next page.  Filter by
     ``topic`` (exact, or a namespace prefix — "a/b/c" is under "a/b"),
     ``status`` (open | resolved | promoted), ``query`` (whitespace tokens,
-    AND, substring over topic+question), and/or ``since`` (an ISO timestamp,
-    filters on ``last_asked_at``); asked_count shows demand for each answer.
-    ``limit`` is capped at 25 regardless of what is asked for — a page can
-    never exceed the tool-result limit (gap 1477ebb2bc35). ``brief``
-    (default True) returns id/topic/status/asked_count/last_asked_at plus
-    the first 200 chars of the question per row; ``brief=False`` returns
-    full records. Read-only."""
+    AND, substring over topic+question), and/or ``since`` (an ISO-8601
+    timestamp, parsed and normalized to UTC, filters on ``last_asked_at``;
+    an unparseable ``since`` is refused with ``{error: EINVAL}`` rather than
+    silently matching nothing). ``asked_count`` shows demand for each
+    answer. ``limit`` is capped at 25 (``brief=True``, the default) or 5
+    (``brief=False``) regardless of what is asked for — a full record is
+    large enough that the brief page's cap does not also bound it, so
+    ``brief=False`` gets a lower one (gap 1477ebb2bc35). ``brief`` (default
+    True) returns id/topic/status/asked_count/last_asked_at plus the first
+    200 chars of the question per row; ``brief=False`` returns full
+    records. Read-only."""
     return gap_backlog.list_gaps(
         topic=topic, status=status, query=query, since=since,
         limit=limit, cursor=cursor, brief=brief,

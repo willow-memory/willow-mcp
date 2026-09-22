@@ -90,11 +90,40 @@ def log(topic: str, question: str) -> dict[str, Any]:
     return {"id": rid, "status": record["status"], "asked_count": record["asked_count"]}
 
 
-#: Hard ceiling on one gap_list page (gap 1477ebb2bc35): a full record can
-#: run over a KB, and the backlog's own operator flagged a 50-95 KB page as
-#: the reason the only working read door was also the worst one. Applied
-#: regardless of what `limit` asks for, and regardless of `brief`.
+#: Hard ceiling on one gap_list page (gap 1477ebb2bc35) when `brief=True`
+#: (the default): a full record can run over a KB, and the backlog's own
+#: operator flagged a 50-95 KB page as the reason the only working read
+#: door was also the worst one. Applied regardless of what `limit` asks for.
 MAX_LIST_LIMIT = 25
+
+#: The ceiling when `brief=False` (Loki EB30E84F F1): a full record carries
+#: the whole question text and every metadata key, so the SAME 25-row cap
+#: measured 134,233 bytes (~33.5k tokens) against 5 KB questions -- over a
+#: real MCP client's ~25k-token tool-result budget by a third, recreating
+#: gap 1477ebb2bc35 one flag away from the default. Question text is not
+#: itself size-bounded at write time (`log()`), so a byte-budget mid-page
+#: would still need a floor somewhere; a materially lower row ceiling for
+#: the shape that carries full records is the smaller change and the fix
+#: Loki named as acceptable.
+MAX_LIST_LIMIT_FULL = 5
+
+
+def _parse_iso(value: str) -> Optional[datetime]:
+    """A timezone-aware UTC `datetime` for `value`, or `None` if it does not
+    parse (Loki EB30E84F F4: the old `since` filter was a raw string
+    compare against `last_asked_at` -- correct only when both sides are the
+    exact same string shape; a 'Z'-suffixed `since` sorted AFTER a
+    microsecond-bearing same-second `last_asked_at` because '.' < 'Z', and
+    an unparseable `since` like "yesterday" silently matched nothing rather
+    than refusing). Naive values are assumed UTC, matching `_now()`'s own
+    `isoformat()` output before a `Z`/offset is ever added."""
+    try:
+        dt = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _matches_topic(row_topic: str, topic: str) -> bool:
@@ -144,15 +173,19 @@ def list_gaps(
     * ``status`` — open | resolved | promoted, exact.
     * ``query`` — whitespace tokens, AND, substring over topic+question
       (see `_matches_query`) — the rule `Store.search` uses.
-    * ``since`` — an ISO timestamp; keeps rows whose ``last_asked_at`` is
-      ``>=`` it (string comparison, correct because ISO-8601 UTC timestamps
-      sort lexicographically the same as chronologically).
+    * ``since`` — an ISO-8601 timestamp, parsed (not string-compared —
+      Loki EB30E84F F4) and normalized to UTC; keeps rows whose
+      ``last_asked_at`` is ``>=`` it. An unparseable ``since`` is refused
+      (``{error: EINVAL}``), never silently treated as "match nothing".
 
     Returns ``{items, next_cursor}`` — *next_cursor* is ``None`` when there
-    are no more pages. ``limit`` is capped at `MAX_LIST_LIMIT` (25)
-    regardless of what is asked for. ``brief`` (default ``True``) returns
-    `_brief_view` per row; ``brief=False`` returns the full record (gap
-    1477ebb2bc35).
+    are no more pages, or ``{error: EINVAL, ...}`` if ``since`` does not
+    parse. ``limit`` is capped at `MAX_LIST_LIMIT` (25) when ``brief=True``
+    (the default) or `MAX_LIST_LIMIT_FULL` (5) when ``brief=False``,
+    regardless of what is asked for — a full record is large enough that
+    the brief page's row cap does not also bound it (Loki EB30E84F F1).
+    ``brief`` (default ``True``) returns `_brief_view` per row;
+    ``brief=False`` returns the full record (gap 1477ebb2bc35).
 
     Loads the collection once (`Store.all`, the same primitive
     `purge_topic` already uses) rather than pushing these filters into SQL:
@@ -168,16 +201,26 @@ def list_gaps(
     rows are not being retired between pages of the SAME query, which for a
     backlog a caller is actively paging through is the expected case.
     """
-    limit = max(1, min(limit, MAX_LIST_LIMIT))
+    cap = MAX_LIST_LIMIT if brief else MAX_LIST_LIMIT_FULL
+    limit = max(1, min(limit, cap))
     tokens = query.lower().split() if query else []
+
+    since_dt = None
+    if since:
+        since_dt = _parse_iso(since)
+        if since_dt is None:
+            return {"error": "EINVAL",
+                    "message": f"`since` is not a parseable ISO-8601 timestamp: {since!r}"}
 
     rows = _store.all(_COLLECTION)
     if topic:
         rows = [r for r in rows if _matches_topic(r.get("topic") or "", topic)]
     if status:
         rows = [r for r in rows if r.get("status") == status]
-    if since:
-        rows = [r for r in rows if (r.get("last_asked_at") or "") >= since]
+    if since_dt is not None:
+        rows = [r for r in rows
+                if (_parse_iso(r.get("last_asked_at") or "") or datetime.min.replace(tzinfo=timezone.utc))
+                >= since_dt]
     if tokens:
         rows = [r for r in rows if _matches_query(r, tokens)]
 

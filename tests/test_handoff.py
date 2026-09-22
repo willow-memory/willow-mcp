@@ -658,6 +658,14 @@ def test_write_refuses_empty_findings_without_reason(tmp_path):
     result = _write(tmp_path, narrative="done")
     assert result["error"] == "EINVAL"
     assert "no_findings_reason" in result["message"]
+    # Loki EB30E84F F3: this is the ONE refusal a real MCP client ever sees
+    # for the BFF5284B (summary/details) shape, since the SDK drops the
+    # unrecognized keys before this check runs -- it must name the
+    # accepted fields, not just say "empty findings".
+    assert "accepted_fields" in result
+    assert "findings" in result["accepted_fields"]
+    assert "narrative" in result["accepted_fields"]
+    assert "field names" in result["message"] or "summary" in result["message"]
 
 
 def test_write_accepts_empty_findings_with_reason_and_records_it(tmp_path):
@@ -722,6 +730,36 @@ def test_write_refuses_checklist_resolved_with_no_completion_evidence(tmp_path):
     )
     assert result["error"] == "EINVAL"
     assert "no evidence backs it" in result["message"]
+
+
+def test_write_and_verify_no_evidence_reason_strings_are_byte_identical(tmp_path):
+    """Loki EB30E84F F5: the check FUNCTIONS were already shared, but the
+    reason STRINGS were two independently-typed literals -- a drifted-copy
+    risk of exactly the kind repair 1 exists to end. Both now come from one
+    constant; prove it by comparing the writer's refusal message against
+    the verifier's reason for the identical bad shape."""
+    from willow_mcp.handoff import _NO_COMPLETION_EVIDENCE_REASON
+
+    write_result = _write(
+        tmp_path,
+        findings=[{"id": "F1", "text": "Found it"}],
+        narrative="done",
+    )
+    assert write_result["message"] == _NO_COMPLETION_EVIDENCE_REASON
+
+    pkt = {"meta": {}, "status": {"status": "complete"}}
+    handoff_data = {
+        "checklist_resolved": True,
+        "envelope_clean": True,
+        "findings": [{"id": "F1", "text": "Found it"}],
+        "narrative": "done",
+    }
+    hr = {"dispatch_id": "d-verify-same", "handoff": handoff_data, "closeout_md": ""}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.handoff_read", return_value=hr):
+        verified = verify_handoff("d-verify-same")
+    assert _NO_COMPLETION_EVIDENCE_REASON in verified["reason"]
+    assert write_result["message"] == _NO_COMPLETION_EVIDENCE_REASON
 
 
 def test_write_accepts_checklist_resolved_false_without_evidence(tmp_path):

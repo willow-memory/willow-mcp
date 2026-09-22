@@ -143,13 +143,25 @@ def write_refusal(*, extra_kwargs: dict, findings: list, checklist_resolved: boo
             "accepted_fields": sorted(WRITE_ACCEPTED_FIELDS | {"app_id", "dispatch_id"}),
         }
     if empty_findings_reason_missing(findings, no_findings_reason):
+        # This is the ONE refusal a real MCP client ever sees for the
+        # BFF5284B shape (Loki EB30E84F F3): the SDK's own arg-validation
+        # already dropped an unrecognized key like `summary`/`details`
+        # before this function runs, so a caller who mistyped a field name
+        # lands here with no other signal. Name the accepted fields and the
+        # possible cause explicitly, not just "empty findings" -- the
+        # message at the moment of failure has to carry what the docstring
+        # otherwise only says up front.
         return {
             "error": "EINVAL",
             "message": (
                 "empty `findings` requires `no_findings_reason` (a documented string "
                 "explaining why there is nothing to report) -- or at least one finding, "
-                f"e.g. {EXAMPLE_FINDING}"
+                f"e.g. {EXAMPLE_FINDING}. If you intended to pass findings/narrative and "
+                "see this anyway, check your field names: an unrecognized keyword (e.g. "
+                "`summary`/`details` instead of `narrative`/`findings`) is silently "
+                "dropped before this check runs, not refused on its own."
             ),
+            "accepted_fields": sorted(WRITE_ACCEPTED_FIELDS | {"app_id", "dispatch_id"}),
         }
     bad = invalid_findings(findings)
     if bad:
