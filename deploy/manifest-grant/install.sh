@@ -377,7 +377,6 @@ fi
 # step 6's loop below.
 say "== 1c. sync + sign constitutional policy files from the checkout bundle (one act)"
 BUNDLE_CONSTITUTIONAL="$CHECKOUT/src/willow_mcp/bundle/constitutional"
-SYSCALL_TABLE="$H/constitutional/syscall-table.json"
 "$PY" "$HERE/sync_constitutional.py" "$BUNDLE_CONSTITUTIONAL" "$H/constitutional" \
   --sign-as "$TRUST_OWNER" --gnupg-home "$GNUPGHOME_TO" --fingerprint "$FPR" \
   || stop "constitutional bundle sync/sign failed — see the STOP line above; sync_and_sign() has already restored the box's constitutional/ to exactly what it was before this step ran"
