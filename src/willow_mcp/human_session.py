@@ -31,8 +31,9 @@ ORCHESTRATOR_APP_ID = "willow"
 # there is no dedicated attestation wall for this identity the way
 # `orchestrator_write_denial` exists for `willow` (see its docstring): the
 # steward's authority is entirely manifest/group driven through the normal
-# `gate.permitted` path (steward_sweep / steward_read / steward_enqueue,
-# gate.py), not a second copy of the orchestrator's human-attestation gate.
+# `gate.permitted` path (steward_sweep / steward_read / steward_human_loop /
+# steward_store_write / steward_gap_resolve / steward_dispatch, gate.py),
+# not a second copy of the orchestrator's human-attestation gate.
 STEWARD_APP_ID = "willow-bot"
 
 # Tools that advance fleet work on behalf of the operator — never agent-autonomous.

@@ -908,7 +908,8 @@ _SEAT_PRIV_RE = re.compile(
     r"envelope_apply|envelope_write|federation_call|fork_write|frank_write|friction_write|full_access|"
     r"gap_promote|gap_purge|gap_write|governance_propose|governance_sync|grove_all|grove_write|human_loop_write|integration_call|"
     r"knowledge_curate|knowledge_write|lineage_write|markdownai_directives|markdownai_write|"
-    r"nest_write|schema_admin|steward_sweep|steward_enqueue|store_all|store_write|task_db|task_queue|"
+    r"nest_write|schema_admin|steward_sweep|steward_human_loop|steward_store_write|steward_gap_resolve|"
+    r"steward_dispatch|store_all|store_write|task_db|task_queue|"
     r"tool_oracle_route|tool_oracle_seal)\b"
 )
 # `orchestrator`, `context` and `binding` are also write-capable groups, but
@@ -974,7 +975,8 @@ _SEAT_ESCALATION_REASON = (
     "fork_write / commitment_write / code_graph_write / agent_dispatch / grove_write / grove_all / "
     "integration_call / federation_call / markdownai_write / markdownai_directives / orchestrator / "
     "context / binding / tool_oracle_route / tool_oracle_seal / governance_propose / governance_sync / "
-    "steward_sweep / steward_enqueue / full_access) or widen store_scope to "
+    "steward_sweep / steward_human_loop / steward_store_write / steward_gap_resolve / steward_dispatch / "
+    "full_access) or widen store_scope to "
     '"*" — "retaking the seat". The SessionStart bootstrap restores every seat to '
     "read-only by default; re-granting write authority is an operator act, not a "
     "self-grant. An agent may REQUEST the seat, never CONFIRM it itself (sudo "

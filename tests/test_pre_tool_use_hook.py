@@ -1190,10 +1190,14 @@ _WRITE_CAPABLE_GROUPS = {
     "orchestrator",
     "schema_admin", "store_all", "store_write", "task_queue",
     "tool_oracle_route", "tool_oracle_seal",
-    # The steward as its own principal (pair 163b9a70): steward_sweep mutates
-    # (seal_drain/net_authority_drain/envelope_retire_sweep/gitsync_sweep/
-    # git_pull_execute); steward_enqueue mutates the human-required queue.
-    "steward_sweep", "steward_enqueue",
+    # The steward as its own principal (pair 163b9a70, reworked D7BD9FE2 per
+    # Loki 207B3590): steward_sweep mutates (seal_drain/net_authority_drain/
+    # envelope_retire_sweep/gitsync_sweep); steward_human_loop files AND
+    # clears human-required items; steward_store_write is run_mirror/
+    # run_resolve's SOIL writes; steward_gap_resolve resolves a backlog gap;
+    # steward_dispatch is the desk's open policy question (dispatch_send).
+    "steward_sweep", "steward_human_loop", "steward_store_write",
+    "steward_gap_resolve", "steward_dispatch",
 }
 
 # Groups that mutate nothing. `web_read` is deliberately here: willow_web_fetch
@@ -1206,7 +1210,8 @@ _READ_ONLY_GROUPS = {
     "fork_read", "friction_read", "gap_read", "human_loop_read",
     "integration_read", "knowledge_read", "lineage_read", "markdownai_read",
     "nest_read", "store_read", "tool_oracle_read", "web_read",
-    # steward_read: human_required_list only — a pure queue view (pair 163b9a70).
+    # steward_read: human_required_list, fleet_health, commitment_surface —
+    # pure views (pair 163b9a70, extended D7BD9FE2 per Loki 207B3590 F1e).
     "steward_read",
 }
 
