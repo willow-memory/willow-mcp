@@ -3,9 +3,11 @@
 the operator's own `~/Desktop/Nest/manifest-grant-system/` staging area
 (never modified there — the desk removes that copy when this PR merges) and
 `install.sh` was reworked here: the broker-public-key and broker-unit
-lookups no longer glob, and step 1 gained ACL lines for the two more trust
-roots the four new verbs (envelope.revoke, manifest.retire, manifest.create,
-federation.ratify — syscall-table rows 19-22) touch beyond
+lookups no longer glob, and step 1 migrates the envelope register and
+federation registry to trust-owner ownership (pair 31f5d3af) for the four
+new verbs (envelope.revoke, manifest.retire, manifest.create,
+federation.ratify — syscall-table rows 20-23, renumbered from an original
+19-22 draft per Loki audit BFCC5C79 finding F4) beyond
 mcp_apps/manifest_grants.
 
 Divergence note (this PR's own finding, not a bug): `src/willow_mcp/bundle/
@@ -85,6 +87,40 @@ def _install_sh_estale_presigned_problems(install_sh_text: str) -> list[str]:
     return problems
 
 
+_FIXED_TMP_NAMES = ("/tmp/manifest-grant.env", "/tmp/$s.manifest.json.sig")
+
+
+def _install_sh_fixed_tmp_names(install_sh_text: str) -> list[str]:
+    """Loki audit BFCC5C79, F7: a predictable name in world-writable /tmp is
+    a symlink race — every staging file must come from mktemp instead."""
+    body = _script_body(install_sh_text)
+    return [name for name in _FIXED_TMP_NAMES if name in body]
+
+
+_F7_REQUIRED_MARKERS = ("mktemp", "trust-owner python interpreter", "traversal")
+
+
+def _install_sh_missing_f7_checks(install_sh_text: str) -> list[str]:
+    """Loki audit BFCC5C79, F7: an interpreter check up front, $H traversal
+    for the trust owner, and mktemp for every staged file."""
+    body = _script_body(install_sh_text)
+    return [marker for marker in _F7_REQUIRED_MARKERS if marker not in body]
+
+
+def _install_sh_6b_before_restart(install_sh_text: str) -> bool:
+    """True when step 6b's withdrawal runs BEFORE the broker restart —
+    Loki audit BFCC5C79, F7: restarting first lets a freshly-restarted
+    broker accept a new request into pending/ before 6b can withdraw the
+    stale ones, and the blanket withdrawal cannot tell them apart by
+    content alone."""
+    body = _script_body(install_sh_text)
+    idx_6b = body.find("6b. withdraw every request")
+    idx_restart = body.find("broker restart (WILLOW_PGP_FINGERPRINT changed")
+    if idx_6b == -1 or idx_restart == -1:
+        return False
+    return idx_6b < idx_restart
+
+
 def _service_unit_missing(text: str) -> list[str]:
     required = ("[Service]", "User=willow-operator", "ReadWritePaths=", "constitutional")
     return [r for r in required if r not in text]
@@ -142,6 +178,24 @@ def test_plant_every_deploy_scan_helper_catches_its_violation():
     assert _old_template_has_a_fixed_user_line("# a comment mentioning User= in prose\n") is False
     assert _old_template_has_a_fixed_user_line("User=@TRUST_OWNER@\n") is False
 
+    assert _install_sh_fixed_tmp_names(
+        "set -euo pipefail\ninstall x /tmp/manifest-grant.env\n"
+    ) == ["/tmp/manifest-grant.env"]
+    assert _install_sh_fixed_tmp_names("set -euo pipefail\nENV_TMP=$(mktemp)\n") == []
+
+    assert _install_sh_missing_f7_checks("set -euo pipefail\nnothing here") == list(_F7_REQUIRED_MARKERS)
+    assert _install_sh_missing_f7_checks(
+        "set -euo pipefail\nmktemp trust-owner python interpreter traversal"
+    ) == []
+
+    assert _install_sh_6b_before_restart(
+        "...6b. withdraw every request...\n...broker restart (WILLOW_PGP_FINGERPRINT changed..."
+    ) is True
+    assert _install_sh_6b_before_restart(
+        "...broker restart (WILLOW_PGP_FINGERPRINT changed...\n...6b. withdraw every request..."
+    ) is False
+    assert _install_sh_6b_before_restart("neither marker present") is False
+
 
 def test_all_five_files_present():
     for name in (
@@ -168,6 +222,17 @@ def test_service_unit_is_a_system_unit_under_the_trust_owner():
 def test_timer_unit_matches_the_service_name():
     text = (_DEPLOY / "willow-mcp-manifest-grant.timer").read_text(encoding="utf-8")
     assert _timer_missing(text) == []
+
+
+def test_install_sh_has_no_fixed_tmp_names():
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    assert _install_sh_fixed_tmp_names(text) == []
+
+
+def test_install_sh_has_the_f7_preflight_and_ordering_fixes():
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    assert _install_sh_missing_f7_checks(text) == []
+    assert _install_sh_6b_before_restart(text) is True
 
 
 def test_install_sh_has_no_glob_for_broker_public_key_or_broker_unit():

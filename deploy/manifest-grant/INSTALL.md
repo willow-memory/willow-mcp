@@ -4,9 +4,12 @@ Sealed `1fdfbdf3` (2026-09-21): the system unit under the trust owner, its
 preconditions. Sealed `1bd6fd29` (2026-09-22): "Setup is the installer's
 (root, once, detects rather than asks). Operations are Willow's, executed by
 the trust-owner apply half under a sealed pair. The operator's only keyboard
-act is the seal." — the seven numbered steps this document used to walk
-through one keyboard line at a time are no longer the operator's to type;
-`install.sh` (beside this file) collapses them into one root act:
+act is the seal." Sealed `31f5d3af` (2026-09-22): the active envelope
+register and the federation registry move to the same trust-owner-owned,
+detach-signed shape a seat manifest already has — the seven numbered steps
+this document used to walk through one keyboard line at a time are no longer
+the operator's to type; `install.sh` (beside this file) collapses them into
+one root act:
 
     sudo bash install.sh            # do it
     sudo bash install.sh --check    # detect-only, change nothing — stops
@@ -25,7 +28,11 @@ The script refuses to start unless: it is run as root; `$H` exists; the
 `willow-operator` trust-owner user already exists (`trust_root_setup` has
 run on this box); the three unit/env files sit beside `install.sh`;
 `/etc/willow-mcp/verifiers.public.json` (the net-signer's public ring) is
-already present; and `$H/env` names `WILLOW_PG_DB`.
+already present; **the trust owner's own python interpreter exists and is
+executable at `$H/venvs/willow-mcp/bin/python`** (Loki audit BFCC5C79, F7 —
+this is used from step 1 on, not just the withdrawal step, so a missing
+interpreter now stops before anything is touched rather than partway
+through); and `$H/env` names `WILLOW_PG_DB`.
 
 ## 0. Find out why mcp_apps reads uid 65534 — before touching ownership
 
@@ -38,7 +45,12 @@ will not stick — the pair needs a different home for `mcp_apps` (e.g.
 `/var/lib/willow-mcp/mcp_apps` with `WILLOW_MCP_APPS_ROOT` pointing at it).
 `--check` stops here, after this step, before anything below is touched.
 
-## 1. Ownership and ACLs
+## 1. Ownership, traversal, and the envelope-register migration
+
+    # F7: o+x on $H itself is traversal-only — it does not expose $H's own
+    # listing or contents, only lets a non-owner pass through to what is
+    # below it (mcp_apps/, manifest_grants/, constitutional/).
+    sudo -u willow-operator test -x $H || chmod o+x $H
 
     chown -R willow-operator:willow-operator $H/mcp_apps
     chmod -R u=rwX,g=rX,o=rX $H/mcp_apps          # broker (uid 1000) still reads manifests
@@ -51,21 +63,31 @@ own name). A pending request already on disk was written `0600` by uid
 1000; the default ACL above does not reach an existing file, so `install.sh`
 grants read on every file already in `pending/` too.
 
-Since pair `1bd6fd29` the same queue drains four more verbs beyond
-`manifest.grant` (`envelope.revoke`, `manifest.retire`, `manifest.create`,
-`federation.ratify` — syscall-table rows 19-22), and one of them writes
-OUTSIDE `mcp_apps/`:
+**Sealed `31f5d3af`, unblocked by the desk after Loki audit BFCC5C79's F1/F2:
+the active envelope register moves to trust-owner ownership — mode `0644`,
+NO ACLs, detach-signed — the same trust shape a seat manifest already has**
+(`paths.trusted_read` gained a trust-owner-plus-signature branch: a file not
+owned by this process's own euid is trusted when it is owned by the trust
+owner, carries no group/other write bit, and its own `<file>.sig` verifies
+under `WILLOW_PGP_FINGERPRINT`). Before the register is chowned, `install.sh`
+splits `proposals[]`/`archived[]` out into a NEW sibling file,
+`constitutional/proposals.json`, owned by the OPERATOR (broker) uid, mode
+`0600` — `envelope_propose` / the pending-proposal reads keep writing and
+reading that sidecar exactly as before, unaffected by the register's
+ownership change:
 
-    install -d -o $OPERATOR -g $OPERATOR -m 755 $H/constitutional
-    setfacl -m u:willow-operator:rwx -m d:u:willow-operator:rwx $H/constitutional
+    REG=$H/constitutional/pre-approved.json
+    PROPOSALS=$H/constitutional/proposals.json
+    # (install.sh runs this split as root via the trust owner's own python,
+    # then:)
+    chown $OPERATOR:$OPERATOR $PROPOSALS && chmod 600 $PROPOSALS
+    chown willow-operator:willow-operator $REG && chmod 644 $REG
 
-`envelope.revoke` (row 19) writes `$H/constitutional/pre-approved.json`
-directly — the chown/ACL on `mcp_apps` above never reaches it, so it gets
-its own line. `federation.ratify` (row 22) writes
-`mcp_apps/_federation/registry.json`, which IS already under `mcp_apps/` and
-so is already covered; if `_federation/` does not exist yet at install time,
-the apply process creates it on demand, running as `willow-operator`
-already, so it is born correctly owned — no extra ACL line needed for it.
+`federation.ratify` (row 23) writes `mcp_apps/_federation/servers.json` —
+already under `mcp_apps/`, already trust-owner-owned by the recursive chown
+above; a `_federation/` that does not exist yet is created on demand by the
+apply process itself (runs as `willow-operator` already), so it is born
+correctly owned, mode `0644`, no ACL — nothing extra to do for it here.
 
 ## 2. Retire the --user unit
 
@@ -108,25 +130,33 @@ own `$H/env` to match.
     # role's read grants on the FRANK tables plus INSERT
     sudo -u willow-operator psql -d $WILLOW_PG_DB -c 'select 1'   # must succeed
 
-## 6. Re-sign every seat manifest once under the new fingerprint
+## 6. Re-sign every seat manifest, the register, and the federation registry
 
 The pre-state check refuses a manifest whose current signature does not
-verify under `WILLOW_PGP_FINGERPRINT`. `install.sh` signs every
-`mcp_apps/*/manifest.json` under the fresh key as the trust owner, then
-restarts the broker's own `--user` unit (tried as `willow-mcp-serve.service`
-first, then the bare `willow-mcp.service` spelling — the package's own known
-names, `reloader.DEFAULT_UNIT` / `unit_reload_executor._BROKER_UNIT_STEMS`,
-no glob) — an env change, not a pull, so the reloader will not do this one.
+verify under `WILLOW_PGP_FINGERPRINT`; after pair `31f5d3af`,
+`paths.trusted_read`'s trust-owner branch does the exact same refusal for the
+envelope register, and `mcp_federation._read_registry_file` does it for the
+federation registry. `install.sh` signs every `mcp_apps/*/manifest.json`
+under the fresh key as the trust owner, **and now also
+`constitutional/pre-approved.json` and `mcp_apps/_federation/servers.json`**
+— Loki audit BFCC5C79's F3: missing the federation registry here meant the
+first `federation.ratify` after any fingerprint change would read "no
+ratified servers" (`mcp_federation.ratify()` starts its merge from `{}` when
+the existing registry's signature does not verify, and does not check the
+flag that says so) and silently drop every other entry.
+`trust_owner_verbs._apply_federation_ratify` also gained a defensive check
+refusing `EACCES` before ever reaching `mcp_federation.ratify()` if the
+registry does not verify, as a backstop for every other way its signature
+could go stale — but this step is the real fix.
 
 ## 6b. Withdraw every request minted before this install
 
 Sealed `33654f35` (2026-09-22): a pending request that predates step 6 is
-withdrawn, not applied. Step 6 just re-signed every manifest, so every
-request already sitting in `pending/` carries a `pre_state` recorded under
-the OLD fingerprint — and the seat set it names may itself be stale (the
-Jeles seat retirement, `ae23d366`, is the concrete case this closes: an old
-request naming a seat that still physically has a manifest on disk must
-never be granted before the desk has said whether that seat still exists).
+withdrawn, not applied. Step 6 just re-signed every manifest (and now the
+register and federation registry), so every request already sitting in
+`pending/` carries a `pre_state` recorded under the OLD fingerprint — and the
+seat set it names may itself be stale (the Jeles seat retirement, `ae23d366`,
+is the concrete case this closes).
 
 `install.sh` moves every file left in `pending/` to `failed/<pair_id>.json`
 with `result.error = "estale_presigned"`, in the EXACT shape
@@ -137,13 +167,35 @@ other reader) sees it as an ordinary `failed` entry, no special-casing.
 `estale_presigned` is on `manifest_grant_executor.TERMINAL_ERRORS`: not
 retryable. The fix is a fresh request under a current sealed pair, never a
 replay of `pre_state` that installing just made stale by definition. The
-script refuses to enable the timer while `pending/` is still non-empty
-after this step.
+script refuses to enable the timer while `pending/` is still non-empty after
+this step.
+
+**This step now runs BEFORE the broker restart below, not after** (Loki audit
+BFCC5C79, F7): restarting first would let a freshly-restarted broker accept a
+brand-new, perfectly valid request into `pending/` in the window before this
+step runs, and the blanket withdrawal above cannot tell that new request from
+a stale one by content alone — order matters here, not just correctness of
+each step in isolation.
+
+## Restart the broker — and what this script cannot restart
+
+    UNITS=$(systemctl --user list-unit-files --no-legend 'willow-mcp-serve.service' 'willow-mcp.service')
+    # restarts whichever of those two names is actually installed
+
+An env change, not a pull — the reloader will not do this one. **This only
+reaches the `--user` SERVE unit.** A stdio-attached desk — an editor or CLI
+session (Claude Code, Cursor, any MCP client that spawned willow-mcp as a
+subprocess over stdio) — is not a systemd unit at all; `install.sh` has no
+process to signal and no way to reach it. That session keeps running with the
+OLD `WILLOW_PGP_FINGERPRINT` in its own environment until the operator
+reconnects it by hand (restart the session). Said here explicitly, rather
+than left for the operator to discover when a freshly-signed manifest reads
+as unsigned to a desk that never restarted.
 
 ## 7. Start, and read the first tick
 
-    systemctl enable --now willow-mcp-manifest-grant.timer
-    systemctl start willow-mcp-manifest-grant.service   # one tick now, don't wait 60s
+    sudo systemctl enable --now willow-mcp-manifest-grant.timer
+    sudo systemctl start willow-mcp-manifest-grant.service   # one tick now, don't wait 60s
     journalctl -u willow-mcp-manifest-grant.service -n 40 --no-pager
 
 Then from the desk: `manifest_grant_status(<pair_id>)` for whichever request
@@ -153,3 +205,15 @@ or one of `envelope_revoke_request` / `manifest_retire_request` /
 this one queue). Every request that predates this install now reads
 `failed/estale_presigned`; `failed/` with a transient cause elsewhere in the
 queue is `manifest_grant_retry`-able, `estale_presigned` is not.
+
+## What is still an operator act after this install
+
+`envelope_authoring.ratify` (the CLI move of a proposal from
+`proposals.json` into the signed active register) still runs as the
+OPERATOR at the terminal, not through the trust-owner apply half — it signs
+the register with the trust owner's key via the same `as_to gpg` shape this
+script uses, which needs the operator's own sudo authority for
+`willow-operator`, exactly as today. A trust-owner `envelope.ratify` verb
+(mirroring `manifest.grant`'s own request/apply split) does not exist yet;
+until it does, ratifying a proposal is still a keyboard act, named honestly
+here rather than implied solved by the register's ownership change alone.
