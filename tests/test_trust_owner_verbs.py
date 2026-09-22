@@ -233,7 +233,7 @@ def test_revoke_grammar_miss_is_einval(home, tmp_path, store, ring_with_sean):
 
 
 def test_revoke_unknown_envelope_is_enoent(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=19, bounds={"envelope_ids": ["env-x"]})
+    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=20, bounds={"envelope_ids": ["env-x"]})
     _seal(home, store, pair_id="pair-rev-1",
           target_text="revoke envelope env-x: cleanup", kr=ring_with_sean)
     out = _revoke_env(store=store, grants_root=home / "manifest_grants")
@@ -309,7 +309,7 @@ def test_retire_orchestrator_itself_is_refused(home, tmp_path, store, ring_with_
 
 
 def test_retire_no_manifest_is_enomanifest(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=20, bounds={"apps": ["ghost"]})
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=21, bounds={"apps": ["ghost"]})
     _seal(home, store, pair_id="pair-ret-1", target_text="retire seat ghost: gone", kr=ring_with_sean)
     out = _retire_seat(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
     assert out["error"] == "enomanifest"
@@ -322,7 +322,7 @@ def test_retire_active_envelope_is_ebusy(home, tmp_path, monkeypatch, store, rin
         "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
         "status": "active",
     }]
-    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=20, bounds={"apps": ["jeles"]},
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=21, bounds={"apps": ["jeles"]},
              extra=active_extra)
     _manifest(home, "jeles")
     _seal(home, store, pair_id="pair-ret-1", target_text="retire seat jeles: retiring the organ",
@@ -333,7 +333,7 @@ def test_retire_active_envelope_is_ebusy(home, tmp_path, monkeypatch, store, rin
 
 
 def test_retire_end_to_end(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=20, bounds={"apps": ["jeles"]})
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=21, bounds={"apps": ["jeles"]})
     _manifest(home, "jeles")
     _seal(home, store, pair_id="pair-ret-1", target_text="retire seat jeles: retiring the organ",
           kr=ring_with_sean)
@@ -364,7 +364,7 @@ def _create_seat(app_id="willow", *, pair_id="pair-cre-1", envelope_id="", ledge
 
 
 def test_create_escalation_permission_refused(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=21,
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
              bounds={"apps": ["jeles-corpus"], "groups": ["full_access"]})
     _seal(home, store, pair_id="pair-cre-1",
           target_text="create seat jeles-corpus store_scope [] store_write [] permissions [full_access]",
@@ -375,7 +375,7 @@ def test_create_escalation_permission_refused(home, tmp_path, monkeypatch, store
 
 
 def test_create_already_exists_is_eexist(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=21,
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
              bounds={"apps": ["jeles-corpus"], "groups": []})
     _manifest(home, "jeles-corpus")
     _seal(home, store, pair_id="pair-cre-1",
@@ -395,7 +395,7 @@ def test_create_seat_named_willow_case_insensitive_collision_is_refused(
     manifest.create let a manifest be created for the literal string
     'Willow'. manifest.retire already refused the same collision (the
     orchestrator seat itself can never be retired); create must agree."""
-    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=21,
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
              bounds={"apps": ["Willow"], "groups": []})
     _seal(home, store, pair_id="pair-cre-willow",
           target_text="create seat Willow store_scope [] store_write [] permissions []",
@@ -430,7 +430,7 @@ def test_create_apply_time_refuses_willow_collision_even_if_request_time_missed_
 
 
 def test_create_end_to_end_jeles_corpus(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=21,
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
              bounds={"apps": ["jeles-corpus"], "groups": []})
     _seal(home, store, pair_id="pair-cre-1",
           target_text=("create seat jeles-corpus store_scope "
@@ -494,7 +494,7 @@ def test_ratify_bad_env_key_is_einval(home, tmp_path, store, ring_with_sean):
 
 def test_ratify_end_to_end(home, tmp_path, monkeypatch, store, ring_with_sean):
     server = _fake_server(tmp_path)
-    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=22,
+    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=23,
              bounds={"servers": ["jeles-corpus"]})
     _seal(home, store, pair_id="pair-fed-1",
           target_text=(f"ratify federation server jeles-corpus command {server} cwd {tmp_path} "
@@ -618,9 +618,9 @@ def test_unknown_verb_in_pending_file_is_enosys(home, tmp_path, store):
 # EACCES receipt in failed/, and (one representative exemplar, since the
 # mechanism is verb-agnostic shared plumbing —
 # _verify_pending_signature_and_citation) apply-time eforged. Apply-time
-# edrift already has direct coverage for envelope.revoke, manifest.retire,
-# and federation.ratify in the end-to-end/refusal tests above; this section
-# does not repeat it.
+# edrift (R4, Loki re-audit 54E3DFC0: "zero edrift assertions exist despite
+# the prior handoff's claim otherwise") is covered below, one test per verb,
+# each driving the exact condition each verb's own `_apply_*` checks.
 
 def test_revoke_second_request_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
     active_extra = [{
@@ -629,7 +629,7 @@ def test_revoke_second_request_is_ealready(home, tmp_path, monkeypatch, store, r
         "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
         "status": "active",
     }]
-    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=19,
+    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=20,
              bounds={"envelope_ids": ["env-x"]}, extra=active_extra)
     _seal(home, store, pair_id="pair-rev-ea", target_text="revoke envelope env-x: first", kr=ring_with_sean)
     grants_root = home / "manifest_grants"
@@ -646,7 +646,7 @@ def test_revoke_apply_time_eseal_mismatch(home, tmp_path, monkeypatch, store, ri
         "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
         "status": "active",
     }]
-    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=19,
+    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=20,
              bounds={"envelope_ids": ["env-x", "env-y"]}, extra=active_extra)
     _seal(home, store, pair_id="pair-rev-mismatch",
           target_text="revoke envelope env-x: original reason", kr=ring_with_sean)
@@ -676,7 +676,7 @@ def test_revoke_apply_time_eforged_on_tampered_signature(home, tmp_path, monkeyp
         "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
         "status": "active",
     }]
-    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=19,
+    _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=20,
              bounds={"envelope_ids": ["env-x"]}, extra=active_extra)
     _seal(home, store, pair_id="pair-rev-forge", target_text="revoke envelope env-x: t", kr=ring_with_sean)
     pg = _FakeGovernancePg()
@@ -703,7 +703,7 @@ def test_revoke_apply_time_eacces_on_unwritable_registry(home, tmp_path, monkeyp
         "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
         "status": "active",
     }]
-    reg = _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=19,
+    reg = _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=20,
                     bounds={"envelope_ids": ["env-x"]}, extra=active_extra)
     _seal(home, store, pair_id="pair-rev-eacces", target_text="revoke envelope env-x: t", kr=ring_with_sean)
     pg = _FakeGovernancePg()
@@ -723,7 +723,7 @@ def test_revoke_apply_time_eacces_on_unwritable_registry(home, tmp_path, monkeyp
 
 
 def test_retire_second_request_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=20, bounds={"apps": ["jeles"]})
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=21, bounds={"apps": ["jeles"]})
     _manifest(home, "jeles")
     _seal(home, store, pair_id="pair-ret-ea", target_text="retire seat jeles: t", kr=ring_with_sean)
     grants_root = home / "manifest_grants"
@@ -734,7 +734,7 @@ def test_retire_second_request_is_ealready(home, tmp_path, monkeypatch, store, r
 
 
 def test_retire_apply_time_eacces_on_unwritable_apps_root(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=20, bounds={"apps": ["jeles"]})
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=21, bounds={"apps": ["jeles"]})
     _manifest(home, "jeles")
     _seal(home, store, pair_id="pair-ret-eacces", target_text="retire seat jeles: t", kr=ring_with_sean)
     pg = _FakeGovernancePg()
@@ -755,7 +755,7 @@ def test_retire_apply_time_eacces_on_unwritable_apps_root(home, tmp_path, monkey
 
 
 def test_create_second_request_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=21,
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
              bounds={"apps": ["jeles-corpus"], "groups": []})
     _seal(home, store, pair_id="pair-cre-ea",
           target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
@@ -768,7 +768,7 @@ def test_create_second_request_is_ealready(home, tmp_path, monkeypatch, store, r
 
 
 def test_create_apply_time_eacces_on_unwritable_apps_root(home, tmp_path, monkeypatch, store, ring_with_sean):
-    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=21,
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
              bounds={"apps": ["jeles-corpus"], "groups": []})
     _seal(home, store, pair_id="pair-cre-eacces",
           target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
@@ -793,7 +793,7 @@ def test_create_apply_time_eacces_on_unwritable_apps_root(home, tmp_path, monkey
 
 def test_ratify_second_request_is_ealready(home, tmp_path, monkeypatch, store, ring_with_sean):
     server = _fake_server(tmp_path)
-    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=22, bounds={"servers": ["jeles-corpus"]})
+    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=23, bounds={"servers": ["jeles-corpus"]})
     _seal(home, store, pair_id="pair-fed-ea",
           target_text=f"ratify federation server jeles-corpus command {server} cwd {tmp_path} env_keys [WILLOW_HOME]",
           kr=ring_with_sean)
@@ -806,7 +806,7 @@ def test_ratify_second_request_is_ealready(home, tmp_path, monkeypatch, store, r
 
 def test_ratify_apply_time_eseal_mismatch(home, tmp_path, monkeypatch, store, ring_with_sean):
     server = _fake_server(tmp_path)
-    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=22, bounds={"servers": ["jeles-corpus"]})
+    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=23, bounds={"servers": ["jeles-corpus"]})
     _seal(home, store, pair_id="pair-fed-mismatch",
           target_text=f"ratify federation server jeles-corpus command {server} cwd {tmp_path} env_keys [WILLOW_HOME]",
           kr=ring_with_sean)
@@ -824,4 +824,224 @@ def test_ratify_apply_time_eseal_mismatch(home, tmp_path, monkeypatch, store, ri
     apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
     processed = apply_out["processed"][0]
     assert processed["error"] == "eseal_mismatch"
-    assert (grants_root / "failed" / "pair-fed-mismatch.json").is_file()
+
+
+# ── R4 (Loki re-audit 54E3DFC0): apply-time edrift, one test per verb ───────
+
+def test_revoke_apply_time_edrift_already_revoked(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """envelope.revoke's own edrift path (trust_owner_verbs.py:241): the
+    envelope named by the request is ALREADY revoked by the time apply runs
+    (e.g. a second, out-of-band revoke landed first) — apply must refuse
+    rather than double-revoke or silently succeed."""
+    active_extra = [{
+        "id": "env-x", "verb_id": 99, "verb": "some.other", "grantee": "jeles",
+        "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
+        "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+        "status": "active",
+    }]
+    reg = _charter(tmp_path, monkeypatch, verb="envelope.revoke", verb_id=20,
+                    bounds={"envelope_ids": ["env-x"]}, extra=active_extra)
+    _seal(home, store, pair_id="pair-rev-edrift", target_text="revoke envelope env-x: t", kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _revoke_env(store=store, ledger=ledger, pair_id="pair-rev-edrift", grants_root=grants_root)
+    assert out["ok"] is True
+
+    # Simulate an out-of-band revoke landing between request and apply: flip
+    # the registry row's own `revoked` flag directly, bypassing this verb.
+    registry = json.loads(reg.read_text())
+    for row in registry["active"]:
+        if row["id"] == "env-x":
+            row["revoked"] = True
+    reg.write_text(json.dumps(registry))
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["error"] == "edrift"
+    assert (grants_root / "failed" / "pair-rev-edrift.json").is_file()
+
+
+def test_retire_apply_time_edrift_manifest_changed(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """manifest.retire's own edrift path (trust_owner_verbs.py:447): the
+    seat's manifest content changed since request-time's pre_state was
+    recorded (its sha256 no longer matches) — apply must refuse rather than
+    retire a manifest it never actually inspected."""
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=21, bounds={"apps": ["jeles"]})
+    manifest_path = _manifest(home, "jeles")
+    _seal(home, store, pair_id="pair-ret-edrift", target_text="retire seat jeles: t", kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _retire_seat(store=store, ledger=ledger, pair_id="pair-ret-edrift",
+                        apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["ok"] is True
+
+    # The manifest changes underneath the request between request and apply.
+    manifest_path.write_text(json.dumps({"app_id": "jeles", "permissions": ["store_read"]}))
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["error"] == "edrift"
+    assert (grants_root / "failed" / "pair-ret-edrift.json").is_file()
+    assert (home / "mcp_apps" / "jeles").exists()  # never moved
+
+
+def test_create_apply_time_edrift_manifest_created_meanwhile(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """manifest.create's own edrift path (trust_owner_verbs.py:695): a
+    manifest for the target seat now exists at apply time even though
+    request-time's pre-state check saw nothing there — e.g. a second create
+    for the same seat landed first. Apply must refuse rather than clobber
+    it."""
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
+             bounds={"apps": ["jeles-corpus"], "groups": []})
+    _seal(home, store, pair_id="pair-cre-edrift",
+          target_text="create seat jeles-corpus store_scope [] store_write [] permissions []",
+          kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _create_seat(store=store, ledger=ledger, pair_id="pair-cre-edrift",
+                        apps_root=home / "mcp_apps", grants_root=grants_root)
+    assert out["ok"] is True
+
+    # A manifest for the same seat shows up between request and apply.
+    _manifest(home, "jeles-corpus")
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["error"] == "edrift"
+    assert (grants_root / "failed" / "pair-cre-edrift.json").is_file()
+
+
+def test_ratify_apply_time_edrift_command_missing(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """federation.ratify's own edrift path (trust_owner_verbs.py:885): the
+    command executable named at request time is gone (or no longer
+    executable) by apply time — apply must refuse rather than ratify a
+    server pointing at a command that can no longer run."""
+    server = _fake_server(tmp_path)
+    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=23, bounds={"servers": ["jeles-corpus"]})
+    _seal(home, store, pair_id="pair-fed-edrift",
+          target_text=f"ratify federation server jeles-corpus command {server} cwd {tmp_path} env_keys [WILLOW_HOME]",
+          kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _ratify(store=store, ledger=ledger, pair_id="pair-fed-edrift", grants_root=grants_root)
+    assert out["ok"] is True
+
+    server.unlink()  # the command disappears between request and apply
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["error"] == "edrift"
+    assert (grants_root / "failed" / "pair-fed-edrift.json").is_file()
+
+
+def test_ratify_apply_time_edrift_cwd_missing(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """F10 (Loki audit 54E3DFC0): `cwd` gets the same apply-time re-check as
+    `command` — it can vanish between request and apply exactly the same
+    way."""
+    server = _fake_server(tmp_path)
+    gone_cwd = tmp_path / "will-vanish"
+    gone_cwd.mkdir()
+    _charter(tmp_path, monkeypatch, verb="federation.ratify", verb_id=23, bounds={"servers": ["jeles-corpus"]})
+    _seal(home, store, pair_id="pair-fed-cwd-edrift",
+          target_text=f"ratify federation server jeles-corpus command {server} cwd {gone_cwd} env_keys [WILLOW_HOME]",
+          kr=ring_with_sean)
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    grants_root = home / "manifest_grants"
+    out = _ratify(store=store, ledger=ledger, pair_id="pair-fed-cwd-edrift", grants_root=grants_root)
+    assert out["ok"] is True
+
+    gone_cwd.rmdir()  # the cwd disappears between request and apply
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["error"] == "edrift"
+    assert (grants_root / "failed" / "pair-fed-cwd-edrift.json").is_file()
+
+
+# ── R6 (F8/F9/F10 from Loki audit BFCC5C79, now readable via 54E3DFC0) ──────
+
+def test_retire_ebusy_ignores_non_active_envelope_rows(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """F8: `_active_envelopes_for_grantee` used to only check `revoked` —
+    broader than the gate's own definition of usable (also `status ==
+    'active'`, unexpired). A row naming this grantee but not `status ==
+    'active'` (e.g. archived) must not block retirement."""
+    active_extra = [{
+        "id": "env-archived", "verb_id": 5, "verb": "dispatch", "grantee": "jeles",
+        "bounds": {}, "issued_by": "root", "issued_at": "2026-01-01",
+        "expires_at": "2027-01-01", "max_count": None, "use_count_source": "frank",
+        "status": "archived",
+    }]
+    _charter(tmp_path, monkeypatch, verb="manifest.retire", verb_id=21, bounds={"apps": ["jeles"]},
+             extra=active_extra)
+    _manifest(home, "jeles")
+    _seal(home, store, pair_id="pair-ret-nonactive", target_text="retire seat jeles: t", kr=ring_with_sean)
+    out = _retire_seat(store=store, pair_id="pair-ret-nonactive",
+                        apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["ok"] is True
+
+
+def test_gates_panel_list_app_ids_skips_retired_and_federation(home, tmp_path, monkeypatch):
+    """F9: `_retired` (manifest.retire's destination) and `_federation`
+    (federation.ratify's registry directory) are not seats and must not be
+    listed as ones."""
+    from willow_mcp import gates_panel
+
+    apps_root = home / "mcp_apps"
+    (apps_root / "_retired").mkdir(parents=True)
+    (apps_root / "_federation").mkdir(parents=True)
+    _manifest(home, "jeles")
+    monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(apps_root))
+    ids = gates_panel.list_app_ids()
+    assert "_retired" not in ids
+    assert "_federation" not in ids
+    assert "jeles" in ids
+
+
+def test_paths_validate_app_id_refuses_retired_and_federation():
+    """F9: the same reserved-name guard `mcp_apps`/`schema_maps` already get
+    must also cover `_retired`/`_federation` — a seat literally named either
+    would collide with manifest.retire's destination or federation.ratify's
+    registry directory."""
+    from willow_mcp import paths
+
+    for reserved in ("_retired", "_federation"):
+        try:
+            paths._validate_app_id(reserved)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{reserved!r} should have been refused as a reserved name")
+
+
+def test_create_unknown_permission_is_einval_at_request_time(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """F10: an unknown permission name used to only be caught at apply time
+    (manifest_admin.create_manifest's own validate_permission call),
+    spending a citation on a request that was always going to fail. Caught
+    here, before any citation is spent."""
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
+             bounds={"apps": ["jeles-corpus"], "groups": ["no_such_permission"]})
+    _seal(home, store, pair_id="pair-cre-badperm",
+          target_text="create seat jeles-corpus store_scope [] store_write [] permissions [no_such_permission]",
+          kr=ring_with_sean)
+    out = _create_seat(store=store, pair_id="pair-cre-badperm",
+                        apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EINVAL"
+
+
+def test_create_refuses_reserved_retired_seat_name_at_request_time(home, tmp_path, monkeypatch, store, ring_with_sean):
+    """F9 applied to manifest.create's request half: `_retired`/`_federation`
+    are reserved container names (paths._validate_app_id) — refused before a
+    citation is spent, not only at apply time via manifest_admin."""
+    _charter(tmp_path, monkeypatch, verb="manifest.create", verb_id=22,
+             bounds={"apps": ["_retired"], "groups": []})
+    _seal(home, store, pair_id="pair-cre-reserved",
+          target_text="create seat _retired store_scope [] store_write [] permissions []",
+          kr=ring_with_sean)
+    out = _create_seat(store=store, pair_id="pair-cre-reserved",
+                        apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EINVAL"

@@ -292,9 +292,31 @@ def _parse_manifest_retire_text(text: str) -> Optional[dict]:
 
 
 def _active_envelopes_for_grantee(app_id: str) -> list[dict]:
+    """Rows a live `EnvelopeAuthority.check()` could still grant against for
+    this app_id — the EBUSY predicate manifest.retire refuses on. Loki audit
+    54E3DFC0, F8: this used to only check `_is_row_revoked`, broader than the
+    gate's own definition of "usable" (`envelopes.usable_active_grants` plus
+    `status == 'active'`, unexpired) — a row that is merely archived,
+    expired, or otherwise not `status == 'active'` could never be granted by
+    the gate yet still blocked a retirement here. Mirrors the gate's own
+    filters (not a full `check()` replay — no verb/bounds/actor match is
+    meaningful without a specific call to test against)."""
+    from datetime import datetime, timezone
+
+    from . import envelopes
+
     out = []
-    for row in (_envelope_registry().get("active") or []):
+    now = datetime.now(timezone.utc)
+    for row in envelopes.usable_active_grants(_envelope_registry()):
         if _is_row_revoked(row):
+            continue
+        if row.get("status") != "active":
+            continue
+        try:
+            expiry = envelopes._deadline(row.get("expires_at"))
+        except ValueError:
+            expiry = None
+        if expiry and expiry <= now:
             continue
         grantee = row.get("grantee")
         if grantee == app_id or (isinstance(grantee, list) and app_id in grantee):
@@ -595,6 +617,19 @@ def manifest_create_request(
         name_error = _validate_seat_name(seat_id)
         if name_error:
             return mgx._refuse("EINVAL", f"{seat_id!r} is not a valid seat name: {name_error}")
+        # gate._validate_app_id (above) only checks the id's charset/shape —
+        # it carries no reserved-name guard. manifest_admin.create_manifest
+        # (apply time) uses paths._validate_app_id instead, which DOES
+        # refuse a seat named after a reserved container directory
+        # (including `_retired`/`_federation` as of Loki audit 54E3DFC0,
+        # F9) — check the same thing here so a doomed request never spends
+        # a citation on an apply that was always going to refuse.
+        from . import paths as _paths
+
+        try:
+            _paths._validate_app_id(seat_id)
+        except ValueError as exc:
+            return mgx._refuse("EINVAL", f"{seat_id!r} is not a valid seat name: {exc}")
         if is_orchestrator_app(seat_id):
             return mgx._refuse(
                 "EPERM",
@@ -613,6 +648,20 @@ def manifest_create_request(
                 f"never grantable through {VERB_CREATE}",
                 escalating=escalating,
             )
+
+        # Loki audit 54E3DFC0, F10: request time only ever checked the
+        # escalation subset, never whether each named permission is even
+        # KNOWN — manifest_admin.create_manifest's own validate_permission
+        # call would refuse EINVAL at apply time regardless, but only after
+        # this request had already spent a citation on a doomed apply. Same
+        # check, moved earlier.
+        from . import manifest_admin as _manifest_admin
+
+        for perm in parsed["permissions"]:
+            try:
+                _manifest_admin.validate_permission(perm)
+            except ValueError as exc:
+                return mgx._refuse("EINVAL", str(exc))
 
         root = apps_root if apps_root is not None else _default_apps_root()
         if (root / seat_id / "manifest.json").is_file():
@@ -883,6 +932,15 @@ def _apply_federation_ratify(record: dict, path: Path, *, ledger, apps_root: Pat
     command_path = Path(target["command"])
     if not command_path.is_file() or not os.access(command_path, os.X_OK):
         return _fail("edrift", f"command {target['command']!r} no longer exists or is not executable")
+
+    # Loki audit 54E3DFC0, F10: only `command` was re-checked at apply time;
+    # `cwd` (also apply-time-fixed in the target, also named in the sealed
+    # text) could vanish between request and apply exactly like `command`
+    # can, and mcp_federation would otherwise spawn the server against a
+    # working directory that no longer exists.
+    cwd_value = target.get("cwd")
+    if cwd_value and not Path(cwd_value).is_dir():
+        return _fail("edrift", f"cwd {cwd_value!r} no longer exists")
 
     from . import mcp_federation
 
