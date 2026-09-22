@@ -908,7 +908,7 @@ _SEAT_PRIV_RE = re.compile(
     r"envelope_apply|envelope_write|federation_call|fork_write|frank_write|friction_write|full_access|"
     r"gap_promote|gap_purge|gap_write|governance_propose|governance_sync|grove_all|grove_write|human_loop_write|integration_call|"
     r"knowledge_curate|knowledge_write|lineage_write|markdownai_directives|markdownai_write|"
-    r"nest_write|schema_admin|store_all|store_write|task_db|task_queue|"
+    r"nest_write|schema_admin|steward_sweep|steward_enqueue|store_all|store_write|task_db|task_queue|"
     r"tool_oracle_route|tool_oracle_seal)\b"
 )
 # `orchestrator`, `context` and `binding` are also write-capable groups, but
