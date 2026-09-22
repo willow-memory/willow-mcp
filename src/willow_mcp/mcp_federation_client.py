@@ -27,6 +27,7 @@ of the first resolution (Decision 5).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import threading
@@ -40,7 +41,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
-from . import external_guard, mcp_federation, signing, tier_policy
+from . import exposure, external_guard, mcp_federation, signing, tier_policy
 
 logger = logging.getLogger("willow_mcp.mcp_federation_client")
 
@@ -80,6 +81,97 @@ def _unwrap(exc: BaseException) -> BaseException:
 def _scan_text(text: str) -> tuple[str, list[dict]]:
     hits = external_guard.scan(text or "")
     return external_guard.verdict(hits), hits
+
+
+def _withheld(row_visibility: str | None) -> dict:
+    """What a withheld SINGLETON row becomes — never `None` (Loki 24242675,
+    finding 4): a `None` rewrites the shape into something a caller can
+    still index into, turning a withheld-content signal into a confusing
+    `TypeError` deep in caller code instead of here. This marker names the
+    tier the row actually required, so a caller can tell "content existed
+    and was withheld" from "this field was empty" — and, unlike `None`, it
+    is never confused for real row data."""
+    return {"withheld": exposure.row_tier(row_visibility)}
+
+
+def _filter_by_visibility(parsed: Any, caller_tier: str) -> tuple[Any, int]:
+    """Sealed ae23d366 clause 3: drop rows whose `visibility` is not
+    visible to `caller_tier` (`exposure.visible_to`) — never rewrite a
+    surviving row, only withhold the ones the caller's tier does not
+    clear.
+
+    REWORK (Loki 8AA7CBE7, finding: "filter covers a top-level list of
+    dicts only"): the original pass only looked at `parsed`'s own top-level
+    values, so a nested shape like `{"result": {"hits": [...]}}` went
+    through unfiltered. This version recurses to ANY depth, and — REWORK 2
+    (Loki 24242675, finding 1) — applies ONE rule to a row whether it
+    arrives as a list member or a singleton:
+
+    * a homogeneous LIST of dicts — every item is treated as a row even
+      without its own `visibility` key (missing -> `internal`, the
+      narrowest default — same rule `exposure.visible_to` applies), and
+      every SURVIVING row is itself walked afterward so a row that nests
+      another row-list inside it is filtered all the way down. A dropped
+      list row is simply omitted (the list shortens) — no marker needed,
+      there is no index a caller can misread as data.
+    * a dict value is ALSO treated as a row — same missing-visibility
+      default — when it either carries an explicit `visibility` key
+      itself, OR shares a parent dict with at least one sibling key whose
+      own value is a row-list. jeles's real top-hit shape is exactly this:
+      `{"nugget": {...no visibility...}, "candidates": [...]}` — detecting
+      "candidates" as a row-list is enough to know "nugget" is a row too,
+      without this module ever assuming either key's name. The FIRST
+      REWORK's version required an explicit `visibility` key for a
+      singleton, which is exactly how an unmarked `nugget` escaped
+      unfiltered to a "public" caller (Loki 24242675, finding 1) — the row
+      most likely to be quoted was the one built to skip this check. A
+      plain dict with NEITHER an explicit `visibility` key NOR a sibling
+      row-list (ordinary wrapper/metadata, e.g. `{"meta": {"source": ..}}`
+      with nothing else nearby) is left untouched — it has nothing to say
+      it is row-shaped at all, and this filter does not guess. A withheld
+      singleton dict is replaced with `_withheld(...)`, never `None`.
+
+    Returns `(filtered, dropped_count)`; `filtered is parsed` (or, for an
+    unchanged nested value, that value's own original object) when nothing
+    under it was dropped."""
+    dropped = 0
+
+    def walk(node: Any) -> Any:
+        nonlocal dropped
+        if isinstance(node, list):
+            if node and all(isinstance(item, dict) for item in node):
+                kept = []
+                for row in node:
+                    if exposure.visible_to(caller_tier, row.get("visibility")):
+                        kept.append(walk(row))
+                    else:
+                        dropped += 1
+                return kept
+            return [walk(item) for item in node]
+        if isinstance(node, dict):
+            has_sibling_row_list = any(
+                isinstance(v, list) and v and all(isinstance(i, dict) for i in v)
+                for v in node.values()
+            )
+            changed = False
+            out: dict = {}
+            for key, val in node.items():
+                if isinstance(val, dict):
+                    is_row = "visibility" in val or has_sibling_row_list
+                    if is_row and not exposure.visible_to(caller_tier, val.get("visibility")):
+                        out[key] = _withheld(val.get("visibility"))
+                        dropped += 1
+                        changed = True
+                        continue
+                new_val = walk(val)
+                out[key] = new_val
+                if new_val is not val:
+                    changed = True
+            return out if changed else node
+        return node
+
+    filtered = walk(parsed)
+    return filtered, dropped
 
 
 def _guard_tool_listing(tools: list[Any]) -> list[dict]:
@@ -368,11 +460,37 @@ class _ServerConnection:
         self._ensure_started()
         return self._tools_cache
 
-    def call_tool(self, tool: str, arguments: dict[str, Any]) -> dict:
+    def call_tool(self, tool: str, arguments: dict[str, Any], *, app_id: str = "",
+                  serve_mode: bool = False) -> dict:
         result = self._request("call", (tool, arguments))
         text = "".join(
             getattr(block, "text", "") or "" for block in (result.content or [])
         )
+
+        # Sealed ae23d366 clause 3: withhold rows above the caller's
+        # exposure tier BEFORE the guard scan below — a row already
+        # dropped for visibility must never be the reason a call reads as
+        # BLOCKED, and the guard must scan exactly the text a caller will
+        # actually receive, not text for rows they never see. `serve_mode`
+        # (the caller's transport ceiling, Loki 8AA7CBE7 finding 3) comes
+        # from the caller (server.federation_call passes its own
+        # `_serve_mode()`) — this module has no transport of its own to
+        # report, so it defaults to False (stdio) rather than guessing.
+        # An empty/omitted app_id is not special-cased to the narrowest
+        # tier anymore (Loki 24242675, finding 2 applies here too):
+        # resolve_exposure_tier already treats "no configured override"
+        # (which an empty app_id trivially has) as "use the transport
+        # ceiling", not "use DEFAULT_VISIBILITY_TIER" — bypassing it here
+        # for a falsy app_id would silently re-introduce the same
+        # blind-desk bug for exactly the caller shape (no app_id at all)
+        # most likely to hit it.
+        dropped = 0
+        caller_tier = exposure.resolve_exposure_tier(app_id, serve_mode=serve_mode)
+        parsed = signing._result_dict(result)
+        filtered, dropped = _filter_by_visibility(parsed, caller_tier)
+        if dropped:
+            text = json.dumps(filtered, separators=(",", ":"))
+
         verdict, hits = _scan_text(text)
         content_text = text
         escaped = False
@@ -386,6 +504,8 @@ class _ServerConnection:
             "content_text": content_text,
             "guard_verdict": verdict,
             "guard_hits": hits,
+            "visibility_tier": caller_tier,
+            "visibility_dropped": dropped,
         }
         if escaped:
             out["guard_escape"] = True
@@ -441,13 +561,23 @@ def list_server_tools(server_id: str, *, refresh: bool = False) -> list[dict]:
     return _get_connection(server_id).list_tools(refresh=refresh)
 
 
-def call_tool(server_id: str, tool: str, arguments: Optional[dict[str, Any]] = None) -> dict:
+def call_tool(server_id: str, tool: str, arguments: Optional[dict[str, Any]] = None,
+              *, app_id: str = "", serve_mode: bool = False) -> dict:
     """Call one tool on one connected-or-connecting server. Callers are
     expected to have already cleared `federation_egress.egress_denial` —
     this module has no gate of its own, exactly as `mcp_generic.py`'s
     upstream ancestor did not: connection-layer code is not where
-    authorization decisions belong."""
-    return _get_connection(server_id).call_tool(tool, dict(arguments or {}))
+    authorization decisions belong.
+
+    `app_id` resolves the CALLER's exposure tier (sealed ae23d366 clause
+    3) for filtering the downstream result's rows by `visibility` before
+    they are guard-scanned; omitted, the caller's tier is this call's own
+    transport ceiling (Loki 24242675 finding 2 — "unconfigured" is not
+    "public"). `serve_mode` is the caller's own transport ceiling (Loki
+    8AA7CBE7 finding 3) — pass `server._serve_mode()` from a caller that
+    has one; defaults to False (stdio, the more permissive ceiling)."""
+    return _get_connection(server_id).call_tool(
+        tool, dict(arguments or {}), app_id=app_id, serve_mode=serve_mode)
 
 
 def disconnect_server(server_id: str) -> bool:
