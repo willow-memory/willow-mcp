@@ -1050,9 +1050,47 @@ def _apply_federation_ratify(record: dict, path: Path, *, ledger, apps_root: Pat
 VERB_ENVELOPE_RATIFY = "envelope.ratify"
 EVENT_ENVELOPE_RATIFIED = "envelope_ratified"
 
+# Loki audit BDC2B0F2, A2 (high, blocking): the grammar used to bind only
+# the proposal id and the operator's words -- the proposal ITSELF (verb,
+# grantee, bounds, expires_at, max_count, use_count_source) was copied at
+# REQUEST time from the broker's own unsigned, broker-writable 0600
+# sidecar, and the apply half compared nothing in that copy but `id`.
+# Measured: edit the sidecar after propose and the row the request copies
+# reads grantee=attacker, bounds={'a': ['*']}, while the sealed text still
+# says only `ratify envelope <id>: <words>` -- the apply half would sign
+# that row into the register as issued_by=root. The human sealed an id;
+# the agent chose the grant. The grammar now carries a DIGEST over the
+# proposal's governing fields, computed from the row the operator actually
+# saw via envelope_pending_read when the pair was drafted -- the seal now
+# covers the grant's CONTENT, not just its name.
 _ENVELOPE_RATIFY_RE = re.compile(
-    r"^ratify envelope (?P<proposal_id>[A-Za-z0-9_.\-]+): (?P<words>.+)$"
+    r"^ratify envelope (?P<proposal_id>[A-Za-z0-9_.\-]+) (?P<digest>[0-9a-f]{64}): (?P<words>.+)$"
 )
+
+#: The exact field set the digest covers -- everything about a proposal
+#: that governs what the ratified envelope actually authorizes.
+#: `bounds_digest` (the field FRANK's own `envelope_proposed` event
+#: carries) covers only `bounds`; this covers the rest too
+#: (expires_at/max_count/use_count_source), which a bounds-only digest
+#: would let drift silently (Loki audit BDC2B0F2, A2's own note: "a
+#: max_count: 1 -> null edit survives a digest check" against bounds
+#: alone).
+_DIGEST_FIELDS = ("verb", "verb_id", "grantee", "bounds", "expires_at", "max_count", "use_count_source")
+
+
+def _proposal_digest(row: dict) -> str:
+    """sha256 hex over the canonical JSON of ``row``'s governing fields
+    (:data:`_DIGEST_FIELDS`). Computed by the desk when drafting the
+    sealed pair (from the row the operator actually saw via
+    ``envelope_pending_read``), recomputed here from whatever row travels
+    with the request/is copied at apply time — any disagreement means the
+    row is not the one that was sealed."""
+    import hashlib
+    import json as _json
+
+    payload = {k: row.get(k) for k in _DIGEST_FIELDS}
+    canonical = _json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _parse_envelope_ratify_text(text: str) -> Optional[dict]:
@@ -1065,7 +1103,7 @@ def _parse_envelope_ratify_text(text: str) -> Optional[dict]:
     words = m.group("words").strip()
     if not words:
         return None
-    return {"proposal_id": m.group("proposal_id"), "words": words}
+    return {"proposal_id": m.group("proposal_id"), "digest": m.group("digest"), "words": words}
 
 
 def _envelope_registry_view() -> dict:
@@ -1077,6 +1115,62 @@ def _envelope_registry_view() -> dict:
     from . import envelope_authoring as _ea
 
     return _ea._load_registry()
+
+
+def _verify_proposal_against_frank(row: dict, *, ledger) -> Optional[dict]:
+    """Cross-check ``row`` (the proposal copy travelling inside the signed
+    request) against FRANK's own ``envelope_proposed`` event for this id —
+    the anchor :func:`envelope_authoring.propose` inks BEFORE any seal
+    exists and the broker cannot rewrite after the fact (Loki audit
+    BDC2B0F2, A2, second independent anchor alongside the sealed digest).
+    Returns a refusal dict on any disagreement or a missing event; ``None``
+    when every field checked agrees. Checked at BOTH halves: the request
+    half refuses fast when the sidecar was already tampered with before
+    the request was even written; the apply half's own check is the one
+    that actually holds, since it runs on the copy that travels inside the
+    signed, citation-bound request."""
+    if ledger is None:
+        return mgx._refuse(
+            "EUNREACH",
+            "no FRANK ledger available to confirm this proposal's own envelope_proposed event",
+        )
+    proposal_id = row.get("id")
+    try:
+        events = ledger.all_events("envelope_proposed", match={"envelope_id": proposal_id})
+    except Exception as exc:  # noqa: BLE001 — ledger unreachable is refused, never swallowed
+        return mgx._refuse(
+            "EUNREACH",
+            f"FRANK ledger unreachable while checking envelope_proposed for {proposal_id!r}: "
+            f"{type(exc).__name__}: {exc}",
+        )
+    proposed = next((e for e in events if (e.get("content") or {}).get("envelope_id") == proposal_id), None)
+    if proposed is None:
+        return mgx._refuse(
+            "edrift",
+            f"no FRANK envelope_proposed event found for proposal {proposal_id!r} — cannot "
+            "confirm what the operator actually saw when the pair was sealed",
+        )
+    from . import envelope_authoring as _ea
+
+    content = proposed.get("content") or {}
+    mismatches = []
+    if content.get("verb") != row.get("verb"):
+        mismatches.append("verb")
+    if content.get("verb_id") != row.get("verb_id"):
+        mismatches.append("verb_id")
+    if content.get("grantee") != row.get("grantee"):
+        mismatches.append("grantee")
+    if content.get("bounds_digest") != _ea._bounds_digest(row.get("bounds") or {}):
+        mismatches.append("bounds")
+    if mismatches:
+        return mgx._refuse(
+            "edrift",
+            f"proposal {proposal_id!r}'s copied row disagrees with FRANK's own "
+            f"envelope_proposed event on {mismatches!r} — the sidecar may have been "
+            "edited after propose",
+            fields=mismatches,
+        )
+    return None
 
 
 def envelope_ratify_request(
@@ -1092,18 +1186,23 @@ def envelope_ratify_request(
     grants_root: Optional[Path] = None,
 ) -> dict:
     """Broker side of ``envelope.ratify``. Sealed text: ``ratify envelope
-    <proposal_id>: <the operator's verbatim words>`` — the operator's
-    ratification words ARE the sealed text, so the seal itself is the
-    ratification; there is no second act. Request pre-state: the named
-    proposal exists in the broker's own sidecar (readable here — this half
-    runs as the broker) and is not already in ``active[]``. Writes one
-    signed request carrying a full copy of the proposal row (option (a) of
-    the packet: the apply half runs as the trust owner and cannot read the
-    sidecar at all, so the row travels inside the signed request instead);
-    never touches the register itself — that is :func:`_apply_envelope_ratify`'s
-    job, run as the trust-owner unit. The broker's own next
-    ``envelope_pending_read`` prunes the sidecar's now-stale copy once it
-    sees the id active in the register."""
+    <proposal_id> <digest>: <the operator's verbatim words>`` where
+    ``<digest>`` is :func:`_proposal_digest` over the proposal's own
+    governing fields — the seal binds the grant's CONTENT, not just its
+    name (Loki audit BDC2B0F2, A2). Request pre-state: the named proposal
+    exists in the broker's own sidecar (readable here — this half runs as
+    the broker) and is not already in ``active[]``; the sidecar row's OWN
+    digest matches the sealed one, and the row agrees with FRANK's own
+    ``envelope_proposed`` event for this id (:func:`_verify_proposal_against_frank`)
+    — refused fast here if either disagrees, though the apply half's own
+    re-check on the COPIED row (not this read) is the one that actually
+    holds. Writes one signed request carrying a full copy of the proposal
+    row (option (a) of the packet: the apply half runs as the trust owner
+    and cannot read the sidecar at all, so the row travels inside the
+    signed request instead); never touches the register itself — that is
+    :func:`_apply_envelope_ratify`'s job, run as the trust-owner unit. The
+    broker's own next ``envelope_pending_read`` prunes the sidecar's
+    now-stale copy once it sees the id active in the register."""
     from .human_session import is_orchestrator_app
 
     if not is_orchestrator_app(app_id):
@@ -1141,8 +1240,9 @@ def envelope_ratify_request(
             return mgx._refuse(
                 "EINVAL",
                 f"sealed pair {pair_id!r} text does not match the strict {VERB_ENVELOPE_RATIFY} "
-                "grammar ('ratify envelope <proposal_id>: <the operator's verbatim words>', "
-                "one line)",
+                "grammar ('ratify envelope <proposal_id> <digest>: <the operator's verbatim "
+                "words>', one line, digest = sha256 hex over verb/verb_id/grantee/bounds/"
+                "expires_at/max_count/use_count_source)",
                 sealed_text=sealed.get("target_text"),
             )
 
@@ -1170,8 +1270,29 @@ def envelope_ratify_request(
         if ledger is None:
             return mgx._refuse("EAMBIG", "no governance ledger: a request that cannot be cited is not performed")
 
+        # Loki audit BDC2B0F2, A2: refuse here, fast, if the sidecar row no
+        # longer matches what was sealed -- the apply half's own re-check
+        # on the COPIED row is the one that actually holds under a race
+        # (this read happens before the copy is even made), but there is
+        # no reason to let a doomed request spend a citation.
+        computed_digest = _proposal_digest(proposal_row)
+        if computed_digest != parsed["digest"]:
+            return mgx._refuse(
+                "eseal_mismatch",
+                f"sealed digest does not match proposal {target_proposal_id!r}'s current "
+                "governing fields (verb/verb_id/grantee/bounds/expires_at/max_count/"
+                "use_count_source) — the sidecar may have been edited since the pair was "
+                "sealed; refusing to request a grant the operator never actually sealed",
+                expected_digest=parsed["digest"], computed_digest=computed_digest,
+            )
+
+        frank_refusal = _verify_proposal_against_frank(proposal_row, ledger=ledger)
+        if frank_refusal is not None:
+            return frank_refusal
+
         target = {
             "proposal_id": target_proposal_id,
+            "digest": parsed["digest"],
             "words": parsed["words"],
             "proposal": {k: v for k, v in proposal_row.items() if not k.startswith("_")},
         }
@@ -1199,6 +1320,7 @@ def _apply_envelope_ratify(record: dict, path: Path, *, ledger, apps_root: Path,
     target = record.get("target") or {}
     proposal_id = target.get("proposal_id")
     words = target.get("words")
+    sealed_digest = target.get("digest")
     proposal_row = target.get("proposal") or {}
 
     def _fail(errno: str, reason_msg: str, **extra) -> dict:
@@ -1224,11 +1346,39 @@ def _apply_envelope_ratify(record: dict, path: Path, *, ledger, apps_root: Path,
     if seal_refusal is not None:
         return _fail(seal_refusal["error"], seal_refusal["reason"])
     parsed = _parse_envelope_ratify_text(sealed.get("target_text", ""))
-    if parsed is None or parsed["proposal_id"] != proposal_id or parsed["words"] != words:
+    if (
+        parsed is None
+        or parsed["proposal_id"] != proposal_id
+        or parsed["words"] != words
+        or parsed["digest"] != sealed_digest
+    ):
         return _fail("eseal_mismatch", "sealed text no longer matches this request's recorded target")
 
     if not proposal_row or proposal_row.get("id") != proposal_id:
         return _fail("eforged", "request carries no valid copy of the proposal row to ratify")
+
+    # Loki audit BDC2B0F2, A2: the check that actually holds. The row
+    # travelling inside this signed, citation-bound request is checked
+    # against TWO independent anchors the broker could not have rewritten
+    # after the seal landed: (1) the digest the operator actually sealed,
+    # recomputed fresh from this copy; (2) FRANK's own envelope_proposed
+    # event, inked before any seal existed. Agreement on both is required
+    # before this row is ever signed into the register as issued_by=root.
+    computed_digest = _proposal_digest(proposal_row)
+    if computed_digest != sealed_digest:
+        return _fail(
+            "eseal_mismatch",
+            f"copied proposal row's digest does not match the sealed digest for "
+            f"{proposal_id!r} — the row disagrees with what the operator actually sealed",
+            expected_digest=sealed_digest, computed_digest=computed_digest,
+        )
+
+    frank_refusal = _verify_proposal_against_frank(proposal_row, ledger=ledger)
+    if frank_refusal is not None:
+        return _fail(
+            frank_refusal["error"], frank_refusal["reason"],
+            **{k: v for k, v in frank_refusal.items() if k not in ("ok", "error", "reason")},
+        )
 
     if _envelope_active_row(proposal_id) is not None:
         return _fail("edrift", f"envelope {proposal_id!r} was already ratified since the request was made")
