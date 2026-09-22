@@ -428,6 +428,28 @@ def test_render_units_fills_every_placeholder(tmp_path, checkout, monkeypatch):
     assert "OnUnitActiveSec=90s" in tmr and f"Unit={reloader.SERVICE_UNIT}" in tmr
 
 
+def test_render_units_names_the_public_keyring_not_the_private_one(tmp_path, checkout, monkeypatch):
+    """R1 (Loki 747B0C04, blocking): the deployed unit carried no
+    WILLOW_KEYRING at all, so every seal read ESEALS forever. The rendered
+    template must name a ring — and it must be the PUBLIC one
+    (net_signer.default_ring_path(), normally
+    $WILLOW_HOME/config/verifiers.public.json), never the private
+    config/verifiers.json this oneshot has no business holding (it only
+    ever verifies, never signs)."""
+    from willow_mcp import net_signer as ns
+
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "home" / "store"))
+    monkeypatch.delenv("WILLOW_NET_RING", raising=False)
+    db = _nestor_db(tmp_path)
+    units = reloader.render_units(_config(checkout, db), python=Path("/venv/bin/python"))
+    svc = units[reloader.SERVICE_UNIT]
+    expected = str(ns.default_ring_path())
+    assert f'Environment="WILLOW_KEYRING={expected}"' in svc
+    assert "verifiers.public.json" in expected
+    assert "verifiers.json" not in expected.replace("verifiers.public.json", "")
+
+
 def test_render_refuses_without_a_checkout(tmp_path):
     cfg = reloader.ReloaderConfig(unit="willow-mcp-serve.service", checkout=None,
                                   repo="willow-memory/willow-mcp", nestor_db=tmp_path / "n.db")
@@ -762,9 +784,80 @@ def test_run_once_refuses_the_whole_restart_when_only_one_open_trigger_is_sealed
     second = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
     assert second["error"] == "EPARTIAL"
     assert not second["reloaded"]
+    # R5 (Loki 747B0C04, low): EPARTIAL is a WAITING state, not a failure —
+    # act=False so `main(["tick"])` exits 0 on every poll until the second
+    # seal lands, the same resting state a single-trigger ENOSEAL already is.
+    assert second["act"] is False
     assert second["pull"]["act"] and second["env"]["error"] == "ENOSEAL"
     assert git.restarts == []  # NEITHER trigger acted — no partial restart
     assert len(ledger.appended) == 1  # only the original env request; no unit_reload ink
+
+
+def test_run_once_epartial_exits_zero_not_one(tmp_path, checkout, monkeypatch, capsys, ring_with_sean):
+    """R5: main(['tick']) must not redden the journal every 60s while
+    waiting on the second seal."""
+    _seed_running_env("A=1\n")
+    _write_live_env("A=1\nB=2\n")
+    ledger = _FakeLedger(_receipt(checkout))
+    git = _FakeSystemctlGit()
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "sealed").mkdir()
+    empty_db = _nestor_db(tmp_path / "empty")
+    first = reloader.run_once(_config(checkout, empty_db), ledger=ledger, runner=git)
+    pull_rid = first["receipt_id"]
+    db = _nestor_db(tmp_path / "sealed", _sealed(ring_with_sean, pull_rid, pid="pair-1"))
+    monkeypatch.setattr(reloader, "_live_ledger", lambda: ledger)
+    monkeypatch.setattr(reloader, "default_config", lambda: _config(checkout, db))
+    monkeypatch.setattr(urx.subprocess, "run", git)
+    rc = reloader.main(["tick"])
+    assert rc == 0
+    assert '"EPARTIAL"' in capsys.readouterr().out
+
+
+def test_run_once_corrupt_env_state_blocks_a_sealed_pull_restart(tmp_path, checkout, ring_with_sean):
+    """R4 (Loki 747B0C04, medium): an unreadable env state file must not
+    read as "nothing pending" — a sealed pull must not restart onto
+    whatever env happens to be on disk, unaudited."""
+    envfp.state_path().parent.mkdir(parents=True, exist_ok=True)
+    envfp.state_path().write_text("not json{{{", encoding="utf-8")
+    db = _nestor_db(tmp_path, _sealed(ring_with_sean, "receipt-7"))
+    git = _FakeSystemctlGit()
+    ledger = _FakeLedger(_receipt(checkout))
+    out = reloader.run_once(_config(checkout, db), ledger=ledger, runner=git)
+    assert out["error"] == "EPARTIAL"
+    assert not out["reloaded"]
+    assert out["env"]["error"] == "EUNREACH"
+    assert git.restarts == []
+
+
+def test_check_env_source_flap_is_eunreach_not_drift(tmp_path, checkout):
+    """R2 (Loki 747B0C04, high): baseline from unit_environment, live read
+    resolves to fallback (as it would after one 'systemctl unreachable'
+    tick) — not comparable, and must not file a receipt claiming every
+    unit key was removed."""
+    envfp.state_path().parent.mkdir(parents=True, exist_ok=True)
+    envfp.record_startup(source={"source": "unit_environment",
+                                 "pairs": [("A", "1"), ("B", "2")]})
+    _write_live_env("A=1\n")  # a different source (fallback) with overlapping content
+    ledger = _FakeLedger()
+    db = _nestor_db(tmp_path)
+    out = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
+    assert out["error"] == "EUNREACH"
+    assert ledger.appended == []  # no bogus receipt
+
+
+def test_check_env_missing_file_is_emissing_not_a_diff(tmp_path, checkout):
+    """F6 (E79FCAE7, still open pre-rework-2): the env file going from
+    populated to MISSING is a state change, never filed as a diff naming
+    '<empty>' as the restart target."""
+    _seed_running_env("A=1\n")
+    env_path = envfp.default_env_path()
+    env_path.unlink()
+    ledger = _FakeLedger()
+    db = _nestor_db(tmp_path)
+    out = reloader.check_env(_config(checkout, db), ledger=ledger, runner=_FakeSystemctlGit())
+    assert out["error"] == "EMISSING"
+    assert ledger.appended == []
 
 
 def test_run_once_pull_only_when_env_has_nothing_pending(tmp_path, checkout, ring_with_sean):

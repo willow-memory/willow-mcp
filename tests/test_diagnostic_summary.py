@@ -614,7 +614,9 @@ def test_env_stale_is_informational_not_severity():
 def test_env_stale_no_state_file_is_empty(tmp_path, monkeypatch):
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     out = server._diag_env_stale()
-    assert out == {"state": "empty", "keys_changed": [], "receipt_id": None, "sealed": False}
+    assert out == {"state": "empty", "keys_changed": [], "values_changed": False,
+                   "receipt_id": None, "sealed": False,
+                   "unit": "willow-mcp-serve.service", "describes": "serve"}
 
 
 def test_env_stale_unreadable_state_file(tmp_path, monkeypatch):
@@ -646,12 +648,55 @@ def test_env_stale_diff_names_keys_changed_never_a_value(tmp_path, monkeypatch):
     env_path.write_text("A=1\nSECRET=sk-do-not-leak-this-8675309\nB=2\n", encoding="utf-8")
     out = server._diag_env_stale()
     assert out["state"] == "populated"
-    # F2: keys_added/removed are exact (B, SECRET); "A" is common to both
-    # sides but the whole-set digest differs, so it is reported too — over-
-    # inclusive on purpose, since a single digest cannot say A's value did
-    # NOT move (see env_fingerprint.diff_keys).
-    assert set(out["keys_changed"]) == {"A", "B", "SECRET"}
+    # R3 (Loki 747B0C04): keys_added/removed are exact (B, SECRET) — "A" is
+    # common to both sides and did NOT change, and is no longer named at
+    # all (the first cut over-claimed it as "changed"; fixed). The common-
+    # set signal is now one boolean, naming no key.
+    assert set(out["keys_changed"]) == {"B", "SECRET"}
+    assert out["values_changed"] is True
     assert "sk-do-not-leak-this-8675309" not in json.dumps(out)
     # no Postgres configured in this test env -> best-effort receipt/seal lookup
     # degrades to the empty default rather than raising.
     assert out["receipt_id"] is None and out["sealed"] is False
+
+
+def test_env_stale_source_mismatch_is_unreachable_not_a_diff(tmp_path, monkeypatch):
+    """R2 (Loki 747B0C04): a baseline recorded via one env_source compared
+    against a live read from a DIFFERENT env_source (e.g. systemctl
+    flapped) is not a diff — unreachable, no keys named."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    from willow_mcp import env_fingerprint as envfp
+    env_path = tmp_path / "env"
+    env_path.write_text("A=1\n", encoding="utf-8")
+    # baseline recorded as unit_environment (what the unit actually loaded)
+    envfp.record_startup(source={"source": "unit_environment", "pairs": [("A", "1")]})
+    # live resolves to fallback (as it would after a systemctl hiccup)
+    out = server._diag_env_stale()
+    assert out["state"] == "unreachable"
+    assert "source flap" in out["cause"] or "env_source" in out["cause"]
+    assert out["keys_changed"] == [] and out["values_changed"] is False
+
+
+def test_env_stale_env_gone_missing_is_unreachable_not_a_diff(tmp_path, monkeypatch):
+    """F6: the env file going from populated to missing is a state change,
+    never filed as a diff naming '<empty>' as the target."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    from willow_mcp import env_fingerprint as envfp
+    env_path = tmp_path / "env"
+    env_path.write_text("A=1\n", encoding="utf-8")
+    envfp.record_startup(source={"source": "fallback", "path": env_path})
+    env_path.unlink()
+    out = server._diag_env_stale()
+    assert out["state"] == "unreachable"
+    assert "state change" in out["cause"]
+    assert out["keys_changed"] == []
+
+
+def test_env_stale_names_unit_and_describes_serve(tmp_path, monkeypatch):
+    """F7 (partial): the desk reading env_stale can tell which broker's
+    baseline this is describing."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    monkeypatch.setenv("WILLOW_RELOADER_UNIT", "willow-mcp-serve.service")
+    out = server._diag_env_stale()
+    assert out["unit"] == "willow-mcp-serve.service"
+    assert out["describes"] == "serve"

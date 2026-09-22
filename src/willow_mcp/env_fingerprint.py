@@ -182,24 +182,27 @@ def diff_keys(before: dict, after: dict) -> dict:
     never a value, never anything derived per-key from a value (F2: there
     is no per-key digest left to consult).
 
-    ``keys_added``/``keys_removed`` come straight from the two ``keys``
-    name-sets — exact, no ambiguity. ``keys_changed`` cannot be exact: a
-    single whole-set digest cannot say WHICH common name's value moved,
-    only that at least one did (the two digests differ). Rather than guess
-    — which would mean deriving a claim from the values themselves, the
-    exact oracle F2 forbids — every name present on BOTH sides is reported
-    as ``keys_changed`` whenever the digests differ, over-inclusive on
-    purpose. A key that only appears on one side is already covered by
-    added/removed and is never double-counted here.
+    Rework (Loki 747B0C04, R3): the first cut reported every name common to
+    both sides as ``keys_changed`` whenever the digest differed — SAFE (no
+    oracle) but FALSE for all but at most one of them: a rotated single key
+    among twenty unrelated ones told the desk twenty names "changed." A
+    single aggregate digest genuinely cannot say WHICH common name moved,
+    so this stops claiming it can. ``keys_added``/``keys_removed`` remain
+    exact (straight name-set differences). In place of ``keys_changed``,
+    ``values_changed`` is ONE boolean — true when the two fingerprints
+    differ at all (added, removed, or a same-name-set value edit) — naming
+    no key, over- or under-claiming nothing about any specific name. Loki
+    explicitly ruled out a keyed/salted per-key digest as a fix: the key
+    would have to live on the same disk, same uid, as the baseline the
+    broker writes and the reloader reads, so anyone holding both holds the
+    oracle again. No per-key claim survives here in any form.
     """
     bkeys = set(before.get("keys") or [])
     akeys = set(after.get("keys") or [])
     added = sorted(akeys - bkeys)
     removed = sorted(bkeys - akeys)
-    common = sorted(akeys & bkeys)
     same_digest = before.get("digest") == after.get("digest") and before.get("state") == after.get("state")
-    changed = [] if same_digest else common
-    return {"keys_added": added, "keys_removed": removed, "keys_changed": changed}
+    return {"keys_added": added, "keys_removed": removed, "values_changed": not same_digest}
 
 
 def fingerprints_equal(a: dict, b: dict) -> bool:

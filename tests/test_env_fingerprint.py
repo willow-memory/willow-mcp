@@ -124,24 +124,34 @@ def test_diff_keys_added_removed_are_exact(tmp_path):
     _assert_no_per_key_material(diff, before, after)
 
 
-def test_diff_keys_changed_is_every_common_key_not_just_the_one_that_moved(tmp_path):
-    """F2: a single whole-set digest cannot say WHICH common name's value
-    moved — only that the set's content differs. Rather than guess (which
-    would require deriving something from the values), every name common
-    to both sides is reported when the digest differs. KEEP's value never
-    moved here, and it is still named — over-inclusive on purpose, never
-    narrowed by anything derived from a value."""
+def test_diff_keys_values_changed_is_one_boolean_naming_no_key(tmp_path):
+    """R3 (Loki 747B0C04): the first cut named every common key "changed"
+    whenever the digest differed — safe (no oracle) but FALSE about all but
+    at most one of them. A single aggregate digest cannot say WHICH common
+    name moved, so it no longer claims to: keys_added/keys_removed stay
+    exact, and values_changed is ONE boolean naming no key at all."""
     before = envfp.compute_fingerprint(_write(tmp_path / "before", "KEEP=1\nCHANGE=old\n"))
     after = envfp.compute_fingerprint(_write(tmp_path / "after", "KEEP=1\nCHANGE=new\n"))
     diff = envfp.diff_keys(before, after)
-    assert diff["keys_added"] == [] and diff["keys_removed"] == []
-    assert diff["keys_changed"] == ["CHANGE", "KEEP"]
+    assert diff == {"keys_added": [], "keys_removed": [], "values_changed": True}
 
 
 def test_diff_keys_no_diff_when_nothing_changed(tmp_path):
     a = envfp.compute_fingerprint(_write(tmp_path / "a", "A=1\nB=2\n"))
     b = envfp.compute_fingerprint(_write(tmp_path / "b", "B=2\nA=1\n"))
-    assert envfp.diff_keys(a, b) == {"keys_added": [], "keys_removed": [], "keys_changed": []}
+    assert envfp.diff_keys(a, b) == {"keys_added": [], "keys_removed": [], "values_changed": False}
+
+
+def test_diff_keys_values_changed_true_even_with_pure_add_remove(tmp_path):
+    """values_changed does not try to disentangle "some key was added/
+    removed" from "a common key's value also moved" — it is simply "the
+    fingerprints differ at all," which the exact keys_added/keys_removed
+    fields already explain more precisely where possible."""
+    before = envfp.compute_fingerprint(_write(tmp_path / "before", "KEEP=1\nDROP=x\n"))
+    after = envfp.compute_fingerprint(_write(tmp_path / "after", "KEEP=1\nADD=y\n"))
+    diff = envfp.diff_keys(before, after)
+    assert diff["keys_added"] == ["ADD"] and diff["keys_removed"] == ["DROP"]
+    assert diff["values_changed"] is True
 
 
 # ── resolve_env_source (F3): read the unit the way the box actually has it ────

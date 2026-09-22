@@ -6908,16 +6908,26 @@ def _diag_env_stale() -> dict:
     `state` is env_fingerprint's own three-state contract on reading what
     the running broker loaded: `empty` (no startup record — an older
     broker, or one that has not restarted since this landed), `unreachable`
-    (the state file or the live env file could not be read), `populated`
-    (compared). `keys_changed` names every key added, removed, OR changed
-    — NAMES only, never a value. `receipt_id`/`sealed` are best-effort: no
-    Postgres, no `env_changed` receipt yet, or the seal lookup failing all
-    leave them at their empty defaults rather than raising — this is a
-    diagnostic, not a gate."""
+    (the state file or the live env could not be read, its source flapped
+    against the recorded baseline, or the env just went missing — a state
+    change, not a diff; F6), `populated` (compared). `keys_changed` names
+    only keys ADDED or REMOVED — exact, never a "this one's value moved"
+    claim about any other name (R3: a single whole-set digest cannot say
+    which common key changed, so it no longer guesses). `values_changed`
+    is one boolean for the common-key set instead. `unit`/`describes`
+    name which broker's baseline this describes (F7, partial: the desk
+    reading this cannot otherwise tell it is the SERVE broker's own
+    startup record, never the stdio desk's — the stdio broker records
+    nothing here). `receipt_id`/`sealed` are best-effort: no Postgres, no
+    `env_changed` receipt yet, or the seal lookup failing all leave them
+    at their empty defaults rather than raising — this is a diagnostic,
+    not a gate."""
     from . import env_fingerprint as _envfp
     from . import reloader as _reloader
 
-    out = {"state": "empty", "keys_changed": [], "receipt_id": None, "sealed": False}
+    unit = os.environ.get("WILLOW_RELOADER_UNIT", _reloader.DEFAULT_UNIT).strip() or _reloader.DEFAULT_UNIT
+    out = {"state": "empty", "keys_changed": [], "values_changed": False,
+           "receipt_id": None, "sealed": False, "unit": unit, "describes": "serve"}
     state = _envfp.read_state()
     out["state"] = state["state"]
     if state["state"] != "populated":
@@ -6926,7 +6936,6 @@ def _diag_env_stale() -> dict:
         return out
     recorded = state["env_fingerprint"]
 
-    unit = os.environ.get("WILLOW_RELOADER_UNIT", _reloader.DEFAULT_UNIT).strip() or _reloader.DEFAULT_UNIT
     try:
         src = _envfp.resolve_env_source(unit)
     except Exception:
@@ -6937,13 +6946,27 @@ def _diag_env_stale() -> dict:
         out["state"] = "unreachable"
         out["cause"] = live.get("cause")
         return out
+
+    # R2: two readings from two different env_source values are not a diff.
+    if recorded.get("env_source") != live.get("env_source"):
+        out["state"] = "unreachable"
+        out["cause"] = (f"baseline recorded via env_source={recorded.get('env_source')!r}, this read "
+                        f"resolved env_source={live.get('env_source')!r} — a source flap, not a diff")
+        return out
+
     if _envfp.fingerprints_equal(recorded, live):
         return out
 
+    # F6: the env going from populated to missing is a state change, not a
+    # diff — report it distinctly rather than as a normal populated compare.
+    if live["state"] != "populated":
+        out["state"] = "unreachable"
+        out["cause"] = f"the unit's env ({live.get('env_source')}) is now {live['state']} — a state change"
+        return out
+
     diff = _envfp.diff_keys(recorded, live)
-    out["keys_changed"] = sorted(
-        set(diff["keys_added"]) | set(diff["keys_removed"]) | set(diff["keys_changed"])
-    )
+    out["keys_changed"] = sorted(set(diff["keys_added"]) | set(diff["keys_removed"]))
+    out["values_changed"] = diff["values_changed"]
     env_path = live.get("env_ref") or ""
     try:
         pg = get_pg()
