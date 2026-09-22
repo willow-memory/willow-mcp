@@ -166,6 +166,20 @@ refusing `EACCES` before ever reaching `mcp_federation.ratify()` if the
 registry does not verify, as a backstop for every other way its signature
 could go stale — but this step is the real fix.
 
+**Fixed, first real two-uid run (2026-09-22):** `SIG_TMP=$(mktemp)` used to
+run as root, producing a root-owned temp file, then handed to `gpg -o
+"$SIG_TMP"` running AS THE TRUST OWNER — which cannot open a root-owned file
+for writing. `gpg: can't create '/tmp/tmp.xxx': Permission denied`, every
+time, on every real install; a same-uid test fixture could not see it.
+Fixed by never giving gpg a path to open at all — `--output -` writes the
+signature to gpg's own stdout, and the `>` redirection into `$SIG_TMP` is
+evaluated by THIS script's own shell (root) before `sudo -u willow-operator`
+ever runs, so the already-open fd's ownership is root's, not the child
+process's, and the child uid's permission on the path is irrelevant. Steps
+0 through 5 are all idempotent (each detects and skips what already
+converged); re-running `install.sh` after this step stopped resumes
+correctly — nothing earlier needs to be undone by hand.
+
 ## 6b. Withdraw every request minted before this install
 
 Sealed `33654f35` (2026-09-22): a pending request that predates step 6 is

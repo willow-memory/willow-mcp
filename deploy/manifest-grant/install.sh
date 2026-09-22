@@ -111,6 +111,53 @@ stop() { printf 'STOP: %s\n' "$*" >&2; exit 2; }
 as_op() { sudo -u "$OPERATOR" XDG_RUNTIME_DIR="/run/user/$OPERATOR_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$OPERATOR_UID/bus" "$@"; }
 as_to() { sudo -u "$TRUST_OWNER" GNUPGHOME="$GNUPGHOME_TO" "$@"; }
 
+# ------------------------------------------------------- --dry-run-sign
+# A real two-uid run of step 6 cannot be exercised in Kart (single-uid
+# sandbox) or by any test fixture that fakes the interpreter under one uid —
+# exactly the gap that let the mktemp-owned-by-root bug through in the first
+# place (2026-09-22, first live install). This prints the EXACT command
+# sequence step 6 runs, uid by uid, for a reader to check by eye instead of
+# by running it — no root required, touches nothing, needs no real box.
+if [ "${1:-}" = "--dry-run-sign" ]; then
+  cat <<DRYRUN
+--dry-run-sign: step 6's sign sequence, one file, both loops are identical in shape.
+Three processes, two uids -- read top to bottom:
+
+  SIG_TMP=\$(mktemp)
+      # uid: root (this script). Creates a 0600 file THIS process owns.
+      # Nothing here yet involves $TRUST_OWNER.
+
+  as_to gpg --batch --yes --detach-sign --armor --local-user "\$FPR" --output - "<file>" > "\$SIG_TMP"
+      # uid: root opens \$SIG_TMP for writing (the ">" redirection is
+      # evaluated by THIS shell, before sudo runs) -- root now holds an
+      # already-open, root-owned file descriptor.
+      # uid: $TRUST_OWNER (via "sudo -u $TRUST_OWNER", inside as_to) runs gpg.
+      # gpg writes its detached signature to ITS OWN stdout (--output -),
+      # never touching \$SIG_TMP's path at all -- gpg as $TRUST_OWNER never
+      # needs permission on that path, because it never opens it. The bytes
+      # land in \$SIG_TMP because that fd (root's) is what stdout was
+      # connected to before gpg ever started.
+      # This is the fix: the OLD sequence had gpg (as $TRUST_OWNER) open
+      # \$SIG_TMP itself via "-o \$SIG_TMP" -- a path open() by the WRONG
+      # uid, against a file only root could write. That failed on every
+      # real box; this cannot.
+
+  install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "\$SIG_TMP" "<file>.sig"
+      # uid: root. Copies root's temp file into place, chowned to
+      # $TRUST_OWNER on the way -- the final ".sig" is $TRUST_OWNER-owned,
+      # exactly as every other reader (paths.trusted_read) requires.
+
+  rm -f "\$SIG_TMP"
+      # uid: root. Cleans up root's own temp file. Never owned by uid 994
+      # ($TRUST_OWNER) at any point, success or failure.
+
+Run once per mcp_apps/*/manifest.json, then once each for the active
+register (constitutional/pre-approved.json) and the federation registry
+(mcp_apps/_federation/servers.json) -- same four lines, same two uids.
+DRYRUN
+  exit 0
+fi
+
 # ---------------------------------------------------------------- preflight
 [ "$(id -u)" = 0 ] || stop "run as root (sudo bash install.sh)"
 [ -d "$H" ] || stop "operator box not found at $H"
@@ -273,12 +320,25 @@ sudo -u postgres psql -v ON_ERROR_STOP=1 -qd "$PG_DB" -c "GRANT CONNECT ON DATAB
 sudo -u "$TRUST_OWNER" psql -d "$PG_DB" -qtc 'select 1' >/dev/null || stop "peer auth for $TRUST_OWNER on $PG_DB failed — check pg_hba.conf"
 
 # --------------------------- 6. re-sign every seat manifest under the new key
+# Fix (2026-09-22, first real two-uid install): `SIG_TMP=$(mktemp)` here runs
+# as ROOT (this whole script), producing a 0600 root-owned file — but `as_to`
+# runs gpg as willow-operator (uid 994), which cannot open a root-owned file
+# for writing even via `-o`. The fake-interpreter test that exercised this
+# control flow ran everything as one uid and could not see it; the operator's
+# first live run did (`gpg: can't create '/tmp/tmp.xxx': Permission denied`).
+# Fixed by never handing gpg a path to open at all: `--output -` writes the
+# signature to gpg's own stdout, and `> "$SIG_TMP"` is THIS shell's (root's)
+# redirection, evaluated and opened before `as_to`'s `sudo -u willow-operator`
+# ever runs — the fd is already open and root-owned by the time gpg (as
+# willow-operator) inherits and writes to it, so the child uid's permissions
+# on the PATH never matter. No temp file is ever owned by uid 994, on success
+# or on failure.
 say "== 6. re-sign every manifest under $FPR"
 for a in "$H"/mcp_apps/*/; do
   [ -f "$a/manifest.json" ] || continue
   s=$(basename "$a")
   SIG_TMP=$(mktemp)
-  as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" -o "$SIG_TMP" "$a/manifest.json"
+  as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" --output - "$a/manifest.json" > "$SIG_TMP"
   install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$SIG_TMP" "$a/manifest.json.sig"
   rm -f "$SIG_TMP"
   say "  signed $s"
@@ -293,7 +353,7 @@ done
 for f in "$REG" "$H/mcp_apps/_federation/servers.json"; do
   [ -f "$f" ] || continue
   SIG_TMP=$(mktemp)
-  as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" -o "$SIG_TMP" "$f"
+  as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" --output - "$f" > "$SIG_TMP"
   install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$SIG_TMP" "$f.sig"
   rm -f "$SIG_TMP"
   say "  signed $(basename "$f")"
