@@ -4559,13 +4559,28 @@ def handoff_write_v4(
     narrative: str = "",
     checklist_resolved: bool = True,
     envelope_clean: bool = True,
+    no_findings_reason: Optional[str] = None,
 ) -> dict:
     """Close out a dispatch you accepted: writes handoff.json (the structured
     `findings` list) plus closeout.md (the `narrative`) into the packet and
     flips its status to complete. `checklist_resolved` and `envelope_clean`
     are your declarations that the assignment checklist is finished and no
     authority envelope was left open — the orchestrator checks both in
-    verify_handoff before releasing you via agent_clear."""
+    verify_handoff before releasing you via agent_clear.
+
+    The accepted keyword fields are exactly: `findings`, `narrative`,
+    `checklist_resolved`, `envelope_clean`, `no_findings_reason` (plus the
+    positional `app_id`/`dispatch_id`). There is no `summary` or `details`
+    field — those are refused by name (`EINVAL`), never silently dropped
+    (gap 21f80b2b348a).
+
+    Each finding is an object with a one-line statement (`text`, or one of
+    `title`/`finding`/`summary`) and `evidence`: a list of non-empty strings
+    naming what backs it (a test count, a commit sha, a diff reviewed) —
+    both this tool and verify_handoff refuse a finding missing either
+    (gap 34c8e60f4260, same validator both ways). An empty `findings` list
+    is refused unless `no_findings_reason` explains why there is nothing to
+    report (e.g. a genuine blocker); the reason is recorded in the closeout."""
     return handoff_stack.handoff_write_v4(
         app_id,
         dispatch_id,
@@ -4573,6 +4588,7 @@ def handoff_write_v4(
         narrative=narrative,
         checklist_resolved=checklist_resolved,
         envelope_clean=envelope_clean,
+        no_findings_reason=no_findings_reason,
     )
 
 

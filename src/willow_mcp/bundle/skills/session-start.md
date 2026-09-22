@@ -124,6 +124,16 @@ Full overlay text: `persona-overlays.md`.
 2. Work within manifest permissions
 3. Call `closeout.tool` (today: `handoff_write_v4`) — output will be `format: handoff_v1`
 
+`handoff_write_v4`'s accepted keyword fields are exactly `findings`, `narrative`,
+`checklist_resolved`, `envelope_clean`, `no_findings_reason` (plus the positional
+`app_id`/`dispatch_id`). There is no `summary` or `details` field — either one is
+refused (`EINVAL`, naming the unknown field), never silently dropped (gap
+21f80b2b348a). Each finding needs a one-line statement (`text`, or one of
+`title`/`finding`/`summary`) and `evidence` is where you name what backs a claim
+(a test count, a commit sha, a diff reviewed) — verify_handoff reads it from
+there, not from narrative prose alone. An empty `findings` list is refused
+unless `no_findings_reason` explains why there is nothing to report.
+
 ### Human path
 
 1. `session_enter` → `entry_mode: human`

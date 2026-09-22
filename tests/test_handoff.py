@@ -611,3 +611,96 @@ def test_verify_honest_blocker_report_not_penalized_for_missing_evidence():
     })
     assert result["verified"] is False
     assert result["reason"] == "checklist not resolved"
+
+
+# ── handoff_write_v4 refuses instead of dropping (gap 21f80b2b348a; sealed
+# cdcd948c stage 2; gap 34c8e60f4260) ────────────────────────────────────────
+
+def _write(tmp_path, dispatch_id="d-refuse", **kwargs):
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    dispatch_root.mkdir(parents=True, exist_ok=True)
+    pkt = {
+        "meta": {"to_app": "hanuman", "reply_to": "willow", "role": "builder"},
+        "status": {"status": "active"},
+    }
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root), \
+         patch("willow_mcp.handoff.dispatch_set_status"):
+        return handoff_write_v4("hanuman", dispatch_id, **kwargs)
+
+
+def test_write_refuses_unknown_top_level_key(tmp_path):
+    """The exact BFF5284B shape: summary/details are not accepted fields --
+    refused by name, never silently dropped into findings=[]/narrative=''."""
+    result = _write(
+        tmp_path, summary="Build task", details="did the thing",
+    )
+    assert result["error"] == "EINVAL"
+    assert set(result["unknown_fields"]) == {"summary", "details"}
+    assert "summary" in result["message"]
+    assert "details" in result["message"]
+
+
+def test_write_refuses_single_unknown_key_by_name(tmp_path):
+    result = _write(
+        tmp_path,
+        findings=[{"id": "F1", "text": "x"}],
+        narrative="done",
+        notas="typo of narrative",
+    )
+    assert result["error"] == "EINVAL"
+    assert result["unknown_fields"] == ["notas"]
+    assert "accepted_fields" in result
+
+
+def test_write_refuses_empty_findings_without_reason(tmp_path):
+    result = _write(tmp_path, narrative="done")
+    assert result["error"] == "EINVAL"
+    assert "no_findings_reason" in result["message"]
+
+
+def test_write_accepts_empty_findings_with_reason_and_records_it(tmp_path):
+    dispatch_id = "d-no-findings"
+    result = _write(
+        tmp_path, dispatch_id=dispatch_id,
+        narrative="Investigated; nothing to report.",
+        no_findings_reason="pure read-only audit, no issues found",
+    )
+    assert result["status"] == "complete"
+    handoff_json = json.loads(
+        (tmp_path / "dispatch" / dispatch_id / "handoff.json").read_text()
+    )
+    assert handoff_json["no_findings_reason"] == "pure read-only audit, no issues found"
+    closeout = (tmp_path / "dispatch" / dispatch_id / "closeout.md").read_text()
+    assert "pure read-only audit, no issues found" in closeout
+
+
+def test_write_refuses_finding_with_no_statement(tmp_path):
+    result = _write(
+        tmp_path,
+        narrative="done",
+        findings=[{"id": "F1", "severity": "high"}],
+    )
+    assert result["error"] == "EINVAL"
+    assert result["invalid_findings"] == [{"index": 0, "keys": ["id", "severity"]}]
+
+
+def test_valid_write_then_passes_verify_handoff(tmp_path):
+    """A valid write (through the new validator) is also accepted by
+    verify_handoff — the writer refuses what the verifier would refuse, and
+    accepts what the verifier accepts."""
+    dispatch_id = "d-roundtrip"
+    written = _write(
+        tmp_path, dispatch_id=dispatch_id,
+        findings=[{"id": "F1", "text": "Found it", "evidence": ["a.py:1"]}],
+        narrative="Full suite: 12 passed, 0 failed.",
+    )
+    assert written["status"] == "complete"
+
+    pkt = {"meta": {"to_app": "hanuman"}, "status": {"status": "complete"}}
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root), \
+         patch("willow_mcp.handoff.dispatch_set_status"):
+        verified = verify_handoff(dispatch_id)
+    assert verified["verified"] is True

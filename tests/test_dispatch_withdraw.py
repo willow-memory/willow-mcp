@@ -150,6 +150,7 @@ def test_withdraw_refuses_closed_packets(home, closer):
     ds.dispatch_accept(did, "hanuman")
     ho.handoff_write_v4(
         "hanuman", did, narrative="Did it: 3 checks, 0 issues.", findings=[],
+        no_findings_reason="test fixture: withdraw-refusal test",
     )
     if closer in ("verified", "cleared"):
         assert ho.verify_handoff(did).get("verified") is True
