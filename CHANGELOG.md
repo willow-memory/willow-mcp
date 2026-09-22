@@ -36,12 +36,20 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **trust-owner:** four more apply-half verbs — envelope.revoke, manifest.retire, manifest.create, federation.ratify — a signature-trusted envelope register, and the manifest-grant installer in-repo ([5a7b097](https://github.com/willow-memory/willow-mcp/commit/5a7b097b6cfb5fc3c581ef37bf30bcbc7ac35856))
+* **deploy:** register migration (F1/F2), servers.json re-sign (F3), preflight fixes (F7) ([013aa74](https://github.com/willow-memory/willow-mcp/commit/013aa742a5959abfa56af1dae0c707e647369888))
+* **envelopes:** trust-owner-owned register, split proposals sidecar (F1/F2, sealed 31f5d3af) ([c4017ab](https://github.com/willow-memory/willow-mcp/commit/c4017ab5978e14fe1caa014ee3f4f4a7dc6a3706))
+* **deploy:** manifest-grant system-unit installer (pair 1fdfbdf3 / 1bd6fd29) ([de8f851](https://github.com/willow-memory/willow-mcp/commit/de8f851fce128fcef8a184b01492b574a984fc15))
+* **manifest-grant:** four more trust-owner verbs (envelope.revoke, manifest.retire, manifest.create, federation.ratify) ([c4e2ed8](https://github.com/willow-memory/willow-mcp/commit/c4e2ed8fa2ca561167ea36476c00cd963c7b5291))
+* **manifest-grant:** generalize the request/apply queue for more verbs ([2f5ed60](https://github.com/willow-memory/willow-mcp/commit/2f5ed609a39283212d8ed42a4950cfd8a7fe6644))
 
 
 ### Fixed
 
 * **deploy:** quote install.sh's remaining unquoted expansions (SC2086) ([b23728d](https://github.com/willow-memory/willow-mcp/commit/b23728d9846bfd77fc23295682f8c80412f45837))
+* **envelopes:** ratify() write order and umask-safe sidecar mkdir (T1/T2) ([29a60bf](https://github.com/willow-memory/willow-mcp/commit/29a60bf88e5b9f14848329903054d45bd54446ca))
+* **manifest-grant:** trust-owner-owned constitutional/ directory, broker proposals sidecar (R1/R2/R3) ([312f979](https://github.com/willow-memory/willow-mcp/commit/312f979c5243199c81e0351470060dfe06d14c08))
+* **manifest-grant:** F3 backstop, F5 orchestrator collision, F6 test coverage (Loki BFCC5C79) ([03077d1](https://github.com/willow-memory/willow-mcp/commit/03077d18bc3e69165763f0cb4b331de6409d2ab8))
+* **manifest-grant:** renumber rows 19-22 to 20-23 (Loki BFCC5C79, F4) ([9727c7d](https://github.com/willow-memory/willow-mcp/commit/9727c7dc6eb9618f7168cedeacf984f0d1c5d65a))
 
 ## [2.77.0](https://github.com/willow-memory/willow-mcp/compare/v2.76.0...v2.77.0) (2026-09-22)
 
