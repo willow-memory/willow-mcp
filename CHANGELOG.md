@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.81.2](https://github.com/willow-memory/willow-mcp/compare/v2.81.1...v2.81.2) (2026-09-23)
+
+
+### Fixed
+
+* **seed:** a real signature, and exact project resolution, for the boot lanes ([c15a962](https://github.com/willow-memory/willow-mcp/commit/c15a9622a5fdb0f4bb0adc78e49fbcf2beda4f6a))
+* **seed:** escape the sealed pair id (and created_at) in boot refusal text ([cbfce61](https://github.com/willow-memory/willow-mcp/commit/cbfce61b61a366bd09e798ead8e41c14360ac601))
+* **seed:** name refused seals at boot, bound the ancestor fallback at the git root ([7f274ba](https://github.com/willow-memory/willow-mcp/commit/7f274ba78fcdf246d42cbf26ad72718140df8711))
+* **seed:** operator corrections reach boot — sealed is operator, memory is unverified, scoped to the seat's project ([9b731a8](https://github.com/willow-memory/willow-mcp/commit/9b731a8712f9b46fc20ce0a62645cb5b1d6326f9))
+* **seed:** seed_corpus_corrections reads frontmatter type, not filename ([6203af2](https://github.com/willow-memory/willow-mcp/commit/6203af2c5b3f36c309da68df077646118bfdfba3))
+* **seed:** trust gate and project scope for the memory-corrections boot lane ([561f0e3](https://github.com/willow-memory/willow-mcp/commit/561f0e3e1b8f6ae648e0e8793a239c173c215a3a))
+
 ## [2.81.1](https://github.com/willow-memory/willow-mcp/compare/v2.81.0...v2.81.1) (2026-09-23)
 
 
