@@ -20,13 +20,111 @@ def test_seed_corpus_corrections_idempotent(tmp_path, monkeypatch):
         "---\ntitle: x\n---\nDo not use Bash for fleet work.\n"
     )
     monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
-    monkeypatch.setattr(sl, "claude_memory_dir", lambda: memory)
+    monkeypatch.setattr(sl, "memory_dirs", lambda: [memory])
     first = sl.seed_corpus_corrections()
     second = sl.seed_corpus_corrections()
     assert first == 1
     assert second == 0
     lanes = sl.load_corpus_lanes()
     assert any("Bash" in c for c in lanes["corrections"])
+
+
+def _frontmatter(name, mtype, description):
+    return (
+        "---\n"
+        f"name: {name}\n"
+        f'description: "{description}"\n'
+        "metadata: \n"
+        "  node_type: memory\n"
+        f"  type: {mtype}\n"
+        "  originSessionId: abc\n"
+        "  modified: 2026-09-01T00:00:00.000Z\n"
+        "---\n\n"
+        "Body text here.\n"
+    )
+
+
+def test_seed_corpus_corrections_reads_kebab_frontmatter(tmp_path, monkeypatch):
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "no-terminal-incantations.md").write_text(
+        _frontmatter("no-terminal-incantations", "feedback", "Never hand over a terminal one-liner.")
+    )
+    (memory / "canonical-verifier-name.md").write_text(
+        _frontmatter("canonical-verifier-name", "project", "Verifier name is sean campbell.")
+    )
+    (memory / "some-user-pref.md").write_text(
+        _frontmatter("some-user-pref", "user", "Prefers terse replies.")
+    )
+    (memory / "MEMORY.md").write_text("- index only, never a record\n")
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
+    monkeypatch.setattr(sl, "memory_dirs", lambda: [memory])
+
+    seeded = sl.seed_corpus_corrections()
+    assert seeded == 2  # feedback + project; user and MEMORY.md excluded
+
+    lanes = sl.load_corpus_lanes()
+    joined = " ".join(lanes["corrections"])
+    assert "terminal one-liner" in joined
+    assert "sean campbell" in joined
+    assert "terse replies" not in joined
+
+
+def test_seed_corpus_corrections_edit_updates_record(tmp_path, monkeypatch):
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    fpath = memory / "canonical-verifier-name.md"
+    fpath.write_text(_frontmatter("canonical-verifier-name", "project", "Old text."))
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
+    monkeypatch.setattr(sl, "memory_dirs", lambda: [memory])
+
+    sl.seed_corpus_corrections()
+    store = sl._corpus_store()
+    first_created = store.get("corpus_corrections", "canonical-verifier-name")["_created"]
+
+    fpath.write_text(_frontmatter("canonical-verifier-name", "project", "New corrected text."))
+    seeded_again = sl.seed_corpus_corrections()
+    assert seeded_again == 1
+
+    updated = store.get("corpus_corrections", "canonical-verifier-name")
+    assert updated["content"] == "New corrected text."
+    assert updated["_created"] == first_created  # created_at preserved across an edit
+
+
+def test_seed_corpus_corrections_delete_retires_record(tmp_path, monkeypatch):
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    fpath = memory / "canonical-verifier-name.md"
+    fpath.write_text(_frontmatter("canonical-verifier-name", "project", "Some text."))
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
+    monkeypatch.setattr(sl, "memory_dirs", lambda: [memory])
+
+    sl.seed_corpus_corrections()
+    store = sl._corpus_store()
+    assert store.get("corpus_corrections", "canonical-verifier-name") is not None
+
+    fpath.unlink()
+    sl.seed_corpus_corrections()
+    # Soft-deleted (retired), not hard-deleted: get() returns None post-delete
+    # (deleted=0 filter), but the row still exists under the tombstone.
+    assert store.get("corpus_corrections", "canonical-verifier-name") is None
+
+
+def test_seed_corpus_corrections_malformed_frontmatter_reported_not_seeded(tmp_path, monkeypatch, caplog):
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    (memory / "broken-one.md").write_text(
+        "---\nname broken-one no-colon-here\n---\nSome body.\n"
+    )
+    monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
+    monkeypatch.setattr(sl, "memory_dirs", lambda: [memory])
+
+    with caplog.at_level("INFO", logger="willow_mcp.seed_loader"):
+        seeded = sl.seed_corpus_corrections()
+    assert seeded == 0
+    store = sl._corpus_store()
+    assert store.get("corpus_corrections", "broken-one") is None
+    assert any("broken-one.md" in rec.message for rec in caplog.records)
 
 
 def test_session_start_includes_boot_context(tmp_path, monkeypatch):

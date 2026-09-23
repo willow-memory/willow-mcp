@@ -8,6 +8,7 @@ See docs/design/agent-seed.md.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -160,20 +161,39 @@ def _project_repo_name() -> str:
     return Path.cwd().name.lower()
 
 
-def claude_memory_dir() -> Path | None:
-    """Resolve Claude Code project memory dir for the open repo (operator path)."""
+def memory_dirs() -> list[Path]:
+    """Every Claude Code project memory dir on this box, not just this repo's.
+
+    Bounded discovery: one listing of ``~/.claude/projects`` plus one
+    ``is_dir()`` check on each entry's ``memory/`` subdirectory — never a
+    recursive walk. ``memory/`` is the boundary Claude Code itself writes
+    inside for a project, so nothing outside it is read. Order is
+    deterministic (sorted by project dir name) so seeding is reproducible.
+    """
     projects = Path.home() / ".claude" / "projects"
     if not projects.is_dir():
-        return None
-    repo_name = _project_repo_name()
+        return []
+    dirs: list[Path] = []
     for entry in sorted(projects.iterdir()):
         if not entry.is_dir():
             continue
-        slug = entry.name.lower().lstrip("-")
+        memory = entry / "memory"
+        if memory.is_dir():
+            dirs.append(memory)
+    return dirs
+
+
+def claude_memory_dir() -> Path | None:
+    """Resolve Claude Code project memory dir for the open repo (operator path).
+
+    Kept as the single-project lookup some callers still want; seeding
+    itself now reads every project's memory dir via :func:`memory_dirs`.
+    """
+    repo_name = _project_repo_name()
+    for memory in memory_dirs():
+        slug = memory.parent.name.lower().lstrip("-")
         if repo_name.replace("-", "") in slug.replace("-", ""):
-            memory = entry / "memory"
-            if memory.is_dir():
-                return memory
+            return memory
     return None
 
 
@@ -181,42 +201,206 @@ def _corpus_store() -> Store:
     return Store(str(store_root()))
 
 
+# Frontmatter shape Claude Code memory files use: a leading `---` block of
+# flat `key: value` pairs plus one nested block (`metadata:`) with the same
+# shape, indented. Not a general YAML parser — PyYAML is a test-only
+# dependency here (pyproject.toml `[test]` extra), and this loader runs on
+# every SessionStart in every install, so it stays stdlib-only and handles
+# exactly the shape these files are written in. Anything it can't parse this
+# way is reported by name and skipped, never guessed at.
+_FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n(.*?)\n---[ \t]*\n(.*)", re.DOTALL)
+
+# Which frontmatter `metadata.type` values feed the operator-corrections
+# corpus (as opposed to preferences/confirmations, seeded elsewhere).
+# `feedback` is the direct case — an operator correcting a behavior pattern
+# in the moment, the exact shape the legacy `feedback_*.md` glob targeted.
+# `project` is included too: in this repo's memory files (canonical-verifier-
+# name.md, port-map-and-signing-origin.md) `project`-typed entries are also
+# operator-set facts that supersede a stale belief ("if it drifts back to
+# `sean`, every desk open is refused") — the same "don't repeat the mistake"
+# job as feedback, just about repo state rather than behavior. `user` is
+# left out: it's cross-project persona/preference material, not a correction
+# of something that was wrong — it belongs in the preferences lane this
+# function doesn't own. `reference` is left out: pure documentation, nothing
+# to act differently on. MEMORY.md itself is never a record — it's the
+# index, excluded by name below.
+_CORRECTION_MEMORY_TYPES = frozenset({"feedback", "project"})
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        inner = value[1:-1]
+        if value[0] == '"':
+            inner = inner.replace('\\"', '"').replace("\\\\", "\\")
+        return inner
+    return value
+
+
+def _parse_frontmatter_block(block: str) -> dict[str, Any] | None:
+    data: dict[str, Any] = {}
+    nested: dict[str, Any] | None = None
+    for raw_line in block.splitlines():
+        if not raw_line.strip():
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        line = raw_line.strip()
+        if ":" not in line:
+            return None
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            return None
+        if indent == 0:
+            if not value:
+                nested = {}
+                data[key] = nested
+            else:
+                nested = None
+                data[key] = _unquote(value)
+        else:
+            if nested is None:
+                return None
+            nested[key] = _unquote(value)
+    return data
+
+
+def _first_content_line(body: str, limit: int = 200) -> str:
+    for line in body.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and not line.startswith("@"):
+            return line[:limit]
+    return ""
+
+
+def _content_hash(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
+def _legacy_record(fpath: Path, body: str) -> tuple[str, dict[str, str]] | None:
+    """`feedback_*.md` with no (or unparseable) frontmatter — the original
+    behavior, kept so nothing that seeds today stops seeding."""
+    rule = _first_content_line(body)
+    if not rule:
+        return None
+    return fpath.stem, {"content": rule, "source": fpath.name, "memory_type": "feedback"}
+
+
+def _memory_record(fpath: Path) -> tuple[str | None, dict[str, str] | None, str | None]:
+    """Extract (record_id, record, skip_reason) for one memory file.
+
+    ``skip_reason`` is only set when the file looked like it should seed but
+    couldn't be read this way — reported by name, never seeded as garbage.
+    A file that parses fine but is out of scope (wrong type, empty) returns
+    ``(None, None, None)``: nothing to report, nothing to seed.
+    """
+    is_legacy_name = fpath.name.startswith("feedback_")
+    try:
+        text = fpath.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return None, None, f"unreadable: {e}"
+
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        if is_legacy_name:
+            body = text.split("---", 2)[-1].strip() if "---" in text else text.strip()
+            rec = _legacy_record(fpath, body)
+            return (rec[0], rec[1], None) if rec else (None, None, None)
+        return None, None, None
+
+    fm = _parse_frontmatter_block(m.group(1))
+    body = m.group(2)
+    if fm is None:
+        if is_legacy_name:
+            rec = _legacy_record(fpath, body)
+            return (rec[0], rec[1], None) if rec else (None, None, None)
+        return None, None, "frontmatter did not parse"
+
+    metadata = fm.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    mtype = str(metadata.get("type") or "").strip().lower()
+    if not mtype and is_legacy_name:
+        mtype = "feedback"
+    if mtype not in _CORRECTION_MEMORY_TYPES:
+        return None, None, None
+
+    record_id = str(fm.get("name") or "").strip() or fpath.stem
+    content = str(fm.get("description") or "").strip() or _first_content_line(body)
+    if not content:
+        return None, None, None
+    return record_id, {
+        "content": content[:400],
+        "source": fpath.name,
+        "memory_type": mtype,
+    }, None
+
+
 def seed_corpus_corrections() -> int:
-    """Idempotent feedback_*.md → corpus_corrections (operator memory dir)."""
-    memory_dir = claude_memory_dir()
-    if memory_dir is None:
-        return 0
+    """Operator memory (frontmatter `type: feedback|project`, plus legacy
+    `feedback_*.md`) → `corpus_corrections`, across every discovered memory
+    dir (:func:`memory_dirs`). Keyed by frontmatter `name` (path stem for
+    legacy files) and a content hash: unchanged content is skipped, changed
+    content updates the same record in place (`Store.put` upserts by
+    `record_id`), and a record this run no longer sees among this loader's
+    own rows is retired (soft-deleted — `Store.delete`, not a hard delete)
+    rather than left to serve stale content forever.
+    """
     store = _corpus_store()
     seeded = 0
-    for fpath in sorted(memory_dir.glob("feedback_*.md")):
-        try:
-            text = fpath.read_text(encoding="utf-8", errors="replace")
-            body = text.split("---", 2)[-1].strip() if "---" in text else text.strip()
-            rule = ""
-            for line in body.splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and not line.startswith("@"):
-                    rule = line[:200]
-                    break
-            if not rule:
+    seen_ids: set[str] = set()
+    skipped: list[str] = []
+
+    for memory_dir in memory_dirs():
+        for fpath in sorted(memory_dir.glob("*.md")):
+            if fpath.name == "MEMORY.md":
                 continue
-            record_id = fpath.stem
-            if store.get(_CORPUS_CORRECTIONS, record_id):
+            try:
+                record_id, payload, skip_reason = _memory_record(fpath)
+            except Exception:
+                logger.debug("seed_corpus_corrections: failed on %s", fpath, exc_info=True)
+                skipped.append(f"{fpath}: unexpected error")
                 continue
+            if skip_reason:
+                skipped.append(f"{fpath}: {skip_reason}")
+                continue
+            if not record_id or not payload:
+                continue
+            seen_ids.add(record_id)
+            content_hash = _content_hash(payload["content"])
+            existing = store.get(_CORPUS_CORRECTIONS, record_id)
+            if existing is not None and existing.get("content_hash") == content_hash:
+                continue
+            now = datetime.now(timezone.utc).isoformat()
             store.put(
                 _CORPUS_CORRECTIONS,
                 {
                     "id": record_id,
-                    "content": rule,
-                    "source": fpath.name,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "content": payload["content"],
+                    "content_hash": content_hash,
+                    "source": payload["source"],
+                    "memory_type": payload["memory_type"],
+                    "created_at": (existing or {}).get("created_at") or now,
+                    "updated_at": now,
                 },
                 record_id=record_id,
             )
             seeded += 1
-        except Exception:
-            logger.debug("seed store_put failed for %s", record_id, exc_info=True)
+
+    # Retire rows this loader owns (tagged with memory_type) that no file
+    # accounted for this run. Untagged rows predate this change or come from
+    # a different writer, if any, and are left alone.
+    for existing in store.all(_CORPUS_CORRECTIONS):
+        rid = existing.get("_id") or existing.get("id")
+        if not rid or rid in seen_ids or "memory_type" not in existing:
             continue
+        store.delete(_CORPUS_CORRECTIONS, rid)
+
+    if skipped:
+        logger.info(
+            "seed_corpus_corrections: %d file(s) reported unparsable: %s",
+            len(skipped), "; ".join(skipped),
+        )
     return seeded
 
 
