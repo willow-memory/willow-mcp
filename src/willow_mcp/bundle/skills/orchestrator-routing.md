@@ -50,7 +50,7 @@ Shell front-end: `bash scripts/willow-seat.sh` (repo `willow-memory`).
 | Use | Model / path | Gate |
 |-----|--------------|------|
 | Nestor draft (suggestions only) | `willow-lane4-3b:latest` or `llama3.2:3b` via `OLLAMA_HOST` loopback | `nestor_draft`; human seals |
-| Nest intake classify/embed | `nest_scan(use_embed=…, use_llm=…)` | Loopback Ollama; Kart `allow_localhost` |
+| Nest intake classify/embed | `nest_scan(use_embed=…, use_llm=…)` | Loopback Ollama; Kart `allow_localhost` is retired (2026-09-23) — use `allow_net` + `task_net` + a lease until the loopback-only tier ships |
 | Specialist monitor seats (Loki, Ada) | `model_hint: local-3b` in specialists.json | Dispatch to those seats for audit/monitor |
 | Voice ingress | whisper + Kokoro (`willow-mcp voice`) | Pure-script state machine; models injected |
 | Cloud fallback | `WILLOW_INFERENCE_PROVIDER=auto` + keys | `consent.cloud_llm` for off-box |

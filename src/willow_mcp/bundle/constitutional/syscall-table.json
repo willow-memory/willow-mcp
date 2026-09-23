@@ -155,7 +155,7 @@
       "enforcement": "hard",
       "enforced_by": "Kart daemon + bwrap \u2014 all agent shell is already mediated",
       "min_ring": "WORKER",
-      "note": "allow_net / allow_localhost / detached are profile dimensions. An unsandboxed shell is not a wider bound; it is ENOSYS."
+      "note": "allow_net / detached are profile dimensions. allow_localhost is retired (2026-09-23, amends sealed 9fe5e179) and refused by name, not a live dimension. An unsandboxed shell is not a wider bound; it is ENOSYS."
     },
     {
       "id": 7,

@@ -67,7 +67,13 @@ dependencies = [
     # like a permissions bug. Same class as B-33's floor, and the same reason it
     # is regression-tested rather than trusted to the pin
     # (tests/test_b65_work_root_sandbox.py).
-    "kartikeya>=0.0.12,<1.0.0",
+    #
+    # Floor raised to 0.3.2 for retire-allow-localhost-2026-09-23 (amends
+    # sealed 9fe5e179, Loki 506FD78E F1): 0.3.2 is the first published
+    # kartikeya release whose executor itself refuses `# allow_localhost`
+    # rather than mapping it to host networking, so an old kartikeya in some
+    # other venv can no longer undo this broker's refusal.
+    "kartikeya>=0.3.2,<1.0.0",
     # Jeles the Librarian — the ~60 named institutional and academic collections
     # behind `willow_institutional_search`. A hard dependency rather than an
     # extra because the tool is registered unconditionally: an optional import

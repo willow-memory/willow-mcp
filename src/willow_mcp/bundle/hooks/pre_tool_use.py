@@ -25,7 +25,8 @@ Ten guards:
 - task_submit calls that hand-embed a Kart network directive (`# allow_net`
   / `# allow_localhost`) in the task text — the server strips these (B-21),
   so it does nothing; the correct path is allow_net=True + the task_net
-  permission (warns).
+  permission (warns). `# allow_localhost` is retired outright (2026-09-23,
+  amends sealed 9fe5e179) — the server refuses it by name, embedded or not.
 - The IDE-native web tools, now that `willow_web_*` ships: WebSearch and
   WebFetch are blocked with a redirect, so a fetch goes through the seat that
   records it rather than around it (blocks). Wired by its own
@@ -780,7 +781,8 @@ def check_task_submit(tool_input: dict) -> Optional[str]:
         parts.append(
             "run a task with network egress, pass allow_net=True and grant the "
             "'task_net' permission in the app's manifest (not part of task_queue or "
-            "full_access). '# allow_localhost' cannot be self-granted at all"
+            "full_access). '# allow_localhost' is retired (2026-09-23, amends sealed "
+            "9fe5e179) and refused by name whether passed as the parameter or embedded"
         )
     if db_bits:
         parts.append(

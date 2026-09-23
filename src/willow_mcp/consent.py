@@ -77,9 +77,13 @@ CONSENT_KEYS = ("internet", "cloud_llm", "federation")
 #: attributable per-task authorization as allow_net".
 #:
 #: So there is no "LAN but not internet" capability here to gate. `allow_net`
-#: and `allow_localhost` are correctly gated on `consent.internet` today, and a
-#: third key would have implied a confinement the sandbox never provided —
-#: which is the defect this key already was, not its cure.
+#: is correctly gated on `consent.internet`. `allow_localhost` is RETIRED
+#: (2026-09-23, governance record retire-allow-localhost-2026-09-23, amends
+#: this same sealed decision) — `task_submit` refuses it by name before the
+#: consent check ever runs, so it is no longer gated on `consent.internet`
+#: at all; it is gated on nothing because it does not run. A third key would
+#: have implied a confinement the sandbox never provided — which is the
+#: defect this key already was, not its cure.
 #:
 #: Migration is a no-op by construction: `_strict_bools` projects only
 #: CONSENT_KEYS, so a settings file still carrying `lan` is ignored rather than

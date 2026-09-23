@@ -115,8 +115,15 @@ standing keys plus a one-use signed task envelope** (B-19, B-29, B-32, B-37):
   such caller-supplied line unconditionally** before storing the task (B-21 /
   L-NET-01). Embedding one does nothing except signal a misunderstanding of the
   gate. `# allow_net` can only enter the stored task through the
-  permission-checked `allow_net=True` path; `# allow_localhost` cannot be
-  self-granted at all. The PreToolUse hook warns if you try.
+  permission-checked `allow_net=True` path. The PreToolUse hook warns if you try.
+- **`allow_localhost` is retired (2026-09-23, governance record
+  `retire-allow-localhost-2026-09-23`, amends sealed 9fe5e179).** It used to
+  share the host network namespace unfiltered — full internet reach, no
+  lease, no envelope — on the false premise that loopback is not egress.
+  `task_submit(allow_localhost=True)` and a bare `# allow_localhost` line in
+  task text are now both refused by name, with no replacement yet. A real
+  loopback-only tier (network-off sandbox + allowlisted forwarders, a new
+  `task_localhost` capability) is designed but not built.
 
 So: **network = `allow_net=True` + `task_net` + `consent.internet` + a live
 lease + an operator-signed `network_authorization` envelope.** Never a directive
