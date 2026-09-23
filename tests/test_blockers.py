@@ -213,6 +213,38 @@ def test_an_active_lease_does_not_block(monkeypatch):
     assert blockers._check_lease("kart") is None
 
 
+def test_expired_lease_does_not_block_a_seat_with_no_net_egress(home, monkeypatch):
+    """Auditor seats (e.g. loki) must not refuse ratatosk wake on lease alone."""
+    import willow_mcp.lease as lease
+
+    apps = home / "mcp_apps" / "loki"
+    apps.mkdir(parents=True)
+    (apps / "manifest.json").write_text(json.dumps({
+        "permissions": ["dispatch_read", "task_queue", "grove_read"],
+    }))
+    monkeypatch.setattr(lease, "read_lease", lambda a: {
+        "status": "expired", "expires_at": "2020-01-01T00:00:00+00:00",
+    })
+    assert blockers._check_lease("loki") is None
+
+
+def test_expired_lease_still_blocks_when_manifest_carries_task_net(home, monkeypatch):
+    import willow_mcp.lease as lease
+
+    apps = home / "mcp_apps" / "netkart"
+    apps.mkdir(parents=True)
+    (apps / "manifest.json").write_text(json.dumps({
+        "permissions": ["full_access", "task_net"],
+    }))
+    monkeypatch.setattr(lease, "read_lease", lambda a: {
+        "status": "expired", "expires_at": "2020-01-01T00:00:00+00:00",
+    })
+    found = blockers._check_lease("netkart")
+    assert found is not None
+    assert found["id"] == "no_egress_lease"
+    assert "corpus_host_card" in found["effect"]
+
+
 def test_an_unreadable_lease_blocks_with_a_chmod_fix_not_a_regrant(monkeypatch):
     """Gap d90246688413: the fix for a lease this process cannot read is a
     mode change. Telling the operator to re-issue reproduces the same file."""

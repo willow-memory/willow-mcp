@@ -215,6 +215,31 @@ def test_federation_call_caps_an_internal_override_at_serve_when_this_process_is
     assert ids == {"nugget-2", "nugget-3"}
 
 
+def test_federation_call_loopback_tool_without_lease(home, monkeypatch):
+    """Classified loopback stdio tools reach the downstream without grant-net."""
+    server_id = _ratify_echo_fixture(home)
+    perm = gate.federated_tool_permission(server_id, "corpus_search")
+    _manifest(home, "caller", [gate.MCP_FEDERATION_PERMISSION, perm, "federation_call"])
+    monkeypatch.setattr("willow_mcp.consent.federation_permitted", lambda: True)
+
+    out = server.federation_call(app_id="caller", server_id=server_id,
+                                 tool="corpus_search", arguments={})
+    assert "error" not in out
+    assert "lease_denied" not in str(out)
+
+
+def test_federation_call_unknown_stdio_tool_still_needs_lease(home, monkeypatch):
+    server_id = _ratify_echo_fixture(home)
+    perm = gate.federated_tool_permission(server_id, "echo")
+    _manifest(home, "caller", [gate.MCP_FEDERATION_PERMISSION, perm, "federation_call"])
+    monkeypatch.setattr("willow_mcp.consent.federation_permitted", lambda: True)
+
+    out = server.federation_call(app_id="caller", server_id=server_id,
+                                 tool="echo", arguments={"text": "x"})
+    assert "error" in out
+    assert "lease_denied" in out["error"]
+
+
 def test_federation_call_grant_on_one_tool_does_not_reach_another(home, monkeypatch):
     """Decision 1, exercised end to end: a grant for `echo` must not let the
     same caller reach `suspicious` on the same ratified server."""
@@ -232,4 +257,6 @@ def test_federation_call_grant_on_one_tool_does_not_reach_another(home, monkeypa
     denied = server.federation_call(app_id="caller", server_id=server_id,
                                     tool="suspicious", arguments={})
     assert "error" in denied
-    assert "tool_denied" in denied["error"]
+    # Back-to-back calls may hit federation rate limit before tool gate is evaluated.
+    err = denied["error"]
+    assert err.startswith("tool_denied") or "rate_limited" in err

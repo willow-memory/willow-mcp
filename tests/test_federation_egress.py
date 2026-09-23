@@ -73,6 +73,7 @@ def test_denied_without_consent_federation(home, monkeypatch):
 
 
 def test_denied_without_lease(home, monkeypatch):
+    """Unknown stdio tools stay lease-gated (fail closed)."""
     _ratify()
     _manifest(home, "caller", [
         gate.MCP_FEDERATION_PERMISSION,
@@ -80,6 +81,48 @@ def test_denied_without_lease(home, monkeypatch):
     ])
     monkeypatch.setattr("willow_mcp.consent.federation_permitted", lambda: True)
     denial = federation_egress.egress_denial("caller", SERVER_ID, "echo")
+    assert denial is not None
+    assert "lease_denied" in denial["error"]
+
+
+def test_loopback_stdio_tool_granted_without_lease(home, monkeypatch):
+    _ratify()
+    _manifest(home, "caller", [
+        gate.MCP_FEDERATION_PERMISSION,
+        gate.federated_tool_permission(SERVER_ID, "corpus_host_card"),
+    ])
+    monkeypatch.setattr("willow_mcp.consent.federation_permitted", lambda: True)
+    assert federation_egress.egress_denial(
+        "caller", SERVER_ID, "corpus_host_card") is None
+
+
+def test_net_bearing_stdio_tool_denied_without_lease(home, monkeypatch):
+    _ratify()
+    _manifest(home, "caller", [
+        gate.MCP_FEDERATION_PERMISSION,
+        gate.federated_tool_permission(SERVER_ID, "corpus_web_search"),
+    ])
+    monkeypatch.setattr("willow_mcp.consent.federation_permitted", lambda: True)
+    denial = federation_egress.egress_denial(
+        "caller", SERVER_ID, "corpus_web_search")
+    assert denial is not None
+    assert "lease_denied" in denial["error"]
+    assert "leaves the box" in denial["error"]
+
+
+def test_http_downstream_denied_without_lease(home, monkeypatch):
+    spec = mf.McpServerSpec(
+        id="remote-srv", name="remote", command="",
+        transport="streamable-http", url="https://example.com/mcp",
+    )
+    mf.ratify(spec, ratified_by="operator", reason="test")
+    remote_id = spec.id
+    _manifest(home, "caller", [
+        gate.MCP_FEDERATION_PERMISSION,
+        gate.federated_tool_permission(remote_id, "echo"),
+    ])
+    monkeypatch.setattr("willow_mcp.consent.federation_permitted", lambda: True)
+    denial = federation_egress.egress_denial("caller", remote_id, "echo")
     assert denial is not None
     assert "lease_denied" in denial["error"]
 
@@ -95,6 +138,20 @@ def test_granted_when_every_key_holds(home, monkeypatch):
     monkeypatch.setattr("willow_mcp.consent.federation_permitted", lambda: True)
     lease.grant("caller", 1800, issuer="operator", reason="test")
     assert federation_egress.egress_denial("caller", SERVER_ID, "echo") is None
+
+
+def test_loopback_stdio_granted_without_lease_even_when_net_tool_also_granted(
+    home, monkeypatch,
+):
+    _ratify()
+    _manifest(home, "caller", [
+        gate.MCP_FEDERATION_PERMISSION,
+        gate.federated_tool_permission(SERVER_ID, "corpus_search"),
+        gate.federated_tool_permission(SERVER_ID, "corpus_web_search"),
+    ])
+    monkeypatch.setattr("willow_mcp.consent.federation_permitted", lambda: True)
+    assert federation_egress.egress_denial(
+        "caller", SERVER_ID, "corpus_search") is None
 
 
 def test_granting_one_tool_does_not_grant_another_on_the_same_server(home, monkeypatch):

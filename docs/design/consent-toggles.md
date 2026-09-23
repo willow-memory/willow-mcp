@@ -342,6 +342,12 @@ implemented three times, inconsistently, with no key behind it.
 > below stays as the design record for that future tier; it does not describe
 > current behavior — `# allow_localhost` reaches nothing now, gated or not.
 
+**Federation (2026-09-23).** The same “loopback is not egress” mistake applied to
+jeles-corpus: every `federation_call` required grant-net even for SOIL-local
+stdio tools. `federation_tool_egress` now skips the lease for classified loopback
+tools; net-bearing corpus tools and HTTP downstream still use the standing lease.
+See `federated-mcp-gating.md` Decision 3 addendum.
+
 ### Recommendation: **ENFORCE**
 
 `lan` names a real destination class that three live code paths reach and that

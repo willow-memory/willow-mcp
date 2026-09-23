@@ -62,19 +62,33 @@ def egress_denial(app_id: str, server_id: str, tool: str) -> Optional[dict]:
             "for this tool, but egress is switched off (or the consent "
             "policy could not be read, which denies).")}
 
-    lease_state = lease.read_lease(app_id)
-    if lease_state["status"] != "active":
-        from . import gate_request
+    from . import federation_tool_egress
 
-        return {"error": (
-            f"lease_denied: federated MCP calls require an unexpired egress "
-            f"lease for '{app_id}' (status: {lease_state['status']}"
-            + (f" — {lease_state['error']}" if lease_state.get("error") else "")
-            + "). Leases are issued only by the operator via `willow-mcp "
-            f"grant-net {app_id or '<app_id>'} --ttl 30m --reason ...` and "
-            "they expire. No MCP tool can mint one."
-            + gate_request.note_for_lease_denial(
-                app_id, reason="federated MCP calls were refused for want of a lease"))}
+    if federation_tool_egress.federated_call_requires_net_lease(server_id, tool):
+        lease_state = lease.read_lease(app_id)
+        if lease_state["status"] != "active":
+            from . import gate_request
+
+            scope = (
+                f"this federated tool ({tool!r}) leaves the box or uses a "
+                "remote HTTP downstream"
+            )
+            return {"error": (
+                f"lease_denied: {scope} and requires an unexpired egress "
+                f"lease for '{app_id}' (status: {lease_state['status']}"
+                + (f" — {lease_state['error']}" if lease_state.get("error") else "")
+                + "). Loopback stdio corpus tools (e.g. corpus_search, "
+                "corpus_ask, corpus_host_card) do not need a lease. Leases "
+                "are issued only by the operator via `willow-mcp "
+                f"grant-net {app_id or '<app_id>'} --ttl 30m --reason ...` "
+                "and they expire. No MCP tool can mint one."
+                + gate_request.note_for_lease_denial(
+                    app_id,
+                    reason=(
+                        f"federated tool {tool!r} was refused for want of a "
+                        "net egress lease"
+                    ),
+                ))}
 
     if lease.strict_trust_root():
         forgeable = lease.self_writable_trust_paths(app_id)
