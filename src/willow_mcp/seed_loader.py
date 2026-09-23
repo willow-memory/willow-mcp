@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -161,6 +162,16 @@ def _project_repo_name() -> str:
     return Path.cwd().name.lower()
 
 
+def _projects_root() -> Path:
+    """Where Claude Code keeps its per-project state — ``~/.claude/projects``.
+
+    Factored out (rather than inlined in both :func:`memory_dirs` and
+    :func:`resolve_own_project`) so a test can monkeypatch discovery and
+    own-project resolution against one fake tree instead of two.
+    """
+    return Path.home() / ".claude" / "projects"
+
+
 def memory_dirs() -> list[Path]:
     """Every Claude Code project memory dir on this box, not just this repo's.
 
@@ -176,7 +187,7 @@ def memory_dirs() -> list[Path]:
     Loki 022800C8): a seat opened with a HOME that doesn't have this tree
     yet must never be read as "every memory everywhere was deleted".
     """
-    projects = Path.home() / ".claude" / "projects"
+    projects = _projects_root()
     if not projects.is_dir():
         return []
     dirs: list[Path] = []
@@ -189,18 +200,82 @@ def memory_dirs() -> list[Path]:
     return dirs
 
 
-def claude_memory_dir() -> Path | None:
-    """Resolve Claude Code project memory dir for the open repo (operator path).
+def resolve_own_project(project_root: str | None = None) -> dict[str, Any]:
+    """Resolve THIS seat's own Claude Code memory dir EXACTLY from its
+    resolved project root — never by fuzzy substring (G3, Loki 5C276CEA:
+    the old substring match sent a willow-mcp seat to a stale
+    ``-github-willow-mcp`` dir and a seat in ``willow-memory/willow`` to a
+    completely different repo's (``willow``) notes, while ``seat/heimdallr``
+    and any worktree matched nothing and printed no boot line at all —
+    silent, not empty).
 
-    Kept as the single-project lookup some callers still want; seeding
-    itself now reads every project's memory dir via :func:`memory_dirs`.
+    ``project_root`` is the seat's resolved project root — ``session_enter``
+    already computes this (``enter_result["project"]["root"]``); callers
+    thread it through rather than re-deriving it. Falls back to
+    ``WILLOW_PROJECT_ROOT`` then ``Path.cwd()`` only when the caller has
+    nothing better (a bare script, a test).
+
+    A worktree (``<repo>/worktrees/<name>`` — this fleet's own convention;
+    every dispatch brief says ``git worktree add worktrees/<name>``) is
+    normalized to its repo path first: the operator's memory of a repo is
+    not per-worktree.
+
+    Matching is EXACT, then walks up one path segment at a time when the
+    exact path has no memory dir of its own (Loki's own narrative:
+    "falling back to the nearest ancestor") — e.g. ``seat/heimdallr`` has
+    never been opened as its own Claude Code project, so it falls back to
+    its parent, the willows-grove repo root, which has. Claude Code names
+    a project directory by taking the absolute path and replacing every
+    ``/`` with ``-``; this reproduces that encoding FORWARD only (never
+    inverts a slug back to a path, which would be ambiguous for a path
+    segment that itself contains a dash).
+
+    Returns ``{"project_dir": str|None, "repo_name": str, "state":
+    "populated"|"empty"|"unreachable"}``. ``"unreachable"``:
+    ``~/.claude/projects`` itself isn't there. ``"empty"``: the tree
+    exists but no directory — at the resolved path or any ancestor —
+    encodes this seat's project. ``"populated"``: ``project_dir`` names
+    the exact match.
     """
-    repo_name = _project_repo_name()
-    for memory in memory_dirs():
-        slug = memory.parent.name.lower().lstrip("-")
-        if repo_name.replace("-", "") in slug.replace("-", ""):
-            return memory
-    return None
+    projects = _projects_root()
+    if not projects.is_dir():
+        return {"project_dir": None, "repo_name": "", "state": "unreachable"}
+
+    root = (project_root or os.environ.get("WILLOW_PROJECT_ROOT", "") or str(Path.cwd())).strip()
+    if not root:
+        return {"project_dir": None, "repo_name": "", "state": "empty"}
+    try:
+        candidate = Path(root).resolve()
+    except OSError:
+        return {"project_dir": None, "repo_name": "", "state": "empty"}
+
+    parts = candidate.parts
+    if "worktrees" in parts:
+        candidate = Path(*parts[: parts.index("worktrees")])
+
+    repo_name = candidate.name
+    hops = 0
+    while True:
+        hops += 1
+        if hops > 64:  # bounded — no real filesystem path is this deep
+            break
+        encoded = str(candidate).replace(os.sep, "-")
+        memory = projects / encoded / "memory"
+        if memory.is_dir():
+            return {"project_dir": encoded, "repo_name": candidate.name, "state": "populated"}
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    return {"project_dir": None, "repo_name": repo_name, "state": "empty"}
+
+
+def claude_memory_dir() -> Path | None:
+    """Back-compat single-path resolution, built on :func:`resolve_own_project`."""
+    resolved = resolve_own_project()
+    if resolved["state"] != "populated" or not resolved["project_dir"]:
+        return None
+    return _projects_root() / resolved["project_dir"] / "memory"
 
 
 def _corpus_store() -> Store:
@@ -326,6 +401,19 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
 
+def _fs_modified(fpath: Path) -> str:
+    """The file system's own mtime, ISO-8601 UTC. G4 (Loki 5C276CEA): a
+    memory file's own frontmatter `modified` claim is author-controlled
+    (including by an agent), so letting it drive fleet-wide ranking let a
+    fabricated future date jump a note to the top of every seat's boot.
+    The file system's mtime is not something a memory file's own text can
+    assert its way past."""
+    try:
+        return datetime.fromtimestamp(fpath.stat().st_mtime, tz=timezone.utc).isoformat()
+    except OSError:
+        return ""
+
+
 def _legacy_record(fpath: Path, project_dir: str, body: str) -> tuple[str, dict[str, Any]] | None:
     """`feedback_*.md` with no (or unparseable) frontmatter — the original
     behavior, kept so nothing that seeds today stops seeding. Still keyed
@@ -347,6 +435,7 @@ def _legacy_record(fpath: Path, project_dir: str, body: str) -> tuple[str, dict[
         "scope": "own",
         "session_id": "",
         "modified": "",
+        "fs_modified": _fs_modified(fpath),
     }
 
 
@@ -411,6 +500,7 @@ def _memory_record(fpath: Path, project_dir: str) -> tuple[str | None, dict[str,
         "scope": _FLEET_SCOPE_VALUE if scope_raw == _FLEET_SCOPE_VALUE else "own",
         "session_id": str(metadata.get("originSessionId") or "").strip(),
         "modified": str(metadata.get("modified") or "").strip(),
+        "fs_modified": _fs_modified(fpath),
     }, None
 
 
@@ -537,78 +627,190 @@ def seed_corpus_corrections() -> int:
     return seeded
 
 
-def load_sealed_corrections(store: Store | None = None) -> dict[str, Any]:
-    """Sealed governance decisions eligible as boot 'operator' corrections.
+# ── sealed operator corrections: a signature, not a status string ──────────
+#
+# G1/G2 (Loki 5C276CEA): the first build of the "operator" lane trusted a
+# `projects_willow_governance_decisions` row whose `status` field said
+# `"sealed"` and whose `boot_correction` field was truthy — both plain JSON
+# values any uid-1000 process, any Kart task (the store root is writable
+# there), or the willow seat's own `store_put` (full_access) can set. Loki
+# forged exactly that row in a throwaway store and it rendered at boot as
+# an "operator" correction. That is F6 again, moved from a memory file to
+# a database row.
+#
+# The fix reads Nestor's OWN database directly (never the SOIL mirror
+# `seal_handler.on_seal` writes, which stays a convenience copy, not a
+# trust boundary) and verifies the seal's ed25519 signature against the
+# fleet's verifier keyring with `net_signer.verify_seal` — the SAME
+# verifier `reloader.find_sealing_decision` and
+# `manifest_grant_executor`/`manifest_grant_request` already trust for a
+# seal; nothing here is a new trust primitive. A row with a forged or
+# missing `seal_sig` fails `Ed25519PublicKey.verify` and is refused — there
+# is no private key reachable to a uid-1000 process that could fake that.
+#
+# The `boot-correction: <scope>` marker (G2) lives as the FIRST LINE OF THE
+# SEALED TEXT ITSELF (the Nestor pair's `target_text` — what
+# `decision_bridge.propose(..., boot_correction=<scope>)` writes into the
+# conclusion BEFORE the operator ever seals it), never a side field. A
+# signature verifies the exact bytes it was made over; a marker anywhere
+# else could be added or removed AFTER the seal by the same uid-1000 write
+# path that forged the SOIL row, and the signature would still show green.
+# Putting the marker inside the signed bytes makes the tag exactly as
+# unforgeable as the seal.
+
+_BOOT_CORRECTION_RE = re.compile(r"\Aboot-correction:[ \t]*(\S+)[ \t]*\r?\n(.*)\Z", re.DOTALL)
+
+
+def _boot_correction_marker(text: str) -> tuple[str, str] | None:
+    """Parse the grammar a sealed pair's text must carry to be read as an
+    operator boot correction: a first line ``boot-correction: <scope>``,
+    then the correction text. Returns ``(scope, content)`` or ``None``."""
+    m = _BOOT_CORRECTION_RE.match(text or "")
+    if not m:
+        return None
+    scope, rest = m.group(1).strip(), m.group(2).strip()
+    if not rest:
+        return None
+    return scope, rest
+
+
+def _ring_from_keyring(kr) -> dict[str, dict]:
+    """The `net_signer.verify_seal` ring shape, built from the process's
+    own keyring — the same shape `manifest_grant_executor._ring_from_keyring`
+    and `reloader._ring_from_keyring` build, duplicated here rather than
+    imported (this codebase's established pattern for this exact helper:
+    a few lines, no cross-packet dependency)."""
+    return {
+        e.name: {"key": e.key, "kind": e.kind, "revoked_at": e.revoked_at, "compromised": e.compromised}
+        for e in kr.entries()
+    }
+
+
+def load_sealed_corrections(*, db_path: Path | None = None,
+                             ring: dict[str, dict] | None = None) -> dict[str, Any]:
+    """Sealed governance decisions eligible as boot 'operator' corrections
+    — Nestor-sealed, cryptographically verified, never a trusted string.
 
     Operator ruling `boot-corrections-trust-and-scope-2026-09-23`, ruling
-    1: "sealed = operator; memory = unverified". Reads
-    `seal_handler.GOVERNANCE_COLLECTION` in SOIL — the collection a seal
-    already upgrades to `status="sealed"` via `seal_handler.on_seal` — not
-    the Nestor MCP, which is down (Ada's 2026-09-23 survey, 5FC763D7).
+    1: "sealed = operator; memory = unverified". See the module-level
+    comment above this function for the G1/G2 rework this implements.
 
-    A governance record only counts as a boot correction when it opts in
-    with `boot_correction: true` on the record itself. Nothing yet sets
-    that key — this lane is genuinely empty today, on real data, and that
-    is the ruling working as designed, not a bug: "if no sealed
-    corrections exist yet, the operator lane is empty, shown as empty
-    (three states), never backfilled from memory." The moment a governance
-    record is proposed, sealed, and tagged `boot_correction: true`
-    (`decision_bridge.propose` + a human seal in Nestor), it appears here
-    with no further wiring.
+    A row whose signature does not verify, or whose verifier is not on
+    the ring, is never shown and never silently dropped either — it is
+    counted (`unverifiable`) and logged best-effort, so a real sealed
+    decision with a rotated-out verifier is visible to whoever reads the
+    logs without ever reaching a seat's boot labelled "operator". A row
+    that doesn't even carry the marker is not a candidate at all — no
+    keyring lookup is spent on the (likely many) sealed pairs that are
+    ordinary governance decisions, not boot corrections.
 
-    Returns `{"items": [...], "total": N, "state": "populated"|"empty"|"unreachable"}`.
-    `state` is never inferred from an empty list alone — a store read
-    failure is `"unreachable"`, a clean empty scan is `"empty"`; the two
-    must never be presented the same way at boot (three states).
+    `ring` is an injection seam for tests (the same shape
+    :func:`_ring_from_keyring` builds) — production always resolves it
+    from the process's own keyring when omitted.
+
+    Returns `{"items": [...], "total": N, "state":
+    "populated"|"empty"|"unreachable", "unverifiable": [...]}`. State is
+    never inferred from an empty item list alone: a database or keyring
+    read failure is `"unreachable"`; a clean scan that finds zero
+    verified, marked, sealed pairs is `"empty"`.
     """
-    st = store if store is not None else _corpus_store()
+    from . import seal_handler as _seal_handler
+
+    path = db_path if db_path is not None else _seal_handler._nestor_db_path()
+
     try:
-        from .seal_handler import GOVERNANCE_COLLECTION
-        rows = st.all(GOVERNANCE_COLLECTION)
-    except Exception:
-        logger.debug("load_sealed_corrections: governance read failed", exc_info=True)
-        return {"items": [], "total": 0, "state": "unreachable"}
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return {"items": [], "total": 0, "state": "unreachable",
+                "cause": f"{type(exc).__name__}: {exc}", "unverifiable": []}
+    try:
+        rows = conn.execute(
+            "SELECT id, source_norm, target_text, verifier, seal_sig, created_at "
+            "FROM tm_pairs WHERE source_lang = 'decision' AND status = 'sealed' "
+            "AND seal_sig != '' AND superseded_by = '' ORDER BY created_at DESC"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        return {"items": [], "total": 0, "state": "unreachable",
+                "cause": f"{type(exc).__name__}: {exc}", "unverifiable": []}
+    finally:
+        conn.close()
+
+    candidates = [r for r in rows if _boot_correction_marker(r[2]) is not None]
+    if not candidates:
+        return {"items": [], "total": 0, "state": "empty", "unverifiable": []}
+
+    from . import net_signer
+
+    if ring is None:
+        from . import keyring as _keyring
+
+        try:
+            ring_kr = _keyring.get_keyring()
+        except _keyring.KeyringError as exc:
+            return {"items": [], "total": 0, "state": "unreachable",
+                    "cause": f"keyring unusable: {exc}", "unverifiable": []}
+        if ring_kr is None:
+            return {"items": [], "total": 0, "state": "unreachable",
+                    "cause": "no keyring configured — a seal cannot be verified "
+                             "without a ring to verify it against",
+                    "unverifiable": []}
+        ring = _ring_from_keyring(ring_kr)
 
     items: list[dict[str, str]] = []
-    for rec in rows:
-        if not isinstance(rec, dict):
+    unverifiable: list[str] = []
+    for pair_id, source_norm, target_text, verifier, seal_sig, created_at in candidates:
+        sealed = {"source_norm": source_norm, "target_text": target_text,
+                  "verifier": verifier, "seal_sig": seal_sig, "created_at": created_at}
+        ok, reason, _field = net_signer.verify_seal(sealed, ring, max_age_s=None)
+        if not ok:
+            unverifiable.append(f"{pair_id} ({verifier!r}): {reason}")
             continue
-        if rec.get("status") != "sealed" or not rec.get("boot_correction"):
-            continue
-        text = str(rec.get("ruling") or rec.get("title") or "").strip()
-        if not text:
-            continue
+        marker = _boot_correction_marker(target_text)
+        if marker is None:
+            continue  # can't happen (filtered into candidates above) — defensive
+        scope, content = marker
         items.append({
-            "content": text,
-            "sealed_at": str(rec.get("sealed_at") or ""),
-            "verifier": str(rec.get("nestor_verifier") or ""),
+            "content": content,
+            "scope": scope,
+            "verifier": verifier,
+            "sealed_at": str(created_at or ""),
+            "pair_id": pair_id,
         })
+
+    if unverifiable:
+        logger.info(
+            "load_sealed_corrections: %d marked pair(s) failed verification: %s",
+            len(unverifiable), "; ".join(unverifiable),
+        )
     items.sort(key=lambda r: r["sealed_at"], reverse=True)
-    return {"items": items, "total": len(items), "state": "populated" if items else "empty"}
+    return {"items": items, "total": len(items),
+            "state": "populated" if items else "empty",
+            "unverifiable": unverifiable}
 
 
-def load_corpus_lanes(own_project_dir: str | None = None) -> dict[str, Any]:
+def load_corpus_lanes(project_root: str | None = None) -> dict[str, Any]:
     """Read operator corpus lanes for SessionStart injection.
 
     Two distinctly-trusted correction lanes
     (`boot-corrections-trust-and-scope-2026-09-23`):
 
-      - `sealed_corrections` / `sealed_lane_state`: Nestor-sealed
-        governance decisions — the only thing labelled "operator". See
-        :func:`load_sealed_corrections`.
+      - `sealed_corrections` / `sealed_lane_state`: Nestor-sealed,
+        signature-verified governance decisions — the only thing labelled
+        "operator". See :func:`load_sealed_corrections`. Scoped the same
+        way memory notes are: a sealed pair's `boot-correction: fleet`
+        marker reaches every seat, anything else is scoped to the
+        matching repo name.
       - `memory_notes` / `memory_note_total`: `feedback`-type memory
         files, always labelled unverified, scoped to the seat's own
-        project plus anything explicitly marked `scope: fleet`. Ranked
-        own-project first, then most-recently-edited (frontmatter
-        `metadata.modified`, falling back to this loader's own
-        `updated_at`) — an edit moves a note up, per ruling 3.
+        project (:func:`resolve_own_project`, EXACT match — G3) plus
+        anything explicitly marked `scope: fleet`. Ranked own-project
+        first, then by file-system mtime (`fs_modified` — G4, never the
+        note's own self-reported `modified` claim) within each group.
 
-    `own_project_dir` is the caller's own Claude project memory dir's
-    PARENT name (the same string `seed_corpus_corrections` stores as
-    `project_dir`) — defaults to `claude_memory_dir()`'s resolution for
-    the process's own `WILLOW_PROJECT_ROOT`/cwd when omitted, exactly how
-    a real boot call resolves it ("It is already resolved at
-    session_enter" — ruling 2).
+    `project_root` is the seat's resolved project root
+    (`enter_result["project"]["root"]` from `session_enter`) — defaults to
+    `WILLOW_PROJECT_ROOT`/`Path.cwd()` via `resolve_own_project` when
+    omitted (a bare script, a test).
     """
     from .session_inject import (
         CONFIRMATION_EXCERPT_CHARS,
@@ -623,15 +825,19 @@ def load_corpus_lanes(own_project_dir: str | None = None) -> dict[str, Any]:
 
     store = _corpus_store()
 
-    sealed = load_sealed_corrections(store)
+    own = resolve_own_project(project_root)
+    repo_name = own["repo_name"]
+    own_project_dir = own["project_dir"] if own["state"] == "populated" else None
+
+    sealed = load_sealed_corrections()
+    sealed_in_scope = [
+        it for it in sealed["items"]
+        if it["scope"] == _FLEET_SCOPE_VALUE or (repo_name and it["scope"] == repo_name)
+    ]
     sealed_shown = [
         excerpt_corpus(item["content"], CORRECTION_EXCERPT_CHARS)
-        for item in sealed["items"][:MAX_SEALED_CORRECTIONS]
+        for item in sealed_in_scope[:MAX_SEALED_CORRECTIONS]
     ]
-
-    if own_project_dir is None:
-        own_dir = claude_memory_dir()
-        own_project_dir = own_dir.parent.name if own_dir else None
 
     def _is_own(r: dict[str, Any]) -> bool:
         return bool(own_project_dir) and r.get("project_dir") == own_project_dir
@@ -639,11 +845,11 @@ def load_corpus_lanes(own_project_dir: str | None = None) -> dict[str, Any]:
     all_notes = [r for r in store.all(_CORPUS_CORRECTIONS) if r.get("status") == "active"]
     in_scope = [r for r in all_notes if r.get("scope") == _FLEET_SCOPE_VALUE or _is_own(r)]
 
-    # Stable two-pass sort: most-recently-edited first WITHIN a relevance
-    # group, own-project group ahead of fleet-wide-from-elsewhere. Sorting
-    # by the secondary key first and the primary key last relies on sort
-    # stability to compose them correctly.
-    in_scope.sort(key=lambda r: r.get("modified") or r.get("updated_at") or "", reverse=True)
+    # Stable two-pass sort: most-recently-edited (by FILE SYSTEM mtime —
+    # G4) first WITHIN a relevance group, own-project group ahead of
+    # fleet-wide-from-elsewhere. Sorting by the secondary key first and
+    # the primary key last relies on sort stability to compose correctly.
+    in_scope.sort(key=lambda r: r.get("fs_modified") or r.get("updated_at") or "", reverse=True)
     in_scope.sort(key=lambda r: 0 if _is_own(r) else 1)
 
     memory_shown = []
@@ -664,10 +870,12 @@ def load_corpus_lanes(own_project_dir: str | None = None) -> dict[str, Any]:
 
     return {
         "sealed_corrections": sealed_shown,
-        "sealed_correction_total": sealed["total"],
+        "sealed_correction_total": len(sealed_in_scope),
         "sealed_lane_state": sealed["state"],
         "memory_notes": memory_shown,
         "memory_note_total": len(in_scope),
+        "memory_own_project_state": own["state"],
+        "memory_own_repo_name": repo_name,
         "preferences": [
             excerpt_corpus(r.get("content", ""), PREFERENCE_EXCERPT_CHARS)
             for r in prefs[:MAX_PREFERENCES]

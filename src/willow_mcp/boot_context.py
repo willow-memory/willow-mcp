@@ -186,7 +186,12 @@ def build_boot_lines(
         if path:
             lines.append(f"handoff: {path}")
 
-    corpus = load_corpus_lanes()
+    # G3 (Loki 5C276CEA): thread session_enter's own resolved project root
+    # through rather than re-deriving it — the old substring match here
+    # sent a willow-mcp seat to a stale dir and a seat/heimdallr or
+    # worktree seat to nothing at all, silently.
+    project_root = (enter_result.get("project") or {}).get("root") or None
+    corpus = load_corpus_lanes(project_root)
 
     # Sealed lane ("operator") — three states, never collapsed (ruling
     # boot-corrections-trust-and-scope-2026-09-23, #1). An empty scan and
@@ -226,6 +231,21 @@ def build_boot_lines(
         lines.append(head)
         for c in shown:
             lines.append(f"  · {c}")
+    else:
+        # G3: this must never be silent. Either the seat has an own
+        # project resolved and simply nothing is in scope yet, or
+        # resolution itself came back empty/unreachable — a seat at
+        # seat/heimdallr or in a worktree with no matching ancestor used
+        # to print NOTHING here, indistinguishable from "checked, found
+        # none".
+        own_state = corpus.get("memory_own_project_state", "empty")
+        if own_state == "populated":
+            lines.append("notes — memory, unverified: none in scope")
+        else:
+            lines.append(
+                f"notes — memory, unverified: own project unresolved "
+                f"({own_state}) — no fleet-wide notes either"
+            )
 
     if corpus.get("preferences") and not lite_inject:
         shown = corpus["preferences"][:MAX_PREFERENCES]
