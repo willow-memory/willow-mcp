@@ -31,22 +31,89 @@ register under the broker's process environment even though the file on disk
 was signed correctly.
 
 The fingerprint's one source of truth is now
-**`$WILLOW_HOME/constitutional/trust.env`** — trust-owner-owned, world-
-readable, `0644` — **not** `$H/env` (which is `0600` and holds every
-provider API key; a fingerprint is public, only a key's private half is a
-secret, so it does not belong behind that mode). `pgp.expected_fingerprint()`
-reads `trust.env`, consults the process environment only to catch a leftover
-pin that DISAGREES with it, and refuses loudly (naming both values and both
-sources) rather than silently trusting either side when they conflict — see
-`pgp.PgpFingerprintConflict`. A `trust.env` that is MISSING, unreadable, owned
-by the wrong uid, or carries a malformed value is ALSO refused rather than
-silently treated as "no enforcement" — see `pgp.PgpSourceUnreadable` — on any
-`$WILLOW_HOME` install.sh has already provisioned for trust. Enforcement is
-off only when the trust owner wrote that down (an explicit empty value in
+**`$VAULT/constitutional/trust.env`** — trust-owner-owned, world-readable,
+`0644` — **not** `$H/env` (which is `0600` and holds every provider API
+key; a fingerprint is public, only a key's private half is a secret, so it
+does not belong behind that mode). `$VAULT` is `$WILLOW_VAULT_BOX` when the
+operator has configured one, else `$H` itself
+(`src/willow_mcp/paths.py:operator_secrets_root()`, mirrored in
+`install.sh` as `VAULT="${WILLOW_VAULT_BOX:-$H}"`).
+
+**Rework #3 (dispatch `FA4F79AC`, 2026-09-23) — the vault, not `$H` bare.**
+Operator ruling, verbatim: "it should be in the vault with the rest of the keys."
+`trust.env` moves into its own `constitutional/` subdirectory of
+the vault — beside `dispatch_signing.key`, `vault.key`, `vault.db` (the
+box's other keys) at the vault's top level, but not IN that top level
+directly, because those three are the BROKER's own secrets and their
+parent must stay broker-writable for the broker to keep managing them;
+only a dedicated, separately-owned subdirectory can carry different
+ownership. See `paths.trust_config_path()`'s own docstring for the exact
+argument.
+
+**Whether this closes Loki's rename-away finding (audit `D06A0EF3`)
+depends entirely on how `$VAULT` is provisioned — read this before relying
+on it.** The hole: `$H` is owned by the broker's own uid, mode `700`, so
+the broker can rename `$H/constitutional` away entirely and put an empty,
+self-owned directory of the same name back — `constitutional/` then reads
+as "never provisioned," trust.env as "legitimately absent," and
+enforcement as off. Moving trust.env to `$VAULT/constitutional/trust.env`
+closes this ONLY when `$VAULT` itself sits under a parent chain the
+broker's uid cannot write — which is **NOT** the case when
+`WILLOW_VAULT_BOX` is unset, or set to `$H` (both leave `$VAULT == $H`,
+broker-owned, unchanged from before this rework — this is the box's actual
+state as of 2026-09-23). It also is not fully closed even with a genuinely
+separate `WILLOW_VAULT_BOX`, unless that directory's OWN top level is
+root-provisioned outside the broker's reach — which additionally requires
+relocating the broker's own vault secrets to a broker-owned subdirectory
+of it, a larger change out of this dispatch's scope (see "Provisioning a
+new box: closing the rename-away hole for real" below). Named plainly, not
+claimed and left broken: on today's box, this rework moves trust.env to
+the SAME path it already occupied (`$VAULT` resolves to `$H`) — the
+rename-away hole is UNCHANGED, not closed, by this rework alone. What it
+DOES do: give a real, root-provisioned vault (when the operator sets one
+up per the section below) a place to put trust.env that closes the hole,
+and stop tests from ever reaching the path through an environment variable
+the broker could set (a module constant, `paths.trust_config_path()`,
+only).
+
+`pgp.expected_fingerprint()` reads `trust.env`, consults the process
+environment only to catch a leftover pin that DISAGREES with it, and
+refuses loudly (naming both values and both sources) rather than silently
+trusting either side when they conflict — see `pgp.PgpFingerprintConflict`.
+A `trust.env` that is MISSING, unreadable, owned by the wrong uid, or
+carries a malformed value is ALSO refused rather than silently treated as
+"no enforcement" — see `pgp.PgpSourceUnreadable` — on any vault
+`install.sh` has already provisioned for trust. Enforcement is off only
+when the trust owner wrote that down (an explicit empty value in
 `trust.env`), never because something is missing. `install.sh` strips the
 serve unit's own stale pin every run (`strip_pgp_pin`, shared by the plain
 install and `--rotate`) so nothing but `trust.env` sets this variable on the
 box going forward.
+
+### Provisioning a new box: closing the rename-away hole for real
+
+Loki's own alternative (audit `D06A0EF3`) was a root-owned
+`/etc/willow-mcp/trust.env`; the operator chose the vault instead. To get
+the SAME property there: set `WILLOW_VAULT_BOX` to a directory whose own
+parent — and every ancestor above that, up to `/` — is NOT owned or
+group/other-writable by the broker's uid (e.g. `/var/lib/willow-mcp/vault`,
+under root-owned `/var/lib`, never a directory under the broker's own
+`$HOME`). Provision it as root, once, at install time:
+
+    install -d -o root -g willow-operator -m 0751 /var/lib/willow-mcp/vault
+    # then move the broker's OWN secrets into a subdirectory it can still
+    # write, so the vault's own top level can stay out of its reach:
+    install -d -o <broker-uid> -g <broker-uid> -m 0700 /var/lib/willow-mcp/vault/broker
+    # relocate dispatch_signing.key, vault.key, vault.db there and repoint
+    # the broker at the new paths (paths.py's operator_secrets_root()-based
+    # resolvers) — NOT done by this rework; recorded as the follow-on gap
+    # that actually closes D06A0EF3, not merely narrows it.
+    export WILLOW_VAULT_BOX=/var/lib/willow-mcp/vault   # in $H/env, for the broker to read
+
+`install.sh` itself only provisions `$VAULT/constitutional/` (the
+trust-owner-owned subdirectory trust.env lives in) and reports, every run,
+whether `$VAULT`'s own directory is broker-owned — it does not perform the
+broker-secrets relocation above, which is a larger, deliberate act.
 
 This document is now the human-readable account of what `install.sh` does
 and why, in the same order the script runs it — read it to know what the
@@ -66,12 +133,25 @@ running anything if your box looks the same:
   cut of this fix — see `B291C0C7`'s own history)
 * the active envelope register (`constitutional/pre-approved.json`) is
   hand-signed under `9B6F…`
-* `$H/constitutional/trust.env` does **not exist yet**
+* `$VAULT/constitutional/trust.env` does **not exist yet** (`$VAULT` is
+  `$H` on this box — `WILLOW_VAULT_BOX` is not set to anything else)
 
-Numbered steps. **Step 4 is the point of no return** — everything before it
-is read-only or reversible by re-running; step 4 is a real key generation
-and the first write to `trust.env`, and nothing after it un-happens on its
-own.
+Numbered steps, walked from this exact state, with what is DOWN during
+each one and for how long — no step below claims a stronger guarantee
+than it actually has (Loki audit `D06A0EF3`, M2).
+
+**The real point of no return is step 3, not step 4 — corrected here (an
+earlier draft of this document put it at step 4; wrong).** Steps 1-2 are
+read-only or reversible. The moment step 3 deploys this rework's code, the
+box is ALREADY provisioned for trust (`constitutional/` is trust-owner-owned
+from a PRIOR install run — that never un-happens) but has no `trust.env` —
+`pgp.PgpSourceUnreadable` fires for every process that starts or restarts on
+the new code from that instant, fleet down, FAILING CLOSED (this is
+correct, not a bug — see N2 in `D06A0EF3`), until step 4 completes. Step 4
+itself is not a NEW point of no return; it is the step that ENDS the outage
+step 3 opened. If step 4 stops partway, the box stays down in the same
+fail-closed state — rerunning `install.sh` (idempotent) is the recovery,
+not a rollback.
 
 1. **Read-only check first.** `sudo bash install.sh --check-signatures`.
    With no `trust.env` yet, this runs in report-only mode (Loki re-audit
@@ -79,7 +159,8 @@ own.
    it names which fingerprint currently signs each governed file (today:
    `9B6F…` on the register, nothing on the rest) without needing anything
    to compare against yet. Confirms the box is in the state this section
-   describes before anything changes it.
+   describes before anything changes it. Nothing is down; this step reads
+   only.
 2. **Desk-owned: remove the desk's `.mcp.json` pin and the template's
    default.** `willows-grove/.mcp.json:17`'s `env.WILLOW_PGP_FINGERPRINT`
    entry, and the `f9ed979` template pin in `mcp.template.json`, both
@@ -90,20 +171,44 @@ own.
    that pin and whatever `trust.env` says once it exists. This step is
    the desk's own repo's to make (not `install.sh`'s) — listed here so
    the sequence is complete and in the right order, not because this
-   script does it.
+   script does it. **Do not reconnect the desk between this step and step
+   4.** With the OLD code still deployed (process-env-only resolution) and
+   no pin left in `.mcp.json`, a reconnect in this window runs with NO
+   fingerprint at all — enforcement OFF for that session, silently, until
+   step 3 deploys the new code (which then refuses to boot unpinned and
+   unprovisioned-with-trust.env — see step 3 below) or step 4 completes.
+   This is the one window in the whole sequence where enforcement can be
+   off without the trust owner having written that down; close it by not
+   reconnecting here, not by relying on the code to catch it.
 3. **Deploy this rework.** Merge/pull the branch carrying `pgp.py`'s
    `trust.env`-based resolution, `install.sh`'s `--rotate`/
    `--check-signatures`/pin-strip fixes, and this document.
-4. **`sudo bash install.sh`** — THE POINT OF NO RETURN. Generates (or
-   reuses) the trust-owner signing key, re-signs every governed file as
-   one atomic batch (Loki re-audit `93D0F057`, N1 — signing happens
-   BEFORE `trust.env` is ever written, so a stop anywhere before the
-   write leaves the box exactly as it was; see "Ordering" below), THEN
-   publishes `trust.env`, strips the serve unit's stale `9B6F…` pin, and
-   restarts the `--user` serve unit. `$H/env`'s leftover `DEE4…` line is
-   migrated out (deleted) in the same run, with a fail-closed stop if it
-   ever disagrees with the key actually being published (see step 1b
-   below) rather than silently discarding it.
+   **THE FLEET GOES DOWN HERE, FAIL-CLOSED, UNTIL STEP 4 COMPLETES** —
+   see "The real point of no return" above. Reversible in the sense that
+   the code itself can be reverted (nothing has been written to `$VAULT`
+   yet), but NOT reversible in the sense of "no outage": the moment this
+   step's code is live, every process that starts or restarts on it
+   refuses to boot.
+4. **`sudo bash install.sh`.** Generates (or reuses) the trust-owner
+   signing key; syncs and signs `syscall-table.json` (step 1c) under that
+   key explicitly (not through `trust.env`, which does not exist yet —
+   see "Ordering" below); seeds the `envelope.ratify` bootstrap envelope
+   (step 1d) the SAME way, under the same explicit key, never through
+   `pgp.pgp_enabled()` (dispatch `FA4F79AC`, M1 — see "Why step 1d does
+   not deadlock" below); re-signs every OTHER governed file as one atomic
+   batch; THEN publishes `trust.env`, strips the serve unit's stale
+   `9B6F…` pin, and restarts the `--user` serve unit. `$H/env`'s leftover
+   `DEE4…` line is migrated out (deleted) in the same run, with a
+   fail-closed stop if it ever disagrees with the key actually being
+   published (see step 1b below) rather than silently discarding it.
+   **A stop anywhere in this step leaves the box fail-closed and down,
+   exactly as step 3 already left it — not reverted, not corrupted,
+   recoverable by rerunning `install.sh` from the top** (idempotent at
+   every sub-step: 1b reuses an existing key, 1c/1d are no-ops on
+   already-correct content, the final re-sign batch only touches files
+   that do not yet verify). See "N1: the syscall-table residual" below
+   for the one sub-step (1c) whose signed-but-not-yet-published state
+   this description now accounts for honestly.
 5. **Confirm.** `sudo bash install.sh --check-signatures` again — now in
    comparison mode (`trust.env` exists): every governed file should read
    `OK`. Also confirms `$H/env` no longer names a leftover fingerprint.
@@ -111,6 +216,61 @@ own.
    pin — the operator restarts (or reopens) the stdio session by hand;
    `install.sh` cannot reach a per-session stdio subprocess it does not
    own (see "Restart the broker" below).
+
+### Why step 1d does not deadlock (dispatch `FA4F79AC`, M1)
+
+Loki audit `D06A0EF3` measured: step 1 (a PRIOR install run) already made
+`constitutional/` trust-owner-owned — "provisioned" — before this run's
+step 1d (seed the `envelope.ratify` bootstrap envelope) has a `trust.env`
+to read. Every fresh install hit this, every time, because `trust.env` is
+never written until step 6 — not a transient failure a retry clears, an
+unconditional deadlock. The fix: step 1d's one write (through
+`envelope_authoring.ratify_proposal_row` → `_save_active`) now takes an
+explicit `sign_as` fingerprint — root's own already-resolved `$FPR`,
+passed via this one process's environment — and signs under it directly,
+the same way `rotate_resign.py` and `sync_constitutional.py --sign-as`
+already sign install-time writes, rather than asking
+`pgp.pgp_enabled()`/`pgp.expected_fingerprint()` whether `trust.env`
+(which does not exist yet) says this is trusted. This is install's OWN
+internal bootstrap act, root vouching for a value it is about to publish
+— never a fallback available to the real `envelope.ratify` apply half,
+which still goes through the ordinary `trust.env`-backed check exactly as
+before.
+
+This does **not** make "provisioned" and "`trust.env` exists" simultaneous
+— that gap is real and is what step 3's outage window (above) documents
+honestly. What it fixes is narrower and sufficient: install's OWN forward
+progress no longer depends on the trust it has not finished establishing
+yet, so the box always reaches step 6 and completes, rather than
+deadlocking on itself indefinitely partway through its own bootstrap.
+
+### N1: the syscall-table residual (Loki audit `D06A0EF3`)
+
+Step 1c (`sync_constitutional.py --sign-as`) signs `syscall-table.json`
+under `$FPR` explicitly — the same explicit-fingerprint discipline as
+step 1d above, never through `trust.env` — and, in isolation, is already
+atomic: a signing or verification failure inside it restores the file's
+exact previous bytes AND its exact previous `.sig`, so a failure DURING
+1c itself really does leave the box exactly as it was.
+
+What is NOT true, and this document previously claimed was ("a stop
+anywhere before the write leaves the box exactly as it was" — INSTALL.md,
+prior draft): a stop AFTER 1c succeeds but BEFORE step 6 publishes
+`trust.env` leaves `syscall-table.json` signed under `$FPR` while
+`trust.env` (on a REROTATION or migration where a different key was
+already published) still names the OLD fingerprint. Every reader refuses
+`syscall-table.json` until step 6 completes — fail-closed, not corrupted,
+not "as it was." Re-running `install.sh` is safe (1c is idempotent — a
+file already synced and correctly signed is a no-op) and completes the
+box's provisioning. `syscall-table.json` is not folded into
+`governed_files()`'s own re-sign batch, because that batch re-signs
+EXISTING content unchanged, while 1c also SYNCS new content from the
+checkout bundle — a different, larger act than a re-sign; the atomicity
+that matters (this step's own success or exact rollback) is what it has,
+not "nothing changes anywhere in the box until the very last write,"
+which no multi-file, single-signature scheme in this installer promises
+for any of its steps once step 3 has already put the box in the
+fail-closed, provisioned-without-trust.env state described above.
 
 Where `--rotate` fits: it is the SAME step-4 sequence (generate → sign+
 verify → publish → retire), used later for a routine key rotation once

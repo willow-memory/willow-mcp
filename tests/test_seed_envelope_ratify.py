@@ -196,3 +196,106 @@ def test_main_seeded_and_no_op_output(registry, capsys):
 def test_main_refuses_unexpected_arguments():
     rc = seed_envelope_ratify.main(["--bogus"])
     assert rc == 2
+
+
+# ── M1 (dispatch FA4F79AC): the install deadlock and its fix ──────────────
+#
+# Loki audit D06A0EF3: step 1 (a PRIOR install run) leaves constitutional/
+# already trust-owner-owned -- "provisioned" -- before THIS run's step 1d
+# (this seed) has a trust.env to read (only written at step 6, much later).
+# _save_active's `if pgp.pgp_enabled():` branch called
+# pgp.expected_fingerprint(), which raised PgpSourceUnreadable
+# unconditionally on a provisioned-but-missing-trust.env box -- every fresh
+# install, forever, since trust.env is never written until AFTER this exact
+# call would need to succeed.
+
+def test_seed_without_sign_as_still_hits_the_deadlock_pgp_pgp_enabled_path(registry, monkeypatch):
+    """Reproduction: with no sign_as (the shape every OTHER caller of
+    ratify_proposal_row uses, and the shape this script itself used before
+    the fix), a provisioned-but-missing-trust.env box raises exactly as
+    Loki measured -- proving the deadlock is real for that path, and that
+    the fix below is not simply "the check never fires anymore.\""""
+    from willow_mcp import pgp
+
+    monkeypatch.setattr(pgp, "_trust_config_dir_already_provisioned", lambda d: True)
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    with pytest.raises(pgp.PgpSourceUnreadable):
+        seed_envelope_ratify.seed(envelope_authoring, envelopes)
+
+
+def test_seed_with_sign_as_bypasses_the_deadlock_entirely(registry, monkeypatch):
+    """The fix: sign_as threads straight through to _save_active, which
+    signs unconditionally under it and never calls
+    pgp.pgp_enabled()/pgp.expected_fingerprint() at all -- proven by making
+    both raise if reached. sign_detached is faked (Kart cannot exercise
+    real two-uid gpg signing -- same limit every signing step in this
+    codebase has; see rotate_resign.py's own tests for the precedent) but
+    still WRITES the .sig content _save_active's rename step needs, so the
+    write completes for real, on a provisioned-but-missing-trust.env box
+    that would otherwise deadlock (previous test)."""
+    from willow_mcp import pgp
+
+    def _raise(*a, **k):
+        raise AssertionError("pgp.expected_fingerprint()/pgp_enabled() must not be "
+                              "called when sign_as is given")
+
+    monkeypatch.setattr(pgp, "expected_fingerprint", _raise)
+    monkeypatch.setattr(pgp, "pgp_enabled", _raise)
+    monkeypatch.setattr(pgp, "_trust_config_dir_already_provisioned", lambda d: True)
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+
+    def _fake_sign_detached(path, local_user=""):
+        sig_path = path.parent / f"{path.name}.sig"
+        sig_path.write_text("fake-detached-signature\n", encoding="utf-8")
+        return True, str(sig_path)
+
+    monkeypatch.setattr(pgp, "sign_detached", _fake_sign_detached)
+
+    report = seed_envelope_ratify.seed(envelope_authoring, envelopes, sign_as="A" * 40)
+
+    assert report["seeded"] is True
+    active = _active_rows(registry)
+    assert len(active) == 1
+    assert active[0]["verb"] == "envelope.ratify"
+    # the register's own .sig now exists, signed under the explicit fingerprint
+    assert (registry.parent / f"{registry.name}.sig").is_file()
+
+
+def test_main_reads_sign_as_from_the_process_environment(registry, monkeypatch):
+    """install.sh passes WILLOW_PGP_FINGERPRINT=$FPR in this ONE process's
+    own env (deploy/manifest-grant/install.sh's `as_to ... WILLOW_PGP_
+    FINGERPRINT="$FPR"` call at step 1d) -- main() reads it as sign_as
+    directly, never through pgp.expected_fingerprint()."""
+    from willow_mcp import pgp
+
+    def _raise(*a, **k):
+        raise AssertionError("must not consult trust.env when the env carries a valid fingerprint")
+
+    monkeypatch.setattr(pgp, "expected_fingerprint", _raise)
+    monkeypatch.setattr(pgp, "pgp_enabled", _raise)
+    monkeypatch.setattr(pgp, "_trust_config_dir_already_provisioned", lambda d: True)
+
+    def _fake_sign_detached(path, local_user=""):
+        assert local_user == "A" * 40
+        sig_path = path.parent / f"{path.name}.sig"
+        sig_path.write_text("fake\n", encoding="utf-8")
+        return True, str(sig_path)
+
+    monkeypatch.setattr(pgp, "sign_detached", _fake_sign_detached)
+    monkeypatch.setenv("WILLOW_PGP_FINGERPRINT", "A" * 40)
+
+    rc = seed_envelope_ratify.main([])
+    assert rc == 0
+
+
+def test_main_with_no_env_fingerprint_falls_back_to_normal_unsigned_path(registry):
+    """No WILLOW_PGP_FINGERPRINT at all (the registry fixture's own default
+    state) must not be treated as sign_as -- falls back to the pre-existing
+    pgp.pgp_enabled()-gated behavior (enforcement off here, unsigned
+    write), exactly as every test above this M1 section already exercises
+    through seed() directly."""
+    rc = seed_envelope_ratify.main([])
+    assert rc == 0
+    active = _active_rows(registry)
+    assert len(active) == 1
+    assert not (registry.parent / f"{registry.name}.sig").exists()

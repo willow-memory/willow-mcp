@@ -333,6 +333,48 @@ def test_plant_every_deploy_scan_helper_catches_its_violation():
         "reconnecting that session is NOT enough by itself"
     ) is False
 
+    assert _install_md_still_claims_step_4_is_point_of_no_return(
+        "Step 4 is the point of no return, everything before it is reversible"
+    ) is True
+    assert _install_md_still_claims_step_4_is_point_of_no_return(
+        "nothing about step numbering at all"
+    ) is True
+    assert _install_md_still_claims_step_4_is_point_of_no_return(
+        "the real point of no return is step 3, not step 4"
+    ) is False
+
+    assert _install_md_missing_step_3_outage_window("nothing about an outage here") is True
+    assert _install_md_missing_step_3_outage_window(
+        "THE FLEET GOES DOWN HERE, FAIL-CLOSED, until step 4 completes"
+    ) is False
+
+    assert _install_md_missing_step_2_to_3_reconnect_warning("reconnect whenever you like") is True
+    assert _install_md_missing_step_2_to_3_reconnect_warning(
+        "Do not reconnect the desk between this step and step 4"
+    ) is False
+
+    assert _install_md_missing_m1_explanation("nothing about the deadlock here") is True
+    assert _install_md_missing_m1_explanation(
+        "why step 1d does not deadlock, dispatch FA4F79AC: sign_as bypasses the check"
+    ) is False
+
+    assert _install_md_still_claims_a_stop_anywhere_leaves_the_box_as_it_was(
+        "a stop anywhere before the write leaves the box exactly as it was"
+    ) is True
+    assert _install_md_still_claims_a_stop_anywhere_leaves_the_box_as_it_was(
+        "no residual section at all"
+    ) is True
+    assert _install_md_still_claims_a_stop_anywhere_leaves_the_box_as_it_was(
+        "the syscall-table residual: a stop after step 1c leaves the box fail-closed, "
+        "not as it was, but recoverable"
+    ) is False
+
+    assert _install_md_missing_vault_ruling_and_closure("nothing about a vault here") is True
+    assert _install_md_missing_vault_ruling_and_closure(
+        'it should be in the vault with the rest of the keys" -- not closed by '
+        "default; see Provisioning a new box"
+    ) is False
+
 
 def test_all_five_files_present():
     for name in (
@@ -359,6 +401,92 @@ def test_install_md_no_longer_claims_home_env_is_the_source_of_truth():
 def test_install_md_no_longer_claims_reconnect_alone_picks_up_a_new_key():
     text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
     assert _install_md_missing_reconnect_is_not_enough_caveat(text) is False
+
+
+# ── Loki audit D06A0EF3 (rework #3, dispatch FA4F79AC): M1 install
+# deadlock, M2 point-of-no-return mislabelled, N1 syscall-table residual,
+# and the vault location's honest closure argument. Each check below is a
+# module-level helper, planted in test_plant_every_deploy_scan_helper_
+# catches_its_violation like every other scan in this file. ────────────
+
+def _install_md_still_claims_step_4_is_point_of_no_return(text: str) -> bool:
+    return "Step 4 is the point of no return" in text or "step 3, not step 4" not in text
+
+
+def _install_md_missing_step_3_outage_window(text: str) -> bool:
+    return not ("fleet goes down here" in text.lower() and "fail-closed" in text.lower())
+
+
+def _install_md_missing_step_2_to_3_reconnect_warning(text: str) -> bool:
+    return "do not reconnect the desk between this step and step" not in text.lower()
+
+
+def _install_md_missing_m1_explanation(text: str) -> bool:
+    return not ("does not deadlock" in text and "sign_as" in text and "FA4F79AC" in text)
+
+
+def _install_md_still_claims_a_stop_anywhere_leaves_the_box_as_it_was(text: str) -> bool:
+    """N1 residual: the false blanket claim this document used to make."""
+    return (
+        "a stop anywhere before the write leaves the box exactly as it was" in text
+        or "syscall-table residual" not in text
+    )
+
+
+def _install_md_missing_vault_ruling_and_closure(text: str) -> bool:
+    return not (
+        "it should be in the vault with the rest of the keys" in text
+        and "not closed" in text.lower()
+        and "Provisioning a new box" in text
+    )
+
+
+def test_install_md_no_longer_claims_step_4_is_the_point_of_no_return():
+    """M2: the real point of no return is step 3 (the code deploy itself
+    puts an already-provisioned box into a fail-closed outage, before
+    step 4 ever runs) — the prior draft's "Step 4 is the point of no
+    return" is corrected."""
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_still_claims_step_4_is_point_of_no_return(text) is False
+
+
+def test_install_md_documents_the_step_3_outage_window():
+    """M2: the fleet-down window opened by deploying the code before
+    trust.env exists must be named explicitly, with what is down and why
+    it is safe (fail-closed, not a bug)."""
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_missing_step_3_outage_window(text) is False
+
+
+def test_install_md_documents_the_step_2_to_3_enforcement_off_window():
+    """M2: a desk reconnect between removing its .mcp.json pin (step 2)
+    and deploying the new code (step 3) runs with NO fingerprint at all —
+    named explicitly, not left implicit."""
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_missing_step_2_to_3_reconnect_warning(text) is False
+
+
+def test_install_md_documents_m1_and_why_step_1d_does_not_deadlock():
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_missing_m1_explanation(text) is False
+
+
+def test_install_md_no_longer_claims_a_stop_anywhere_leaves_the_box_exactly_as_it_was():
+    """N1 residual: the prior draft's blanket claim ('a stop anywhere
+    before the write leaves the box exactly as it was') is false once
+    step 1c has already succeeded — corrected to name the real, fail-closed,
+    recoverable-by-rerun state instead."""
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_still_claims_a_stop_anywhere_leaves_the_box_as_it_was(text) is False
+
+
+def test_install_md_documents_the_vault_ruling_and_its_closure_condition():
+    """The location work: the operator's ruling is named verbatim, and the
+    document does not silently claim the rename-away hole is closed —
+    it states the actual condition (a genuinely separate, root-provisioned
+    WILLOW_VAULT_BOX) and names today's box as NOT meeting it."""
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_missing_vault_ruling_and_closure(text) is False
 
 
 def test_every_file_cites_both_sealed_pairs():
@@ -401,6 +529,8 @@ _INSTALL_MD_REQUIRED_STRINGS = (
     "point of no return",     # N3: mark it
     "--check-signatures",     # N3: first step is a read-only check
     "report-only",            # N4: that check must work with no trust.env yet
+    "WILLOW_VAULT_BOX",       # FA4F79AC: the location ruling, named
+    "rename-away",            # FA4F79AC: the closure argument is not silently assumed
 )
 
 

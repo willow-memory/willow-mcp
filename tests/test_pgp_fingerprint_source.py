@@ -345,3 +345,45 @@ def test_malformed_process_env_value_raises_even_when_pgp_enabled_is_called(tmp_
             pgp.pgp_enabled()
     finally:
         del os.environ["WILLOW_PGP_FINGERPRINT"]
+
+
+# ── Rework #3 (dispatch FA4F79AC): the vault, not a bare $WILLOW_HOME ─────
+#
+# Operator ruling, verbatim: "it should be in the vault with the rest of
+# the keys." paths.trust_config_path() = operator_secrets_root() /
+# "constitutional" / "trust.env" -- a MODULE-LEVEL function, redirected in
+# tests by monkeypatching WILLOW_HOME/WILLOW_VAULT_BOX (paths' own env
+# resolution) or the function itself, never by an env var the broker could
+# set to steer pgp.py specifically.
+
+def test_trust_config_path_defaults_to_willow_home_when_vault_box_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("WILLOW_VAULT_BOX", raising=False)
+    assert paths.trust_config_path() == tmp_path / "constitutional" / "trust.env"
+
+
+def test_trust_config_path_moves_under_vault_box_when_configured(tmp_path, monkeypatch):
+    """The whole point of the location work: when the operator has
+    configured a real vault separate from $WILLOW_HOME, trust.env follows
+    it there -- beside dispatch_signing.key/vault.key/vault.db (all
+    resolved from the same operator_secrets_root()), in its own
+    constitutional/ subdirectory, never at the vault's own top level (see
+    the function's own docstring for why: the vault's top level holds the
+    BROKER's own secrets and must stay broker-writable)."""
+    vault = tmp_path / "vault"
+    monkeypatch.setenv("WILLOW_VAULT_BOX", str(vault))
+    assert paths.trust_config_path() == vault / "constitutional" / "trust.env"
+    assert paths.dispatch_signing_key_path() == vault / "dispatch_signing.key"
+
+
+def test_expected_fingerprint_reads_from_the_vault_box_location(tmp_path, monkeypatch):
+    """Functional, not just a path-resolution check: pgp.py actually reads
+    trust.env from wherever paths.trust_config_path() resolves to, once a
+    vault is configured -- not from $WILLOW_HOME/constitutional regardless."""
+    vault = tmp_path / "vault"
+    monkeypatch.setenv("WILLOW_VAULT_BOX", str(vault))
+    vault_const = vault / "constitutional"
+    vault_const.mkdir(parents=True)
+    (vault_const / "trust.env").write_text(f"WILLOW_PGP_FINGERPRINT={_FPR_A}\n", encoding="utf-8")
+    # nothing at the OLD (pre-rework) $WILLOW_HOME/constitutional/trust.env location
+    assert not (tmp_path / "constitutional" / "trust.env").exists()
+    assert pgp.expected_fingerprint() == _FPR_A

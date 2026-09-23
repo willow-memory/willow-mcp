@@ -137,12 +137,30 @@ ETC=/etc/willow-mcp
 # key); the trust-owner apply unit (uid willow-operator) cannot read it, so a
 # second copy in /etc/willow-mcp/manifest-grant.env existed only so that unit
 # could see the fingerprint -- and nothing ever checked the two copies still
-# agreed (Loki A38D41C2, F8). TRUST_ENV lives beside the active register and
-# syscall table (constitutional/ is already trust-owner-owned, 0755) --
-# trust-owner-owned, 0644, WORLD-READABLE: every verifying process (broker,
-# serve, desk, the trust-owner apply unit, this script) reads the SAME file,
-# and only the trust owner (or root) can write it.
-TRUST_ENV="$H/constitutional/trust.env"
+# agreed (Loki A38D41C2, F8).
+#
+# Rework #3 (dispatch FA4F79AC, 2026-09-23; operator ruling, verbatim: "it
+# should be in the vault with the rest of the keys"): TRUST_ENV now lives
+# under the VAULT ($WILLOW_VAULT_BOX when the operator has configured one
+# outside $H, else $H itself -- src/willow_mcp/paths.py's
+# operator_secrets_root(), matched here in bash), in its OWN
+# trust-owner-owned constitutional/ subdirectory -- same convention as
+# $H/constitutional/, never the vault's own top level, because the vault's
+# top level ALSO holds the broker's own secrets (dispatch_signing.key,
+# vault.key, vault.db) which must stay broker-writable. Trust-owner-owned,
+# 0644, WORLD-READABLE: every verifying process (broker, serve, desk, the
+# trust-owner apply unit, this script) reads the SAME file, and only the
+# trust owner (or root) can write it.
+#
+# THE RENAME-AWAY HOLE (Loki audit D06A0EF3) is closed ONLY when VAULT
+# differs from $H and VAULT's own directory is root-provisioned outside any
+# path the broker's uid can write -- NOT the case by default (VAULT_BOX
+# unset, or set to $H, both leave VAULT == $H, broker-owned 700, unchanged
+# from before this rework). See paths.trust_config_path()'s own docstring
+# for the exact condition and INSTALL.md's "Provisioning a new box" section
+# for the root step that closes it where it CAN be closed.
+VAULT="${WILLOW_VAULT_BOX:-$H}"
+TRUST_ENV="$VAULT/constitutional/trust.env"
 KEY_UID='willow-mcp manifest-grant (trust owner) <manifest-grant@willow-operator-box>'
 HERE=$(cd "$(dirname "$0")" && pwd)
 CHECKOUT=$(cd "$HERE/../.." && pwd)   # deploy/manifest-grant/ -> checkout root
@@ -663,6 +681,38 @@ chmod 755 "$H/constitutional"
 if [ -f "$REG" ]; then
   chown "$TRUST_OWNER:$TRUST_OWNER" "$REG"
   chmod 644 "$REG"
+fi
+
+# ---- vault provisioning: trust.env's OWN directory (dispatch FA4F79AC) ----
+# TRUST_ENV lives at $VAULT/constitutional/trust.env, never $H/constitutional
+# alone -- see TRUST_ENV's own definition above for why (the vault, beside
+# the box's other keys). When $VAULT == $H (the default: WILLOW_VAULT_BOX
+# unset, or set to $H) this is the SAME directory already provisioned two
+# lines up -- idempotent, no separate step needed. When $VAULT differs, its
+# own constitutional/ subdirectory needs the same trust-owner ownership.
+if [ "$VAULT" != "$H" ]; then
+  install -d -m 755 "$VAULT"
+  install -d -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 755 "$VAULT/constitutional"
+  chown "$TRUST_OWNER:$TRUST_OWNER" "$VAULT/constitutional"
+  chmod 755 "$VAULT/constitutional"
+fi
+# RENAME-AWAY CHECK (Loki audit D06A0EF3), read-only -- a rename needs write
+# on the PARENT, so what actually matters is $VAULT's OWN ownership, not
+# constitutional/'s. Report the true state rather than claim a close this
+# script cannot perform: fully closing it needs $VAULT itself provisioned
+# outside any path the broker's uid can write, WITH the broker's own
+# secrets (dispatch_signing.key, vault.key, vault.db) relocated to a
+# broker-owned subdirectory of $VAULT it can still write -- a larger,
+# deliberate root act, not something this idempotent installer run should
+# do silently on every invocation. See INSTALL.md's "Provisioning a new
+# box" section for that step.
+VAULT_UID=$(stat -c %u "$VAULT")
+if [ "$VAULT_UID" = "$OPERATOR_UID" ]; then
+  say "  NOTE: $VAULT (trust.env's vault) is owned by the broker (uid $OPERATOR_UID) --"
+  say "  the rename-away hole (Loki D06A0EF3) is NOT closed by this location alone."
+  say "  See INSTALL.md's 'Provisioning a new box' section for the root step that closes it."
+else
+  say "  $VAULT (trust.env's vault) is not broker-owned -- the rename-away hole is closed"
 fi
 # federation.ratify (row 23) writes mcp_apps/_federation/servers.json —
 # already under mcp_apps/, already trust-owner-owned by the recursive chown
