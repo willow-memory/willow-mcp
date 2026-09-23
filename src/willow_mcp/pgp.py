@@ -12,14 +12,104 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Iterator
 
 _FP_RE = re.compile(r"^[A-F0-9]{40}$", re.IGNORECASE)
 
 
+class PgpFingerprintConflict(RuntimeError):
+    """The process environment and ``$WILLOW_HOME/env`` disagree on
+    ``WILLOW_PGP_FINGERPRINT``. This is exactly the split brain measured
+    2026-09-23 (dispatch B291C0C7): install.sh rewrote the trust owner's
+    key into ``$WILLOW_HOME/env``, a per-file pin elsewhere (a systemd
+    drop-in, a manifest-grant env file) kept the old one, and whichever
+    file a given process happened to read decided whether it trusted the
+    register. ``$WILLOW_HOME/env`` is the one source of truth; a process
+    environment that disagrees with it is never silently preferred or
+    silently ignored — it is refused, loudly, naming both values and both
+    sources, the first time anything asks what the fingerprint is."""
+
+
+#: Guards ``_env_file_cache`` — ``expected_fingerprint()`` is hot (called
+#: on every trust-owner-owned read), so the ``$WILLOW_HOME/env`` file is
+#: cached by (path, mtime, size) rather than re-read and re-parsed on
+#: every call. Keyed on a stat, not just "read once": a rotation (or a
+#: test pointing WILLOW_HOME elsewhere) changes the stat, so the cache
+#: self-invalidates without any caller needing to know to clear it.
+_env_file_cache_lock = threading.Lock()
+_env_file_cache: tuple[str, float, int, str] | None = None
+
+
+def _home_env_path() -> Path:
+    from . import paths
+
+    return paths.willow_home() / "env"
+
+
+def _read_home_env_fingerprint() -> str:
+    """``WILLOW_PGP_FINGERPRINT=`` as set in ``$WILLOW_HOME/env``, or ``""``
+    when the file is absent, unreadable, or carries no such line. Cached by
+    (path, mtime, size); see the module-level lock/cache docstring."""
+    global _env_file_cache
+    path = _home_env_path()
+    try:
+        st = path.stat()
+    except OSError:
+        with _env_file_cache_lock:
+            _env_file_cache = None
+        return ""
+    key = (str(path), st.st_mtime, st.st_size)
+    with _env_file_cache_lock:
+        cached = _env_file_cache
+        if cached is not None and cached[:3] == key:
+            return cached[3]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    value = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, raw_value = stripped.partition("=")
+        if name.strip() != "WILLOW_PGP_FINGERPRINT":
+            continue
+        value = raw_value.strip().strip("'").strip('"').upper()
+    with _env_file_cache_lock:
+        _env_file_cache = (*key, value)
+    return value
+
+
 def expected_fingerprint() -> str:
-    return (os.environ.get("WILLOW_PGP_FINGERPRINT") or "").strip().upper()
+    """The one trusted signer fingerprint, resolved with exactly one
+    source of truth: ``$WILLOW_HOME/env``. The process environment is
+    consulted too — a caller may set ``WILLOW_PGP_FINGERPRINT`` directly
+    (tests; a CLI invoked before the home env is written) — but only to
+    confirm it AGREES with the file when the file also has a value.
+    Three states, never collapsed into each other:
+
+    * unset — neither source has a value: returns ``""``.
+    * set — exactly one source has a value, or both agree: returns it.
+    * conflicting — both sources have a value and they differ: raises
+      :class:`PgpFingerprintConflict` rather than picking one. Silently
+      preferring either side is exactly how the 2026-09-23 lockout
+      happened — the broker trusted its own pin while the register was
+      re-signed under the box's new one.
+    """
+    env_value = (os.environ.get("WILLOW_PGP_FINGERPRINT") or "").strip().upper()
+    file_value = _read_home_env_fingerprint()
+    if env_value and file_value and env_value != file_value:
+        raise PgpFingerprintConflict(
+            "WILLOW_PGP_FINGERPRINT conflict: the process environment says "
+            f"{env_value} but {_home_env_path()} says {file_value} — "
+            "$WILLOW_HOME/env is the one source of truth and these must "
+            "agree; refusing rather than guessing which one is right. Fix "
+            "the stale pin (see INSTALL.md --check) and retry."
+        )
+    return env_value or file_value
 
 
 def pgp_enabled() -> bool:
