@@ -253,7 +253,12 @@ def verify_seal(seal: dict, ring: dict[str, dict], *, now: Optional[datetime] = 
         return False, "seal carries no timezone-aware created_at", "created_at"
     current = (now or _now())
     if max_age_s is not None and (current - sealed_at).total_seconds() > max_age_s:
-        return False, f"seal from {seal['created_at']} is older than {max_age_s}s", "created_at"
+        # created_at is the other nestor.db row field this reason string
+        # carries verbatim; repr it the same way verifier is repr'd
+        # elsewhere in this function, since it reaches the boot refusal
+        # line unescaped otherwise (seed_loader.load_sealed_corrections,
+        # Loki 86CDF0CE M1).
+        return False, f"seal from {seal['created_at']!r} is older than {max_age_s}s", "created_at"
     if sealed_at > current + timedelta(seconds=300):
         return False, "seal is dated in the future", "created_at"
     try:

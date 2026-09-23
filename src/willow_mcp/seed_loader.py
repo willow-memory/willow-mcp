@@ -821,7 +821,12 @@ def load_sealed_corrections(*, db_path: Path | None = None,
                   "verifier": verifier, "seal_sig": seal_sig, "created_at": created_at}
         ok, reason, _field = net_signer.verify_seal(sealed, ring, max_age_s=None)
         if not ok:
-            unverifiable.append(f"{pair_id} ({verifier!r}): {reason}")
+            # M1 (Loki 86CDF0CE): pair_id comes straight off a nestor.db row a
+            # ring-less writer can control. It is repr-escaped exactly like
+            # verifier below — a newline (or a spliced "  · Operator: ..."
+            # line) inside it must render as one escaped line, never break
+            # out into its own bullet under the operator heading.
+            unverifiable.append(f"{pair_id!r} ({verifier!r}): {reason}")
             continue
         marker = _boot_correction_marker(target_text)
         if marker is None:
