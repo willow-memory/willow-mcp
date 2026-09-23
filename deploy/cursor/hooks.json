@@ -57,7 +57,7 @@
     "sessionEnd": [
       {
         "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.session_stop_hook",
-        "timeout": 15,
+        "timeout": 120,
         "failClosed": false
       }
     ],
