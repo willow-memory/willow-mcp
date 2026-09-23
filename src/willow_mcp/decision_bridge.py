@@ -78,10 +78,26 @@ def available() -> bool:
 
 
 def propose(app_id: str, record_id: str, question: str = "", conclusion: str = "",
-            rationale: str = "", origin: str = "", *,
+            rationale: str = "", origin: str = "", *, boot_correction: str = "",
             store: Optional[Store] = None,
             db_path: Optional[Path] = None) -> dict:
     """Propose a SOIL governance record as a draft decision in Nestor.
+
+    ``boot_correction``, when non-empty, names the scope
+    (``"fleet"`` or a repo name) a `seed_loader.load_sealed_corrections`
+    boot read will show this decision under — but names it by PREPENDING
+    a ``boot-correction: <scope>`` first line onto the CONCLUSION
+    (``target_text`` — the side Nestor actually seals), never as a side
+    field on the SOIL record. That is the whole fix in Loki audit
+    5C276CEA G1/G2: a side field is a plain JSON value any uid-1000
+    process or Kart task can set on a row whose `status` string merely
+    *says* "sealed"; a signature verifies the bytes it was made over, so
+    the only place a marker can live and still be exactly as unforgeable
+    as the seal itself is inside those bytes. The read path
+    (`seed_loader.load_sealed_corrections`) re-derives this same marker
+    from Nestor's own database AFTER verifying `seal_sig` against the
+    verifier keyring — it never trusts this call, or anything this
+    process writes, on its own say-so.
 
     Loads ``record_id`` from ``GOVERNANCE_COLLECTION``, and:
 
@@ -162,6 +178,10 @@ def propose(app_id: str, record_id: str, question: str = "", conclusion: str = "
     c = conclusion or gov.get("ruling", "")
     r = rationale or gov.get("rationale", "")
     o = origin or f"willow:{app_id}:{record_id}"
+
+    scope = boot_correction.strip()
+    if scope:
+        c = f"boot-correction: {scope}\n{c}"
 
     try:
         draft = dm.propose(q, c, rationale=r, origin=o)

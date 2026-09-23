@@ -165,7 +165,7 @@ def test_commitment_boot_lines_degrades_on_render_fault(monkeypatch):
 
 
 def test_build_boot_lines_includes_commitment_section_when_present(monkeypatch):
-    monkeypatch.setattr(bc, "load_corpus_lanes", lambda: {})
+    monkeypatch.setattr(bc, "load_corpus_lanes", lambda *a, **k: {})
     monkeypatch.setattr(bc, "read_stack_snapshot", lambda app_id: None)
     monkeypatch.setattr(bc, "degraded_boot_line", lambda app_id: None)
     monkeypatch.setattr(bc, "_blocker_lines", lambda *a, **k: [])
@@ -181,7 +181,7 @@ def test_build_boot_lines_includes_commitment_section_when_present(monkeypatch):
 
 
 def test_build_boot_lines_omits_commitment_section_when_silent(monkeypatch):
-    monkeypatch.setattr(bc, "load_corpus_lanes", lambda: {})
+    monkeypatch.setattr(bc, "load_corpus_lanes", lambda *a, **k: {})
     monkeypatch.setattr(bc, "read_stack_snapshot", lambda app_id: None)
     monkeypatch.setattr(bc, "degraded_boot_line", lambda app_id: None)
     monkeypatch.setattr(bc, "_blocker_lines", lambda *a, **k: [])
@@ -201,7 +201,7 @@ def test_build_boot_lines_survives_commitment_render_fault(monkeypatch):
     intact. Deliberately does NOT patch a restore-throws lambda (that only
     exercises the try/except that already existed and proves nothing about
     the render span — see commitment_boot_lines_degrades_on_render_fault)."""
-    monkeypatch.setattr(bc, "load_corpus_lanes", lambda: {})
+    monkeypatch.setattr(bc, "load_corpus_lanes", lambda *a, **k: {})
     monkeypatch.setattr(bc, "read_stack_snapshot", lambda app_id: None)
     monkeypatch.setattr(bc, "degraded_boot_line", lambda app_id: None)
     monkeypatch.setattr(bc, "_blocker_lines", lambda *a, **k: ["[BLOCKERS] keep-me"])

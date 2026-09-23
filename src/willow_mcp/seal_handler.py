@@ -98,6 +98,44 @@ def _seal_sig_prefix(pair_id: str, db_path: Optional[Path] = None) -> Optional[s
     return str(row[0])[:_SIG_PREFIX_LEN]
 
 
+def _boot_correction_scope(pair_id: str, db_path: Optional[Path] = None) -> Optional[str]:
+    """Best-effort carry-through of the ``boot-correction: <scope>``
+    marker (see ``decision_bridge.propose``'s ``boot_correction`` param
+    and ``seed_loader._boot_correction_marker``) from the sealed pair's
+    own text onto the SOIL record — purely for observability (a human or
+    a dashboard reading the governance collection can see it was tagged).
+
+    NEVER the trust boundary: ``seed_loader.load_sealed_corrections()``
+    re-derives this same marker straight from Nestor's own database and
+    re-verifies the signature itself before ever showing it at boot; this
+    field is informational only and must never be read as authoritative
+    by any boot path. Same never-raise shape as :func:`_seal_sig_prefix` —
+    a missing/unreadable db or no matching row just means no carry-through
+    this time, never a failed seal upgrade."""
+    resolved_path = db_path if db_path is not None else _nestor_db_path()
+    try:
+        conn = sqlite3.connect(f"file:{resolved_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT target_text FROM tm_pairs WHERE id = ?", (pair_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    text = str(row[0])
+    if not text.lower().startswith("boot-correction:"):
+        return None
+    first_line = text.splitlines()[0]
+    _, _, scope = first_line.partition(":")
+    scope = scope.strip()
+    return scope or None
+
+
 def _strip_meta(record: dict) -> dict:
     return {k: v for k, v in record.items() if not k.startswith("_")}
 
@@ -180,6 +218,7 @@ def _on_seal(record: dict, *, store: Optional[Store], db_path: Optional[Path]) -
         return "already"
 
     sig_prefix = _seal_sig_prefix(pair_id, db_path=db_path)
+    boot_scope = _boot_correction_scope(pair_id, db_path=db_path)
 
     updated = _strip_meta(gov)
     updated["status"] = "sealed"
@@ -188,6 +227,8 @@ def _on_seal(record: dict, *, store: Optional[Store], db_path: Optional[Path]) -
     updated["sealed_at"] = record.get("ts")
     if sig_prefix:
         updated["nestor_seal_sig_prefix"] = sig_prefix
+    if boot_scope:
+        updated["boot_correction_scope"] = boot_scope
 
     st.update(GOVERNANCE_COLLECTION, record_id, updated)
 

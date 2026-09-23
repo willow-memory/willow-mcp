@@ -10,7 +10,6 @@ from .commitments.boot import commitment_boot_lines
 from .nest import autointake as nest_autointake
 from .seed_loader import load_corpus_lanes
 from .session_inject import (
-    MAX_CORRECTIONS,
     MAX_HUMAN_CONFIRMATIONS,
     MAX_PREFERENCES,
     dedup_fingerprint,
@@ -187,17 +186,97 @@ def build_boot_lines(
         if path:
             lines.append(f"handoff: {path}")
 
-    corpus = load_corpus_lanes()
-    if corpus.get("corrections"):
-        cap = min(2, MAX_CORRECTIONS) if lite_inject else MAX_CORRECTIONS
-        shown = corpus["corrections"][:cap]
-        total = int(corpus.get("correction_total") or len(corpus["corrections"]))
-        head = f"corrections — operator ({len(shown)}"
+    # G3 (Loki 5C276CEA): thread session_enter's own resolved project root
+    # through rather than re-deriving it — the old substring match here
+    # sent a willow-mcp seat to a stale dir and a seat/heimdallr or
+    # worktree seat to nothing at all, silently.
+    project_root = (enter_result.get("project") or {}).get("root") or None
+    corpus = load_corpus_lanes(project_root)
+
+    # Sealed lane ("operator") — four states, never collapsed (ruling
+    # boot-corrections-trust-and-scope-2026-09-23, #1; K1, Loki 3C1BB137).
+    # "empty" and "unreachable" mean different next moves (wait vs. fix
+    # the path). "refused" is its own state, not a detail folded into
+    # "empty": if the only tagged candidates this boot found were
+    # forgeries, saying "none sealed yet" reads as an all-clear — the
+    # exact attack a refused-but-unnamed seal enables. A refusal is
+    # rendered in EVERY state where it's present (including "populated",
+    # when some tagged pairs verified and others didn't), never optional.
+    def _unverifiable_line(items: list[str]) -> str | None:
+        if not items:
+            return None
+        shown = items[:2]
+        detail = "; ".join(shown)
+        line = f"{len(items)} marked seal(s) failed verification: {detail}"
+        if len(items) > len(shown):
+            line += f" (+{len(items) - len(shown)} more)"
+        return line
+
+    sealed_state = corpus.get("sealed_lane_state", "empty")
+    sealed_unverifiable = corpus.get("sealed_unverifiable") or []
+    if sealed_state == "unreachable":
+        lines.append("corrections — operator (sealed): unreachable this boot")
+    elif sealed_state == "empty":
+        lines.append("corrections — operator (sealed): none sealed yet")
+    elif sealed_state == "refused":
+        uv = _unverifiable_line(sealed_unverifiable)
+        lines.append(f"corrections — operator (sealed): none verified; {uv}")
+    else:
+        shown = corpus.get("sealed_corrections") or []
+        if lite_inject:
+            shown = shown[:2]
+        total = int(corpus.get("sealed_correction_total") or len(shown))
+        head = f"corrections — operator (sealed) ({len(shown)}"
         if total > len(shown):
             head += f"/{total}"
         lines.append(head + "):")
         for c in shown:
             lines.append(f"  · {c}")
+        uv = _unverifiable_line(sealed_unverifiable)
+        if uv:
+            lines.append(f"  ! {uv}")
+
+    # Memory lane ("unverified") — a memory file is context an agent wrote,
+    # never an order; always labelled, always carries which project/scope
+    # and full path it came from (ruling #1's "impossible for an
+    # agent-written memory file to read as an operator correction").
+    if corpus.get("memory_notes"):
+        shown = corpus["memory_notes"]
+        if lite_inject:
+            shown = shown[:2]
+        total = int(corpus.get("memory_note_total") or len(shown))
+        if total > len(shown):
+            head = f"notes — memory, unverified ({len(shown)} of {total} shown"
+        else:
+            head = f"notes — memory, unverified ({len(shown)}"
+        # K2/Watch: a fallback match (e.g. seat/heimdallr resolving to its
+        # repo root) is another project's notes, not this seat's own —
+        # label it rather than let it read as this seat's own project.
+        # The operator has not ruled on whether a seat like the Watch
+        # should inherit its Desk's corrections at all; the label keeps
+        # that visible until they do.
+        if corpus.get("memory_own_is_fallback"):
+            repo = corpus.get("memory_own_repo_name") or "?"
+            head += f", from {repo}'s notes"
+        lines.append(head + "):")
+        for c in shown:
+            lines.append(f"  · {c}")
+    else:
+        # G3: this must never be silent. Either the seat has an own
+        # project resolved and simply nothing is in scope yet, or
+        # resolution itself came back empty/unreachable — a seat at
+        # seat/heimdallr or in a worktree with no matching ancestor used
+        # to print NOTHING here, indistinguishable from "checked, found
+        # none".
+        own_state = corpus.get("memory_own_project_state", "empty")
+        if own_state == "populated":
+            lines.append("notes — memory, unverified: none in scope")
+        else:
+            lines.append(
+                f"notes — memory, unverified: own project unresolved "
+                f"({own_state}) — no fleet-wide notes either"
+            )
+
     if corpus.get("preferences") and not lite_inject:
         shown = corpus["preferences"][:MAX_PREFERENCES]
         if shown:
