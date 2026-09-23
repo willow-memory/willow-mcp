@@ -31,6 +31,17 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.81.1](https://github.com/willow-memory/willow-mcp/compare/v2.81.0...v2.81.1) (2026-09-23)
+
+
+### Fixed
+
+* **pgp:** fresh-install deadlock, and drop the broker-settable trust path ([80540aa](https://github.com/willow-memory/willow-mcp/commit/80540aac5755a027156de1d96ec48b40ca66c0e6))
+* **pgp:** move trust.env into the vault, break the install-1d deadlock ([5960280](https://github.com/willow-memory/willow-mcp/commit/5960280e1ec983b840720a2ba1390a7e7dbaaa01))
+* **pgp:** enforcement off only when the trust owner wrote it down (N2/N6) ([1eccae7](https://github.com/willow-memory/willow-mcp/commit/1eccae79104a8383d6c23fde7b18b3948f9b6b46))
+* **pgp:** trust config splits from secrets, fails closed, never crashes boot ([438a050](https://github.com/willow-memory/willow-mcp/commit/438a0503fec52cee6d13b8fec0223c456174821a))
+* **pgp:** WILLOW_PGP_FINGERPRINT resolves from one source, refuses on conflict ([a055d7b](https://github.com/willow-memory/willow-mcp/commit/a055d7b7deeae794e53d41efa43367c141b040c6))
+
 ## [2.81.0](https://github.com/willow-memory/willow-mcp/compare/v2.80.0...v2.81.0) (2026-09-23)
 
 
