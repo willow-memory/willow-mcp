@@ -532,7 +532,10 @@ _CORPUS_FIRST_REMINDER = (
     f"jeles-corpus federation (federation_call to server {JELES_FEDERATION_SERVER}), "
     "and nestor_ask / nestor_resolve for a sealed answer. Order: nestor "
     "(sealed) -> box (knowledge_search / jeles federation) -> remote (web) — "
-    "and say which tier answered. The corpus can miss; web search is a fine "
+    "and say which tier answered. Local jeles tools (corpus_search, corpus_ask, "
+    "corpus_host_card, …) need mcp_federation + per-tool grants + "
+    "consent.federation but not grant-net; net-bearing corpus tools and open "
+    "web still need a live lease. The corpus can miss; web search is a fine "
     "fallback then, but say the result is unverified. This is a reminder, "
     "not a block."
 )
