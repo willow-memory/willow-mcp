@@ -31,6 +31,19 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.82.0](https://github.com/willow-memory/willow-mcp/compare/v2.81.3...v2.82.0) (2026-09-23)
+
+
+### Added
+
+* **federation:** exempt loopback Jeles tools from net lease ([7744060](https://github.com/willow-memory/willow-mcp/commit/7744060c72e94af6ff4f932157f16baa7e2a16ac))
+
+
+### Fixed
+
+* **tests:** accept prose tool_denied strings in federation grant test ([53afb2d](https://github.com/willow-memory/willow-mcp/commit/53afb2d30ff033bf6ccf4fb3f1a2fb425c60ee6a))
+* **hooks:** keep repo pre_tool_use.py in sync with bundle twin ([76d78c8](https://github.com/willow-memory/willow-mcp/commit/76d78c8b6e471679195e948e6223dda0e4817e65))
+
 ## [2.81.3](https://github.com/willow-memory/willow-mcp/compare/v2.81.2...v2.81.3) (2026-09-23)
 
 
