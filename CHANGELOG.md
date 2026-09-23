@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.80.0](https://github.com/willow-memory/willow-mcp/compare/v2.79.0...v2.80.0) (2026-09-23)
+
+
+### Added
+
+* **unit-ops:** broker Kart unit enable without D-Bus in the sandbox ([a05de37](https://github.com/willow-memory/willow-mcp/commit/a05de373f20bc7310bd22caac7908dd1ec6450b8))
+
+
+### Fixed
+
+* **unit-ops:** classify fleet_read; bump tool counts; re-render skills ([d19f536](https://github.com/willow-memory/willow-mcp/commit/d19f536572d612a6975c26bc73807386a1986ae8))
+
 ## [2.79.0](https://github.com/willow-memory/willow-mcp/compare/v2.78.0...v2.79.0) (2026-09-22)
 
 
