@@ -12,17 +12,26 @@ template (:mod:`manifest_grant_executor`, verb 18, sealed ``d5504878`` /
 ``b74019ac`` / ``6bd11def``) — read that module's docstring first, every
 rule there applies here.
 
+**Amendment (sealed ``9fe5e179`` / gap ``aafad73d4606``):** routine
+``envelope.ratify`` is an *envelope click*, not a Nestor knowledge seal.
+The desk default is :func:`envelope_ratify_click_request` (and the
+``envelope_ratify`` MCP tool's EACCES fall-through): attributed session +
+operator words. :func:`envelope_ratify_request` remains the remote /
+unattended sealed-pair path only. Manifest/federation/revoke verbs still
+use sealed pairs as their human act.
+
 Same two halves, same one queue, five verbs:
 
 * **Request** (broker, orchestrator-only, signs nothing): one function per
   verb below, each mirroring :func:`manifest_grant_executor.
-  manifest_grant_request` — orchestrator check, a strict single-line grammar
-  parsed out of the sealed pair's OWN ``target_text`` (never the mutable
-  SOIL record), :func:`manifest_grant_executor._verify_seal_only` for the
-  seal itself, a verb-specific pre-state check, then ONE signed request
-  under ``$WILLOW_HOME/manifest_grants/pending/<pair_id>.json`` via
-  :func:`manifest_grant_executor._cite_and_persist` (write, cite, sign — in
-  that order), gated on the SAME one-request-per-pair queue as
+  manifest_grant_request` — orchestrator check, then (for sealed-pair
+  verbs) a strict single-line grammar parsed out of the sealed pair's OWN
+  ``target_text`` (never the mutable SOIL record) and
+  :func:`manifest_grant_executor._verify_seal_only`; for the envelope.ratify
+  *click* path, the human act is the attributed session instead. Then ONE
+  signed request under ``$WILLOW_HOME/manifest_grants/pending/<pair_id>.json``
+  via :func:`manifest_grant_executor._cite_and_persist` (write, cite, sign —
+  in that order), gated on the SAME one-request-per-pair queue as
   ``manifest.grant`` (``verb`` distinguishes the record; the queue itself is
   shared, not duplicated).
 
@@ -31,12 +40,12 @@ Same two halves, same one queue, five verbs:
   :func:`manifest_grant_executor.manifest_grant_apply`'s own drain loop,
   which already refuses to run inside Kart and refuses to run as any uid
   other than the one owning ``apps_root`` — nothing about that changes here.
-  Each apply function re-verifies the seal AND the target's pre-state fresh
-  (:func:`manifest_grant_executor._verify_pending_signature_and_citation`
-  for the broker-signature + FRANK-citation half, common to every verb),
-  then performs its own act through the SAME staged/signed paths the rest
-  of the fleet already uses for that kind of mutation — never a bare
-  ``Path.write_text``, never a hand-rolled JSON dump over a trust-root file.
+  Each apply function re-verifies the request (broker signature + FRANK
+  citation; sealed-pair verbs also re-verify the seal) and the target's
+  pre-state fresh, then performs its own act through the SAME staged/signed
+  paths the rest of the fleet already uses for that kind of mutation —
+  never a bare ``Path.write_text``, never a hand-rolled JSON dump over a
+  trust-root file.
 
 Every apply function receipts to FRANK as ``<verb>_applied`` (dots become
 underscores: ``envelope_revoke_applied`` / ``manifest_retire_applied`` /
@@ -1066,6 +1075,22 @@ def _apply_federation_ratify(record: dict, path: Path, *, ledger, apps_root: Pat
 VERB_ENVELOPE_RATIFY = "envelope.ratify"
 EVENT_ENVELOPE_RATIFIED = "envelope_ratified"
 
+#: Pending-record auth for the desk click path (sealed 9fe5e179 / gap
+#: aafad73d4606): attributed orchestrator session + operator words — not a
+#: Nestor knowledge seal. The sealed-pair path leaves ``auth`` unset /
+#: absent and carries ``sealed_row`` instead.
+AUTH_SESSION_CLICK = "session_click"
+
+
+def click_request_id(proposal_id: str) -> str:
+    """Stable queue id for a session-click ratify of ``proposal_id``.
+
+    Distinct from Nestor pair UUIDs so the shared ``manifest_grants/``
+    queue never collides a click with a sealed-pair request for the same
+    proposal. Filename-safe: proposal ids are already ``[A-Za-z0-9_.-]``.
+    """
+    return f"click-{proposal_id}"
+
 # Loki audit BDC2B0F2, A2 (high, blocking): the grammar used to bind only
 # the proposal id and the operator's words -- the proposal ITSELF (verb,
 # grantee, bounds, expires_at, max_count, use_count_source) was copied at
@@ -1189,6 +1214,122 @@ def _verify_proposal_against_frank(row: dict, *, ledger) -> Optional[dict]:
     return None
 
 
+def envelope_ratify_click_request(
+    app_id: str,
+    *,
+    proposal_id: str,
+    verifier: str,
+    words: str = "ratify",
+    envelope_id: str = "",
+    project: str = "",
+    session: str = "",
+    ledger=None,
+    grants_root: Optional[Path] = None,
+) -> dict:
+    """Desk click path for ``envelope.ratify`` (sealed ``9fe5e179`` / gap
+    ``aafad73d4606``): an attributed orchestrator session + the operator's
+    verbatim words — not a Nestor knowledge seal. Writes one signed request
+    carrying a full copy of the proposal row; the trust-owner apply half
+    completes the move. Same queue and cite/sign discipline as
+    :func:`envelope_ratify_request`; the pending record carries
+    ``auth=session_click`` and no ``sealed_row``.
+
+    Digests and FRANK's ``envelope_proposed`` still bind the grant's
+    CONTENT (Loki BDC2B0F2 A2) — only the human-act instrument changes
+    from memory.seal to the envelope click.
+    """
+    from .human_session import is_orchestrator_app
+
+    if not is_orchestrator_app(app_id):
+        return mgx._refuse(
+            "EPERM", f"{VERB_ENVELOPE_RATIFY} is orchestrator-only; {app_id!r} may not call it"
+        )
+    words = (words or "").strip()
+    if not words:
+        return mgx._refuse("EINVAL", "words must be the operator's non-empty ratification text")
+    verifier = (verifier or "").strip()
+    if not verifier:
+        return mgx._refuse("EINVAL", "verifier is required for a session-click ratify")
+    proposal_id = (proposal_id or "").strip()
+    if not proposal_id:
+        return mgx._refuse("EINVAL", "proposal_id is required")
+
+    pair_id = click_request_id(proposal_id)
+    grants_root_p = mgx._grants_root(grants_root)
+
+    def _body() -> dict:
+        existing = mgx._existing_request_state(grants_root_p, pair_id)
+        if existing is not None:
+            return mgx._refuse(
+                "EALREADY",
+                f"a {VERB_ENVELOPE_RATIFY} click request for proposal_id={proposal_id!r} "
+                f"already exists ({existing})",
+                state=existing,
+                pair_id=pair_id,
+            )
+
+        registry = _envelope_registry_view()
+        active_ids = {r.get("id") for r in (registry.get("active") or [])}
+        if proposal_id in active_ids:
+            return mgx._refuse(
+                "EALREADY",
+                f"envelope {proposal_id!r} is already active — nothing to ratify",
+                envelope_id=proposal_id,
+            )
+
+        proposal_row = None
+        for row in registry.get("proposals") or []:
+            if row.get("id") == proposal_id:
+                proposal_row = row
+                break
+        if proposal_row is None:
+            return mgx._refuse(
+                "ENOENT", f"no pending proposal with id={proposal_id!r} to ratify"
+            )
+
+        if ledger is None:
+            return mgx._refuse(
+                "EAMBIG", "no governance ledger: a request that cannot be cited is not performed"
+            )
+
+        digest = _proposal_digest(proposal_row)
+        frank_refusal = _verify_proposal_against_frank(proposal_row, ledger=ledger)
+        if frank_refusal is not None:
+            return frank_refusal
+
+        target = {
+            "proposal_id": proposal_id,
+            "digest": digest,
+            "words": words,
+            "verifier": verifier,
+            "proposal": {k: v for k, v in proposal_row.items() if not k.startswith("_")},
+        }
+        pending_path = mgx._pending_path(grants_root_p, pair_id)
+        pending_record = {
+            "pair_id": pair_id,
+            "verb": VERB_ENVELOPE_RATIFY,
+            "auth": AUTH_SESSION_CLICK,
+            "envelope_id": None,
+            "citation_id": None,
+            "actor": app_id,
+            "target": target,
+            "project": project or "willow-mcp",
+            "session": session,
+            "requested_at": mgx._now_iso(),
+            "pre_state": {"proposal": {"exists": True}, proposal_id: {"active": False}},
+            # No sealed_row — the human act is the attributed session click,
+            # not a Nestor knowledge seal (9fe5e179 / aafad73d4606).
+        }
+        return mgx._cite_and_persist(
+            pending_path, pending_record, ledger=ledger, envelope_id=envelope_id,
+            app_id=app_id, call_args={"proposal_ids": [proposal_id]},
+            project=project, session=session,
+            pair_id=pair_id, grants_root_p=grants_root_p,
+        )
+
+    return mgx._run_locked_request(grants_root_p, pair_id, _body)
+
+
 def envelope_ratify_request(
     app_id: str,
     *,
@@ -1201,8 +1342,13 @@ def envelope_ratify_request(
     db_path: Optional[Path] = None,
     grants_root: Optional[Path] = None,
 ) -> dict:
-    """Broker side of ``envelope.ratify``. Sealed text: ``ratify envelope
-    <proposal_id> <digest>: <the operator's verbatim words>`` where
+    """Broker side of ``envelope.ratify`` for the REMOTE / UNATTENDED path
+    (gap ``aafad73d4606``): a human-sealed Nestor pair whose ``target_text``
+    is ``ratify envelope <proposal_id> <digest>: <words>``. The desk's
+    default click is :func:`envelope_ratify_click_request` (and the
+    ``envelope_ratify`` MCP tool's EACCES fall-through) — sealed
+    ``9fe5e179``: routine authority is an envelope, not a Nestor seal.
+
     ``<digest>`` is :func:`_proposal_digest` over the proposal's own
     governing fields — the seal binds the grant's CONTENT, not just its
     name (Loki audit BDC2B0F2, A2). Request pre-state: the named proposal
@@ -1346,6 +1492,7 @@ def _apply_envelope_ratify(record: dict, path: Path, *, ledger, apps_root: Path,
     words = target.get("words")
     sealed_digest = target.get("digest")
     proposal_row = target.get("proposal") or {}
+    is_click = record.get("auth") == AUTH_SESSION_CLICK
 
     def _fail(errno: str, reason_msg: str, **extra) -> dict:
         out = {"ok": False, "error": errno, "reason": reason_msg, **extra}
@@ -1366,19 +1513,35 @@ def _apply_envelope_ratify(record: dict, path: Path, *, ledger, apps_root: Path,
     if citation_refusal is not None:
         return _fail(citation_refusal["error"], citation_refusal["reason"])
 
-    # Gap 035d287206e1, F1: never opens nestor.db at apply — verifies the
-    # sealed row's bytes the request half already embedded (and signed).
-    seal_refusal, sealed = mgx._verify_seal_only(pair_id, sealed_row=record.get("sealed_row"))
-    if seal_refusal is not None:
-        return _fail(seal_refusal["error"], seal_refusal["reason"])
-    parsed = _parse_envelope_ratify_text(sealed.get("target_text", ""))
-    if (
-        parsed is None
-        or parsed["proposal_id"] != proposal_id
-        or parsed["words"] != words
-        or parsed["digest"] != sealed_digest
-    ):
-        return _fail("eseal_mismatch", "sealed text no longer matches this request's recorded target")
+    if is_click:
+        # Session-click path (9fe5e179 / aafad73d4606): no Nestor seal.
+        # Human act was the attributed desk call; broker sig + FRANK
+        # citation + content digest bind the grant.
+        verifier = (target.get("verifier") or "").strip()
+        if not verifier:
+            return _fail(
+                "eforged",
+                "session-click request carries no verifier on target — refusing",
+            )
+        if not words:
+            return _fail("eforged", "session-click request carries empty words")
+        if not sealed_digest:
+            return _fail("eforged", "session-click request carries no proposal digest")
+    else:
+        # Gap 035d287206e1, F1: never opens nestor.db at apply — verifies the
+        # sealed row's bytes the request half already embedded (and signed).
+        seal_refusal, sealed = mgx._verify_seal_only(pair_id, sealed_row=record.get("sealed_row"))
+        if seal_refusal is not None:
+            return _fail(seal_refusal["error"], seal_refusal["reason"])
+        parsed = _parse_envelope_ratify_text(sealed.get("target_text", ""))
+        if (
+            parsed is None
+            or parsed["proposal_id"] != proposal_id
+            or parsed["words"] != words
+            or parsed["digest"] != sealed_digest
+        ):
+            return _fail("eseal_mismatch", "sealed text no longer matches this request's recorded target")
+        verifier = sealed.get("verifier") or ""
 
     if not proposal_row or proposal_row.get("id") != proposal_id:
         return _fail("eforged", "request carries no valid copy of the proposal row to ratify")
@@ -1386,16 +1549,16 @@ def _apply_envelope_ratify(record: dict, path: Path, *, ledger, apps_root: Path,
     # Loki audit BDC2B0F2, A2: the check that actually holds. The row
     # travelling inside this signed, citation-bound request is checked
     # against TWO independent anchors the broker could not have rewritten
-    # after the seal landed: (1) the digest the operator actually sealed,
+    # after the human act landed: (1) the digest bound at request time,
     # recomputed fresh from this copy; (2) FRANK's own envelope_proposed
-    # event, inked before any seal existed. Agreement on both is required
-    # before this row is ever signed into the register as issued_by=root.
+    # event, inked at propose. Agreement on both is required before this
+    # row is ever signed into the register as issued_by=root.
     computed_digest = _proposal_digest(proposal_row)
     if computed_digest != sealed_digest:
         return _fail(
             "eseal_mismatch",
-            f"copied proposal row's digest does not match the sealed digest for "
-            f"{proposal_id!r} — the row disagrees with what the operator actually sealed",
+            f"copied proposal row's digest does not match the bound digest for "
+            f"{proposal_id!r} — the row disagrees with what was ratified",
             expected_digest=sealed_digest, computed_digest=computed_digest,
         )
 
@@ -1411,7 +1574,6 @@ def _apply_envelope_ratify(record: dict, path: Path, *, ledger, apps_root: Path,
 
     from . import envelope_authoring, envelopes
 
-    verifier = sealed.get("verifier") or ""
     try:
         result = envelope_authoring.ratify_proposal_row(
             proposal_row,
@@ -1437,6 +1599,8 @@ def _apply_envelope_ratify(record: dict, path: Path, *, ledger, apps_root: Path,
     out = {
         "ok": True, "envelope_id": proposal_id, "ratified_at": result.get("issued_at"),
         "ratified_by": result.get("ratified_by"), "receipt_ids": receipt_ids,
+        "auth": AUTH_SESSION_CLICK if is_click else "sealed_pair",
+        "words": words,
     }
     if result.get("_ledger_error"):
         out["receipt_error"] = result["_ledger_error"]

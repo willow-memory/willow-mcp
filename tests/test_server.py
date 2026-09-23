@@ -1115,14 +1115,57 @@ def test_task_submit_allow_net_appends_directive_with_permission(tmp_path, monke
     assert params[3] == envelope
 
 
-def test_task_submit_allow_localhost_requires_and_binds_signed_authority(
+def test_task_submit_allow_localhost_queues_without_envelope_or_hold(
     tmp_path, monkeypatch
 ):
+    """Sealed 9fe5e179 / gap 582b1e676fb3: localhost is not a net lease.
+
+    Kart's localhost_tier shares the host netns for loopback; the broker must
+    not hold_and_propose or demand a standing lease / signed envelope.
+    """
+    from willow_mcp import decision_bridge, net_authority
+
     app = _app_with_perms(
         tmp_path, monkeypatch, "localapp", ["full_access", "task_net"]
     )
     _operator_consents(tmp_path)
-    _operator_leases(app)
+    # Deliberately NO lease — localhost must not require one.
+    fake = _FakePg(columns=_TASKS_COLUMNS)
+    monkeypatch.setattr(server, "get_pg", lambda: fake)
+    server.schema_confirm_mapping(app_id=app, table="tasks")
+    proposed = []
+
+    def _propose(app_id, record_id, store=None, db_path=None):
+        proposed.append((app_id, record_id))
+        return {"pair_id": "pair-should-not", "record_id": record_id, "status": "draft"}
+
+    monkeypatch.setattr(decision_bridge, "propose", _propose)
+
+    result = server.task_submit(
+        app_id=app,
+        task="curl http://127.0.0.1:11434",
+        agent="kart",
+        allow_localhost=True,
+    )
+
+    assert result["status"] == "pending", result
+    assert result.get("pair_id") is None
+    assert result["status"] != net_authority.HELD_STATUS
+    assert proposed == [], "localhost must not propose a Nestor seal pair"
+    insert_sql, params = fake.executed[-1]
+    assert insert_sql.startswith("INSERT INTO tasks")
+    assert params[1] == "curl http://127.0.0.1:11434\n# allow_localhost"
+    assert '"network_authorization"' not in insert_sql
+
+
+def test_task_submit_allow_localhost_ignores_supplied_network_authorization(
+    tmp_path, monkeypatch
+):
+    """A leftover envelope on allow_localhost must not bind or hold the row."""
+    app = _app_with_perms(
+        tmp_path, monkeypatch, "localapp2", ["full_access", "task_net"]
+    )
+    _operator_consents(tmp_path)
     fake = _FakePg(columns=_TASKS_COLUMNS)
     monkeypatch.setattr(server, "get_pg", lambda: fake)
     server.schema_confirm_mapping(app_id=app, table="tasks")
@@ -1136,10 +1179,12 @@ def test_task_submit_allow_localhost_requires_and_binds_signed_authority(
         network_authorization=envelope,
     )
 
-    assert result == {"task_id": "NETTASK1", "status": "pending"}
+    assert result["status"] == "pending", result
+    # task_id must be freshly minted, not the envelope's claimed id
+    assert result["task_id"] != "NETTASK1"
     insert_sql, params = fake.executed[-1]
     assert params[1] == "curl http://127.0.0.1:11434\n# allow_localhost"
-    assert '"network_authorization"' in insert_sql
+    assert '"network_authorization"' not in insert_sql
 
 
 def test_task_submit_allow_net_without_envelope_is_held_and_proposed(tmp_path, monkeypatch):

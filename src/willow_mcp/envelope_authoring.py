@@ -386,17 +386,17 @@ def _register_writable() -> tuple[bool, str, dict]:
         owner = str(d.stat().st_uid)
     reason = (
         f"{d} is not writable by this process (uid {os.geteuid()}) — owned "
-        f"by {owner!r}. This process (the desk, via the envelope_ratify MCP "
-        f"tool) cannot complete ratify() as written — a sudo -u {owner} run "
-        "of this same function fails too, on the OTHER file this call would "
-        "need to touch (the broker-owned, 0600 proposals sidecar it cannot "
-        "read as this uid). Use envelope_ratify_request instead: it verifies "
-        "a human-sealed Nestor pair, writes one signed request, and the "
-        "trust-owner apply half (envelope.ratify, gap d3f79320ccb5) moves "
-        "the proposal into the register from there — the same request/apply "
-        "split manifest.grant and envelope.revoke already use. The proposal "
-        "named here queues in $WILLOW_HOME/proposals/ and is not lost; "
-        "nothing was touched by this refusal."
+        f"by {owner!r}. Direct ratify() cannot span both the broker-owned "
+        "0600 proposals sidecar and this trust-owner-owned register from one "
+        "uid (Loki 367C367A/42B3B46F). Default click (sealed 9fe5e179 / gap "
+        "aafad73d4606): from an attributed orchestrator session call "
+        "envelope_ratify — the MCP tool queues a session-click request and "
+        "the trust-owner apply half completes the move; no Nestor seal. "
+        f"Operator terminal click: `sudo -E willow-mcp envelope ratify "
+        f"<proposal_id> --verifier NAME` (root spans both files). "
+        "Remote/unattended only: envelope_ratify_request with a sealed "
+        "Nestor pair. The proposal named here stays in "
+        "$WILLOW_HOME/proposals/; nothing was touched by this refusal."
     )
     return False, reason, {"error": "EACCES", "path": str(d), "owner": owner}
 

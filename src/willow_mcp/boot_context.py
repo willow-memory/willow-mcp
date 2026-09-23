@@ -251,6 +251,21 @@ def build_boot_lines(
     # degrades to no line on any fault (see commitments/boot.py).
     lines.extend(commitment_boot_lines(app_id))
 
+    # Desk NOTIFY consume (CI red / title fail + complete awaiting verify).
+    # Prefer the orientation slice session_enter already computed; fall back
+    # to a fresh collect so boot stays useful if orientation omitted it.
+    try:
+        from . import desk_attention as _desk_attention
+
+        attention = (orientation or {}).get("desk_attention")
+        if not attention:
+            attention = _desk_attention.collect_desk_attention(app_id)
+        lines.extend(_desk_attention.attention_boot_lines(attention))
+    except Exception:
+        logging.getLogger("willow_mcp.boot_context").debug(
+            "desk_attention boot lines failed", exc_info=True
+        )
+
     lines.extend(_frank_line(orientation))
     lines.extend(_attestation_line(enter_result))
     lines.extend(_blocker_lines(orientation))

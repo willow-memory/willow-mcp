@@ -1319,6 +1319,64 @@ def test_envelope_ratify_end_to_end(home, tmp_path, monkeypatch, store, ring_wit
     assert not any(r["id"] == "env-jeles-dispatch" for r in sidecar_doc["proposals"])
 
 
+def test_envelope_ratify_session_click_end_to_end(home, tmp_path, monkeypatch, store):
+    """Sealed 9fe5e179 / gap aafad73d4606: desk click queues without a
+    Nestor pair; apply still moves the proposal under digest + FRANK."""
+    default_reg = home / "constitutional" / "pre-approved.json"
+    default_reg.parent.mkdir(parents=True, exist_ok=True)
+    governing = {
+        "id": "env-envelope.ratify-test", "verb_id": 24, "verb": "envelope.ratify",
+        "grantee": "willow", "bounds": {"proposal_ids": ["env-jeles-dispatch"]},
+        "issued_by": "root", "issued_at": "2026-01-01", "expires_at": "2027-01-01",
+        "max_count": None, "use_count_source": "frank", "status": "active",
+    }
+    default_reg.write_text(json.dumps({"active": [governing]}))
+    tab = home / "constitutional" / "syscall-table.json"
+    tab.write_text(json.dumps({"verbs": [{"id": 24, "verb": "envelope.ratify",
+                                           "bounds": {"proposal_ids": "l"}}]}))
+    monkeypatch.setenv("WILLOW_SYSCALL_TABLE", str(tab))
+
+    proposal = _proposal_row(bounds={"channel": "ops"})
+    _write_sidecar(home, proposals=[proposal])
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    _ink_proposed(ledger, proposal)
+
+    grants_root = home / "manifest_grants"
+    out = tov.envelope_ratify_click_request(
+        "willow",
+        proposal_id=proposal["id"],
+        verifier="sean",
+        words="ratify",
+        session="s-click-1",
+        ledger=ledger,
+        grants_root=grants_root,
+    )
+    assert out["ok"] is True, out
+    assert out["state"] == "requested"
+    assert out["pair_id"] == tov.click_request_id(proposal["id"])
+    pending = json.loads((grants_root / "pending" / f"{out['pair_id']}.json").read_text())
+    assert pending["auth"] == tov.AUTH_SESSION_CLICK
+    assert "sealed_row" not in pending
+    assert pending["target"]["verifier"] == "sean"
+    assert pending["target"]["words"] == "ratify"
+
+    apply_out = _apply(ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root)
+    processed = apply_out["processed"][0]
+    assert processed["ok"] is True, processed
+    assert processed["envelope_id"] == "env-jeles-dispatch"
+    assert processed["auth"] == tov.AUTH_SESSION_CLICK
+
+    registry = json.loads(default_reg.read_text())
+    active = next(r for r in registry["active"] if r["id"] == "env-jeles-dispatch")
+    assert active["status"] == "active"
+    assert active["issued_by"] == "root"
+    assert active["ratified_by"] == "sean"
+
+    assert _receipts(pg, tov.EVENT_ENVELOPE_RATIFIED)
+
+
 def test_envelope_ratify_apply_refuses_tampered_row_even_if_request_missed_it(
     home, tmp_path, store,
 ):
