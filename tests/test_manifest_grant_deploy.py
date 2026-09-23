@@ -318,6 +318,21 @@ def test_plant_every_deploy_scan_helper_catches_its_violation():
         "set -euo pipefail\nwillow-mcp-serve.service.d/pgp.conf"
     ) is False
 
+    assert _install_md_missing_required_content("nothing here") == list(_INSTALL_MD_REQUIRED_STRINGS)
+    assert _install_md_missing_required_content(" ".join(_INSTALL_MD_REQUIRED_STRINGS)) == []
+
+    assert _install_md_still_claims_home_env_is_the_source(
+        "`$H/env` is now the **one** source of truth"
+    ) is True
+    assert _install_md_still_claims_home_env_is_the_source(
+        "`trust.env` is now the one source of truth"
+    ) is False
+
+    assert _install_md_missing_reconnect_is_not_enough_caveat("reconnecting just works") is True
+    assert _install_md_missing_reconnect_is_not_enough_caveat(
+        "reconnecting that session is NOT enough by itself"
+    ) is False
+
 
 def test_all_five_files_present():
     for name in (
@@ -325,6 +340,25 @@ def test_all_five_files_present():
         "willow-mcp-manifest-grant.timer", "manifest-grant.env",
     ):
         assert (_DEPLOY / name).is_file(), f"missing {name}"
+
+
+def test_install_md_documents_trust_env_and_the_mcp_json_pin():
+    """N3 BLOCKING-per-re-audit: the prior round's closeout claimed this
+    file was updated; `git diff --stat` for those commits had no
+    INSTALL.md in it at all. This asserts the CONTENT a re-audit actually
+    checked for, not merely that some line changed."""
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_missing_required_content(text) == []
+
+
+def test_install_md_no_longer_claims_home_env_is_the_source_of_truth():
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_still_claims_home_env_is_the_source(text) is False
+
+
+def test_install_md_no_longer_claims_reconnect_alone_picks_up_a_new_key():
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_missing_reconnect_is_not_enough_caveat(text) is False
 
 
 def test_every_file_cites_both_sealed_pairs():
@@ -355,6 +389,39 @@ def test_install_sh_has_the_f7_preflight_and_ordering_fixes():
     text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
     assert _install_sh_missing_f7_checks(text) == []
     assert _install_sh_6b_before_restart(text) is True
+
+
+# ── Loki re-audit 93D0F057, N3: "claimed but not done" last round — this
+# time the diff is in evidence (see the handoff), and this test proves the
+# CONTENT, not just that some edit happened. ────────────────────────────
+
+_INSTALL_MD_REQUIRED_STRINGS = (
+    "trust.env",              # the one source of truth is named
+    ".mcp.json",              # the desk's pin is named
+    "point of no return",     # N3: mark it
+    "--check-signatures",     # N3: first step is a read-only check
+    "report-only",            # N4: that check must work with no trust.env yet
+)
+
+
+def _install_md_missing_required_content(text: str) -> list[str]:
+    return [s for s in _INSTALL_MD_REQUIRED_STRINGS if s not in text]
+
+
+def _install_md_still_claims_home_env_is_the_source(text: str) -> bool:
+    """The stale claim Loki measured: '$H/env is the one source'. The
+    fingerprint's source is trust.env now; $H/env is still named (it
+    holds secrets, and the migration step references it), but never as
+    THE source of the fingerprint."""
+    return "$H/env` is now the **one**" in text or "$H/env` is now the one" in text
+
+
+def _install_md_missing_reconnect_is_not_enough_caveat(text: str) -> bool:
+    """The stale claim Loki measured (F2): reconnecting a stdio desk
+    session picks up a new fingerprint. It does not, when that session's
+    own .mcp.json still pins one — this must be said explicitly, not
+    implied to just work."""
+    return "NOT enough" not in text
 
 
 def test_install_sh_has_no_glob_for_broker_public_key_or_broker_unit():
@@ -417,6 +484,107 @@ def test_install_sh_key_setup_runs_before_the_atomic_sync_and_sign_step():
     assert idx_key != -1, "signing-key step not found"
     assert idx_sync_sign != -1, "sync+sign step not found"
     assert idx_key < idx_sync_sign
+
+
+def test_install_sh_writes_trust_env_exactly_once_from_one_shared_function():
+    """Loki re-audit 93D0F057, N1: the plain install used to publish
+    trust.env at step 1b, separately from --rotate's own write, and could
+    drift out of sync with it (F3's pattern recurring in the plain-install
+    path). There is now exactly ONE place in the whole script that installs
+    a file at $TRUST_ENV — inside sign_and_publish_trust — proving both
+    the plain install and --rotate call the same sequence rather than
+    maintaining two orderings."""
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    body = _script_body(text)
+    write_marker = 'install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$TRUST_TMP" "$TRUST_ENV"'
+    assert body.count(write_marker) == 1, (
+        f"expected exactly one $TRUST_ENV write site, found {body.count(write_marker)}"
+    )
+    # And it must live inside sign_and_publish_trust, not inside step 1b.
+    idx_write = body.find(write_marker)
+    idx_shared_fn = body.find("sign_and_publish_trust() {")
+    idx_step_1c = body.find("1c. sync + sign constitutional")
+    assert idx_shared_fn != -1 and idx_step_1c != -1
+    assert idx_shared_fn < idx_write < idx_step_1c, (
+        "the $TRUST_ENV write must live inside sign_and_publish_trust's own "
+        "definition, which install.sh defines before step 1c ever runs"
+    )
+
+
+def test_install_sh_step_6_calls_the_shared_sign_and_publish_function():
+    """The plain install's step 6 must call sign_and_publish_trust rather
+    than re-sign files with its own independent loop (N1) — this also
+    means it now covers frank_head_anchor.json and ratified seeds via
+    governed_files(), which the old step 6 loop never did."""
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    body = _script_body(text)
+    idx_step6 = body.find('say "== 6. re-sign everything under $FPR')
+    assert idx_step6 != -1
+    tail = body[idx_step6:idx_step6 + 400]
+    assert 'sign_and_publish_trust "$FPR" "$OLD_TRUST_FPR"' in tail
+
+
+def _extract_strip_pgp_pin_heredoc(install_sh_text: str) -> str:
+    """The Python tokenizer embedded in `strip_pgp_pin()`'s
+    `"$PY" - "$dropin" <<'PYEOF' ... PYEOF` heredoc, extracted so it can
+    be executed directly against synthetic drop-in files — the only way
+    to prove the REAL logic handles a given Environment= shape, rather
+    than eyeballing the regex."""
+    marker_start = '"$PY" - "$dropin" <<\'PYEOF\'\n'
+    start = install_sh_text.index(marker_start) + len(marker_start)
+    end = install_sh_text.index("\nPYEOF", start)
+    return install_sh_text[start:end]
+
+
+@pytest.mark.parametrize(
+    "dropin_line",
+    [
+        'Environment="WILLOW_PGP_FINGERPRINT=9B6F87BEB4AE56E2000000000000000000000000"',
+        'Environment="FOO=1" "WILLOW_PGP_FINGERPRINT=9B6F87BEB4AE56E2000000000000000000000000"',
+        'Environment = "WILLOW_PGP_FINGERPRINT=9B6F87BEB4AE56E2000000000000000000000000"',
+        'WILLOW_PGP_FINGERPRINT=9B6F87BEB4AE56E2000000000000000000000000',
+    ],
+    ids=["quoted-solo", "multi-token", "spaced-equals", "bare-legacy"],
+)
+def test_strip_pgp_pin_heredoc_actually_strips_every_real_shape(tmp_path, dropin_line):
+    """Loki audit A38D41C2 F1 and its re-audit residual (93D0F057): proves
+    the REAL extracted tokenizer — not a paraphrase of it — removes the
+    fingerprint token from every shape systemd's Environment= directive
+    can actually take, including two the first cut's sed missed:
+    `Environment="FOO=1" "WILLOW_PGP_FINGERPRINT=..."` (a second
+    assignment sharing the line) and `Environment = "..."` (space before
+    the `=`)."""
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    heredoc_src = _extract_strip_pgp_pin_heredoc(text)
+    script = tmp_path / "strip.py"
+    script.write_text(heredoc_src, encoding="utf-8")
+    dropin = tmp_path / "pgp.conf"
+    dropin.write_text(f"[Service]\n{dropin_line}\n", encoding="utf-8")
+    result = subprocess.run(
+        ["python3", str(script), str(dropin)], capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    final = dropin.read_text(encoding="utf-8")
+    assert "WILLOW_PGP_FINGERPRINT" not in final, (
+        f"pin survived the strip for shape {dropin_line!r}: {final!r}"
+    )
+
+
+def test_strip_pgp_pin_heredoc_preserves_an_unrelated_token_on_the_same_line(tmp_path):
+    """The multi-token shape must not delete the WHOLE line just because
+    it also carries the fingerprint — only that one token."""
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    heredoc_src = _extract_strip_pgp_pin_heredoc(text)
+    script = tmp_path / "strip.py"
+    script.write_text(heredoc_src, encoding="utf-8")
+    dropin = tmp_path / "pgp.conf"
+    dropin.write_text(
+        '[Service]\nEnvironment="FOO=1" "WILLOW_PGP_FINGERPRINT=AAAA"\n', encoding="utf-8"
+    )
+    subprocess.run(["python3", str(script), str(dropin)], check=True, capture_output=True)
+    final = dropin.read_text(encoding="utf-8")
+    assert "FOO=1" in final
+    assert "WILLOW_PGP_FINGERPRINT" not in final
 
 
 _TRACKED_SHEBANG_SCRIPTS = (

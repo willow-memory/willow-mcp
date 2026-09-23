@@ -299,19 +299,63 @@ strip_pgp_pin() {
     say "  no pin found at $dropin"
     return 0
   fi
-  # Loki A38D41C2, F1 (BLOCKING): the real drop-in line is
-  # Environment="WILLOW_PGP_FINGERPRINT=..." (systemd's Environment=
-  # directive, optionally quoted) -- NOT a bare WILLOW_PGP_FINGERPRINT= at
-  # line start. The old regex matched nothing on the real file, deleted
-  # nothing, and printed "stripped" anyway. Both shapes are matched now,
-  # and the strip is VERIFIED afterward -- a step that reports success it
-  # did not achieve is worse than no step at all.
-  sed -i -E \
-    -e '/^WILLOW_PGP_FINGERPRINT=/d' \
-    -e '/^Environment="?WILLOW_PGP_FINGERPRINT=/d' \
-    "$dropin"
-  if grep -qE '(^|=)"?WILLOW_PGP_FINGERPRINT=' "$dropin"; then
-    stop "$dropin still names WILLOW_PGP_FINGERPRINT after the strip -- the regex did not match its actual shape. Not reporting success; fix strip_pgp_pin() in install.sh and rerun. Contents: $(cat "$dropin")"
+  # Loki A38D41C2, F1 (BLOCKING) and its re-audit residual (93D0F057):
+  # systemd's Environment= directive is not line-shaped the way a bare
+  # sed regex can safely match -- it takes a SPACE-SEPARATED list of
+  # shell-quoted NAME=VALUE tokens on one line
+  # (`Environment="FOO=1" "WILLOW_PGP_FINGERPRINT=..."`), tolerates space
+  # around the `=` (`Environment = "..."`), and a naive per-line regex
+  # either matches nothing (deletes nothing, reports "stripped" falsely)
+  # or -- worse -- deletes an ENTIRE line that also carries an unrelated
+  # variable. Tokenized properly with shlex (the same approach
+  # env_fingerprint.py already uses for this exact directive) via the
+  # trust-owner python: strip ONLY the WILLOW_PGP_FINGERPRINT= token from
+  # each Environment= line, rebuild the line from whatever tokens remain,
+  # and drop the line entirely only if nothing remains on it.
+  "$PY" - "$dropin" <<'PYEOF'
+import re, shlex, sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+had_trailing_newline = text.endswith("\n")
+lines = text.split("\n")
+out = []
+changed = False
+env_re = re.compile(r'^(\s*)Environment\s*=\s*(.*)$')
+bare_re = re.compile(r'^\s*WILLOW_PGP_FINGERPRINT=')
+for line in lines:
+    if bare_re.match(line):
+        # The pre-systemd-drop-in shape this install once wrote directly
+        # (no Environment= wrapper at all) -- still matched for anything
+        # left over from before the drop-in existed.
+        changed = True
+        continue
+    m = env_re.match(line)
+    if not m:
+        out.append(line)
+        continue
+    indent, rest = m.groups()
+    try:
+        tokens = shlex.split(rest, posix=True)
+    except ValueError:
+        out.append(line)  # can't safely tokenize -- leave it, never guess
+        continue
+    kept = [t for t in tokens if not t.startswith("WILLOW_PGP_FINGERPRINT=")]
+    if len(kept) == len(tokens):
+        out.append(line)
+        continue
+    changed = True
+    if not kept:
+        continue  # drop the whole line
+    out.append(indent + "Environment=" + " ".join(f'"{t}"' for t in kept))
+new_text = "\n".join(out)
+if had_trailing_newline and not new_text.endswith("\n"):
+    new_text += "\n"
+if changed:
+    open(path, "w", encoding="utf-8").write(new_text)
+print("CHANGED" if changed else "UNCHANGED")
+PYEOF
+  if grep -qE 'WILLOW_PGP_FINGERPRINT=' "$dropin"; then
+    stop "$dropin still names WILLOW_PGP_FINGERPRINT after the strip -- the tokenizer did not match its actual shape. Not reporting success; fix strip_pgp_pin() in install.sh and rerun. Contents: $(cat "$dropin")"
   fi
   local remainder
   remainder=$(grep -vE '^\s*(#|\[Service\]\s*$|\s*$)' "$dropin" || true)
@@ -350,17 +394,72 @@ restart_broker() {
   say "  session will conflict with $TRUST_ENV and refuse to boot."
 }
 
+# sign_and_publish_trust: the ONE code path for "change what is trusted" --
+# Loki re-audit 93D0F057, N1: the plain install used to publish trust.env at
+# step 1b and re-sign at step 6, many steps and several stop points later
+# (the migration stop, a sync failure, the seed stop, postgres peer auth,
+# the pending/ refusal) -- any one of them left trust switched with nothing
+# re-signed. --rotate already had the safe order (sign+verify -> THEN
+# publish -> THEN retire); this is that same sequence, extracted so BOTH the
+# plain install and --rotate call it instead of maintaining two orderings
+# that can drift apart. Also closes the other half of N1: the plain
+# install's own step 6 never covered frank_head_anchor.json or the ratified
+# seeds (only --rotate's governed_files() did) -- calling THIS function from
+# the plain install covers them too, since governed_files() always has.
+sign_and_publish_trust() {
+  local new_fpr="$1"
+  local old_fpr="$2"   # may be empty -- nothing to retire
+  mapfile -t FILES < <(governed_files)
+  say "  re-signing ${#FILES[@]} governed path(s) under $new_fpr (trust NOT switched yet)"
+  if ! "$PY" "$HERE/rotate_resign.py" --sign-as "$TRUST_OWNER" --gnupg-home "$GNUPGHOME_TO" \
+       --fingerprint "$new_fpr" "${FILES[@]}"; then
+    stop "re-signing failed -- rotate_resign.py already restored every file it touched this run to its previous signature, and $TRUST_ENV was not written, so the box is exactly as it was before this step started. Nothing to revert by hand; fix the failure above and retry."
+  fi
+  as_op "$PY" "$HERE/rotate_resign.py" --check --fingerprint "$new_fpr" "${FILES[@]}" \
+    || stop "post-sign verification found a file that does not verify under $new_fpr -- see the table above. $TRUST_ENV was not written; the box still trusts whatever it trusted before. Fix the mismatch and retry."
+  say "  every governed file verifies under $new_fpr -- safe to switch trust now"
+
+  TRUST_TMP=$(mktemp)
+  printf 'WILLOW_PGP_FINGERPRINT=%s\n' "$new_fpr" > "$TRUST_TMP"
+  install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$TRUST_TMP" "$TRUST_ENV"
+  rm -f "$TRUST_TMP"
+  say "  wrote $new_fpr to $TRUST_ENV -- trust switched"
+
+  if [ -n "$old_fpr" ] && [ "$old_fpr" != "$new_fpr" ]; then
+    if as_to gpg --batch --yes --delete-secret-and-public-key "$old_fpr"; then
+      say "  retired previous trust-owner key $old_fpr from $GNUPGHOME_TO"
+    else
+      say "  WARNING: could not retire $old_fpr from $GNUPGHOME_TO -- retire it by hand (as_to gpg --batch --yes --delete-secret-and-public-key $old_fpr)"
+    fi
+  fi
+}
+
 # ---------------------------------------------------------- --check-signatures
-# Item 5 (B291C0C7): one read that tells the desk whether the rotation
-# actually landed everywhere, rather than trusting --rotate's own exit code.
-# Read-only — touches nothing. Runs as the operator: the operator's own
-# keyring is what step 1b/--rotate import the trust owner's PUBLIC key into,
-# so a plain (no --homedir) gpg --verify as that uid is the same trust a real
-# reader (paths.trusted_read, run by the broker) exercises.
+# Item 5 (B291C0C7): one read that tells the desk whether a migration or
+# rotation actually landed everywhere, rather than trusting the mutating
+# step's own exit code. Read-only — touches nothing. Runs as the operator:
+# the operator's own keyring is what step 1b/--rotate import the trust
+# owner's PUBLIC key into, so a plain (no --homedir) gpg --verify as that
+# uid is the same trust a real reader (paths.trusted_read, run by the
+# broker) exercises.
+#
+# Loki re-audit 93D0F057, N4: this is supposed to be the FIRST step of a
+# migration -- but trust.env does not exist on a box that has never been
+# through this install, which is exactly the state a first-run check needs
+# to work from. No longer stops when trust.env is absent: falls back to
+# rotate_resign.py --check's report-only mode (no --fingerprint), which
+# names who signed each file right now without needing anything to compare
+# against.
 if [ -n "$CHECK_SIGNATURES" ]; then
   say "== --check-signatures: which fingerprint does each governed file verify under"
   CUR_FPR=$(grep -E '^WILLOW_PGP_FINGERPRINT=' "$TRUST_ENV" 2>/dev/null | tail -1 | cut -d= -f2- || true)
-  [ -n "$CUR_FPR" ] || stop "WILLOW_PGP_FINGERPRINT not set in $TRUST_ENV — nothing to check against"
+  mapfile -t FILES < <(governed_files)
+  if [ -z "$CUR_FPR" ]; then
+    say "  $TRUST_ENV not set (or does not exist yet) -- report-only mode: naming"
+    say "  who signed each governed file right now, nothing to compare against."
+    as_op "$PY" "$HERE/rotate_resign.py" --check "${FILES[@]}"
+    exit $?
+  fi
   # Loki A38D41C2, F8: root can read BOTH $H/env (0600) and $TRUST_ENV
   # (0644) -- this is the one place that CAN catch the two copies drifting
   # apart, since neither the broker nor the trust-owner apply unit alone
@@ -371,7 +470,6 @@ if [ -n "$CHECK_SIGNATURES" ]; then
   if [ -n "$STALE_HOME_FPR" ]; then
     say "  WARNING: $H/env still names WILLOW_PGP_FINGERPRINT=$STALE_HOME_FPR -- the fingerprint's one source is now $TRUST_ENV ($CUR_FPR). A leftover value in \$H/env is inert to pgp.py (which no longer reads that file for this key) UNLESS something exports it into a process's own environment, in which case it competes with $TRUST_ENV and pgp.expected_fingerprint() refuses. Remove the line from $H/env (rerun a plain install to migrate it automatically) or confirm nothing sources it."
   fi
-  mapfile -t FILES < <(governed_files)
   as_op "$PY" "$HERE/rotate_resign.py" --check --fingerprint "$CUR_FPR" "${FILES[@]}"
   exit $?
 fi
@@ -409,49 +507,15 @@ if [ -n "$ROTATE" ]; then
   echo "$NEW_FPR:6:" | sudo -u "$OPERATOR" gpg --batch --import-ownertrust
   say "  imported $NEW_FPR into $OPERATOR's keyring"
 
-  # 3. re-sign and verify every governed file — one atomic batch
-  # (rotate_resign.py: a failure on file N rolls back every file this run
-  # already re-signed, not just N; Ctrl-C/SIGTERM mid-batch roll back too —
-  # Loki A38D41C2, F7). $TRUST_ENV is NOT touched yet, so the running broker
-  # still trusts $OLD_FPR while this runs. If this step fails or is
-  # interrupted, $TRUST_ENV was never written, so there is NOTHING to revert
-  # by hand — the box is exactly as it was before --rotate started, which is
-  # the fix for F3 (the old cut wrote $TRUST_ENV/$H/env FIRST, so a running
-  # broker's trust flipped to the new key before anything was signed under
-  # it — "the register is signed by a key the broker does not trust", the
+  # 3-5. re-sign+verify as one atomic batch, THEN switch trust, THEN retire
+  # the old trust-owner key — the ONE shared sequence (Loki re-audit
+  # 93D0F057, N1); see sign_and_publish_trust's own definition for why the
+  # order is the whole point (F3: the old cut wrote trust before signing,
+  # so a running broker's trust flipped to a key nothing was signed under
+  # yet — "the register is signed by a key the broker does not trust", the
   # 2026-09-23 incident, verbatim).
-  mapfile -t FILES < <(governed_files)
-  say "  re-signing ${#FILES[@]} governed path(s) under $NEW_FPR (trust NOT switched yet)"
-  if ! "$PY" "$HERE/rotate_resign.py" --sign-as "$TRUST_OWNER" --gnupg-home "$GNUPGHOME_TO" \
-       --fingerprint "$NEW_FPR" "${FILES[@]}"; then
-    stop "re-signing failed — rotate_resign.py already restored every file it touched this run to its previous signature, and \$TRUST_ENV was never written, so the box is exactly as it was before --rotate started. The old key ($OLD_FPR) was NOT retired. Nothing to revert by hand; fix the failure above and rerun --rotate."
-  fi
-  as_op "$PY" "$HERE/rotate_resign.py" --check --fingerprint "$NEW_FPR" "${FILES[@]}" \
-    || stop "post-rotate verification found a file that does not verify under $NEW_FPR — see the table above. \$TRUST_ENV was never written, so the box still trusts $OLD_FPR and nothing is half-switched. The old key was NOT retired; fix the mismatch and rerun --rotate."
-  say "  every governed file verifies under $NEW_FPR — safe to switch trust now"
+  sign_and_publish_trust "$NEW_FPR" "$OLD_FPR"
 
-  # 4. ONLY NOW — everything is already signed AND verified under the new
-  # key — switch trust: write $TRUST_ENV. This is the narrowest possible
-  # window where $TRUST_ENV's write could be interrupted mid-write; if it
-  # is, the file becomes unreadable/malformed, which pgp.py now (F4) fails
-  # CLOSED on rather than silently disabling enforcement — never a state
-  # where the register is trusted-but-wrongly-signed, which is what F3
-  # measured.
-  TRUST_TMP=$(mktemp)
-  printf 'WILLOW_PGP_FINGERPRINT=%s\n' "$NEW_FPR" > "$TRUST_TMP"
-  install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$TRUST_TMP" "$TRUST_ENV"
-  rm -f "$TRUST_TMP"
-  say "  wrote $NEW_FPR to $TRUST_ENV — trust switched"
-
-  # 5. only now — trust has switched and every file already verifies —
-  # retire the old keys.
-  if [ -n "$OLD_FPR" ] && [ "$OLD_FPR" != "$NEW_FPR" ]; then
-    if as_to gpg --batch --yes --delete-secret-and-public-key "$OLD_FPR"; then
-      say "  retired previous trust-owner key $OLD_FPR from $GNUPGHOME_TO"
-    else
-      say "  WARNING: could not retire $OLD_FPR from $GNUPGHOME_TO — retire it by hand (as_to gpg --batch --yes --delete-secret-and-public-key $OLD_FPR)"
-    fi
-  fi
   for fpr in "${RETIRE_FPRS[@]}"; do
     if sudo -u "$OPERATOR" gpg --batch --yes --delete-key "$fpr"; then
       say "  retired $fpr from $OPERATOR's keyring"
@@ -628,21 +692,25 @@ echo "$FPR:6:" | sudo -u "$OPERATOR" gpg --batch --import-ownertrust
 
 # Dispatch 0CB0C85C: the fingerprint's one source is $TRUST_ENV
 # (trust-owner-owned, world-readable — constitutional/ is already
-# trust-owner-owned by step 1, above), never $H/env (0600, secrets). Written
-# by root, then chowned to the trust owner — same shape as the register.
-TRUST_TMP=$(mktemp)
-printf 'WILLOW_PGP_FINGERPRINT=%s\n' "$FPR" > "$TRUST_TMP"
-install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$TRUST_TMP" "$TRUST_ENV"
-rm -f "$TRUST_TMP"
-say "  published $FPR to $TRUST_ENV"
+# trust-owner-owned by step 1, above), never $H/env (0600, secrets).
+#
+# Loki re-audit 93D0F057, N1: $TRUST_ENV is NOT written here any more —
+# doing so this early is the exact F3 pattern (trust switches before
+# anything is re-signed under it). The key is only GENERATED/resolved
+# here; sign_and_publish_trust (called after 1c/1d/2-5, once every
+# governed file already verifies under $FPR) is what actually writes
+# $TRUST_ENV, the one place trust switches, for both this plain-install
+# path and --rotate.
+OLD_TRUST_FPR=$(grep -E '^WILLOW_PGP_FINGERPRINT=' "$TRUST_ENV" 2>/dev/null | tail -1 | cut -d= -f2- || true)
 
 # Migration (0CB0C85C): leave nothing behind in $H/env — a second copy is
 # the defect this whole PR removes. Fails closed rather than silently
-# discarding: if $H/env still names a DIFFERENT fingerprint, stop and ask
-# the operator to reconcile by hand rather than guessing which is right.
+# discarding: if $H/env still names a DIFFERENT fingerprint than the one
+# about to be published, stop and ask the operator to reconcile by hand
+# rather than guessing which is right.
 OLD_HOME_FPR=$(grep -E '^(export[[:space:]]+)?WILLOW_PGP_FINGERPRINT=' "$H/env" 2>/dev/null | tail -1 | sed -E 's/^(export[[:space:]]+)?WILLOW_PGP_FINGERPRINT=//' || true)
 if [ -n "$OLD_HOME_FPR" ] && [ "$OLD_HOME_FPR" != "$FPR" ]; then
-  stop "$H/env still names WILLOW_PGP_FINGERPRINT=$OLD_HOME_FPR, disagreeing with $TRUST_ENV's $FPR — this is exactly the split brain this PR removes. Reconcile by hand (decide which is right, edit $H/env, then rerun) rather than letting install.sh silently discard one."
+  stop "$H/env still names WILLOW_PGP_FINGERPRINT=$OLD_HOME_FPR, disagreeing with the key about to be published ($FPR) — this is exactly the split brain this PR removes. Reconcile by hand (decide which is right, edit $H/env, then rerun) rather than letting install.sh silently discard one."
 fi
 if grep -qE '^(export[[:space:]]+)?WILLOW_PGP_FINGERPRINT=' "$H/env"; then
   sed -i -E '/^(export[[:space:]]+)?WILLOW_PGP_FINGERPRINT=/d' "$H/env"
@@ -753,51 +821,22 @@ sudo -u postgres psql -v ON_ERROR_STOP=1 -qd "$PG_DB" -c "GRANT CONNECT ON DATAB
   -c "GRANT SELECT, INSERT ON frank_ledger TO \"$TRUST_OWNER\";"
 sudo -u "$TRUST_OWNER" psql -d "$PG_DB" -qtc 'select 1' >/dev/null || stop "peer auth for $TRUST_OWNER on $PG_DB failed — check pg_hba.conf"
 
-# --------------------------- 6. re-sign every seat manifest under the new key
-# Fix (2026-09-22, first real two-uid install; 338bbdb): `SIG_TMP=$(mktemp)`
-# here runs as ROOT (this whole script), producing a 0600 root-owned file —
-# but `as_to` runs gpg as the trust owner (uid 994), which cannot open a
-# root-owned file for writing even via `-o`. The fake-interpreter test that
-# exercised this control flow ran everything as one uid and could not see
-# it; the operator's first live run did (`gpg: can't create
-# '/tmp/tmp.xxx': Permission denied`). Fixed by never handing gpg a path to
-# open at all: `--output -` writes the signature to gpg's own stdout, and
-# `> "$SIG_TMP"` is THIS shell's (root's) redirection, evaluated and opened
-# before `as_to`'s `sudo -u <trust owner>` ever runs — the fd is already
-# open and root-owned by the time gpg (as the trust owner) inherits and
-# writes to it, so the child uid's permissions on the PATH never matter. No
-# temp file is ever owned by the trust-owner uid, on success or on failure.
-say "== 6. re-sign every manifest under $FPR"
-for a in "$H"/mcp_apps/*/; do
-  [ -f "$a/manifest.json" ] || continue
-  s=$(basename "$a")
-  SIG_TMP=$(mktemp)
-  as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" --output - "$a/manifest.json" > "$SIG_TMP"
-  install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$SIG_TMP" "$a/manifest.json.sig"
-  rm -f "$SIG_TMP"
-  say "  signed $s"
-done
-# F3 + F1/F2: the active register and the federation registry carry the same
-# trust-owner-owned, detached-signed shape as a seat manifest now — re-sign
-# them here too, or every reader (paths.trusted_read's new signature branch;
-# mcp_federation._read_registry_file) refuses them as unsigned/stale the
-# moment the fingerprint changes. Missing the federation registry here was
-# exactly Loki's F3: the first post-install federation.ratify would otherwise
-# read "no ratified servers" and silently drop every existing entry.
-# gap c1395b307421 / dispatch A9BF01A9: syscall-table.json does NOT join
-# this loop — it is synced AND signed atomically back in step 1c
-# (sync_and_sign(), before $FPR even needed to exist yet at the OLD step 3's
-# position). Re-signing it again here would be redundant on every run and,
-# worse, re-introduces exactly the two-acts-not-one shape this PR exists to
-# close if this loop ever runs on its own between 1c and a failure.
-for f in "$REG" "$H/mcp_apps/_federation/servers.json"; do
-  [ -f "$f" ] || continue
-  SIG_TMP=$(mktemp)
-  as_to gpg --batch --yes --detach-sign --armor --local-user "$FPR" --output - "$f" > "$SIG_TMP"
-  install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$SIG_TMP" "$f.sig"
-  rm -f "$SIG_TMP"
-  say "  signed $(basename "$f")"
-done
+# --------------------------- 6. re-sign everything, THEN publish trust.env
+# Loki re-audit 93D0F057, N1: this used to be N independent gpg calls (seat
+# manifests, then the register and federation registry in a second loop),
+# with $TRUST_ENV already written back in step 1b — so any stop between 1b
+# and here (the 1c sync failure, the 1d seed stop, step 5's postgres peer
+# auth) left trust already switched with nothing re-signed. It also never
+# covered frank_head_anchor.json or the ratified seeds (only --rotate's
+# governed_files() did). sign_and_publish_trust is the SAME atomic
+# sign-verify-then-publish sequence --rotate uses (Loki A38D41C2 F3/F7):
+# one code path for "change what is trusted", so this finding cannot recur
+# by the two paths drifting apart again. $OLD_TRUST_FPR (captured in step
+# 1b, before this ran) is almost always empty (first install) or equal to
+# $FPR (an idempotent re-run reuses the existing GNUPGHOME key) — retiring
+# only fires when they genuinely differ.
+say "== 6. re-sign everything under $FPR, then publish $TRUST_ENV"
+sign_and_publish_trust "$FPR" "$OLD_TRUST_FPR"
 
 # ------------------ 6b. guard: no request minted before this install may apply
 # Sealed 33654f35 (2026-09-22): d23a3726's pending request "is withdrawn, not

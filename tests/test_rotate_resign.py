@@ -73,6 +73,44 @@ def test_resign_all_signs_every_existing_file(tmp_path):
         assert sig.read_bytes() == signer.key + b":" + f.name.encode()
 
 
+def test_resign_all_preserves_a_previous_sigs_owner_and_mode_on_resign(tmp_path):
+    """Loki re-audit 93D0F057, N5: a re-sign used to write the new .sig
+    via a root-owned temp file plus os.replace, which does NOT carry the
+    REPLACED file's ownership/mode forward -- a trust-owner-owned 0644
+    .sig silently became root-owned. Any later in-place re-sign by the
+    trust owner (gpg -o <path>.sig, e.g. mcp_federation.ratify) would then
+    hit EACCES on a file it no longer owns. resign_all now preserves the
+    PREVIOUS .sig's own (uid, gid, mode) on every re-sign -- verified here
+    by giving the prior .sig an unusual mode (0640, not the default 0644)
+    and confirming the fresh write keeps it."""
+    files = _make_files(tmp_path, ["a.json"])
+    sig = tmp_path / "a.json.sig"
+    import os
+    os.chmod(sig, 0o640)
+    before_uid, before_gid = sig.stat().st_uid, sig.stat().st_gid
+    signer = _FakeSigner()
+    rotate_resign.resign_all(files, signer.sign_fn, signer.verify_fn)
+    after = sig.stat()
+    assert (after.st_mode & 0o777) == 0o640
+    assert after.st_uid == before_uid
+    assert after.st_gid == before_gid
+
+
+def test_resign_all_applies_the_owner_argument_to_a_brand_new_sig(tmp_path):
+    """The other half of N5: a file with NO previous .sig (first-ever
+    sign) has nothing to preserve the ownership of, so it falls back to
+    the `owner` argument -- normally the trust owner's (uid, gid, 0o644).
+    Only self-chown (uid/gid matching this process) is exercised here,
+    since a real chown to another uid needs root."""
+    files = _make_files(tmp_path, ["a.json"], with_prior_sig=False)
+    signer = _FakeSigner()
+    import os
+    owner = (os.geteuid(), os.getegid(), 0o644)
+    rotate_resign.resign_all(files, signer.sign_fn, signer.verify_fn, owner=owner)
+    sig = tmp_path / "a.json.sig"
+    assert (sig.stat().st_mode & 0o777) == 0o644
+
+
 def test_resign_all_skips_absent_paths_without_error(tmp_path):
     files = _make_files(tmp_path, ["a.json"])
     missing = tmp_path / "does-not-exist.json"
