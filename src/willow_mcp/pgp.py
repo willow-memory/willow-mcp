@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import fcntl
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import threading
@@ -18,78 +19,199 @@ from typing import Iterator
 
 _FP_RE = re.compile(r"^[A-F0-9]{40}$", re.IGNORECASE)
 
+#: dispatch 0CB0C85C (amending E29CCFC7/B291C0C7): a fingerprint is public —
+#: only a key's PRIVATE half is a secret. `$WILLOW_HOME/env` (0600, every
+#: provider API key) is the wrong home for a value every verifying process
+#: needs to read. The one source of truth lives under the same trust-owner-
+#: owned directory the active envelope register and syscall table already
+#: do, world-readable, writable only by the trust owner — a file the
+#: broker's own uid (1000) could rewrite would let the broker choose what
+#: it trusts, which is exactly the property a trust root must not have.
+_TRUST_CONFIG_NAME = "trust.env"
+
 
 class PgpFingerprintConflict(RuntimeError):
-    """The process environment and ``$WILLOW_HOME/env`` disagree on
+    """The process environment and the trust-config file
+    (``$WILLOW_HOME/constitutional/trust.env``) disagree on
     ``WILLOW_PGP_FINGERPRINT``. This is exactly the split brain measured
     2026-09-23 (dispatch B291C0C7): install.sh rewrote the trust owner's
-    key into ``$WILLOW_HOME/env``, a per-file pin elsewhere (a systemd
+    key into the one source of truth, a per-file pin elsewhere (a systemd
     drop-in, a manifest-grant env file) kept the old one, and whichever
     file a given process happened to read decided whether it trusted the
-    register. ``$WILLOW_HOME/env`` is the one source of truth; a process
+    register. The trust-config file is the one source of truth; a process
     environment that disagrees with it is never silently preferred or
     silently ignored — it is refused, loudly, naming both values and both
     sources, the first time anything asks what the fingerprint is."""
 
 
-#: Guards ``_env_file_cache`` — ``expected_fingerprint()`` is hot (called
-#: on every trust-owner-owned read), so the ``$WILLOW_HOME/env`` file is
-#: cached by (path, mtime, size) rather than re-read and re-parsed on
-#: every call. Keyed on a stat, not just "read once": a rotation (or a
-#: test pointing WILLOW_HOME elsewhere) changes the stat, so the cache
+class PgpSourceUnreadable(RuntimeError):
+    """The trust-config file could not be trusted as a source of truth —
+    it exists but could not be read, its ownership/permissions do not meet
+    the trust-root shape, or its ``WILLOW_PGP_FINGERPRINT`` value does not
+    parse as a fingerprint. Loki audit A38D41C2, F4: *unreachable is not
+    empty*. A missing file (this box never configured PGP at all) still
+    resolves to unset — that is the legitimate bootstrap state. But a file
+    that EXISTS and cannot be trusted must never be read as though it said
+    nothing, because that silently turns enforcement off exactly when
+    something has gone wrong with the one thing enforcement depends on."""
+
+
+#: Guards ``_trust_config_cache`` — ``expected_fingerprint()`` is hot
+#: (called on every trust-owner-owned read), so the trust-config file is
+#: cached rather than re-read and re-parsed on every call. Keyed on
+#: (path, inode, mtime_ns, size) — not just mtime+size (Loki A38D41C2, F9):
+#: a same-size rewrite landing within one float-mtime tick, or a different
+#: inode reusing the same path, must still invalidate. A rotation (or a
+#: test pointing WILLOW_HOME elsewhere) changes this key, so the cache
 #: self-invalidates without any caller needing to know to clear it.
-_env_file_cache_lock = threading.Lock()
-_env_file_cache: tuple[str, float, int, str] | None = None
+_trust_config_cache_lock = threading.Lock()
+_trust_config_cache: tuple[str, int, int, int, str] | None = None
 
 
-def _home_env_path() -> Path:
+def _trust_config_path() -> Path:
     from . import paths
 
-    return paths.willow_home() / "env"
+    return paths.willow_home() / "constitutional" / _TRUST_CONFIG_NAME
 
 
-def _read_home_env_fingerprint() -> str:
-    """``WILLOW_PGP_FINGERPRINT=`` as set in ``$WILLOW_HOME/env``, or ``""``
-    when the file is absent, unreadable, or carries no such line. Cached by
-    (path, mtime, size); see the module-level lock/cache docstring."""
-    global _env_file_cache
-    path = _home_env_path()
+def _trust_config_ownership_ok(path: Path) -> None:
+    """The trust-config file (and its parent) must not be writable by
+    anyone but its owner, and must be owned by this process's own euid or
+    the resolved trust owner. No signature check here — unlike
+    ``paths.trusted_read``'s trust-owner-plus-signature branch, THIS file
+    is the fingerprint a signature would need to verify against, so
+    checking its own signature would be circular. Ownership plus no
+    group/other write is the whole check; raises :class:`PgpSourceUnreadable`
+    rather than returning a bool, so a caller cannot forget to check it."""
+    from . import paths
+
+    euid = os.geteuid()
     try:
-        st = path.stat()
-    except OSError:
-        with _env_file_cache_lock:
-            _env_file_cache = None
-        return ""
-    key = (str(path), st.st_mtime, st.st_size)
-    with _env_file_cache_lock:
-        cached = _env_file_cache
-        if cached is not None and cached[:3] == key:
-            return cached[3]
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
+        parent_info = path.parent.stat()
+        info = path.stat()
+    except OSError as exc:
+        raise PgpSourceUnreadable(
+            f"{path}: could not stat it or its parent ({exc}) — refusing "
+            "to treat an unstattable trust-config file as unconfigured"
+        ) from exc
+    if stat.S_IMODE(parent_info.st_mode) & 0o022 or stat.S_IMODE(info.st_mode) & 0o022:
+        raise PgpSourceUnreadable(
+            f"{path} or its parent directory is group- or other-writable — "
+            "refusing to trust a fingerprint file anyone but its owner "
+            "could rewrite. Fix the mode (0644 file, 0755 directory, no "
+            "wider) and retry."
+        )
+    trust_owner_uid = paths._trust_owner_uid()
+    if info.st_uid not in (euid, trust_owner_uid):
+        raise PgpSourceUnreadable(
+            f"{path} is owned by uid {info.st_uid}, neither this process's "
+            f"own uid ({euid}) nor the trust owner's — refusing to trust it"
+        )
+
+
+def _parse_trust_config_text(text: str, *, path: Path) -> str:
+    """``WILLOW_PGP_FINGERPRINT=`` as set in the trust-config file's text,
+    or ``""`` when no such line is present (or it is present with an
+    explicitly empty value — the template shape before a key is first
+    generated). Handles an ``export NAME=value`` line (Loki A38D41C2, F4:
+    the box's own env files already use export lines; the old parser
+    silently missed the key entirely, resolving to "unset" instead of the
+    configured value — a fail-open bug, not intended lenience). A
+    non-empty value that does not parse as a 40-hex-character fingerprint
+    (a stray inline comment glued onto the value, systemd's
+    ``EnvironmentFile=`` grammar takes the rest of the line as literal
+    value — there is no comment syntax after the ``=``) raises rather than
+    silently disabling enforcement."""
     value = ""
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export ") or stripped.startswith("export\t"):
+            stripped = stripped[len("export"):].lstrip()
+        if "=" not in stripped:
             continue
         name, _, raw_value = stripped.partition("=")
         if name.strip() != "WILLOW_PGP_FINGERPRINT":
             continue
-        value = raw_value.strip().strip("'").strip('"').upper()
-    with _env_file_cache_lock:
-        _env_file_cache = (*key, value)
+        value = raw_value.strip().strip("'").strip('"')
+    if not value:
+        return ""
+    candidate = value.upper()
+    if not _FP_RE.match(candidate):
+        raise PgpSourceUnreadable(
+            f"WILLOW_PGP_FINGERPRINT in {path} does not look like a "
+            f"40-hex-character fingerprint ({value!r}) — refusing to "
+            "silently treat a malformed value as 'no key configured'. "
+            "This reader takes the whole rest of the line as the value "
+            "(no inline-comment syntax); check for a stray trailing "
+            "comment or stray whitespace and retry."
+        )
+    return candidate
+
+
+def _read_trust_config_fingerprint() -> str:
+    """``WILLOW_PGP_FINGERPRINT=`` from the trust-config file. Three
+    states, never collapsed (Loki A38D41C2, F4):
+
+    * the file does not exist at all — legitimate bootstrap: this box has
+      never configured PGP. Returns ``""``.
+    * the file exists but cannot be trusted (unreadable, wrong ownership/
+      permissions, or a malformed value) — raises
+      :class:`PgpSourceUnreadable` rather than returning ``""``. This is
+      the fix: before, any of these collapsed into "unset", silently
+      turning enforcement off.
+    * the file exists, is trustworthy, and has a fingerprint (or an
+      explicitly empty value, the template shape before a key is first
+      generated) — returns it (or ``""`` for the empty-value case, which
+      is legitimate, not a parse failure).
+
+    Cached by (path, inode, mtime_ns, size); see the module-level
+    lock/cache docstring for why those four fields.
+    """
+    global _trust_config_cache
+    path = _trust_config_path()
+    if not path.exists():
+        with _trust_config_cache_lock:
+            _trust_config_cache = None
+        return ""
+    _trust_config_ownership_ok(path)  # raises PgpSourceUnreadable, never silent
+    try:
+        st = path.stat()
+    except OSError as exc:
+        raise PgpSourceUnreadable(f"{path}: {exc}") from exc
+    key = (str(path), st.st_ino, st.st_mtime_ns, st.st_size)
+    with _trust_config_cache_lock:
+        cached = _trust_config_cache
+        if cached is not None and cached[:4] == key:
+            return cached[4]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PgpSourceUnreadable(
+            f"{path} exists but is unreadable ({exc}) — the one source of "
+            "truth for WILLOW_PGP_FINGERPRINT could not be read; refusing "
+            "to silently treat this as 'no key configured'. Fix the "
+            "file's permissions and retry."
+        ) from exc
+    value = _parse_trust_config_text(text, path=path)
+    with _trust_config_cache_lock:
+        _trust_config_cache = (*key, value)
     return value
 
 
 def expected_fingerprint() -> str:
     """The one trusted signer fingerprint, resolved with exactly one
-    source of truth: ``$WILLOW_HOME/env``. The process environment is
-    consulted too — a caller may set ``WILLOW_PGP_FINGERPRINT`` directly
-    (tests; a CLI invoked before the home env is written) — but only to
-    confirm it AGREES with the file when the file also has a value.
-    Three states, never collapsed into each other:
+    source of truth: ``$WILLOW_HOME/constitutional/trust.env`` — a
+    trust-owner-owned, world-readable file (dispatch 0CB0C85C: a
+    fingerprint is public; only a key's private half is a secret, so the
+    one source of truth does not need to live beside provider API keys in
+    a 0600 file the trust-owner apply unit could never read). The process
+    environment is consulted too — a caller may set
+    ``WILLOW_PGP_FINGERPRINT`` directly (tests; a CLI invoked before the
+    trust-config file is written) — but only to confirm it AGREES with the
+    file when the file also has a value. Three states, never collapsed
+    into each other:
 
     * unset — neither source has a value: returns ``""``.
     * set — exactly one source has a value, or both agree: returns it.
@@ -98,16 +220,24 @@ def expected_fingerprint() -> str:
       preferring either side is exactly how the 2026-09-23 lockout
       happened — the broker trusted its own pin while the register was
       re-signed under the box's new one.
+
+    A trust-config file that exists but cannot be trusted (unreadable,
+    wrong ownership, malformed value) raises :class:`PgpSourceUnreadable`
+    rather than resolving as unset — *unreachable is not empty* (Loki
+    A38D41C2, F4).
     """
     env_value = (os.environ.get("WILLOW_PGP_FINGERPRINT") or "").strip().upper()
-    file_value = _read_home_env_fingerprint()
+    file_value = _read_trust_config_fingerprint()
     if env_value and file_value and env_value != file_value:
         raise PgpFingerprintConflict(
             "WILLOW_PGP_FINGERPRINT conflict: the process environment says "
-            f"{env_value} but {_home_env_path()} says {file_value} — "
-            "$WILLOW_HOME/env is the one source of truth and these must "
-            "agree; refusing rather than guessing which one is right. Fix "
-            "the stale pin (see INSTALL.md --check) and retry."
+            f"{env_value} but {_trust_config_path()} says {file_value} — "
+            f"{_trust_config_path()} is the one source of truth and these "
+            "must agree; refusing rather than guessing which one is "
+            "right. Fix the stale pin (see INSTALL.md --check-signatures) "
+            "and retry — for a stdio-attached desk seat, this usually "
+            "means a pin in this project's .mcp.json (env.WILLOW_PGP_"
+            "FINGERPRINT) that the operator must remove and reconnect."
         )
     return env_value or file_value
 

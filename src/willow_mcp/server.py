@@ -11249,6 +11249,36 @@ def _build_parser():
     return parser
 
 
+def _boot_manifest_verify_sweep_or_exit() -> list[dict[str, str]]:
+    """Run `log_manifest_verify_sweep()` at boot, converting a conflicting
+    or unreadable trust-config file into a clean stderr message plus
+    `SystemExit(1)` — never an uncaught exception.
+
+    Loki audit A38D41C2, F2: `pgp.PgpFingerprintConflict` /
+    `pgp.PgpSourceUnreadable` (both raised from `pgp.expected_fingerprint()`
+    via `pgp.pgp_enabled()` inside the sweep) used to propagate out of
+    `_main()` as an uncaught exception — the whole process (serve broker,
+    or a stdio-attached desk seat) died with a raw Python traceback nobody
+    at a desk can read. Refusing to start is right; crashing unreadably is
+    not. Caught here, once, at the one boot chokepoint both entry modes
+    share, and turned into the same clean stderr-plus-exit(1) shape the
+    manifest-verify refusal (`_main`, just below this call) already uses —
+    the exception's own message already names both values and both
+    sources (or the read failure) and what to do about it. A separate
+    function (not inlined in `_main`) so this exact behavior is callable
+    and assertable from a test without driving the rest of `_main`."""
+    from . import pgp as _pgp_boot
+
+    try:
+        return log_manifest_verify_sweep()
+    except _pgp_boot.PgpFingerprintConflict as exc:
+        print(f"willow-mcp: refusing to start — {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    except _pgp_boot.PgpSourceUnreadable as exc:
+        print(f"willow-mcp: refusing to start — {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def _main():
     args, _ = _build_parser().parse_known_args()
 
@@ -11266,8 +11296,9 @@ def _main():
     # (_load_manifest is deliberately reason-free). Log every BAD-SIG / NO-SIG
     # row, then refuse to start — a process that would deny those app_ids on
     # every gated call is not a healthy serve/stdio boot. No-op (and no exit)
-    # unless WILLOW_PGP_FINGERPRINT is set.
-    _manifest_verify_problems = log_manifest_verify_sweep()
+    # unless WILLOW_PGP_FINGERPRINT is set. See
+    # _boot_manifest_verify_sweep_or_exit's own docstring for the F2 fix.
+    _manifest_verify_problems = _boot_manifest_verify_sweep_or_exit()
     if _manifest_verify_problems:
         print(
             "willow-mcp: refusing to start — "

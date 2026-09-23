@@ -10,6 +10,8 @@ import json
 import pytest
 
 from willow_mcp import frank_head_anchor as fha
+from willow_mcp import paths as _paths
+from willow_mcp import pgp as _pgp
 
 HEAD_A = "a" * 64
 HEAD_B = "b" * 64
@@ -135,6 +137,42 @@ def test_world_writable_parent_dir_is_untrusted(home):
     (home / "constitutional").chmod(0o777)
     anchor = fha.read_anchor()
     assert anchor["status"] == "untrusted"
+
+
+# ── Loki audit A38D41C2, F10 ────────────────────────────────────────────
+# read_anchor()'s own docstring promises "never raises". Before the fix,
+# paths.trusted_read()'s trust-owner-plus-signature branch could raise
+# pgp.PgpFingerprintConflict or pgp.PgpSourceUnreadable (both RuntimeError,
+# not PermissionError) when the trust-config file conflicted or could not
+# be trusted — and read_anchor() caught only PermissionError, so either one
+# escaped its "never raises" contract. Exercised by monkeypatching
+# paths.trusted_read directly (the anchor file in these tests is
+# self-owned, so it never actually reaches trusted_read's trust-owner
+# branch in a plain test fixture) — this targets the except clause itself,
+# not the deeper ownership plumbing pgp's own test suite already covers.
+
+def test_pgp_conflict_during_trust_check_is_untrusted_not_a_crash(home, monkeypatch):
+    fha.write_anchor(HEAD_A, 1)
+
+    def _raise_conflict(path):
+        raise _pgp.PgpFingerprintConflict("simulated conflict for test")
+
+    monkeypatch.setattr(_paths, "trusted_read", _raise_conflict)
+    anchor = fha.read_anchor()  # must not raise
+    assert anchor["status"] == "untrusted"
+    assert anchor["head"] is None
+
+
+def test_pgp_source_unreadable_during_trust_check_is_untrusted_not_a_crash(home, monkeypatch):
+    fha.write_anchor(HEAD_A, 1)
+
+    def _raise_unreadable(path):
+        raise _pgp.PgpSourceUnreadable("simulated unreadable trust config for test")
+
+    monkeypatch.setattr(_paths, "trusted_read", _raise_unreadable)
+    anchor = fha.read_anchor()  # must not raise
+    assert anchor["status"] == "untrusted"
+    assert anchor["head"] is None
 
 
 def test_symlinked_anchor_file_is_untrusted(home):
