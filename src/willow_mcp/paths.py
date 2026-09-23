@@ -211,6 +211,59 @@ def operator_secrets_root() -> Path:
     return box if box is not None else willow_home()
 
 
+def trust_config_path() -> Path:
+    """The single source of truth for ``WILLOW_PGP_FINGERPRINT`` —
+    ``trust.env``, in the vault beside the box's other keys
+    (:func:`dispatch_signing_key_path`, ``vault.key``, ``vault.db``), not
+    inside a github checkout's ``$WILLOW_HOME`` when a real
+    ``WILLOW_VAULT_BOX`` is configured. Operator ruling (dispatch FA4F79AC,
+    rework #3 of one-signing-key, 2026-09-23, verbatim): "it should be in
+    the vault with the rest of the keys" — chosen over Loki's own
+    alternative (a root-owned ``/etc/willow-mcp/trust.env``).
+
+    Lands in a ``constitutional/`` subdirectory of the vault, not at the
+    vault's own top level, for the same reason ``$WILLOW_HOME/constitutional/``
+    already exists as its own trust-owner-owned subdirectory rather than
+    chowning ``$WILLOW_HOME`` itself: :func:`operator_secrets_root`'s other
+    contents (``dispatch_signing_key_path()``, ``vault.key``, ``vault.db``)
+    are the BROKER's own secrets — the broker creates and rewrites them, so
+    their parent directory must stay broker-writable, and a directory the
+    broker can write to is a directory it can rename an entry out of. Only
+    a dedicated, separately-owned subdirectory inside the vault can carry a
+    different ownership than the vault's own top level.
+
+    THE RENAME-AWAY HOLE (Loki audit D06A0EF3): closed only when
+    ``WILLOW_VAULT_BOX`` is configured to a location whose own parent chain
+    the broker's uid cannot write — i.e. NOT the default. When
+    ``WILLOW_VAULT_BOX`` is unset (:func:`operator_secrets_root` falls back
+    to :func:`willow_home`, which is broker-owned, mode 700, by
+    definition — it is the broker's own working home), this resolves to
+    exactly the same path as before this rework
+    (``$WILLOW_HOME/constitutional/trust.env``) and the hole is NOT closed
+    — named plainly, not hidden: the broker can still rename
+    ``$WILLOW_HOME`` itself since it owns the parent. The same is true even
+    with ``WILLOW_VAULT_BOX`` set, AS LONG AS the vault box's own directory
+    sits under a parent the broker's uid can write (e.g. a vault box that
+    is merely another directory under the broker's own ``$HOME``, or is
+    ``$WILLOW_HOME`` itself, as on the box this rework was built against —
+    see ``deploy/manifest-grant/install.sh``'s own comment on the point).
+
+    CLOSING IT FOR REAL requires a root provisioning step outside this
+    module's reach: ``WILLOW_VAULT_BOX`` set to a directory whose own
+    parent (and every ancestor above that, up to ``/``) is NOT owned or
+    group/other-writable by the broker's uid — e.g. a box-provisioned
+    directory under ``/var/lib`` or ``/opt``, owned by the trust owner (or
+    root), with the broker granted write ONLY on its own subdirectory
+    inside it (mirroring the ``constitutional/`` split this function
+    already makes) for its unrelated secrets. That is a root, once,
+    install-time act — see ``install.sh``'s vault-provisioning step and
+    INSTALL.md's "Provisioning a new box" section for the exact chown/mode.
+    Nothing in this module can perform or verify that step; it can only
+    resolve the path a correctly-provisioned vault would use.
+    """
+    return operator_secrets_root() / "constitutional" / "trust.env"
+
+
 def charter_repo() -> Path | None:
     """Grove charter repository (``WILLOW_CHARTER_REPO``)."""
     raw = os.environ.get("WILLOW_CHARTER_REPO", "").strip()

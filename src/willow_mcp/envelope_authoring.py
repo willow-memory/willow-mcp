@@ -401,7 +401,7 @@ def _register_writable() -> tuple[bool, str, dict]:
     return False, reason, {"error": "EACCES", "path": str(d), "owner": owner}
 
 
-def _save_active(registry: dict) -> None:
+def _save_active(registry: dict, *, sign_as: "str | None" = None) -> None:
     """Write ONLY ``active[]`` to the (signed) active register — NEVER
     touches the proposals sidecar. The one write path that mutates the
     trust-owner-owned register: :func:`ratify` (the one broker-side act
@@ -438,6 +438,29 @@ def _save_active(registry: dict) -> None:
     UNSIGNED, the same "unsigned atomic write when PGP is not enforced"
     posture every other write in this codebase takes.
 
+    ``sign_as`` (dispatch FA4F79AC, M1): install.sh's own bootstrap seed
+    (``deploy/manifest-grant/seed_envelope_ratify.py``, the ONLY caller
+    that passes this) runs at a point in the install sequence where
+    ``constitutional/`` is already trust-owner-owned but ``trust.env`` has
+    not been published yet — the generated fingerprint is not yet the
+    trusted one anywhere else can read, only root's own install.sh knows
+    it. Going through ``pgp.pgp_enabled()``/``pgp.expected_fingerprint()``
+    there raises :class:`pgp.PgpSourceUnreadable` (missing trust.env on an
+    already-provisioned directory) EVERY fresh install, forever — not a
+    transient failure a retry clears, a permanent deadlock, because
+    trust.env is never written until AFTER this exact write succeeds.
+    When ``sign_as`` is given, this signs unconditionally under that
+    fingerprint via ``--local-user``, bypassing the trust.env read
+    entirely — the caller (root, mid-install, holding the fingerprint it
+    just generated/resolved and is about to publish) is vouching for the
+    value directly, the same way ``rotate_resign.py`` and
+    ``sync_constitutional.py --sign-as`` already sign install-time writes
+    under an explicit fingerprint rather than consulting
+    ``pgp.expected_fingerprint()``. This is never a fallback available to
+    ordinary callers — :func:`ratify_proposal_row`'s only other caller,
+    the real ``envelope.ratify`` apply half, never passes it, and still
+    goes through the trust.env-backed check exactly as before.
+
     **``ratify()`` (the sidecar-reading path) is a separate case, Loki
     audit 42B3B46F, U1: no uid on an installed box can complete it at
     all** (:func:`_register_writable` refuses before reaching this
@@ -459,7 +482,17 @@ def _save_active(registry: dict) -> None:
     os.chmod(tmp, stat.S_IMODE(os.stat(tmp).st_mode) & ~0o022)
 
     tmp_sig = None
-    if pgp.pgp_enabled():
+    if sign_as:
+        ok, detail = pgp.sign_detached(tmp, local_user=sign_as)
+        if not ok:
+            tmp.unlink(missing_ok=True)
+            raise EnvelopeAuthoringError(
+                f"{path} could not be signed under the explicit "
+                f"sign_as={sign_as!r} ({detail}) — refused before any "
+                "write; the live register and its .sig are untouched"
+            )
+        tmp_sig = pgp.detached_sig_path(tmp)
+    elif pgp.pgp_enabled():
         fingerprint = pgp.expected_fingerprint()
         ok, detail = pgp.sign_detached(tmp, local_user=fingerprint)
         if not ok:
@@ -870,6 +903,7 @@ def ratify_proposal_row(
     ratified_via: str,
     citation_id: Optional[str] = None,
     ledger: Optional[Any] = None,
+    sign_as: Optional[str] = None,
 ) -> dict:
     """Move an ALREADY-KNOWN proposal ROW into ``active[]`` — the
     sidecar-free sibling of :func:`ratify`, built for
@@ -902,7 +936,14 @@ def ratify_proposal_row(
     not touch the keyring) is stamped onto the row as its own field,
     alongside ``ratified_via``; the caller composes ``ratified_via`` (the
     packet's own shape: ``"frank ledger entry <citation_id>"``) rather
-    than this function guessing at it."""
+    than this function guessing at it.
+
+    ``sign_as`` (dispatch FA4F79AC, M1): threaded straight through to
+    :func:`_save_active`'s own parameter of the same name — see its
+    docstring for who this is for (install.sh's bootstrap seed only) and
+    why (the trust.env-backed check deadlocks at that specific point in
+    the install sequence). Every other caller passes ``None`` and gets
+    exactly the pre-existing ``pgp.pgp_enabled()``-gated behavior."""
     _refuse_registry_mismatch("ratify")
     writable, writable_reason, writable_detail = _register_writable()
     if not writable:
@@ -930,7 +971,7 @@ def ratify_proposal_row(
         "ratified_by": ratified_by,
     }
     active.append(ratified)
-    _save_active({"active": active})
+    _save_active({"active": active}, sign_as=sign_as)
 
     ledger_record_id = None
     ledger_error = None

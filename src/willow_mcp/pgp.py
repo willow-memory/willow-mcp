@@ -27,13 +27,21 @@ _FP_RE = re.compile(r"^[A-F0-9]{40}$", re.IGNORECASE)
 #: do, world-readable, writable only by the trust owner — a file the
 #: broker's own uid (1000) could rewrite would let the broker choose what
 #: it trusts, which is exactly the property a trust root must not have.
+#:
+#: Rework #3 (dispatch FA4F79AC, 2026-09-23): the FILE NAME stays
+#: ``trust.env``; its DIRECTORY moved out of a bare ``$WILLOW_HOME`` into
+#: the vault (``paths.trust_config_path()``, beside ``dispatch_signing.key``,
+#: ``vault.key``, ``vault.db`` — operator ruling, verbatim, "it should be
+#: in the vault with the rest of the keys"). See that function's own
+#: docstring for exactly when this closes the rename-away hole and when it
+#: does not.
 _TRUST_CONFIG_NAME = "trust.env"
 
 
 class PgpFingerprintConflict(RuntimeError):
     """The process environment and the trust-config file
-    (``$WILLOW_HOME/constitutional/trust.env``) disagree on
-    ``WILLOW_PGP_FINGERPRINT``. This is exactly the split brain measured
+    (:func:`paths.trust_config_path` — the vault's ``constitutional/trust.env``)
+    disagree on ``WILLOW_PGP_FINGERPRINT``. This is exactly the split brain measured
     2026-09-23 (dispatch B291C0C7): install.sh rewrote the trust owner's
     key into the one source of truth, a per-file pin elsewhere (a systemd
     drop-in, a manifest-grant env file) kept the old one, and whichever
@@ -73,9 +81,17 @@ _trust_config_cache: tuple[str, int, int, int, str] | None = None
 
 
 def _trust_config_path() -> Path:
+    """The one source of truth's path — a thin wrapper over
+    :func:`paths.trust_config_path`, a MODULE-LEVEL FUNCTION, never an
+    environment variable a caller (including the broker) could point
+    somewhere else. Kept as its own function here (rather than every
+    caller in this module importing ``paths`` directly) so tests redirect
+    the path by monkeypatching THIS function or ``paths.trust_config_path``
+    — never by setting an env var, which is exactly the shape Loki's audit
+    asked tests avoid."""
     from . import paths
 
-    return paths.willow_home() / "constitutional" / _TRUST_CONFIG_NAME
+    return paths.trust_config_path()
 
 
 def _trust_config_ownership_ok(path: Path) -> None:
@@ -181,21 +197,23 @@ def _parse_trust_config_text(text: str, *, path: Path) -> str:
 
 
 def _trust_config_dir_already_provisioned(dir_path: Path) -> bool:
-    """Is ``constitutional/`` ITSELF already trust-owner-owned — the
-    signal that install.sh's step 1 has provisioned trust for THIS
-    ``$WILLOW_HOME`` specifically, as opposed to a trust owner merely
-    existing SOMEWHERE on the host.
+    """Is the trust-config file's own directory (the vault's
+    ``constitutional/`` subdirectory — :func:`paths.trust_config_path`)
+    ITSELF already trust-owner-owned — the signal that install.sh's
+    vault-provisioning step has provisioned trust for THIS box
+    specifically, as opposed to a trust owner merely existing SOMEWHERE on
+    the host.
 
     Loki re-audit 93D0F057, N2: keying "trust.env should exist" off
     "``paths._trust_owner_uid()`` resolves to something" is too broad — a
     real ``willow-operator`` account can exist on a box (or in a sandbox
-    that mirrors one) whose test fixtures never touch ``$WILLOW_HOME/
-    constitutional/`` at all, and every one of those would start raising
-    for a directory that was simply never meant to hold a trust file.
-    Keying off THIS directory's own ownership is local to the
-    ``$WILLOW_HOME`` actually in play, matching how install.sh actually
-    provisions trust (chown constitutional/ to the trust owner in step 1,
-    before anything writes trust.env into it).
+    that mirrors one) whose test fixtures never touch this directory at
+    all, and every one of those would start raising for a directory that
+    was simply never meant to hold a trust file. Keying off THIS
+    directory's own ownership is local to the vault actually in play,
+    matching how install.sh actually provisions trust (chown this
+    directory to the trust owner, before anything writes trust.env into
+    it).
 
     Returns ``False`` (never provisioned here) on any stat failure —
     including "does not exist at all", which is legitimate bootstrap, not
@@ -231,20 +249,30 @@ def _read_trust_config_fingerprint() -> str:
       removed it after — raises :class:`PgpSourceUnreadable` rather than
       silently disabling enforcement.
 
-      RESIDUAL GAP, named plainly rather than hidden: the broker owns
-      ``$WILLOW_HOME`` itself, so it can rename ``constitutional/`` away
-      ENTIRELY (a rename needs write only on the PARENT, which the
-      broker's uid holds) and put an empty, self-owned directory of the
-      same name back — at that point THIS check also sees "never
-      provisioned" and returns unset. No purely local, file-permission-
-      based scheme can close that: the parent the broker owns is above
-      anything trust.env's own mode could ever protect. What WOULD close
-      it is a marker the broker's uid cannot remove or recreate — a
-      second signal living outside ``$WILLOW_HOME`` entirely (root-owned
-      ``/etc``, or a sealed ledger entry) that a verifier cross-checks
-      against. That is a deploy/architecture change, not a code fix
-      inside this module, and out of this dispatch's scope; recorded as
-      a gap rather than silently left unfixed.
+      RESIDUAL GAP, named plainly rather than hidden, and NARROWED but not
+      closed by rework #3's move into the vault (dispatch FA4F79AC): the
+      hole is closed ONLY when :func:`paths.trust_config_path`'s own
+      grandparent (the vault box named by ``WILLOW_VAULT_BOX``) is
+      provisioned outside any directory the broker's uid can write — see
+      that function's docstring for the exact condition. On the DEFAULT
+      box (``WILLOW_VAULT_BOX`` unset, or set to the broker's own
+      ``$WILLOW_HOME``) the broker still owns that grandparent, so it can
+      rename this directory away ENTIRELY (a rename needs write only on
+      the PARENT, which the broker's uid holds) and put an empty,
+      self-owned directory of the same name back — at that point THIS
+      check also sees "never provisioned" and returns unset. No purely
+      local, file-permission-based scheme can close that on such a box:
+      the parent the broker owns is above anything trust.env's own mode
+      could ever protect. What WOULD close it there is a marker the
+      broker's uid cannot remove or recreate — a second signal living
+      outside the broker's own writable tree entirely (root-owned
+      ``/etc``, a properly root-provisioned vault box, or a sealed ledger
+      entry) that a verifier cross-checks against. Fully relocating the
+      broker's OWN secrets (``vault.key``, ``vault.db``,
+      ``dispatch_signing.key``) out of the vault's own top level so THAT
+      directory can be locked away from the broker too is a larger
+      deploy/architecture change, out of this dispatch's scope; recorded
+      as a gap rather than silently left unfixed.
     * the file exists but cannot be trusted (unreadable, wrong ownership/
       permissions, or a malformed value) — raises
       :class:`PgpSourceUnreadable`.
@@ -305,8 +333,10 @@ def _read_trust_config_fingerprint() -> str:
 
 def expected_fingerprint() -> str:
     """The one trusted signer fingerprint, resolved with exactly one
-    source of truth: ``$WILLOW_HOME/constitutional/trust.env`` — a
-    trust-owner-owned, world-readable file (dispatch 0CB0C85C: a
+    source of truth: :func:`paths.trust_config_path` (the vault's
+    ``constitutional/trust.env`` — see that function's docstring for
+    exactly where the vault resolves to) — a trust-owner-owned,
+    world-readable file (dispatch 0CB0C85C: a
     fingerprint is public; only a key's private half is a secret, so the
     one source of truth does not need to live beside provider API keys in
     a 0600 file the trust-owner apply unit could never read). The process
