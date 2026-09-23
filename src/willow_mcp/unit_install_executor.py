@@ -238,15 +238,38 @@ def render_values(unit: str) -> dict[str, str]:
     process's own environment when set — "resolved values, not guesses";
     a template needing one that is unset here refuses ``ETEMPLATE`` rather
     than rendering an empty ``Environment=`` line."""
+    home = Path.home()
+    willow_home = paths.willow_home()
+    # willow-bot's install-service.sh placeholders (VAULT_BOX / VENV_BIN /
+    # WORKDIR) — same defaults as scripts/install-service.sh so verb 17 can
+    # re-render the steward unit without a keyboard (desk-notify Bite 1).
+    vault_box = (
+        os.environ.get("WILLOW_BOT_VAULT_BOX", "").strip()
+        or os.environ.get("WILLOW_VAULT_BOX", "").strip()
+        or str(willow_home)
+    )
+    venv_bin = (
+        os.environ.get("WILLOW_BOT_VENV_BIN", "").strip()
+        or str(Path(vault_box) / "venvs" / "willow-bot" / "bin")
+    )
+    workdir = (
+        os.environ.get("WILLOW_BOT_WORKDIR", "").strip()
+        or str(home / "github" / "willow-memory" / "willow-bot")
+    )
     values: dict[str, object] = {
         "PYTHON": Path(sys.executable),
         "UNIT": unit,
-        "WILLOW_HOME": paths.willow_home(),
+        "WILLOW_HOME": willow_home,
         "WILLOW_STORE_ROOT": paths.store_root(),
         "PG_DB": paths.pg_db(),
         "USER": os.environ.get("USER", ""),
-        "HOME": Path.home(),
-        "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")),
+        "HOME": home,
+        "XDG_CONFIG_HOME": os.environ.get(
+            "XDG_CONFIG_HOME", str(home / ".config")
+        ),
+        "VAULT_BOX": vault_box,
+        "VENV_BIN": venv_bin,
+        "WORKDIR": workdir,
     }
     try:
         from .seal_handler import _nestor_db_path
@@ -729,23 +752,24 @@ def execute_unit_install(
             envelope_ids=matches,
         )
 
-    result = EnvelopeAuthority(ledger).authorize_and_cite(
+    result = EnvelopeAuthority(ledger).check(
         matches[0], actor=app_id, verb=VERB, call_args=call_args,
-        project=project, session=session,
     )
     if not result.get("ok"):
+        # Denial path still cites (outcome ≠ granted) so the refuse is visible
+        # in FRANK without burning max_count.
+        cited = EnvelopeAuthority(ledger).authorize_and_cite(
+            matches[0], actor=app_id, verb=VERB, call_args=call_args,
+            project=project, session=session,
+        )
         errno = result.get("errno", "EAMBIG")
         reason = result.get("reason", "")
         fields = result.get("fields")
-        # A bounds miss names the VALUE, not only the field: the offending
-        # unit is usually an Also=/Wants=/activation extra, not `unit`
-        # itself, and an ask proposing `units=[unit]` would refuse again on
-        # the same name (Loki 1AEBF250).
         outside = _outside_bounds(rows, matches[0], judged=judged, source=source)
         if fields and outside:
             reason = f"{reason}: {'; '.join(outside)}"
         out = _refuse(errno, reason, envelope_id=matches[0],
-                      citation_id=result.get("citation_id"), fields=fields)
+                      citation_id=cited.get("citation_id"), fields=fields)
         if errno in _ASKABLE:
             out["ask"] = _file_ask(app_id, units=judged, source=source, errno=errno,
                                    reason=out["reason"], fields=fields,
@@ -753,11 +777,14 @@ def execute_unit_install(
         return out
 
     # ── the act ──────────────────────────────────────────────────────────────
+    # Cite AFTER a successful enable (or when the unit-ops helper completes
+    # enable). Citing before write burned max_count=1 grants on desk MCP
+    # no_user_bus failures while leaving the unit file on disk
+    # (kart-vs-operator-systemctl-broker-2026-09-23). Write is reversible on
+    # non-bus failure; bus miss keeps the file and queues unit_ops.
     # Replace is reversible: the previous unit is kept beside the new one as
-    # `<unit>.pre-install-<ts>` and put back if enable fails, so a failed
-    # install never leaves a changed definition of what runs under the
-    # operator's identity with only a sha256 surviving (Loki FECF6FED).
-    # Every failure after citation inks a FRANK row — the grant was spent.
+    # `<unit>.pre-install-<ts>` and put back if enable fails for a reason
+    # other than missing user bus.
     root = Path(destination) if destination is not None else unit_dir()
     root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -778,28 +805,35 @@ def execute_unit_install(
         os.replace(tmp, target)
         written.append(str(target))
 
-    def _fail(errno: str, reason: str) -> dict:
+    def _fail(errno: str, reason: str, *, keep_written: bool = False,
+              pending: dict | None = None) -> dict:
         restored = []
-        for target, _ in targets:
-            try:
-                target.unlink()
-            except OSError:
-                pass
-        for target, keep in backups:
-            try:
-                os.replace(keep, target)
-                restored.append(str(target))
-            except OSError as exc:  # noqa: PERF203 — report, never hide
-                restored.append(f"{target}: restore failed: {exc}")
+        if not keep_written:
+            for target, _ in targets:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+            for target, keep in backups:
+                try:
+                    os.replace(keep, target)
+                    restored.append(str(target))
+                except OSError as exc:  # noqa: PERF203 — report, never hide
+                    restored.append(f"{target}: restore failed: {exc}")
         out = {"ok": False, "installed": False, "error": errno, "reason": reason,
                "written": written, "restored": restored, "previous_digest": previous_digest,
-               "envelope_id": matches[0], "citation_id": result.get("citation_id")}
+               "kept_written": keep_written,
+               "envelope_id": matches[0], "citation_id": None}
+        if pending:
+            out.update(pending)
         try:
             out["receipt_id"] = ledger.append(project, f"{EVENT}_failed", {
                 "actor": app_id, "unit": unit, "source": source, "repo": repo, "path": rel,
                 "head": head_sha, "errno": errno, "reason": reason, "written": written,
-                "restored": restored, "previous_digest": previous_digest,
-                "session": session, "citation_id": result.get("citation_id"),
+                "restored": restored, "kept_written": keep_written,
+                "previous_digest": previous_digest,
+                "pending_id": (pending or {}).get("pending_id"),
+                "session": session, "citation_id": None,
             })
         except Exception as exc:  # noqa: BLE001 — the failure happened; the receipt failing is reported, not hidden
             out["receipt_error"] = f"{type(exc).__name__}: {exc}"
@@ -816,7 +850,55 @@ def execute_unit_install(
             return _fail("ETIMEDOUT", f"{' '.join(argv[2:])} exceeded {_SYSTEMCTL_TIMEOUT_S}s")
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip()[-300:]
-            return _fail("EINSTALL", tail or f"{' '.join(argv[2:])} exited {proc.returncode}")
+            # Desk MCP often has no user D-Bus (Cursor stdio). Keep the written
+            # files and queue willow-mcp-unit-ops — do NOT burn max_count.
+            bus_missing = (
+                "DBUS_SESSION_BUS_ADDRESS" in tail
+                or "XDG_RUNTIME_DIR" in tail
+                or "Failed to connect to user scope bus" in tail
+            )
+            if bus_missing:
+                from . import unit_ops
+                pending_id = unit_ops.enqueue_enable(
+                    app_id=app_id,
+                    unit=unit,
+                    enable_target=enable_target,
+                    source=source,
+                    envelope_id=matches[0],
+                    project=project,
+                    session=session,
+                    head=head_sha,
+                    written=written,
+                    judged_units=judged,
+                )
+                return _fail(
+                    "EINSTALL",
+                    tail or f"{' '.join(argv[2:])} exited {proc.returncode}",
+                    keep_written=True,
+                    pending={
+                        "pending_enable": True,
+                        "pending_id": pending_id,
+                        "hint": "willow-mcp-unit-ops will enable under the same envelope; grant not spent",
+                    },
+                )
+            return _fail(
+                "EINSTALL",
+                tail or f"{' '.join(argv[2:])} exited {proc.returncode}",
+                keep_written=False,
+            )
+
+    # Enable succeeded — now cite (meters max_count) and ink the success receipt.
+    cited = EnvelopeAuthority(ledger).authorize_and_cite(
+        matches[0], actor=app_id, verb=VERB, call_args=call_args,
+        project=project, session=session,
+    )
+    if not cited.get("ok"):
+        return _fail(
+            cited.get("errno", "EAMBIG"),
+            cited.get("reason", "citation refused after enable"),
+            keep_written=True,
+            pending={"citation_id": cited.get("citation_id"), "enabled_without_cite": True},
+        )
 
     state_after = show_unit(unit, runner=runner)
     pruned: list[str] = []
@@ -837,7 +919,7 @@ def execute_unit_install(
         "timer": timer_name, "activates": activates, "creates": creates,
         "starts": starts, "judged_units": judged, "enabled": enable_target,
         "written": written,
-        "envelope_id": matches[0], "citation_id": result.get("citation_id"),
+        "envelope_id": matches[0], "citation_id": cited.get("citation_id"),
         "state_before": state_before, "state_after": state_after,
     }
     try:
@@ -853,7 +935,7 @@ def execute_unit_install(
             "starts": starts, "judged_units": judged, "enabled": enable_target,
             "active_state_after": state_after.get("ActiveState"),
             "active_enter_after": state_after.get("ActiveEnterTimestamp"),
-            "session": session, "citation_id": result.get("citation_id"),
+            "session": session, "citation_id": cited.get("citation_id"),
         })
         receipt_out["receipt_id"] = rec
     except Exception as exc:  # noqa: BLE001 — the install happened; the receipt failing is reported, not hidden

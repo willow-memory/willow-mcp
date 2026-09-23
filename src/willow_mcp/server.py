@@ -2925,14 +2925,17 @@ def task_submit(
     trust-root failure denies network. Signing is available only through the local
     interactive `willow-mcp sign-net-task` CLI; no MCP tool can mint authority.
 
-    Without a `network_authorization` the submission is HELD, not refused
-    (decision c8572a92): the row lands as `held_net_authorization` — a status
-    the worker never claims — and one Nestor decision pair binding exactly what
-    the envelope will sign is proposed; the response carries `pair_id` and the
-    one line to seal. The operator's seal mints the envelope through the
-    net signer (a separate process running as the egress key's owner) and
-    releases the row; a sealed pair stands in for the standing lease for that
-    one task.
+    Without a `network_authorization`, an ``allow_net`` submission is HELD, not
+    refused (decision c8572a92): the row lands as `held_net_authorization` —
+    a status the worker never claims — and one Nestor decision pair binding
+    exactly what the envelope will sign is proposed; the response carries
+    `pair_id` and the one line to seal. The operator's seal mints the envelope
+    through the net signer (a separate process running as the egress key's
+    owner) and releases the row; a sealed pair stands in for the standing
+    lease for that one task. Sealed 9fe5e179 / gap 582b1e676fb3:
+    ``allow_localhost`` is NOT that path — loopback/local process is not a
+    net lease; it queues as ordinary ``pending`` with ``# allow_localhost``
+    (Kart's localhost_tier) and never hold_and_propose.
 
     Task text is security-scanned at SUBMIT time (defense-in-depth): a task the
     Kart scanner would refuse — destructive, exfiltration, secret access, obfusc-
@@ -2999,9 +3002,13 @@ def task_submit(
 
     if allow_net and allow_localhost:
         return {"error": "network_mode_invalid: choose allow_net or allow_localhost"}
-    network_requested = allow_net or allow_localhost
-    if network_requested:
-        from . import consent, gate, lease
+    # allow_net = egress (lease + envelope / hold). allow_localhost = Kart
+    # localhost_tier (share host netns, strip credentials) — not a net lease
+    # (sealed 9fe5e179, gap 582b1e676fb3). Both still need task_net + standing
+    # consent.internet because sharing the netns can reach the public internet;
+    # only allow_net takes the lease / hold_and_propose / envelope path.
+    if allow_net or allow_localhost:
+        from . import consent, gate
         # Key 1: is this app allowed to ask at all? (capability, granted once)
         if not gate.permitted(app_id, gate.NET_PERMISSION):
             return {"error": (
@@ -3017,9 +3024,12 @@ def task_submit(
                 f"'{gate.NET_PERMISSION}', but egress is switched off (or the consent "
                 "policy could not be read, which denies). Only the operator may turn it "
                 "on — an agent may request egress, never grant it to itself.")}
+    if allow_net:
+        from . import lease
         # Key 3: has the operator issued a live lease for THIS app? (B-32)
         # A capability that never expires is indistinguishable from one that was
         # self-granted an hour ago; a lease has a clock and an issuer.
+        # allow_localhost skips this — a local process is not a net lease.
         lease_state = lease.read_lease(app_id)
         # Decision c8572a92: a submission with NO envelope takes the held path
         # below, where the operator's seal stands in for the lease for that
@@ -3127,9 +3137,15 @@ def task_submit(
         if line.strip() not in {"# allow_net", "# allow_localhost", "# allow_db"}
     )
     task_id = ""
-    if network_requested:
+    if allow_localhost:
+        # Kart localhost_tier: share host netns for loopback (Ollama, etc.).
+        # Not egress — no envelope, no hold_and_propose, no standing lease
+        # (sealed 9fe5e179 / gap 582b1e676fb3). network_authorization, if
+        # supplied, is ignored on this path.
+        task = egress_authorization.canonical_network_task(task, localhost=True)
+    elif allow_net:
         task = egress_authorization.canonical_network_task(
-            task, localhost=allow_localhost
+            task, localhost=False
         )
         if not network_authorization:
             # Decision c8572a92: no envelope is a REQUEST, not a refusal. The
@@ -3138,6 +3154,7 @@ def task_submit(
             # operator's seal — not a terminal — is what mints it. The
             # standing-lease check above is deliberately not required on
             # this path: the seal satisfies the lease for that task.
+            # allow_localhost never reaches here.
             from . import net_authority
 
             if not fields["network_authorization"]["column"]:
@@ -3234,7 +3251,7 @@ def task_submit(
     values = {"task_id": task_id, "task": task}
     if fields["submitted_by"]["column"]:
         values["submitted_by"] = app_id or "willow-mcp"
-    if network_requested:
+    if allow_net and network_authorization:
         values["network_authorization"] = network_authorization
     if allow_db and _enforce_db_perimeter():
         values["db_authorization"] = db_authorization
@@ -4981,6 +4998,16 @@ def session_enter(
                 discards[-1]["error_class"] if discards else None
             ),
         }
+        # Desk NOTIFY consume: open CI/title review rows + complete packets
+        # waiting verify_handoff. Silent when quiet (dew-rule).
+        try:
+            from . import desk_attention as _desk_attention
+
+            result["orientation"]["desk_attention"] = (
+                _desk_attention.collect_desk_attention(app_id)
+            )
+        except Exception:
+            pass
     return result
 
 
@@ -5582,6 +5609,17 @@ def unit_install_execute(
         return {"ok": False, "installed": False, "error": f"unit_install_execute_failed: {exc}"}
 
 
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("fleet_read")
+def unit_ops_status(app_id: str, pending_id: str) -> dict:
+    """Poll a pending unit enable queued when `unit_install_execute` hit
+    no_user_bus — states pending / done / failed / not_found. Read-only;
+    the drain is `python -m willow_mcp.unit_ops tick` (willow-mcp-unit-ops
+    systemd --user oneshot)."""
+    from . import unit_ops
+    return unit_ops.status(pending_id)
+
+
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("envelope_apply")
 def manifest_grant_request(
@@ -5839,27 +5877,20 @@ def envelope_ratify_request(
     envelope_id: str,
     pair_id: str,
 ) -> dict:
-    """Verify a human-sealed Nestor pair against every precondition for
-    `envelope.ratify` (gap `d3f79320ccb5`) and, if every one holds, write
-    ONE signed request under `$WILLOW_HOME/manifest_grants/pending/<pair_id>.json`
-    — orchestrator-only. `pair_id` names a sealed decision whose
-    `target_text` is `ratify envelope <proposal_id>: <the operator's
-    verbatim words>` (one line) — the operator's own ratification words ARE
-    the sealed text, so the seal itself is the ratification; there is no
-    second act. Request pre-state: the named proposal exists in the
+    """REMOTE / UNATTENDED path for `envelope.ratify` (gap `aafad73d4606`).
+    Verify a human-sealed Nestor pair and write ONE signed request under
+    `$WILLOW_HOME/manifest_grants/pending/<pair_id>.json` — orchestrator-only.
+
+    Desk default is the click: `envelope_ratify(proposal_id)` from an
+    attributed session (sealed `9fe5e179`) — no Nestor seal. Use this tool
+    when no operator is at a tty and a sealed pair must stand in.
+
+    `pair_id` names a sealed decision whose `target_text` is
+    `ratify envelope <proposal_id> <digest>: <the operator's verbatim
+    words>` (one line). Request pre-state: the named proposal exists in the
     broker's own sidecar and is not already active (`ENOENT` / `EALREADY`).
-    This is the working path on an installed box where the desk's own
-    `envelope_ratify` refuses `EACCES` — the register is trust-owner-owned
-    and the broker holds proposals only (sealed `31f5d3af`), and no single
-    uid can complete the old sidecar-read-then-register-write in one call
-    (Loki audits 367C367A/42B3B46F). `manifest_grant_apply` (the same
-    trust-owner unit as `manifest.grant` and the other three trust-owner
-    verbs, dispatching on the pending record's own `verb` field) re-verifies
-    fresh and moves the proposal into `active[]`, re-signed. Same queue,
-    same `manifest_grant_status`/`manifest_grant_retry` surface as the
-    other four verbs. On a single-uid box the desk's own `envelope_ratify`
-    keeps working exactly as before this verb existed; use whichever the
-    box's own uid layout supports."""
+    `manifest_grant_apply` re-verifies fresh and moves the proposal into
+    `active[]`, re-signed. Same queue as the other trust-owner verbs."""
     pg = get_pg()
     if not pg:
         return _postgres_unavailable()
@@ -6111,25 +6142,31 @@ def envelope_propose(
 
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("envelope_ratify")
-def envelope_ratify(proposal_id: str) -> dict:
+def envelope_ratify(proposal_id: str, words: str = "ratify") -> dict:
     """Move a proposal from proposals[] to active[]. Operator-only; requires
     the current orchestrator session's verifier to pass the keyring check.
     Writes envelope_ratified to the FRANK ledger. issued_by is stamped as
     'root' (invariant preserved from pre-PR5).
 
+    On a single-uid box this writes the register directly.
+
     On an installed box where constitutional/ is trust-owner-owned (sealed
-    31f5d3af), this refuses EACCES before touching anything — no single uid
-    can both read the broker-owned proposals sidecar and write the
-    trust-owner-owned register (Loki audits 367C367A/42B3B46F). The refusal
-    message names envelope_ratify_request as the working path there (gap
-    d3f79320ccb5): it writes a signed request instead, and the trust-owner
-    apply half completes the move. On a single-uid box this tool keeps
-    working exactly as it always has."""
+    31f5d3af), no single uid can both read the broker-owned proposals
+    sidecar and write the register (Loki 367C367A/42B3B46F). This tool then
+    queues a **session-click** request (sealed 9fe5e179 / gap aafad73d4606)
+    — attributed session + ``words`` (default the operator's "ratify") —
+    and the trust-owner apply half completes the move. No Nestor seal.
+    ``envelope_ratify_request`` remains the remote/unattended sealed-pair
+    path only.
+
+    Operator terminal without MCP: ``sudo -E willow-mcp envelope ratify
+    <id> --verifier NAME`` (root spans both files)."""
     ctx = _envelope_authoring_session()
     if isinstance(ctx, dict):
         return ctx
-    verifier, _ = ctx
+    verifier, session_id = ctx
     from . import envelope_authoring as _ea
+    from . import trust_owner_verbs as _tov
     pg = get_pg()
     ledger = None
     if pg is not None:
@@ -6139,14 +6176,28 @@ def envelope_ratify(proposal_id: str) -> dict:
         row = _ea.ratify(proposal_id, verifier=verifier, ledger=ledger)
     except _ea.RegistryMismatchError as exc:
         return {**exc.detail, "message": str(exc)}
-    except _ea.RegisterUnwritableError as exc:
-        # Loki audit 367C367A, T1: refused before either file was touched —
-        # the desk's own uid cannot write a trust-owner-owned register on an
-        # installed box. exc.detail already carries error=EACCES, path, owner.
-        return {**exc.detail, "message": str(exc)}
+    except _ea.RegisterUnwritableError:
+        # Split-uid box: queue the click request instead of pointing at
+        # Nestor (9fe5e179 / aafad73d4606).
+        out = _tov.envelope_ratify_click_request(
+            "willow",
+            proposal_id=proposal_id,
+            verifier=verifier,
+            words=words or "ratify",
+            session=session_id,
+            ledger=ledger,
+        )
+        if out.get("ok"):
+            out["path"] = "session_click"
+            out["message"] = (
+                f"queued session-click ratify for {proposal_id!r}; "
+                "trust-owner apply will move it into the register"
+            )
+        return out
     except _ea.EnvelopeAuthoringError as exc:
         return {"error": type(exc).__name__, "message": str(exc)}
-    return {"ok": True, "envelope": row, "registry": _ea.registry_identity()}
+    return {"ok": True, "envelope": row, "registry": _ea.registry_identity(),
+            "path": "direct"}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)

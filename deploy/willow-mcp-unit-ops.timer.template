@@ -1,0 +1,16 @@
+# unit: willow-mcp-unit-ops.timer
+#
+# Cadence for willow-mcp-unit-ops.service — drain pending enables written when
+# desk stdio lacked a user D-Bus. Sibling of the .service template; enable
+# installs the timer (service starts on each tick).
+[Unit]
+Description=Timer for willow-mcp unit-ops pending enable drain
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Persistent=true
+Unit=willow-mcp-unit-ops.service
+
+[Install]
+WantedBy=timers.target

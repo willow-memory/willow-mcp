@@ -188,7 +188,7 @@ class _Fake:
     def __init__(self, *, tracked=True, dirty="", head="abc123", remote_ok=True,
                  show_rc_before=1, bus_down=False, enable_rc=0, reload_rc=0,
                  on_remote="  origin/master\n", mode="100644",
-                 timer_tracked=True, timer_dirty=""):
+                 timer_tracked=True, timer_dirty="", enable_stderr=""):
         self.tracked = tracked
         self.dirty = dirty
         self.head = head
@@ -201,6 +201,7 @@ class _Fake:
         self.mode = mode
         self.timer_tracked = timer_tracked
         self.timer_dirty = timer_dirty
+        self.enable_stderr = enable_stderr
         self.calls: list[list[str]] = []
         self._enabled = False
 
@@ -223,7 +224,8 @@ class _Fake:
                 return subprocess.CompletedProcess(argv, self.reload_rc, "", "reload failed" if self.reload_rc else "")
             if sub == "enable":
                 self._enabled = self.enable_rc == 0
-                return subprocess.CompletedProcess(argv, self.enable_rc, "", "enable failed" if self.enable_rc else "")
+                err = self.enable_stderr or ("enable failed" if self.enable_rc else "")
+                return subprocess.CompletedProcess(argv, self.enable_rc, "", err)
             raise AssertionError(f"unexpected systemctl call {argv}")
         if argv[0] == "git":
             rest = argv[3:]
@@ -409,6 +411,28 @@ def test_unfillable_placeholder_is_ETEMPLATE(home, tmp_path, monkeypatch, github
     assert _citations(pg) == [] and not (dest / UNIT).exists()
 
 
+def test_render_values_fills_willow_bot_install_placeholders(home, monkeypatch):
+    """willow-bot's steward template uses VAULT_BOX/VENV_BIN/WORKDIR — same
+    names as scripts/install-service.sh. Verb 17 must fill them or ETEMPLATE."""
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+    monkeypatch.delenv("WILLOW_BOT_VAULT_BOX", raising=False)
+    monkeypatch.delenv("WILLOW_BOT_VENV_BIN", raising=False)
+    monkeypatch.delenv("WILLOW_BOT_WORKDIR", raising=False)
+    monkeypatch.setenv("WILLOW_VAULT_BOX", str(home))
+    vals = uix.render_values("willow-bot-steward.service")
+    assert vals["VAULT_BOX"] == str(home)
+    assert vals["VENV_BIN"] == str(home / "venvs" / "willow-bot" / "bin")
+    assert "willow-bot" in vals["WORKDIR"]
+    rendered = uix.render_template(
+        "Environment=WILLOW_HOME=@VAULT_BOX@\n"
+        "ExecStart=@VENV_BIN@/willow-bot-steward loop\n"
+        "WorkingDirectory=@WORKDIR@\n",
+        "willow-bot-steward.service",
+        values=vals,
+    )
+    assert "@" not in rendered
+
+
 def test_real_deploy_template_renders_clean(home, tmp_path, monkeypatch, github_root, dest):
     """The tracked ``deploy/nestor-ui.service.template`` — not this file's own
     ``TEMPLATE`` fixture constant — is what row 17 actually installs. Render
@@ -531,6 +555,11 @@ _DEPLOY_TEMPLATE_CONTENT_VALUES = {
         "NESTOR_DB": "/srv/wh/nestor.db",
     },
     "willow-mcp-manifest-grant.timer.template": {"SERVICE_UNIT": "willow-mcp-manifest-grant.service"},
+    "willow-mcp-unit-ops.service.template": {
+        "WILLOW_HOME": "/srv/wh", "WILLOW_STORE_ROOT": "/srv/store",
+        "PG_DB": "willow", "PYTHON": "/srv/venv/bin/python",
+    },
+    "willow-mcp-unit-ops.timer.template": {},
 }
 
 #: Templates Loki found carrying a literal `@PLACEHOLDERS@`-shaped token
@@ -1193,21 +1222,53 @@ def test_source_outside_bounds_is_refused(home, tmp_path, monkeypatch, github_ro
     assert not (dest / UNIT).exists()
 
 
-def test_envelope_consumed_only_on_success(home, tmp_path, monkeypatch, github_root, dest):
-    """A cited-then-failed enable leaves a granted citation (the act was
-    authorized), a `unit_install_failed` row naming the errno, and no
-    `unit_install` receipt — and a second try under a max_count=1 grant is
-    EDQUOT, which is the honest reading: the grant was spent on an act that
-    did not complete, and that is visible in the ledger."""
+def test_envelope_not_consumed_on_ordinary_enable_fail(home, tmp_path, monkeypatch, github_root, dest):
+    """Cite-after-success: an enable failure that is NOT a missing user bus
+    restores the tree and leaves max_count unused so a retry can complete."""
     _charter(tmp_path, monkeypatch, max_count=1)
     pg = _FakeGovernancePg()
     out = _install(pg, _Fake(enable_rc=1), github_root, dest)
     assert out["ok"] is False and out["error"] == "EINSTALL"
+    assert out.get("citation_id") is None
     assert _receipts(pg) == []
-    assert len(_citations(pg)) == 1
+    assert not any(
+        r["content"].get("outcome") == "granted"
+        for r in _citations(pg)
+    )
     assert [r for r in pg.rows if r["event_type"] == f"{uix.EVENT}_failed"]
     again = _install(pg, _Fake(), github_root, dest)
-    assert again["error"] == "EDQUOT"
+    assert again.get("ok") is True, again
+    assert again.get("installed") is True
+    assert len([c for c in _citations(pg) if c["content"].get("outcome") == "granted"]) == 1
+
+
+def test_no_user_bus_keeps_written_queues_pending_and_does_not_burn_grant(
+        home, tmp_path, monkeypatch, github_root, dest):
+    """Desk without D-Bus: keep the unit file, enqueue unit_ops, leave grant."""
+    _charter(tmp_path, monkeypatch, max_count=1)
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+    pg = _FakeGovernancePg()
+    fake = _Fake(enable_rc=1, enable_stderr=(
+        "Failed to connect to user scope bus via local transport: "
+        "$DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined"
+    ))
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] is False and out["error"] == "EINSTALL"
+    assert out.get("pending_enable") is True and out.get("pending_id")
+    assert out.get("kept_written") is True
+    assert (dest / UNIT).is_file()
+    assert not any(
+        r["content"].get("outcome") == "granted" for r in _citations(pg)
+    )
+    from willow_mcp import unit_ops
+    st = unit_ops.status(out["pending_id"])
+    assert st.get("state") == "pending"
+    # helper completes enable + cites
+    drain = unit_ops.tick(ledger=_ledger(pg), runner=_Fake())
+    assert drain["processed"] == 1
+    assert drain["results"][0].get("ok") is True, drain
+    assert len([c for c in _citations(pg) if c["content"].get("outcome") == "granted"]) == 1
+    assert unit_ops.status(out["pending_id"]).get("state") == "done"
 
 
 def test_no_ledger_is_EAMBIG_before_any_write(home, tmp_path, monkeypatch, github_root, dest):

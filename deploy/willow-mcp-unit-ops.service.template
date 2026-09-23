@@ -1,0 +1,29 @@
+# unit: willow-mcp-unit-ops.service
+#
+# systemd --user oneshot: drain $WILLOW_HOME/unit_ops/pending/ — enable units
+# written by unit_install_execute when the desk MCP had no user D-Bus
+# (SOIL kart-vs-operator-systemctl-broker-2026-09-23). Kart never runs
+# systemctl; this helper inherits the session bus from the user systemd.
+#
+# Installed via unit_install_execute under a unit.install envelope (same
+# discipline as nestor-ui / ratatosk-listen-loki). Pair with the .timer sibling.
+#
+# Placeholders filled by unit_install_executor.render_values(): only
+# @PYTHON@ @WILLOW_HOME@ @WILLOW_STORE_ROOT@ @PG_DB@ — no stray ALL-CAPS
+# at-sign tokens in comments.
+[Unit]
+Description=willow-mcp unit-ops — enable pending user units (session bus)
+After=default.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@WILLOW_HOME@
+EnvironmentFile=@WILLOW_HOME@/env
+Environment=WILLOW_HOME=@WILLOW_HOME@
+Environment=WILLOW_STORE_ROOT=@WILLOW_STORE_ROOT@
+Environment=WILLOW_PG_DB=@PG_DB@
+ExecStart=@PYTHON@ -m willow_mcp.unit_ops tick
+Nice=10
+
+[Install]
+WantedBy=default.target

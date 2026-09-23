@@ -147,6 +147,10 @@ TOOL_CLASS: dict[str, str] = {
     # follow explicitly — same class as before the split, unchanged for the
     # human orchestrator seat.
     "gitsync_sweep": EXECUTE, "git_pull_execute": EXECUTE,
+    # Brokered systemd --user install/reload (kart-vs-operator partition):
+    # never Kart; EXECUTE under willow-gate when the app is registered.
+    "unit_install_execute": EXECUTE, "unit_reload_execute": EXECUTE,
+    "unit_ops_status": READ,
     # ── admin (never sudo) ────────────────────────────────────────────────────
     "schema_confirm_mapping": ADMIN, "gap_purge_topic": ADMIN, "gap_promote": ADMIN,
     # gap_retopic curates the fleet-shared backlog (same group as gap_promote).
