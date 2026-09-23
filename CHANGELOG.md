@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.81.0](https://github.com/willow-memory/willow-mcp/compare/v2.80.0...v2.81.0) (2026-09-23)
+
+
+### Added
+
+* **session-end:** stage-1 corpus-lens + reconciler stub receipts ([90897fc](https://github.com/willow-memory/willow-mcp/commit/90897fc1d8aef211e84909321faea39feb5f2e8d))
+
+
+### Fixed
+
+* **test:** drop allow_localhost from forged/reclaimed net-deny cases ([200ce45](https://github.com/willow-memory/willow-mcp/commit/200ce45b004816da4907703120b9335cc23743b9))
+
 ## [2.80.0](https://github.com/willow-memory/willow-mcp/compare/v2.79.0...v2.80.0) (2026-09-23)
 
 
