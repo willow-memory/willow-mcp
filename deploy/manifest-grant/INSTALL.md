@@ -11,9 +11,29 @@ this document used to walk through one keyboard line at a time are no longer
 the operator's to type; `install.sh` (beside this file) collapses them into
 one root act:
 
-    sudo bash install.sh            # do it
-    sudo bash install.sh --check    # detect-only, change nothing — stops
-                                     # after step 0, before any mutation
+    sudo bash install.sh                       # do it
+    sudo bash install.sh --check               # detect-only, change nothing — stops
+                                                 # after step 0, before any mutation
+    sudo bash install.sh --check-signatures     # read-only: which fingerprint does
+                                                 # each governed file verify under, right now
+    sudo bash install.sh --rotate [--retire FPR ...]
+                                                 # generate a new trust-owner signing key,
+                                                 # re-sign everything, THEN retire old key(s)
+
+Dispatch `B291C0C7` ("one signing key, one source of truth", amending
+`A9BF01A9`): the operator ratified an envelope, the trust-owner apply drained
+it and re-signed `constitutional/pre-approved.json` under the fingerprint
+`install.sh` had just written to `$H/env` — but the serve broker's own
+`--user` unit carried a SECOND, stale pin (a `WILLOW_PGP_FINGERPRINT=` line
+in a systemd drop-in) that `install.sh` never touched, so `paths.trusted_read`
+refused the whole register under the broker's process environment even
+though the file on disk was signed correctly. `$H/env` is now the **one**
+source of truth: `pgp.expected_fingerprint()` reads it, consults the process
+environment only to catch a leftover pin that DISAGREES with it, and refuses
+loudly (naming both values and both sources) rather than silently trusting
+either side when they conflict — see `pgp.PgpFingerprintConflict`. `install.sh`
+now strips the serve unit's own pin (step 3, every run, idempotent) so
+nothing but `$H/env` sets this variable on the box going forward.
 
 This document is now the human-readable account of what `install.sh` does
 and why, in the same order the script runs it — read it to know what the
@@ -214,6 +234,69 @@ read, which is now request time only. A pending request can already sit
 for minutes before the next tick; this narrows, but does not remove, that
 window.
 
+## Rotating the trust-owner signing key: `--rotate` / `--retire` / `--check-signatures`
+
+Dispatch `B291C0C7`. Operator ruling (verbatim): "I kinda wanna delete both
+these keys and just set one new one that applies correctly, instead of split
+brain." `--rotate` is a SEPARATE mode from the plain install above — it does
+not run steps 0-7; it runs its own sequence, in this order, and the order is
+the whole point:
+
+    sudo bash install.sh --rotate [--retire FPR ...]
+
+1. **Generate a new key, always** — never reuse whatever the trust owner's
+   GNUPGHOME already holds, even if a key of the same name-prefix is already
+   there. The OLD key is left in place (not deleted yet).
+2. **Write the new fingerprint to `$H/env` and `/etc/willow-mcp/
+   manifest-grant.env`** — one value, one write path (the same render step 4
+   of the plain install performs, run here too).
+3. **Import the new public half into the operator's keyring.**
+4. **Re-sign every governed file under the new key, as ONE atomic batch**
+   (`rotate_resign.py`, `resign_all()`): every `mcp_apps/*/manifest.json`,
+   `constitutional/pre-approved.json`, `constitutional/syscall-table.json`,
+   `mcp_apps/_federation/servers.json`, `constitutional/frank_head_anchor.json`
+   (skipped by the plain install's step 6 — covered here), and every ratified
+   seed under `$H/seeds/*.json` (also skipped by the plain install — covered
+   here). Unlike step 6's own bash loop (N independent `gpg` calls, no
+   rollback), a failure on file N of this batch restores every file the batch
+   ALREADY re-signed this run, not just N — a half-rotated box (some files
+   under the new key, some still under the old one) is worse than the split
+   brain this dispatch exists to close, so `--rotate` never leaves one.
+5. **Verify every one under the new fingerprint** (`rotate_resign.py --check`,
+   run as the operator).
+6. **Only now, with every file confirmed — retire the old key(s):** the
+   previous trust-owner key (read from `$H/env` before step 2 overwrote it)
+   is deleted from the trust owner's own GNUPGHOME; every fingerprint passed
+   as `--retire FPR` (repeatable) is deleted from the OPERATOR's keyring.
+
+If step 4 or 5 fails, `install.sh` stops with `$H/env` and
+`/etc/willow-mcp/manifest-grant.env` already pointing at the new (unverified)
+fingerprint but every governed file's `.sig` restored to what it verified
+under before — revert those two files by hand (or re-run `--rotate`, which
+generates a fresh key again) before trusting anything that reads the new
+fingerprint. **The old key is never retired unless every file verified.**
+
+`--check-signatures` is read-only and touches nothing: it reads the SAME
+governed-file list `--rotate` re-signs and reports, per file, which
+fingerprint its `.sig` actually verifies under right now versus the one
+named in `$H/env` — the one read that confirms a rotation landed everywhere,
+rather than trusting `--rotate`'s own exit code.
+
+**v1 PGP session-attestation sidecars are NOT re-signed by `--rotate`** and
+go invalid the moment the old key retires — they attest a session under the
+OLD key by design (a point-in-time signature, not a live pointer), and
+sessions attest through the ed25519 keyring, not PGP, going forward. An
+already-attested session does not need to re-attest merely because the trust
+owner's PGP key rotated; a NEW attestation after a rotate naturally uses
+whichever key `WILLOW_PGP_FINGERPRINT` names at the time.
+
+**Legs this script cannot exercise off the real box** (same limit every
+signing step in this file has always had): the real two-uid `gpg` signing
+boundary (`rotate_resign.py`'s own tests fake `sign_fn`/`verify_fn`);
+`systemctl`; deleting a key from a keyring `sudo -u <uid> gpg
+--delete-secret-and-public-key` actually reaches. Only a real `--rotate` run
+on the box exercises those.
+
 ## 2. Retire the --user unit
 
     systemctl --user disable --now willow-mcp-manifest-grant.timer
@@ -228,7 +311,12 @@ request/apply split was always an audit-trail boundary, never a privilege
 one, on a box with no uid split; this system unit is the uid split actually
 landing.
 
-## 3. The signing key the service uid owns
+## 1b. The signing key the service uid owns
+
+(Renumbered from the original "3." by dispatch `A9BF01A9` — moved ahead of
+1c's atomic sync-and-sign, which needs `$FPR` to exist before it writes
+anything. The heading below is kept for search continuity; the script's own
+`say` line reads `== 1b. signing key owned by ...`.)
 
     install -d -o willow-operator -g willow-operator -m 700 /var/lib/willow-mcp/manifest-grant/gnupg
     sudo -u willow-operator GNUPGHOME=/var/lib/willow-mcp/manifest-grant/gnupg \
@@ -240,6 +328,23 @@ landing.
 (idempotent — re-running after a stop is the intended recovery), generates
 one only if absent, and rewrites `WILLOW_PGP_FINGERPRINT` in the broker's
 own `$H/env` to match.
+
+## 3. Strip the serve unit's own WILLOW_PGP_FINGERPRINT pin, if any
+
+Dispatch `B291C0C7`. Every run (plain install or `--rotate`), idempotent:
+
+    PGP_DROPIN=~/.config/systemd/user/willow-mcp-serve.service.d/pgp.conf
+    # removed outright if it pins only WILLOW_PGP_FINGERPRINT= and nothing
+    # else; otherwise only that one line is stripped, the rest is kept
+    systemctl --user daemon-reload
+
+This is the exact file the 2026-09-23 lockout traced to: a second,
+independent pin that `install.sh` had never touched, disagreeing with
+`$H/env` the moment a rotation changed one and not the other. `install.sh`
+deliberately does NOT give the serve unit `EnvironmentFile=$H/env` in its
+place — that file holds every provider API key, and it is unnecessary now
+that `pgp.expected_fingerprint()` reads `$H/env` directly as the one source
+of truth.
 
 ## 4. Env file, units
 

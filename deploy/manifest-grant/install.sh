@@ -132,7 +132,6 @@ ETC=/etc/willow-mcp
 KEY_UID='willow-mcp manifest-grant (trust owner) <manifest-grant@willow-operator-box>'
 HERE=$(cd "$(dirname "$0")" && pwd)
 CHECKOUT=$(cd "$HERE/../.." && pwd)   # deploy/manifest-grant/ -> checkout root
-CHECK_ONLY=${1:-}
 BROKER_PUBLIC_KEY_NAME=broker_public_key.pub   # manifest_grant_executor._broker_public_key_path
 BROKER_UNIT_CANDIDATES=(willow-mcp-serve.service willow-mcp.service)  # reloader.DEFAULT_UNIT / unit_reload_executor._BROKER_UNIT_STEMS
 PY="$H/venvs/willow-mcp/bin/python"
@@ -189,6 +188,27 @@ DRYRUN
   exit 0
 fi
 
+# ------------------------------------------------------------- argument parsing
+# Dispatch B291C0C7 ("one signing key, one source of truth"): --rotate and
+# --check-signatures are new; --retire is repeatable and only meaningful with
+# --rotate. --dry-run-sign was already handled above (it exits before this
+# point on its own, and needs no root).
+CHECK_ONLY=""
+ROTATE=""
+CHECK_SIGNATURES=""
+RETIRE_FPRS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) CHECK_ONLY="--check"; shift ;;
+    --check-signatures) CHECK_SIGNATURES=1; shift ;;
+    --rotate) ROTATE=1; shift ;;
+    --retire)
+      [ $# -ge 2 ] || stop "--retire requires a fingerprint argument"
+      RETIRE_FPRS+=("$2"); shift 2 ;;
+    *) stop "unknown argument: $1 (known: --check, --check-signatures, --rotate, --retire FPR, --dry-run-sign)" ;;
+  esac
+done
+
 # ---------------------------------------------------------------- preflight
 [ "$(id -u)" = 0 ] || stop "run as root (sudo bash install.sh)"
 [ -d "$H" ] || stop "operator box not found at $H"
@@ -200,6 +220,123 @@ done
 [ -x "$PY" ] || stop "trust-owner python interpreter not found or not executable at $PY — venvs/willow-mcp must exist before this script does anything"
 PG_DB=$(grep -E '^WILLOW_PG_DB=' "$H/env" | tail -1 | cut -d= -f2- || true)
 [ -n "$PG_DB" ] || stop "WILLOW_PG_DB not set in $H/env"
+
+# governed_files: every file trusted-owner-signed under WILLOW_PGP_FINGERPRINT
+# that --rotate must re-sign and --check-signatures reads — one list, used by
+# both, so they can never silently drift apart. Prints one path per line;
+# absent paths are printed too (both callers treat "absent" as its own state,
+# never an error).
+governed_files() {
+  for a in "$H"/mcp_apps/*/; do
+    [ -f "$a/manifest.json" ] && printf '%s\n' "$a/manifest.json"
+  done
+  printf '%s\n' "$H/constitutional/pre-approved.json"
+  printf '%s\n' "$H/constitutional/syscall-table.json"
+  printf '%s\n' "$H/mcp_apps/_federation/servers.json"
+  printf '%s\n' "$H/constitutional/frank_head_anchor.json"
+  for s in "$H"/seeds/*.json; do
+    [ -e "$s" ] && printf '%s\n' "$s"
+  done
+}
+
+# ---------------------------------------------------------- --check-signatures
+# Item 5 (B291C0C7): one read that tells the desk whether the rotation
+# actually landed everywhere, rather than trusting --rotate's own exit code.
+# Read-only — touches nothing. Runs as the operator: the operator's own
+# keyring is what step 1b/--rotate import the trust owner's PUBLIC key into,
+# so a plain (no --homedir) gpg --verify as that uid is the same trust a real
+# reader (paths.trusted_read, run by the broker) exercises.
+if [ -n "$CHECK_SIGNATURES" ]; then
+  say "== --check-signatures: which fingerprint does each governed file verify under"
+  CUR_FPR=$(grep -E '^WILLOW_PGP_FINGERPRINT=' "$H/env" | tail -1 | cut -d= -f2- || true)
+  [ -n "$CUR_FPR" ] || stop "WILLOW_PGP_FINGERPRINT not set in $H/env — nothing to check against"
+  mapfile -t FILES < <(governed_files)
+  as_op "$PY" "$HERE/rotate_resign.py" --check --fingerprint "$CUR_FPR" "${FILES[@]}"
+  exit $?
+fi
+
+# -------------------------------------------------------------------- --rotate
+# Dispatch B291C0C7 ("one signing key, one source of truth"), amending
+# A9BF01A9. Operator ruling (verbatim): "I kinda wanna delete both these keys
+# and just set one new one that applies correctly, instead of split brain."
+# Order is the whole point — see the module docstring on rotate_resign.py for
+# why re-signing is one atomic batch, not N independent gpg calls, and why the
+# old key is retired ONLY after every file verifies under the new one.
+if [ -n "$ROTATE" ]; then
+  say "== --rotate: generate a new trust-owner signing key, re-sign everything, retire what's named"
+
+  # 1. a NEW key, always — the whole point of --rotate is a fresh key, never
+  # reusing whatever the trust owner's GNUPGHOME already holds. The OLD key
+  # is left in GNUPGHOME (never deleted) until step 6 below confirms the
+  # rotation actually landed.
+  install -d -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 700 "$(dirname "$GNUPGHOME_TO")" "$GNUPGHOME_TO"
+  ROTATE_UID="$KEY_UID $(date -u +%Y%m%dT%H%M%SZ)"
+  as_to gpg --batch --pinentry-mode loopback --passphrase '' \
+    --quick-gen-key "$ROTATE_UID" ed25519 sign never
+  NEW_FPR=$(as_to gpg --batch --list-keys --with-colons "$ROTATE_UID" | awk -F: '/^fpr/{print $10; exit}')
+  [ -n "$NEW_FPR" ] || stop "key generation appeared to succeed but no fingerprint was found for it"
+  say "  generated $NEW_FPR"
+  OLD_FPR=$(grep -E '^WILLOW_PGP_FINGERPRINT=' "$H/env" | tail -1 | cut -d= -f2- || true)
+  say "  previous fingerprint (from $H/env): ${OLD_FPR:-<none>}"
+
+  # 2. write the new fingerprint to $H/env and $ETC/manifest-grant.env — one
+  # value, one write path (the same render step 4 below performs, run here
+  # too so a --rotate needs no separate re-run of plain install to pick it
+  # up in the systemd env file).
+  if grep -qE '^WILLOW_PGP_FINGERPRINT=' "$H/env"; then
+    sed -i -E "s|^WILLOW_PGP_FINGERPRINT=.*|WILLOW_PGP_FINGERPRINT=$NEW_FPR|" "$H/env"
+  else
+    printf 'WILLOW_PGP_FINGERPRINT=%s\n' "$NEW_FPR" >> "$H/env"
+  fi
+  install -d -m 755 "$ETC"
+  ENV_TMP=$(mktemp)
+  sed -E -e "s|^WILLOW_PGP_FINGERPRINT=.*|WILLOW_PGP_FINGERPRINT=$NEW_FPR|" \
+         -e "s|^WILLOW_PG_DB=.*|WILLOW_PG_DB=$PG_DB|" "$HERE/manifest-grant.env" > "$ENV_TMP"
+  install -o root -g "$TRUST_OWNER" -m 640 "$ENV_TMP" "$ETC/manifest-grant.env"
+  rm -f "$ENV_TMP"
+  say "  wrote $NEW_FPR to $H/env and $ETC/manifest-grant.env"
+
+  # 3. the public half into the operator's keyring
+  as_to gpg --batch --armor --export "$NEW_FPR" | sudo -u "$OPERATOR" gpg --batch --import
+  echo "$NEW_FPR:6:" | sudo -u "$OPERATOR" gpg --batch --import-ownertrust
+  say "  imported $NEW_FPR into $OPERATOR's keyring"
+
+  # 4/5. re-sign and verify every governed file — one atomic batch
+  # (rotate_resign.py: a failure on file N rolls back every file this run
+  # already re-signed, not just N).
+  mapfile -t FILES < <(governed_files)
+  say "  re-signing ${#FILES[@]} governed path(s) under $NEW_FPR"
+  if ! "$PY" "$HERE/rotate_resign.py" --sign-as "$TRUST_OWNER" --gnupg-home "$GNUPGHOME_TO" \
+       --fingerprint "$NEW_FPR" "${FILES[@]}"; then
+    stop "re-signing failed — rotate_resign.py already restored every file it touched this run to its previous signature. $H/env and $ETC/manifest-grant.env were already written as $NEW_FPR above, though: revert those two by hand (set them back to ${OLD_FPR:-the previous value}) or rerun --rotate before trusting anything that reads $NEW_FPR. The old key ($OLD_FPR) was NOT retired."
+  fi
+  as_op "$PY" "$HERE/rotate_resign.py" --check --fingerprint "$NEW_FPR" "${FILES[@]}" \
+    || stop "post-rotate verification found a file that does not verify under $NEW_FPR — see the table above. The old key ($OLD_FPR) was NOT retired; fix the mismatch and rerun --check-signatures before rerunning --rotate."
+  say "  every governed file verifies under $NEW_FPR"
+
+  # 6. only now — everything verifies — retire the old keys.
+  if [ -n "$OLD_FPR" ] && [ "$OLD_FPR" != "$NEW_FPR" ]; then
+    if as_to gpg --batch --yes --delete-secret-and-public-key "$OLD_FPR"; then
+      say "  retired previous trust-owner key $OLD_FPR from $GNUPGHOME_TO"
+    else
+      say "  WARNING: could not retire $OLD_FPR from $GNUPGHOME_TO — retire it by hand (as_to gpg --batch --yes --delete-secret-and-public-key $OLD_FPR)"
+    fi
+  fi
+  for fpr in "${RETIRE_FPRS[@]}"; do
+    if sudo -u "$OPERATOR" gpg --batch --yes --delete-key "$fpr"; then
+      say "  retired $fpr from $OPERATOR's keyring"
+    else
+      say "  WARNING: could not retire $fpr from $OPERATOR's keyring — retire it by hand"
+    fi
+  done
+
+  say
+  say "done. New fingerprint: $NEW_FPR."
+  say "v1 PGP session-attestation sidecars signed under the old key are now invalid — see INSTALL.md."
+  say "Restart the broker (systemctl --user restart willow-mcp-serve.service) and reconnect any"
+  say "stdio-attached desk session by hand to pick up $NEW_FPR."
+  exit 0
+fi
 
 # ------------------------------------------------- 0. why is mcp_apps 65534?
 say "== 0. mcp_apps ownership and mount"
@@ -423,6 +560,35 @@ as_op systemctl --user stop willow-mcp-manifest-grant.service 2>/dev/null || tru
 rm -f "/home/$OPERATOR/.config/systemd/user/willow-mcp-manifest-grant.service" \
       "/home/$OPERATOR/.config/systemd/user/willow-mcp-manifest-grant.timer"
 as_op systemctl --user daemon-reload
+
+# -------------------------------------------- 3. strip stale per-file pgp pins
+# Dispatch B291C0C7 ("one signing key, one source of truth"): $H/env is the
+# only place WILLOW_PGP_FINGERPRINT is ever set now — pgp.expected_fingerprint()
+# refuses at first use if the process environment disagrees with it, never
+# silently prefers either. A systemd drop-in pinning it a SECOND place is
+# exactly the split brain measured 2026-09-23: install.sh rewrote $H/env's
+# copy to the new key while this drop-in still carried the old one, and
+# whichever file a given process happened to load decided whether it trusted
+# the register. Idempotent — a no-op once the pin is gone.
+say "== 3. strip the serve unit's own WILLOW_PGP_FINGERPRINT pin, if any"
+PGP_DROPIN="/home/$OPERATOR/.config/systemd/user/willow-mcp-serve.service.d/pgp.conf"
+if [ -f "$PGP_DROPIN" ]; then
+  REMAINDER=$(grep -vE '^\s*(#|\[Service\]\s*$|\s*$|WILLOW_PGP_FINGERPRINT=)' "$PGP_DROPIN" || true)
+  if [ -z "$REMAINDER" ]; then
+    rm -f "$PGP_DROPIN"
+    say "  removed $PGP_DROPIN (it pinned WILLOW_PGP_FINGERPRINT and nothing else)"
+  else
+    sed -i -E '/^WILLOW_PGP_FINGERPRINT=/d' "$PGP_DROPIN"
+    say "  stripped WILLOW_PGP_FINGERPRINT= from $PGP_DROPIN (other settings left in place)"
+  fi
+  as_op systemctl --user daemon-reload
+else
+  say "  no pin found at $PGP_DROPIN"
+fi
+# Deliberately NOT giving the serve unit EnvironmentFile=$H/env here: that
+# file holds every provider API key, and pgp.py's one-source-of-truth read
+# makes the pin unnecessary — the broker never needs WILLOW_PGP_FINGERPRINT
+# in its own process environment at all once it, too, is on this pgp.py.
 
 # ---------------------------------------------------------- 4. env file, units
 say "== 4. $ETC and system units"

@@ -180,6 +180,39 @@ def _old_template_has_a_fixed_user_line(text: str) -> bool:
     return False
 
 
+# dispatch B291C0C7 ("one signing key, one source of truth"), amending
+# A9BF01A9: --rotate/--check-signatures/--retire, the pgp.conf strip, and
+# retire-only-after-verify ordering.
+
+_ROTATE_REQUIRED_MARKERS = (
+    "--rotate", "--check-signatures", "--retire", "governed_files",
+    "rotate_resign.py", "frank_head_anchor.json",
+)
+
+
+def _install_sh_missing_rotate_markers(install_sh_text: str) -> list[str]:
+    body = _script_body(install_sh_text)
+    return [marker for marker in _ROTATE_REQUIRED_MARKERS if marker not in body]
+
+
+def _install_sh_retires_before_verify(install_sh_text: str) -> bool:
+    """True (a defect) only if a `--delete-secret-and-public-key` call
+    appears BEFORE the post-rotate `--check` verification — the old key
+    must survive until every governed file is confirmed to verify under
+    the new one."""
+    body = _script_body(install_sh_text)
+    idx_delete = body.find("delete-secret-and-public-key")
+    idx_verify = body.find('rotate_resign.py" --check --fingerprint "$NEW_FPR"')
+    if idx_delete == -1 or idx_verify == -1:
+        return False
+    return idx_delete < idx_verify
+
+
+def _install_sh_missing_pgp_dropin_strip(install_sh_text: str) -> bool:
+    body = _script_body(install_sh_text)
+    return "willow-mcp-serve.service.d/pgp.conf" not in body
+
+
 def test_plant_every_deploy_scan_helper_catches_its_violation():
     """Plants one violation per scan helper above and shows each one fires."""
     assert _missing_pair_citations("no citations here") == list(_SEALED_PAIRS)
@@ -254,6 +287,26 @@ def test_plant_every_deploy_scan_helper_catches_its_violation():
     ) is True
     assert _install_sh_syscall_table_double_signed(
         'set -euo pipefail\nfor f in "$REG" "$H/mcp_apps/_federation/servers.json"; do :; done'
+    ) is False
+
+    assert _install_sh_missing_rotate_markers("set -euo pipefail\nnothing here") == list(
+        _ROTATE_REQUIRED_MARKERS
+    )
+    assert _install_sh_missing_rotate_markers(
+        "set -euo pipefail\n" + " ".join(_ROTATE_REQUIRED_MARKERS)
+    ) == []
+
+    assert _install_sh_retires_before_verify(
+        'set -euo pipefail\ndelete-secret-and-public-key\nrotate_resign.py" --check --fingerprint "$NEW_FPR"\n'
+    ) is True
+    assert _install_sh_retires_before_verify(
+        'set -euo pipefail\nrotate_resign.py" --check --fingerprint "$NEW_FPR"\ndelete-secret-and-public-key\n'
+    ) is False
+    assert _install_sh_retires_before_verify("neither marker present") is False
+
+    assert _install_sh_missing_pgp_dropin_strip("set -euo pipefail\nnothing here") is True
+    assert _install_sh_missing_pgp_dropin_strip(
+        "set -euo pipefail\nwillow-mcp-serve.service.d/pgp.conf"
     ) is False
 
 
@@ -361,6 +414,7 @@ _TRACKED_SHEBANG_SCRIPTS = (
     _DEPLOY / "install.sh",
     _DEPLOY / "sync_constitutional.py",
     _DEPLOY / "seed_envelope_ratify.py",
+    _DEPLOY / "rotate_resign.py",
 )
 
 
@@ -390,6 +444,28 @@ def test_tracked_shebang_scripts_are_executable():
             assert git_mode == "100755", f"git tracks a non-executable mode: {line}"
     else:
         pytest.skip("not inside the git checkout this test expects (git ls-files unavailable)")
+
+
+def test_install_sh_has_rotate_check_signatures_and_retire():
+    """Dispatch B291C0C7: --rotate generates a new key, writes it to
+    $H/env and $ETC/manifest-grant.env, re-signs every governed file as
+    one atomic batch (rotate_resign.py), and only then retires the old
+    key(s); --check-signatures reports which fingerprint each governed
+    file verifies under right now."""
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    assert _install_sh_missing_rotate_markers(text) == []
+
+
+def test_install_sh_rotate_retires_old_key_only_after_verifying_the_new_one():
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    assert _install_sh_retires_before_verify(text) is False
+
+
+def test_install_sh_strips_the_serve_units_own_pgp_pin():
+    """The split brain this dispatch closes: a per-file WILLOW_PGP_FINGERPRINT
+    pin in the serve unit's own systemd drop-in, disagreeing with $H/env."""
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    assert _install_sh_missing_pgp_dropin_strip(text) is False
 
 
 def test_bundle_manifest_grant_template_is_the_retired_user_unit_design():
