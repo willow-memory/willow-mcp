@@ -73,7 +73,7 @@ When **jeles-corpus federation is ratified and working** (`federation_call` → 
 
 **Still separate (not replaced by jeles):** `integration_call` to **GitHub**, **Pangolin**, **UTETY**, **HuggingFace hub** when the job is a structured API (repos, PRs, vault resources) — not open-web or institutional catalogue search. Those remain earn/grant decisions; default is still jeles-first for anything jeles already covers.
 
-**Failure mode:** if `federation_call` to jeles fails (consent, lease, spawn, guard), log it and surface — do not silently fall back to `willow_web_*` without operator say-so.
+**Failure mode:** if `federation_call` to jeles fails (consent, spawn, guard), log it and surface — do not silently fall back to `willow_web_*` without operator say-so. An expired grant-net lease blocks **net-bearing** corpus tools (`corpus_web_search`, `corpus_institutional_search`, `corpus_verify_claim`, `corpus_search_status`) and HTTP downstream federation; loopback tools (`corpus_search`, `corpus_ask`, `corpus_host_card`, …) do **not** need a lease.
 
 ---
 

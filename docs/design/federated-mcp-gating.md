@@ -8,8 +8,8 @@ description: "How willow-mcp gates a call it makes to a tool on a downstream MCP
 
 # Gating a federated MCP call
 
-*Status: **PROPOSAL** — decided 2026-08-04, no code yet. Blocks the orchestrator
-substrate.*
+*Status: **LANDED** (client + gate shipped). Decision 3 addendum (2026-09-23):
+loopback stdio federation exempt from grant-net for classified local tools.*
 
 *Companion: `permissions-matrix.md` · `egress-request-seam.md` ·
 `trust-architecture.md` · `gate.py` · `web_egress.py` · `lease.py`*
@@ -153,6 +153,25 @@ making it also mean "may fork a process as me" would make the existing grant
 retroactively mean more than the operator agreed to — the precise failure this
 codebase separated `task_net` from `integration_net` from `web_net` to avoid.
 
+### Decision 3 addendum — lease only for net-bearing federated tools (2026-09-23)
+
+Operator ruling: *nothing internal behind egress.* A stdio downstream on the
+same box (jeles-corpus) is still a fourth egress **class** — `mcp_federation`,
+per-tool grants, ratification, and `consent.federation` all still apply before
+spawn. The app-keyed lease from `lease.py` is unchanged on disk; only **when**
+`federation_egress` reads it is narrowed:
+
+| Federated call | Lease required? |
+|---|---|
+| HTTP / streamable-http downstream | Yes (network peer) |
+| Stdio tool in `FEDERATION_LOOPBACK_STDIO_TOOLS` (corpus_search, corpus_ask, …) | No |
+| Stdio tool in `FEDERATION_NET_BEARING_TOOLS` (corpus_web_search, …) | Yes |
+| Stdio tool not yet classified | Yes (fail closed) |
+
+Implementation: `federation_tool_egress.py` + conditional check in
+`federation_egress.egress_denial`. Future `net.egress` envelope row 19 may
+codify the same bounds; runtime behavior landed first.
+
 ## 5. Decision 4 — four controls with no three-key analogue
 
 The three-key gate does not cover these, because none of the existing lanes
@@ -251,8 +270,9 @@ promise refusal. This one can only promise attribution.
 @phase 4-what-is-pinned
 ## 8. What is pinned in code today
 
-The design is unbuilt, but one of its premises is checkable now, and was not
-checked: `test_egress_tools_stay_off_full_access` asserted the own-line rule for
+`federation_egress`, `mcp_federation_client`, and the loopback lease split
+(2026-09-23) are live. One premise was checkable before the client existed, and
+was not checked at the time: `test_egress_tools_stay_off_full_access` asserted the own-line rule for
 `task_net` and `integration_net` — and **omitted `web_net`**, the newest of the
 three and the one this design extends.
 

@@ -98,11 +98,13 @@ def _check_attestation(app_id: str, session_id: str) -> dict | None:
 
 
 def _check_lease(app_id: str) -> dict | None:
-    from . import lease
+    from . import federation_tool_egress, lease
 
     row = lease.read_lease(app_id)
     status = row.get("status")
     if status == "active":
+        return None
+    if not federation_tool_egress.seat_uses_net_egress(app_id):
         return None
     detail = {
         "none": "no lease on disk",
@@ -112,15 +114,15 @@ def _check_lease(app_id: str) -> dict | None:
         "malformed": row.get("error") or "malformed",
         "mismatch": row.get("error") or "names a different app_id",
     }.get(status, str(status))
-    # Two lanes need this lease and they fail differently, so both are named:
-    # only one of them is unblocked by a lease alone. Federated jeles is the
-    # open-web path since the operator retired willow_web_* on this seat
-    # (KB 805162C1, 2026-09-01) — one organ, one confidence ladder.
     effect = (
-        "federated jeles calls (corpus_*) refuse — they need this lease "
-        "alongside mcp_federation and consent.federation. A Kart task carrying "
-        "allow_net needs MORE than this lease: an operator-signed per-task "
-        "envelope too, so granting the lease alone will not unblock git push"
+        "open-web and integration egress, net-bearing jeles-corpus federated "
+        "tools (corpus_web_search, corpus_institutional_search, "
+        "corpus_verify_claim, corpus_search_status), and Kart allow_net tasks "
+        "stay blocked until a lease is active. Loopback jeles-corpus tools "
+        "(corpus_search, corpus_ask, corpus_host_card, …) do not need a lease. "
+        "A Kart task carrying allow_net needs MORE than this lease: an "
+        "operator-signed per-task envelope too, so granting the lease alone "
+        "will not unblock git push"
     )
     if status == "unreadable":
         # Measured 2026-09-10 (gap d90246688413): a root-issued lease landed
