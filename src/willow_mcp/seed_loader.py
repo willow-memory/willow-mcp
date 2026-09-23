@@ -200,6 +200,27 @@ def memory_dirs() -> list[Path]:
     return dirs
 
 
+def _git_root(path: Path) -> Path | None:
+    """Nearest ancestor of ``path`` (inclusive) that is a git work tree
+    root — presence of a ``.git`` entry (a directory for a normal
+    checkout, a file for a worktree). Bounded: at most 64 segments up,
+    same bound as the caller's own walk. Read-only ``.exists()`` checks
+    only. ``None`` when ``path`` isn't inside any git work tree at all.
+    """
+    candidate = path
+    hops = 0
+    while True:
+        hops += 1
+        if hops > 64:
+            return None
+        if (candidate / ".git").exists():
+            return candidate
+        parent = candidate.parent
+        if parent == candidate:
+            return None
+        candidate = parent
+
+
 def resolve_own_project(project_root: str | None = None) -> dict[str, Any]:
     """Resolve THIS seat's own Claude Code memory dir EXACTLY from its
     resolved project root — never by fuzzy substring (G3, Loki 5C276CEA:
@@ -230,31 +251,48 @@ def resolve_own_project(project_root: str | None = None) -> dict[str, Any]:
     inverts a slug back to a path, which would be ambiguous for a path
     segment that itself contains a dash).
 
-    Returns ``{"project_dir": str|None, "repo_name": str, "state":
-    "populated"|"empty"|"unreachable"}``. ``"unreachable"``:
+    K2 (Loki 3C1BB137): that ancestor walk used to be UNBOUNDED, so any
+    repo under ``~/github`` with no memory dir of its own (willow-bot,
+    kartikeya, corpus-lens, willow-gate, any new checkout) climbed all
+    the way out to ``~/github``'s own notes and read them as "own
+    project" — the exact cross-project leak G3 was built to close, one
+    level up. The walk now never climbs past the repo's own git root
+    (:func:`_git_root`; a worktree is already normalized to its repo
+    above). A path that isn't inside any git work tree at all gets no
+    ancestor fallback whatsoever — exact match only.
+
+    Returns ``{"project_dir": str|None, "repo_name": str, "exact": bool,
+    "state": "populated"|"empty"|"unreachable"}``. ``"unreachable"``:
     ``~/.claude/projects`` itself isn't there. ``"empty"``: the tree
-    exists but no directory — at the resolved path or any ancestor —
-    encodes this seat's project. ``"populated"``: ``project_dir`` names
-    the exact match.
+    exists but no directory — at the resolved path or any ancestor up to
+    the git root — encodes this seat's project. ``"populated"``:
+    ``project_dir`` names the match; ``exact`` is ``True`` only when the
+    match was the resolved path itself, ``False`` when it took an
+    ancestor fallback (so a caller can label a fallback as reading
+    another project's notes rather than presenting it as this seat's
+    own — see ``boot_context.py``'s "from <repo>'s notes" line).
     """
     projects = _projects_root()
     if not projects.is_dir():
-        return {"project_dir": None, "repo_name": "", "state": "unreachable"}
+        return {"project_dir": None, "repo_name": "", "exact": False, "state": "unreachable"}
 
     root = (project_root or os.environ.get("WILLOW_PROJECT_ROOT", "") or str(Path.cwd())).strip()
     if not root:
-        return {"project_dir": None, "repo_name": "", "state": "empty"}
+        return {"project_dir": None, "repo_name": "", "exact": False, "state": "empty"}
     try:
         candidate = Path(root).resolve()
     except OSError:
-        return {"project_dir": None, "repo_name": "", "state": "empty"}
+        return {"project_dir": None, "repo_name": "", "exact": False, "state": "empty"}
 
     parts = candidate.parts
     if "worktrees" in parts:
         candidate = Path(*parts[: parts.index("worktrees")])
 
     repo_name = candidate.name
+    git_root = _git_root(candidate)
+
     hops = 0
+    exact = True
     while True:
         hops += 1
         if hops > 64:  # bounded — no real filesystem path is this deep
@@ -262,12 +300,19 @@ def resolve_own_project(project_root: str | None = None) -> dict[str, Any]:
         encoded = str(candidate).replace(os.sep, "-")
         memory = projects / encoded / "memory"
         if memory.is_dir():
-            return {"project_dir": encoded, "repo_name": candidate.name, "state": "populated"}
+            return {"project_dir": encoded, "repo_name": candidate.name,
+                     "exact": exact, "state": "populated"}
+        if git_root is None or candidate == git_root:
+            # Not inside any git work tree at all (no fallback — exact
+            # match only), or already at the repo's own root (never
+            # climb past it, per K2).
+            break
         parent = candidate.parent
         if parent == candidate:
             break
         candidate = parent
-    return {"project_dir": None, "repo_name": repo_name, "state": "empty"}
+        exact = False
+    return {"project_dir": None, "repo_name": repo_name, "exact": False, "state": "empty"}
 
 
 def claude_memory_dir() -> Path | None:
@@ -704,15 +749,28 @@ def load_sealed_corrections(*, db_path: Path | None = None,
     keyring lookup is spent on the (likely many) sealed pairs that are
     ordinary governance decisions, not boot corrections.
 
+    K1 (Loki 3C1BB137): `unverifiable` used to be computed and logged but
+    never returned to a caller that renders boot — so a boot whose ONLY
+    tagged candidates were forgeries printed "none sealed yet", exactly
+    the all-clear an attacker wants. `state` now distinguishes that case
+    (`"refused"` — candidates existed, all failed) from genuine emptiness
+    (`"empty"` — nothing tagged at all) and from a mix (`"populated"`,
+    with `unverifiable` still non-empty alongside `items`). A caller
+    (`load_corpus_lanes`/`boot_context.py`) must render `unverifiable`
+    whenever it is non-empty, in EITHER state — a refusal is never
+    optional detail, never silently folded into "empty".
+
     `ring` is an injection seam for tests (the same shape
     :func:`_ring_from_keyring` builds) — production always resolves it
     from the process's own keyring when omitted.
 
     Returns `{"items": [...], "total": N, "state":
-    "populated"|"empty"|"unreachable", "unverifiable": [...]}`. State is
-    never inferred from an empty item list alone: a database or keyring
-    read failure is `"unreachable"`; a clean scan that finds zero
-    verified, marked, sealed pairs is `"empty"`.
+    "populated"|"refused"|"empty"|"unreachable", "unverifiable": [...]}`.
+    State is never inferred from an empty item list alone: a database or
+    keyring read failure is `"unreachable"`; zero tagged candidates at
+    all is `"empty"`; one or more tagged candidates that ALL failed
+    verification is `"refused"`; at least one verified is `"populated"`
+    (`unverifiable` may still be non-empty alongside it).
     """
     from . import seal_handler as _seal_handler
 
@@ -783,9 +841,17 @@ def load_sealed_corrections(*, db_path: Path | None = None,
             len(unverifiable), "; ".join(unverifiable),
         )
     items.sort(key=lambda r: r["sealed_at"], reverse=True)
-    return {"items": items, "total": len(items),
-            "state": "populated" if items else "empty",
-            "unverifiable": unverifiable}
+    if items:
+        state = "populated"
+    elif unverifiable:
+        # K1: candidates existed (the marker was there) and EVERY one
+        # failed verification — this must never read the same as "nothing
+        # was ever tagged" (empty). A boot whose only tagged pairs are
+        # forgeries has to say so.
+        state = "refused"
+    else:
+        state = "empty"  # defensive: candidates non-empty implies one of the above
+    return {"items": items, "total": len(items), "state": state, "unverifiable": unverifiable}
 
 
 def load_corpus_lanes(project_root: str | None = None) -> dict[str, Any]:
@@ -811,6 +877,13 @@ def load_corpus_lanes(project_root: str | None = None) -> dict[str, Any]:
     (`enter_result["project"]["root"]` from `session_enter`) — defaults to
     `WILLOW_PROJECT_ROOT`/`Path.cwd()` via `resolve_own_project` when
     omitted (a bare script, a test).
+
+    K1 (Loki 3C1BB137): `sealed_unverifiable` is always returned, in
+    every `sealed_lane_state`, so a refused seal can never be silently
+    dropped. K2: `memory_own_is_fallback` tells a caller when the
+    own-project match came from the ancestor fallback rather than an
+    exact match, so it can be labelled rather than presented as this
+    seat's own project.
     """
     from .session_inject import (
         CONFIRMATION_EXCERPT_CHARS,
@@ -872,10 +945,19 @@ def load_corpus_lanes(project_root: str | None = None) -> dict[str, Any]:
         "sealed_corrections": sealed_shown,
         "sealed_correction_total": len(sealed_in_scope),
         "sealed_lane_state": sealed["state"],
+        # K1: always carried through, in every state, so a caller can never
+        # accidentally drop a refusal on the floor by only checking state.
+        "sealed_unverifiable": sealed["unverifiable"],
         "memory_notes": memory_shown,
         "memory_note_total": len(in_scope),
         "memory_own_project_state": own["state"],
         "memory_own_repo_name": repo_name,
+        # K2/Watch labeling: True when the own-project match came from the
+        # ancestor fallback (e.g. seat/heimdallr resolving to its repo
+        # root) rather than an exact match on the seat's own resolved
+        # path — a caller must label these notes as belonging to another
+        # project, not present them as this seat's own.
+        "memory_own_is_fallback": own["state"] == "populated" and not own["exact"],
         "preferences": [
             excerpt_corpus(r.get("content", ""), PREFERENCE_EXCERPT_CHARS)
             for r in prefs[:MAX_PREFERENCES]
