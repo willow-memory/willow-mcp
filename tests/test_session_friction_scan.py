@@ -331,18 +331,22 @@ def test_session_stop_hook_wires_friction_scan(tmp_path, monkeypatch):
     """The hook's own `handle()` calls the join and returns its result
     alongside the stack snapshot, without raising when transcript_path is
     absent (the common case for a session with no Claude Code transcript)."""
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
     monkeypatch.setenv("WILLOW_PG_DB", "nonexistent_db_for_test")
     out = hook.handle({"session_id": "sess-1"})
     assert out["friction_scan"] == {"skipped": "no_transcript_path"}
     assert "stack_snapshot" in out
+    assert out["pre_handoff"]["stage"] == 1
 
 
 def test_session_stop_hook_persists_flag_via_transcript(tmp_path, monkeypatch):
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
     monkeypatch.setenv("WILLOW_PG_DB", "nonexistent_db_for_test")
     transcript = _write_transcript(tmp_path, MIRROR)
     out = hook.handle({"session_id": "sess-2", "transcript_path": transcript})
     assert out["friction_scan"]["tripped"] is True
+    assert "pre_handoff" in out
     store = Store(store_root=str(tmp_path / "store"))
     assert len(FrictionWatcher(store).list_flags()) == 1

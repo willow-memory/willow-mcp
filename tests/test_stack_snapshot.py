@@ -162,6 +162,7 @@ def test_session_stop_hook_writes_snapshot(tmp_path, monkeypatch):
 
     from willow_mcp import session_stop_hook as stop
 
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     monkeypatch.setenv("WILLOW_STORE_ROOT", str(tmp_path / "store"))
     monkeypatch.setenv("WILLOW_APP_ID", "hanuman")
     monkeypatch.setattr(stop.sys, "stdin", io.StringIO(json.dumps({"session_id": "end-1"})))

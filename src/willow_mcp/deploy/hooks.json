@@ -57,7 +57,7 @@
     "sessionEnd": [
       {
         "command": "{{WILLOW_MCP_PYTHON}} -m willow_mcp.hook_runner --format cursor session_stop",
-        "timeout": 15,
+        "timeout": 120,
         "failClosed": false
       }
     ],
