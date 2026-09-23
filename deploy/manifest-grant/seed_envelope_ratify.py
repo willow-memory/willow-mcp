@@ -76,7 +76,7 @@ def find_active_grant(active: list) -> "dict | None":
     return None
 
 
-def seed(envelope_authoring, envelopes) -> dict:
+def seed(envelope_authoring, envelopes, *, sign_as: "str | None" = None) -> dict:
     """Idempotent seed. `envelope_authoring`/`envelopes` are passed in
     (rather than imported at module scope) so tests can point them at a
     throwaway registry via the modules' own `WILLOW_ENVELOPE_REGISTRY`/
@@ -87,8 +87,35 @@ def seed(envelope_authoring, envelopes) -> dict:
     `{"seeded": False, "envelope_id": ..., "reason": ...}` when an active
     grant already covers this verb+grantee — box left completely untouched
     either way past this read.
-    """
-    registry = envelopes._load(envelopes.registry_path())
+
+    `sign_as` (dispatch FA4F79AC, M1 — install deadlock): install.sh calls
+    this AFTER 1c (`constitutional/` already trust-owner-owned, the
+    directory `pgp.pgp_enabled()` treats as "this box is provisioned for
+    trust") but BEFORE trust.env is ever written — the generated
+    fingerprint is not yet published anywhere `pgp.expected_fingerprint()`
+    would find it. Going through the normal `pgp.pgp_enabled()` gate here
+    raised `PgpSourceUnreadable` on EVERY fresh install, forever: not a
+    retryable failure, since trust.env is only ever written by a LATER
+    step that this one blocks. `sign_as`, when given, is passed straight
+    through to `ratify_proposal_row`, which signs the register write
+    unconditionally under that fingerprint — root's own already-resolved
+    value, the same one install.sh is about to publish — instead of
+    consulting the not-yet-published trust config. See
+    `envelope_authoring._save_active`'s own docstring for the full
+    argument.
+
+    F-A (dispatch 10F9E837, Loki audit 23DE8AA9): a TRULY fresh
+    `$WILLOW_HOME` — no register has EVER been written, not even an empty
+    one — used to raise `PermissionError` right here, one call before
+    `ratify_proposal_row` (whose own `_load_active_register` got the same
+    fix, for its OTHER caller, the real `envelope.ratify` apply half).
+    `envelopes._load` -> `paths.trusted_read` correctly refuses to
+    authenticate a file that is not there; there is nothing to
+    authenticate on a box that has never written one. Mirrors
+    `_load_active_register`'s own fix exactly: missing means
+    ``{"active": []}``, legitimate bootstrap, not a refusal."""
+    reg_path = envelopes.registry_path()
+    registry = envelopes._load(reg_path) if reg_path.exists() else {"active": []}
     active = list(registry.get("active") or [])
     existing = find_active_grant(active)
     if existing is not None:
@@ -129,11 +156,15 @@ def seed(envelope_authoring, envelopes) -> dict:
         ratified_via="installer bootstrap seed — gap 18affe49e198, no proposal to ratify from",
         citation_id=None,
         ledger=None,
+        sign_as=sign_as,
     )
     return {"seeded": True, "envelope_id": ratified.get("id")}
 
 
 def main(argv: "list[str] | None" = None) -> int:
+    import os
+    import re
+
     if argv:
         print(f"STOP: no arguments expected, got {argv!r}", file=sys.stderr)
         return 2
@@ -142,7 +173,18 @@ def main(argv: "list[str] | None" = None) -> int:
     # handling testable) even outside a willow_mcp checkout.
     from willow_mcp import envelope_authoring, envelopes
 
-    report = seed(envelope_authoring, envelopes)
+    # install.sh passes WILLOW_PGP_FINGERPRINT=$FPR in this one process's
+    # own env (its own fresh-generated/resolved key, already validated as
+    # a real gpg key by the `gpg --list-keys` call that produced it) —
+    # used here as the explicit sign_as, never through pgp.expected_
+    # fingerprint()/trust.env (see seed()'s own docstring, M1). Validated
+    # to look like a real fingerprint before use; an unset or malformed
+    # value falls back to the pre-existing pgp.pgp_enabled()-gated path
+    # rather than silently signing under garbage.
+    env_fpr = (os.environ.get("WILLOW_PGP_FINGERPRINT") or "").strip().upper()
+    sign_as = env_fpr if re.match(r"^[A-F0-9]{40}$", env_fpr) else None
+
+    report = seed(envelope_authoring, envelopes, sign_as=sign_as)
     if report["seeded"]:
         print(f"  seeded {report['envelope_id']} — envelope.ratify now governed for grantee willow")
     else:

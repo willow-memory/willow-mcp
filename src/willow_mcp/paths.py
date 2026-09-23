@@ -211,6 +211,56 @@ def operator_secrets_root() -> Path:
     return box if box is not None else willow_home()
 
 
+def trust_config_path() -> Path:
+    """The single source of truth for ``WILLOW_PGP_FINGERPRINT`` —
+    ``trust.env``, always at ``$WILLOW_HOME/constitutional/trust.env``.
+    Beside the box's other keys in the sense the operator ruling asked for
+    (dispatch FA4F79AC, verbatim: "it should be in the vault with the rest
+    of the keys") — but resolved WITHOUT consulting ``WILLOW_VAULT_BOX`` or
+    :func:`operator_secrets_root` at all.
+
+    Rework #4 (dispatch 10F9E837, Loki audit 23DE8AA9, F-C): rework #3
+    routed this through :func:`operator_secrets_root`, which reads
+    ``os.environ['WILLOW_VAULT_BOX']`` — a variable the BROKER's own
+    process sets, same as any other env var. "The vault" is meant to be a
+    single, root-chosen answer to "where is the file that decides what
+    this box trusts"; an env var any process can set is instead a second
+    lever the broker holds on top of the file's own ownership/signature
+    checks, and Loki measured the exact failure mode: a recipe that sets
+    ``WILLOW_VAULT_BOX`` only in ``$H/env`` (root-writable, broker-owned)
+    is a value the broker can also unset or repoint, at which point THIS
+    reader and ``install.sh``'s own resolution (root's sudo environment,
+    normally stripped of anything the invoking user exported) can silently
+    disagree about which file is authoritative — install.sh writing one
+    path while a broker convinces itself a DIFFERENT path is the trust
+    source, or vice versa.
+
+    ``$WILLOW_HOME`` itself is not the same kind of lever: every reader
+    that shares a box must already agree on ``$WILLOW_HOME`` for anything
+    to work at all (a mismatched ``$WILLOW_HOME`` is "talking to a
+    different box," not a subtle trust bypass a single process can pull
+    off while still participating normally in the SAME box's operations).
+    Anchoring here to ``willow_home()`` alone — no second variable layered
+    on top — makes the subpath (``constitutional/trust.env``) a true
+    module constant: the only remaining variable is the address every
+    other read/write in this codebase already depends on.
+
+    THE RENAME-AWAY HOLE (Loki audit D06A0EF3) is UNCHANGED by this fix,
+    and still open on the default box: ``$WILLOW_HOME`` is broker-owned,
+    mode 700, so the broker can still rename ``constitutional/`` away and
+    recreate it empty (a rename needs write only on the PARENT). Closing
+    THAT hole needs ``$WILLOW_HOME`` itself to resolve to a root-provisioned
+    location outside the broker's own writable tree for every process that
+    shares this box — a deploy/architecture change (e.g. a root-owned
+    bind-mount or symlink target for ``$WILLOW_HOME``, established once,
+    outside any single process's env), out of this dispatch's scope,
+    recorded as a gap rather than silently left unfixed. It is NOT
+    achieved by layering a second, independently-set variable on top of
+    ``$WILLOW_HOME`` — that was F-C's own finding.
+    """
+    return willow_home() / "constitutional" / "trust.env"
+
+
 def charter_repo() -> Path | None:
     """Grove charter repository (``WILLOW_CHARTER_REPO``)."""
     raw = os.environ.get("WILLOW_CHARTER_REPO", "").strip()

@@ -44,6 +44,7 @@ import time
 from pathlib import Path
 
 from . import paths
+from . import pgp
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,17 @@ def read_anchor() -> dict:
         paths.trusted_read(p)
     except PermissionError as e:
         logger.warning("frank_head_anchor: refusing untrusted anchor file %s: %s", p, e)
+        return {"status": STATUS_UNTRUSTED, "head": None, "error": str(e)}
+    except (pgp.PgpFingerprintConflict, pgp.PgpSourceUnreadable) as e:
+        # Loki audit A38D41C2, F10: this module's own contract ("never
+        # raises") only caught PermissionError, so a conflicting or
+        # unreadable trust-config file (both RuntimeError, not
+        # PermissionError) escaped it. read_anchor() cannot verify this
+        # file's trust-owner signature without knowing which fingerprint to
+        # verify against, so it degrades to the same UNTRUSTED status a
+        # verification failure gets — "we do not have a usable external
+        # anchor right now," never a caller-facing crash.
+        logger.warning("frank_head_anchor: cannot verify trust for anchor file %s: %s", p, e)
         return {"status": STATUS_UNTRUSTED, "head": None, "error": str(e)}
     try:
         data = json.loads(p.read_text())
