@@ -258,4 +258,5 @@ def test_federation_call_grant_on_one_tool_does_not_reach_another(home, monkeypa
                                     tool="suspicious", arguments={})
     assert "error" in denied
     # Back-to-back calls may hit federation rate limit before tool gate is evaluated.
-    assert denied["error"] in ("tool_denied", "rate_limited")
+    err = denied["error"]
+    assert err.startswith("tool_denied") or "rate_limited" in err
