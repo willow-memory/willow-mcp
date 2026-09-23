@@ -195,8 +195,10 @@ def test_mark_done_rejects_unknown_terminal_state(queue):
 # failed. These cover the whole class, not just that one string.
 
 def test_is_permanent_refusal_recognizes_the_named_classes():
-    # allow_localhost — matched by its error prefix (execute.py's
-    # _localhost_retired_result, which predates kart_scan)
+    # allow_localhost — matched by its error prefix, but only on a result
+    # with no "returncode": that's the executor's own pre-execution refusal
+    # shape (execute.py's _localhost_retired_result, which predates
+    # kart_scan and carries no shared key with it)
     assert tq._is_permanent_refusal(
         json.dumps({"error": "allow_localhost_retired: allow_localhost was retired"})
     )
@@ -213,9 +215,29 @@ def test_is_permanent_refusal_recognizes_the_named_classes():
     assert tq._is_permanent_refusal(
         json.dumps({"error": "...", "kart_scan": {"category": "hook_tamper"}})
     )
-    # a denied or missing network authorization envelope
-    assert tq._is_permanent_refusal(
+    # Loki 615C332F P1: a denied network authorization envelope is NOT
+    # permanent — kartikeya stamps context "egress_denied" for every
+    # ExecutorNetworkAuthorizer denial, including environmental ones (an
+    # expired-then-renewed lease, consent, a queue-state blip, an
+    # unreadable verification key) that used to clear on retry.
+    assert not tq._is_permanent_refusal(
         json.dumps({"error": "verifier refused: no lease", "context": "egress_denied"})
+    )
+    # Loki 615C332F P2: a task that merely PRINTS the allow_localhost
+    # prefix to its own stderr and exits non-zero must not make its own
+    # row terminal — kartikeya fills result["error"] from the task's last
+    # stderr line for an ordinary run, and a real run always carries
+    # "returncode". Only a result with no "returncode" (the executor's own
+    # pre-execution refusal shape) is trusted.
+    assert not tq._is_permanent_refusal(
+        json.dumps(
+            {
+                "error": "allow_localhost_retired: just a failing build step",
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "allow_localhost_retired: just a failing build step",
+            }
+        )
     )
     # a transient failure — timeout, OOM, a flaky command — still retries
     assert not tq._is_permanent_refusal(json.dumps({"error": "timeout"}))
@@ -252,18 +274,44 @@ def test_mark_done_tree_rewrite_kart_scan_is_not_retry_eligible(queue, pg):
     assert params[0] is False
 
 
-def test_mark_done_egress_denied_is_not_retry_eligible(queue, pg):
+def test_mark_done_egress_denied_still_retry_eligible(queue, pg):
+    # Loki 615C332F P1: environmental denials (lease, consent, queue
+    # state, key-read) all carry this same context and must keep retrying
+    # within the envelope's TTL, same as before this refusal class existed.
     queue.mark_done(
         "T1",
         status="failed",
         result=json.dumps({"error": "verifier refused: no lease", "context": "egress_denied"}),
     )
     _sql, params = pg.executed[-1]
-    assert params[0] is False
+    assert params[0] is True
 
 
 def test_mark_done_transient_failure_is_still_retry_eligible(queue, pg):
     queue.mark_done("T1", status="failed", result=json.dumps({"error": "timeout"}))
+    _sql, params = pg.executed[-1]
+    assert params[0] is True
+
+
+def test_mark_done_task_printing_the_prefix_to_stderr_still_retries(queue, pg):
+    # Loki 615C332F P2: kartikeya fills result["error"] from a failed
+    # task's own last stderr line, so a task can print the retired
+    # directive's exact prefix and exit non-zero. It must not spoof its
+    # own row into a terminal state — the guard is "no returncode", and a
+    # task that actually ran always has one.
+    queue.mark_done(
+        "T1",
+        status="failed",
+        result=json.dumps(
+            {
+                "error": "allow_localhost_retired: just a failing build step",
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "allow_localhost_retired: just a failing build step",
+                "steps": 1,
+            }
+        ),
+    )
     _sql, params = pg.executed[-1]
     assert params[0] is True
 

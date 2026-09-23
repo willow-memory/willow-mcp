@@ -74,18 +74,43 @@ def _is_permanent_refusal(result: str) -> bool:
     be recognized here rather than by matching one string (Loki 506FD78E:
     the worker retried `allow_localhost_retired` up to `max_attempts`
     before this fix, and the same bug applies to every other named,
-    permanent refusal kartikeya can return):
+    permanent refusal kartikeya can return). Narrowed per Loki 615C332F:
 
     - a `kart_scan` security block (`tree_rewrite_on_read_only_root`,
       `hook_tamper`, `systemd_manager`, and any other scan category —
-      `task_scan.check_kart_task`'s refusal shape always carries this key)
-    - a denied or missing network authorization envelope
-      (`context: "egress_denied"` — `execute.py`'s `_network_denial` and
-      its inline sibling both set this)
-    - the retired `allow_localhost` directive (`execute.py`'s
-      `_localhost_retired_result`, which predates `kart_scan` and carries
-      no shared key with the other two, so it is matched by its named
-      error prefix instead)
+      `task_scan.check_kart_task`'s refusal shape always carries this key,
+      and it is a static verdict on task text: it repeats identically on
+      retry, so it is sound to treat as permanent).
+
+    NOT `context: "egress_denied"` (Loki 615C332F P1): kartikeya stamps
+    that context for EVERY `ExecutorNetworkAuthorizer` denial, and several
+    of those reasons are environmental, not a verdict on the task — an
+    expired-then-renewed lease, consent, a queue-state/Postgres blip, an
+    unreadable verification key (`egress_authorization.py`). The signed
+    envelope is only consumed on a pass, so before this class existed the
+    same envelope retried and could succeed within its TTL; treating
+    `egress_denied` as permanent kills a held/seal-released row on the
+    first environmental hiccup, spending the seal for nothing. Properly
+    splitting real verdicts (bad signature, hash/id mismatch, expired,
+    replay) from transient conditions needs kartikeya to label its own
+    verdicts (e.g. a `permanent: true` flag or a distinct context) — not
+    built here; `egress_denied` rows retry exactly as they did before this
+    whole class was added.
+
+    The retired `allow_localhost` directive is matched by its named error
+    prefix (`execute.py`'s `_localhost_retired_result`, which predates
+    `kart_scan` and carries no shared key with it) — but ONLY when the
+    result has no `returncode` key (Loki 615C332F P2): kartikeya only
+    omits `returncode` on its own pre-execution refusals; any task that
+    actually ran always gets one (`sandbox.py` / `execute.py`'s shell
+    result builder use a fixed key set, and `returncode` is always set for
+    a real run). Without that guard, an ordinary failed shell task fills
+    `result["error"]` from the task's own LAST STDERR LINE
+    (`sandbox.py:1529-1534`), so a task that merely *prints* the prefix and
+    exits non-zero could make its own row non-retryable — self-inflicted,
+    but still spoofable, and unnecessary since the executor's own
+    structural signal (no `returncode`) already distinguishes "refused
+    before running" from "ran and failed".
 
     A result that fails to parse as a JSON object is not recognized as
     permanent — it retries, same as before this fix.
@@ -98,10 +123,12 @@ def _is_permanent_refusal(result: str) -> bool:
         return False
     if "kart_scan" in parsed:
         return True
-    if parsed.get("context") == "egress_denied":
-        return True
     error = parsed.get("error")
-    if isinstance(error, str) and error.startswith("allow_localhost_retired:"):
+    if (
+        "returncode" not in parsed
+        and isinstance(error, str)
+        and error.startswith("allow_localhost_retired:")
+    ):
         return True
     return False
 
@@ -288,12 +315,15 @@ class PgTaskQueue(TaskQueue):
                 stored = Json(result)
         else:
             stored = result
-        # A permanent refusal (named policy block, denied network envelope,
-        # retired allow_localhost — see _is_permanent_refusal) is never
-        # retry-eligible, no matter how far under max_attempts it sits: it
-        # was refused on its merits, not by accident, and refusing it again
-        # would read the same way twice while looking like the queue is
-        # broken.
+        # A permanent refusal (a kart_scan policy block, or the retired
+        # allow_localhost directive on a row that never ran — see
+        # _is_permanent_refusal) is never retry-eligible, no matter how far
+        # under max_attempts it sits: it was refused on its merits, not by
+        # accident, and refusing it again would read the same way twice
+        # while looking like the queue is broken. A denied network
+        # envelope is deliberately NOT in this set (Loki 615C332F P1) —
+        # several denial reasons are environmental, not a verdict, so
+        # those rows keep retrying.
         retry_eligible = status == "failed" and not _is_permanent_refusal(result)
         retrying = (
             f"%s AND COALESCE({self._q('attempts')}, 0) "
