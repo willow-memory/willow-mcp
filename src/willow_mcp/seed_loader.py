@@ -169,6 +169,12 @@ def memory_dirs() -> list[Path]:
     recursive walk. ``memory/`` is the boundary Claude Code itself writes
     inside for a project, so nothing outside it is read. Order is
     deterministic (sorted by project dir name) so seeding is reproducible.
+
+    An empty return means "``~/.claude/projects`` itself is not there" —
+    UNREACHABLE, not "no project has memories". Callers must not read an
+    empty list from this function as license to retire anything (F1,
+    Loki 022800C8): a seat opened with a HOME that doesn't have this tree
+    yet must never be read as "every memory everywhere was deleted".
     """
     projects = Path.home() / ".claude" / "projects"
     if not projects.is_dir():
@@ -202,29 +208,36 @@ def _corpus_store() -> Store:
 
 
 # Frontmatter shape Claude Code memory files use: a leading `---` block of
-# flat `key: value` pairs plus one nested block (`metadata:`) with the same
-# shape, indented. Not a general YAML parser — PyYAML is a test-only
-# dependency here (pyproject.toml `[test]` extra), and this loader runs on
-# every SessionStart in every install, so it stays stdlib-only and handles
-# exactly the shape these files are written in. Anything it can't parse this
-# way is reported by name and skipped, never guessed at.
+# flat `key: value` pairs, one nested block (`metadata:`) with the same
+# shape indented under it, and (per Loki 022800C8 F7) a top-level scalar
+# occasionally written as a YAML block scalar (`description: >` folded, or
+# `description: |` literal) rather than a single quoted line. Not a general
+# YAML parser — PyYAML is a test-only dependency here (pyproject.toml
+# `[test]` extra), and this loader runs on every SessionStart in every
+# install, so it stays stdlib-only and handles exactly the shapes these
+# files are written in. Anything it can't parse this way is reported by
+# name and skipped, never guessed at.
 _FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n(.*?)\n---[ \t]*\n(.*)", re.DOTALL)
 
-# Which frontmatter `metadata.type` values feed the operator-corrections
-# corpus (as opposed to preferences/confirmations, seeded elsewhere).
-# `feedback` is the direct case — an operator correcting a behavior pattern
-# in the moment, the exact shape the legacy `feedback_*.md` glob targeted.
-# `project` is included too: in this repo's memory files (canonical-verifier-
-# name.md, port-map-and-signing-origin.md) `project`-typed entries are also
-# operator-set facts that supersede a stale belief ("if it drifts back to
-# `sean`, every desk open is refused") — the same "don't repeat the mistake"
-# job as feedback, just about repo state rather than behavior. `user` is
-# left out: it's cross-project persona/preference material, not a correction
-# of something that was wrong — it belongs in the preferences lane this
-# function doesn't own. `reference` is left out: pure documentation, nothing
-# to act differently on. MEMORY.md itself is never a record — it's the
-# index, excluded by name below.
-_CORRECTION_MEMORY_TYPES = frozenset({"feedback", "project"})
+# The only frontmatter `metadata.type` (or, per F7, a stray top-level
+# `type:`) that seeds `corpus_corrections`. Operator ruling
+# `boot-corrections-trust-and-scope-2026-09-23`, ruling 2: "its project +
+# fleet-wide feedback" — `project`-type notes stay OUT of boot entirely
+# (they are mostly point-in-time session state, Loki F2/F5's 194-of-321
+# stale-note finding), `user` stays out (cross-project persona/preference,
+# not a correction), `reference` stays out (documentation, nothing to act
+# on). Only `feedback` — an operator correcting a behavior pattern in the
+# moment — seeds here.
+_SEED_MEMORY_TYPE = "feedback"
+
+# Frontmatter marker (inside the existing `metadata:` block, alongside
+# `type:`) that widens a feedback memory's boot audience from "this seat's
+# own project only" to every seat everywhere. Chosen over a new top-level
+# key because it sits next to `type:` where an author is already looking,
+# needs no new frontmatter section, and reads naturally ("type: feedback" /
+# "scope: fleet"). Any other value, or its absence, means "own project
+# only" (ruling 2's default).
+_FLEET_SCOPE_VALUE = "fleet"
 
 
 def _unquote(value: str) -> str:
@@ -237,11 +250,19 @@ def _unquote(value: str) -> str:
     return value
 
 
+_BLOCK_SCALAR_MARKERS = {">", ">-", ">+", "|", "|-", "|+"}
+
+
 def _parse_frontmatter_block(block: str) -> dict[str, Any] | None:
+    lines = block.splitlines()
     data: dict[str, Any] = {}
     nested: dict[str, Any] | None = None
-    for raw_line in block.splitlines():
+    i = 0
+    n = len(lines)
+    while i < n:
+        raw_line = lines[i]
         if not raw_line.strip():
+            i += 1
             continue
         indent = len(raw_line) - len(raw_line.lstrip(" "))
         line = raw_line.strip()
@@ -252,17 +273,44 @@ def _parse_frontmatter_block(block: str) -> dict[str, Any] | None:
         value = value.strip()
         if not key:
             return None
-        if indent == 0:
-            if not value:
-                nested = {}
-                data[key] = nested
-            else:
-                nested = None
-                data[key] = _unquote(value)
-        else:
+        if indent > 0:
             if nested is None:
                 return None
             nested[key] = _unquote(value)
+            i += 1
+            continue
+        if value in _BLOCK_SCALAR_MARKERS:
+            folded = value[0] == ">"
+            i += 1
+            block_lines: list[str] = []
+            block_indent: int | None = None
+            while i < n:
+                bl = lines[i]
+                if not bl.strip():
+                    block_lines.append("")
+                    i += 1
+                    continue
+                bi = len(bl) - len(bl.lstrip(" "))
+                if bi == 0:
+                    break
+                if block_indent is None:
+                    block_indent = bi
+                if bi < block_indent:
+                    break
+                block_lines.append(bl[block_indent:].rstrip())
+                i += 1
+            text = " ".join(s for s in block_lines if s.strip()) if folded \
+                else "\n".join(block_lines).strip("\n")
+            nested = None
+            data[key] = text.strip()
+            continue
+        nested = None
+        if not value:
+            nested = {}
+            data[key] = nested
+        else:
+            data[key] = _unquote(value)
+        i += 1
     return data
 
 
@@ -278,22 +326,40 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
 
-def _legacy_record(fpath: Path, body: str) -> tuple[str, dict[str, str]] | None:
+def _legacy_record(fpath: Path, project_dir: str, body: str) -> tuple[str, dict[str, Any]] | None:
     """`feedback_*.md` with no (or unparseable) frontmatter — the original
-    behavior, kept so nothing that seeds today stops seeding."""
+    behavior, kept so nothing that seeds today stops seeding. Still keyed
+    (project_dir, name) — F3/F4 — so a same-named legacy file in two
+    projects is two records, not a silent overwrite."""
     rule = _first_content_line(body)
     if not rule:
         return None
-    return fpath.stem, {"content": rule, "source": fpath.name, "memory_type": "feedback"}
+    name = fpath.stem
+    record_id = f"{project_dir}::{name}"
+    return record_id, {
+        "project_dir": project_dir,
+        "project": project_dir.lstrip("-"),
+        "path": str(fpath),
+        "name": name,
+        "content": rule,
+        "source": fpath.name,
+        "memory_type": _SEED_MEMORY_TYPE,
+        "scope": "own",
+        "session_id": "",
+        "modified": "",
+    }
 
 
-def _memory_record(fpath: Path) -> tuple[str | None, dict[str, str] | None, str | None]:
+def _memory_record(fpath: Path, project_dir: str) -> tuple[str | None, dict[str, Any] | None, str | None]:
     """Extract (record_id, record, skip_reason) for one memory file.
 
-    ``skip_reason`` is only set when the file looked like it should seed but
-    couldn't be read this way — reported by name, never seeded as garbage.
-    A file that parses fine but is out of scope (wrong type, empty) returns
-    ``(None, None, None)``: nothing to report, nothing to seed.
+    ``skip_reason`` is only set when the file looked like it should seed
+    but couldn't be read this way — reported by name, never seeded as
+    garbage. A file that parses fine but is out of scope (wrong type,
+    empty) returns ``(None, None, None)``: nothing to report, nothing to
+    seed — and critically, per F1, NOT a signal to retire anything; that
+    call belongs to the caller, which knows whether the file is truly gone
+    or just out of scope this run.
     """
     is_legacy_name = fpath.name.startswith("feedback_")
     try:
@@ -305,7 +371,7 @@ def _memory_record(fpath: Path) -> tuple[str | None, dict[str, str] | None, str 
     if not m:
         if is_legacy_name:
             body = text.split("---", 2)[-1].strip() if "---" in text else text.strip()
-            rec = _legacy_record(fpath, body)
+            rec = _legacy_record(fpath, project_dir, body)
             return (rec[0], rec[1], None) if rec else (None, None, None)
         return None, None, None
 
@@ -313,50 +379,108 @@ def _memory_record(fpath: Path) -> tuple[str | None, dict[str, str] | None, str 
     body = m.group(2)
     if fm is None:
         if is_legacy_name:
-            rec = _legacy_record(fpath, body)
+            rec = _legacy_record(fpath, project_dir, body)
             return (rec[0], rec[1], None) if rec else (None, None, None)
         return None, None, "frontmatter did not parse"
 
     metadata = fm.get("metadata")
     metadata = metadata if isinstance(metadata, dict) else {}
-    mtype = str(metadata.get("type") or "").strip().lower()
+    # F7: a top-level `type:` (not nested under `metadata:`) is a real
+    # shape in the wild — fall back to it rather than excluding silently.
+    mtype = str(metadata.get("type") or fm.get("type") or "").strip().lower()
     if not mtype and is_legacy_name:
-        mtype = "feedback"
-    if mtype not in _CORRECTION_MEMORY_TYPES:
+        mtype = _SEED_MEMORY_TYPE
+    if mtype != _SEED_MEMORY_TYPE:
         return None, None, None
 
-    record_id = str(fm.get("name") or "").strip() or fpath.stem
+    name = str(fm.get("name") or "").strip() or fpath.stem
     content = str(fm.get("description") or "").strip() or _first_content_line(body)
     if not content:
         return None, None, None
+
+    scope_raw = str(metadata.get("scope") or fm.get("scope") or "").strip().lower()
+    record_id = f"{project_dir}::{name}"
     return record_id, {
+        "project_dir": project_dir,
+        "project": project_dir.lstrip("-"),
+        "path": str(fpath),
+        "name": name,
         "content": content[:400],
         "source": fpath.name,
         "memory_type": mtype,
+        "scope": _FLEET_SCOPE_VALUE if scope_raw == _FLEET_SCOPE_VALUE else "own",
+        "session_id": str(metadata.get("originSessionId") or "").strip(),
+        "modified": str(metadata.get("modified") or "").strip(),
     }, None
 
 
-def seed_corpus_corrections() -> int:
-    """Operator memory (frontmatter `type: feedback|project`, plus legacy
-    `feedback_*.md`) → `corpus_corrections`, across every discovered memory
-    dir (:func:`memory_dirs`). Keyed by frontmatter `name` (path stem for
-    legacy files) and a content hash: unchanged content is skipped, changed
-    content updates the same record in place (`Store.put` upserts by
-    `record_id`), and a record this run no longer sees among this loader's
-    own rows is retired (soft-deleted — `Store.delete`, not a hard delete)
-    rather than left to serve stale content forever.
+def _retire(store: Store, record_id: str, existing: dict[str, Any]) -> None:
+    """Flip a record's own `status` field to "retired" — never
+    `Store.delete`. `Store.delete` soft-deletes at the SQLite layer, and
+    `Store.put`/`Store.update` never clear that flag by design (db.py's own
+    comment: a re-put must not silently undelete a tombstoned id, a
+    deliberate anti-forgery property). That makes SQLite-level delete a
+    ONE-WAY door — exactly Loki's F1: a file that comes back after being
+    briefly absent (or a transient parse error, or a HOME that momentarily
+    lacked `~/.claude/projects`) would retire permanently and invisibly.
+    A `status` field the seeder itself owns has no such trap: flipping it
+    back to "active" on a later run is an ordinary field update, visible
+    and reversible, the exact "three states, never collapsed" shape this
+    repo's own INVARIANTS.md already commits to elsewhere.
     """
+    updated = {k: v for k, v in existing.items() if not k.startswith("_")}
+    updated["status"] = "retired"
+    updated["updated_at"] = datetime.now(timezone.utc).isoformat()
+    store.update(_CORPUS_CORRECTIONS, record_id, updated)
+
+
+def seed_corpus_corrections() -> int:
+    """`feedback`-type operator memory → `corpus_corrections`, across every
+    discovered memory dir (:func:`memory_dirs`). Keyed by
+    ``(project_dir, frontmatter name-or-stem)`` (F3/F4 — a same-named file
+    in two projects is two records) plus a content hash: unchanged content
+    is skipped; changed content, or a previously-retired record whose file
+    is active again, updates the same record in place (`created_at`
+    preserved). A record whose file this run can positively confirm is
+    gone (its project's dir WAS listed, and its stored path is not among
+    the files found there) is retired via `_retire` (see its docstring for
+    why that is a status flip, never `Store.delete`).
+
+    F1 fixes, all load-bearing:
+      - Zero dirs discovered at all → UNREACHABLE, not empty. Nothing is
+        seeded or retired; the run is a no-op.
+      - A file whose frontmatter fails to parse this run is left exactly
+        as it was — present on disk, just unreadable this pass, never
+        treated as "gone".
+      - A project's dir that WAS listed protects every record it didn't
+        touch by encoding "this file's path is present" independent of
+        whether that file's content changed, was out of scope, or failed
+        to parse — retirement only fires for a record whose path is
+        provably ABSENT from this run's listing.
+    """
+    dirs = memory_dirs()
+    if not dirs:
+        logger.info(
+            "seed_corpus_corrections: no memory dirs discovered "
+            "(~/.claude/projects missing or unreadable) — unreachable, "
+            "not empty; seeding and retirement both skipped this run"
+        )
+        return 0
+
     store = _corpus_store()
     seeded = 0
-    seen_ids: set[str] = set()
     skipped: list[str] = []
+    present_by_project: dict[str, set[str]] = {}
 
-    for memory_dir in memory_dirs():
+    for memory_dir in dirs:
+        project_dir = memory_dir.parent.name
+        present_paths = present_by_project.setdefault(project_dir, set())
         for fpath in sorted(memory_dir.glob("*.md")):
             if fpath.name == "MEMORY.md":
                 continue
+            present_paths.add(str(fpath))
             try:
-                record_id, payload, skip_reason = _memory_record(fpath)
+                record_id, payload, skip_reason = _memory_record(fpath, project_dir)
             except Exception:
                 logger.debug("seed_corpus_corrections: failed on %s", fpath, exc_info=True)
                 skipped.append(f"{fpath}: unexpected error")
@@ -366,35 +490,44 @@ def seed_corpus_corrections() -> int:
                 continue
             if not record_id or not payload:
                 continue
-            seen_ids.add(record_id)
             content_hash = _content_hash(payload["content"])
             existing = store.get(_CORPUS_CORRECTIONS, record_id)
-            if existing is not None and existing.get("content_hash") == content_hash:
+            unchanged_and_active = (
+                existing is not None
+                and existing.get("content_hash") == content_hash
+                and existing.get("status") == "active"
+            )
+            if unchanged_and_active:
                 continue
             now = datetime.now(timezone.utc).isoformat()
-            store.put(
-                _CORPUS_CORRECTIONS,
-                {
-                    "id": record_id,
-                    "content": payload["content"],
-                    "content_hash": content_hash,
-                    "source": payload["source"],
-                    "memory_type": payload["memory_type"],
-                    "created_at": (existing or {}).get("created_at") or now,
-                    "updated_at": now,
-                },
-                record_id=record_id,
-            )
+            record = dict(payload)
+            record["id"] = record_id
+            record["content_hash"] = content_hash
+            record["created_at"] = (existing or {}).get("created_at") or now
+            record["updated_at"] = now
+            record["status"] = "active"
+            store.put(_CORPUS_CORRECTIONS, record, record_id=record_id)
             seeded += 1
 
-    # Retire rows this loader owns (tagged with memory_type) that no file
-    # accounted for this run. Untagged rows predate this change or come from
-    # a different writer, if any, and are left alone.
     for existing in store.all(_CORPUS_CORRECTIONS):
         rid = existing.get("_id") or existing.get("id")
-        if not rid or rid in seen_ids or "memory_type" not in existing:
+        if not rid or existing.get("status") == "retired":
             continue
-        store.delete(_CORPUS_CORRECTIONS, rid)
+        project_dir = existing.get("project_dir")
+        if not project_dir:
+            # F7: a pre-rework row from the old bare-name id scheme. The
+            # new (project_dir, name) identity supersedes it permanently —
+            # nothing will ever re-seed this exact id again.
+            _retire(store, rid, existing)
+            continue
+        present_paths = present_by_project.get(project_dir)
+        if present_paths is None:
+            # This project's dir was not among the ones listed this run —
+            # unreachable for it specifically, not evidence its files are
+            # gone. Leave it alone.
+            continue
+        if existing.get("path") not in present_paths:
+            _retire(store, rid, existing)
 
     if skipped:
         logger.info(
@@ -404,23 +537,123 @@ def seed_corpus_corrections() -> int:
     return seeded
 
 
-def load_corpus_lanes() -> dict[str, Any]:
-    """Read operator corpus lanes for SessionStart injection."""
+def load_sealed_corrections(store: Store | None = None) -> dict[str, Any]:
+    """Sealed governance decisions eligible as boot 'operator' corrections.
+
+    Operator ruling `boot-corrections-trust-and-scope-2026-09-23`, ruling
+    1: "sealed = operator; memory = unverified". Reads
+    `seal_handler.GOVERNANCE_COLLECTION` in SOIL — the collection a seal
+    already upgrades to `status="sealed"` via `seal_handler.on_seal` — not
+    the Nestor MCP, which is down (Ada's 2026-09-23 survey, 5FC763D7).
+
+    A governance record only counts as a boot correction when it opts in
+    with `boot_correction: true` on the record itself. Nothing yet sets
+    that key — this lane is genuinely empty today, on real data, and that
+    is the ruling working as designed, not a bug: "if no sealed
+    corrections exist yet, the operator lane is empty, shown as empty
+    (three states), never backfilled from memory." The moment a governance
+    record is proposed, sealed, and tagged `boot_correction: true`
+    (`decision_bridge.propose` + a human seal in Nestor), it appears here
+    with no further wiring.
+
+    Returns `{"items": [...], "total": N, "state": "populated"|"empty"|"unreachable"}`.
+    `state` is never inferred from an empty list alone — a store read
+    failure is `"unreachable"`, a clean empty scan is `"empty"`; the two
+    must never be presented the same way at boot (three states).
+    """
+    st = store if store is not None else _corpus_store()
+    try:
+        from .seal_handler import GOVERNANCE_COLLECTION
+        rows = st.all(GOVERNANCE_COLLECTION)
+    except Exception:
+        logger.debug("load_sealed_corrections: governance read failed", exc_info=True)
+        return {"items": [], "total": 0, "state": "unreachable"}
+
+    items: list[dict[str, str]] = []
+    for rec in rows:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("status") != "sealed" or not rec.get("boot_correction"):
+            continue
+        text = str(rec.get("ruling") or rec.get("title") or "").strip()
+        if not text:
+            continue
+        items.append({
+            "content": text,
+            "sealed_at": str(rec.get("sealed_at") or ""),
+            "verifier": str(rec.get("nestor_verifier") or ""),
+        })
+    items.sort(key=lambda r: r["sealed_at"], reverse=True)
+    return {"items": items, "total": len(items), "state": "populated" if items else "empty"}
+
+
+def load_corpus_lanes(own_project_dir: str | None = None) -> dict[str, Any]:
+    """Read operator corpus lanes for SessionStart injection.
+
+    Two distinctly-trusted correction lanes
+    (`boot-corrections-trust-and-scope-2026-09-23`):
+
+      - `sealed_corrections` / `sealed_lane_state`: Nestor-sealed
+        governance decisions — the only thing labelled "operator". See
+        :func:`load_sealed_corrections`.
+      - `memory_notes` / `memory_note_total`: `feedback`-type memory
+        files, always labelled unverified, scoped to the seat's own
+        project plus anything explicitly marked `scope: fleet`. Ranked
+        own-project first, then most-recently-edited (frontmatter
+        `metadata.modified`, falling back to this loader's own
+        `updated_at`) — an edit moves a note up, per ruling 3.
+
+    `own_project_dir` is the caller's own Claude project memory dir's
+    PARENT name (the same string `seed_corpus_corrections` stores as
+    `project_dir`) — defaults to `claude_memory_dir()`'s resolution for
+    the process's own `WILLOW_PROJECT_ROOT`/cwd when omitted, exactly how
+    a real boot call resolves it ("It is already resolved at
+    session_enter" — ruling 2).
+    """
     from .session_inject import (
         CONFIRMATION_EXCERPT_CHARS,
         CORRECTION_EXCERPT_CHARS,
         MAX_CORRECTIONS,
         MAX_HUMAN_CONFIRMATIONS,
         MAX_PREFERENCES,
+        MAX_SEALED_CORRECTIONS,
         PREFERENCE_EXCERPT_CHARS,
         excerpt_corpus,
     )
 
     store = _corpus_store()
-    corrs = store.all(_CORPUS_CORRECTIONS) or []
+
+    sealed = load_sealed_corrections(store)
+    sealed_shown = [
+        excerpt_corpus(item["content"], CORRECTION_EXCERPT_CHARS)
+        for item in sealed["items"][:MAX_SEALED_CORRECTIONS]
+    ]
+
+    if own_project_dir is None:
+        own_dir = claude_memory_dir()
+        own_project_dir = own_dir.parent.name if own_dir else None
+
+    def _is_own(r: dict[str, Any]) -> bool:
+        return bool(own_project_dir) and r.get("project_dir") == own_project_dir
+
+    all_notes = [r for r in store.all(_CORPUS_CORRECTIONS) if r.get("status") == "active"]
+    in_scope = [r for r in all_notes if r.get("scope") == _FLEET_SCOPE_VALUE or _is_own(r)]
+
+    # Stable two-pass sort: most-recently-edited first WITHIN a relevance
+    # group, own-project group ahead of fleet-wide-from-elsewhere. Sorting
+    # by the secondary key first and the primary key last relies on sort
+    # stability to compose them correctly.
+    in_scope.sort(key=lambda r: r.get("modified") or r.get("updated_at") or "", reverse=True)
+    in_scope.sort(key=lambda r: 0 if _is_own(r) else 1)
+
+    memory_shown = []
+    for r in in_scope[:MAX_CORRECTIONS]:
+        label = "fleet" if r.get("scope") == _FLEET_SCOPE_VALUE else r.get("project", "?")
+        text = excerpt_corpus(r.get("content", ""), CORRECTION_EXCERPT_CHARS)
+        memory_shown.append(f"[unverified:{label}] {text} ({r.get('path', '')})")
+
     prefs = store.all(_CORPUS_PREFERENCES) or []
     confs = store.all(_CORPUS_CONFIRMATIONS) or []
-    corrs.sort(key=lambda r: r.get("created_at", ""), reverse=True)
     prefs.sort(key=lambda r: r.get("created_at", ""), reverse=True)
     confs.sort(key=lambda r: r.get("last_seen", r.get("created_at", "")), reverse=True)
     human_confs = [
@@ -428,13 +661,13 @@ def load_corpus_lanes() -> dict[str, Any]:
         for r in confs
         if r.get("content") and str(r.get("source", "")).startswith("prompt_submit")
     ]
+
     return {
-        "corrections": [
-            excerpt_corpus(r.get("content", ""), CORRECTION_EXCERPT_CHARS)
-            for r in corrs[:MAX_CORRECTIONS]
-            if r.get("content")
-        ],
-        "correction_total": len(corrs),
+        "sealed_corrections": sealed_shown,
+        "sealed_correction_total": sealed["total"],
+        "sealed_lane_state": sealed["state"],
+        "memory_notes": memory_shown,
+        "memory_note_total": len(in_scope),
         "preferences": [
             excerpt_corpus(r.get("content", ""), PREFERENCE_EXCERPT_CHARS)
             for r in prefs[:MAX_PREFERENCES]

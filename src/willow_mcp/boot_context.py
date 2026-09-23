@@ -10,7 +10,6 @@ from .commitments.boot import commitment_boot_lines
 from .nest import autointake as nest_autointake
 from .seed_loader import load_corpus_lanes
 from .session_inject import (
-    MAX_CORRECTIONS,
     MAX_HUMAN_CONFIRMATIONS,
     MAX_PREFERENCES,
     dedup_fingerprint,
@@ -188,16 +187,46 @@ def build_boot_lines(
             lines.append(f"handoff: {path}")
 
     corpus = load_corpus_lanes()
-    if corpus.get("corrections"):
-        cap = min(2, MAX_CORRECTIONS) if lite_inject else MAX_CORRECTIONS
-        shown = corpus["corrections"][:cap]
-        total = int(corpus.get("correction_total") or len(corpus["corrections"]))
-        head = f"corrections — operator ({len(shown)}"
+
+    # Sealed lane ("operator") — three states, never collapsed (ruling
+    # boot-corrections-trust-and-scope-2026-09-23, #1). An empty scan and
+    # an unreachable store must never read the same at boot: the first
+    # means nothing has been sealed yet, the second means this boot could
+    # not check.
+    sealed_state = corpus.get("sealed_lane_state", "empty")
+    if sealed_state == "unreachable":
+        lines.append("corrections — operator (sealed): unreachable this boot")
+    elif sealed_state == "empty":
+        lines.append("corrections — operator (sealed): none sealed yet")
+    else:
+        shown = corpus.get("sealed_corrections") or []
+        if lite_inject:
+            shown = shown[:2]
+        total = int(corpus.get("sealed_correction_total") or len(shown))
+        head = f"corrections — operator (sealed) ({len(shown)}"
         if total > len(shown):
             head += f"/{total}"
         lines.append(head + "):")
         for c in shown:
             lines.append(f"  · {c}")
+
+    # Memory lane ("unverified") — a memory file is context an agent wrote,
+    # never an order; always labelled, always carries which project/scope
+    # and full path it came from (ruling #1's "impossible for an
+    # agent-written memory file to read as an operator correction").
+    if corpus.get("memory_notes"):
+        shown = corpus["memory_notes"]
+        if lite_inject:
+            shown = shown[:2]
+        total = int(corpus.get("memory_note_total") or len(shown))
+        if total > len(shown):
+            head = f"notes — memory, unverified ({len(shown)} of {total} shown):"
+        else:
+            head = f"notes — memory, unverified ({len(shown)}):"
+        lines.append(head)
+        for c in shown:
+            lines.append(f"  · {c}")
+
     if corpus.get("preferences") and not lite_inject:
         shown = corpus["preferences"][:MAX_PREFERENCES]
         if shown:
