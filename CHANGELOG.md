@@ -42,7 +42,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 ### Fixed
 
 * **unit-ops:** classify fleet_read; bump tool counts; re-render skills ([d19f536](https://github.com/willow-memory/willow-mcp/commit/d19f536572d612a6975c26bc73807386a1986ae8))
-* **unit-ops:** gate Kart; broker owns install/reload ([25ab487](https://github.com/willow-memory/willow-mcp/commit/25ab487957a127523aaeed40b199ec5a948a0df5))
 
 ## [2.79.0](https://github.com/willow-memory/willow-mcp/compare/v2.78.0...v2.79.0) (2026-09-22)
 
