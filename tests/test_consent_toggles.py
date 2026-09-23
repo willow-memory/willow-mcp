@@ -25,6 +25,12 @@ and `consent.internet` already governs both directives correctly. Enforcing
 protection that does not exist, which is the defect the key already was. See
 `consent._REMOVED_KEYS`.
 
+**Update (2026-09-23):** `# allow_localhost` itself is now retired (governance
+record `retire-allow-localhost-2026-09-23`, amends sealed 9fe5e179) — `consent.
+internet` no longer "governs" it, because `task_submit` refuses it by name
+before the consent check runs at all. The paragraph above is the history of
+why a third key was never the fix; it is not a description of current gating.
+
 A key that gates nothing gets deleted or gets a caller. It does not get a label.
 
 A note on method, because it changed. These tests originally patched
@@ -39,7 +45,6 @@ actually sets — rather than a module attribute.
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import pytest
 
@@ -339,13 +344,14 @@ def test_kokoro_synthesis_to_a_public_host_is_denied_without_cloud_llm_consent(h
 # the migration: a settings file still carrying it is ignored, never rejected.
 
 
-def test_allow_localhost_is_gated_on_internet_because_it_reaches_it(tmp_path, monkeypatch):
-    """The positive claim left standing after `lan` was retired.
-
-    `# allow_localhost` shares the host network namespace, so it reaches the
-    public internet and `consent.internet` is the correct key for it — not an
-    approximation pending a finer one. This pins that, so nobody re-derives the
-    LAN split from the directive's name.
+def test_allow_localhost_is_retired_regardless_of_consent(tmp_path, monkeypatch):
+    """Superseded 2026-09-23: `allow_localhost` used to be gated on
+    `consent.internet` because it reached the public internet unfiltered (the
+    positive claim this test used to pin). Operator ruling 2026-09-23
+    (governance record `retire-allow-localhost-2026-09-23`, amends sealed
+    9fe5e179) retired the directive outright instead of finishing the gate —
+    it is refused by name before the consent check ever runs, whatever the
+    operator's consent.internet setting is.
     """
     from willow_mcp import server
 
@@ -358,17 +364,22 @@ def test_allow_localhost_is_gated_on_internet_because_it_reaches_it(tmp_path, mo
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     monkeypatch.delenv("WILLOW_SETTINGS_GLOBAL", raising=False)
     monkeypatch.setenv("WILLOW_MCP_APPS_ROOT", str(apps_root))
-    # internet off, and the retired key still present in the file
-    _canonical(tmp_path, internet=False, cloud_llm=True, lan=True)
-    monkeypatch.setattr(server, "get_pg", lambda: SimpleNamespace())
+    # Even with internet ON, allow_localhost must still be refused by name —
+    # this is a retirement, not a consent gate.
+    _canonical(tmp_path, internet=True, cloud_llm=True, lan=True)
+
+    def _boom():
+        raise AssertionError("task_submit must refuse allow_localhost before touching pg")
+
+    monkeypatch.setattr(server, "get_pg", _boom)
 
     result = server.task_submit(
         app_id="lanapp", task="echo hi", allow_localhost=True,
     )
 
     error = result.get("error", "")
-    assert "consent" in error, error
-    assert "consent.internet" in error, "the denial must name the key that governs"
+    assert error.startswith("allow_localhost_retired:"), error
+    assert not error.startswith("consent_denied:"), "retirement, not a consent denial"
     assert "consent.lan" not in error, "a retired key must never appear in a denial"
 
 

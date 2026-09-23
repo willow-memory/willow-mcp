@@ -2932,10 +2932,22 @@ def task_submit(
     `pair_id` and the one line to seal. The operator's seal mints the envelope
     through the net signer (a separate process running as the egress key's
     owner) and releases the row; a sealed pair stands in for the standing
-    lease for that one task. Sealed 9fe5e179 / gap 582b1e676fb3:
-    ``allow_localhost`` is NOT that path — loopback/local process is not a
-    net lease; it queues as ordinary ``pending`` with ``# allow_localhost``
-    (Kart's localhost_tier) and never hold_and_propose.
+    lease for that one task.
+
+    ``allow_localhost`` is RETIRED (operator ruling 2026-09-23, governance
+    record ``retire-allow-localhost-2026-09-23``, Nestor pair ``3ef0211f``;
+    amends sealed 9fe5e179 / gap 582b1e676fb3). That decision exempted it on
+    the premise that loopback is not egress; Loki's audit (dispatch
+    7173C72A, finding U1) showed the premise is false — kartikeya shares the
+    host network namespace unfiltered for ``# allow_localhost``, so any
+    ``task_net`` holder with ``consent.internet`` reaches the public
+    internet with no lease and no envelope. Both the parameter and a bare
+    ``# allow_localhost`` line in task text are now refused by name, before
+    any other work. The parameter stays in this signature only so existing
+    callers get a named refusal instead of a `TypeError`. Its replacement —
+    a real loopback-only tier (network-off sandbox plus allowlisted
+    forwarders, a new ``task_localhost`` manifest capability) — is designed
+    but not built.
 
     Task text is security-scanned at SUBMIT time (defense-in-depth): a task the
     Kart scanner would refuse — destructive, exfiltration, secret access, obfusc-
@@ -2957,6 +2969,28 @@ def task_submit(
     gates, not laundering an ask through whichever seat happens to be
     trusted enough to reach ``task_submit``.
     """
+    # allow_localhost is retired (operator ruling 2026-09-23, governance record
+    # retire-allow-localhost-2026-09-23, Nestor pair 3ef0211f; amends sealed
+    # 9fe5e179 / gap 582b1e676fb3 — Loki 7173C72A finding U1). Refused by name,
+    # before any other work, whether asked via the parameter or embedded as a
+    # bare directive line in task text (the line would otherwise be silently
+    # stripped by the B-21 normalization below and the caller would never learn
+    # its loopback request got nothing).
+    if allow_localhost or any(
+        line.strip() == "# allow_localhost"
+        for line in (task or "").replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    ):
+        return {"error": (
+            "allow_localhost_retired: allow_localhost was retired by operator ruling "
+            "2026-09-23 (governance record retire-allow-localhost-2026-09-23, Nestor pair "
+            "3ef0211f; amends sealed decision 9fe5e179). It shared the host network "
+            "namespace unfiltered for a Kart task — full internet reach, no lease, no "
+            "envelope — on the premise that loopback is not egress; the sandbox's own "
+            "implementation makes that premise false. There is no replacement yet: a real "
+            "loopback-only tier (network-off sandbox plus allowlisted forwarders, a new "
+            "task_localhost manifest capability) is designed but not built. Use allow_net "
+            "(task_net + consent.internet + lease/envelope) if this task needs the network.")}
+
     # Anticipated-gates validation, before any DB work — the submission fails
     # loudly on a malformed or misdirected ask rather than half-filing and
     # returning a task_id. This is the shape check; the fail-closed side (a
@@ -3000,14 +3034,9 @@ def task_submit(
     if not pg:
         return _postgres_unavailable()
 
-    if allow_net and allow_localhost:
-        return {"error": "network_mode_invalid: choose allow_net or allow_localhost"}
-    # allow_net = egress (lease + envelope / hold). allow_localhost = Kart
-    # localhost_tier (share host netns, strip credentials) — not a net lease
-    # (sealed 9fe5e179, gap 582b1e676fb3). Both still need task_net + standing
-    # consent.internet because sharing the netns can reach the public internet;
-    # only allow_net takes the lease / hold_and_propose / envelope path.
-    if allow_net or allow_localhost:
+    # allow_localhost is retired and already refused above; allow_net = egress
+    # (lease + envelope / hold), gated on task_net + standing consent.internet.
+    if allow_net:
         from . import consent, gate
         # Key 1: is this app allowed to ask at all? (capability, granted once)
         if not gate.permitted(app_id, gate.NET_PERMISSION):
@@ -3137,13 +3166,9 @@ def task_submit(
         if line.strip() not in {"# allow_net", "# allow_localhost", "# allow_db"}
     )
     task_id = ""
-    if allow_localhost:
-        # Kart localhost_tier: share host netns for loopback (Ollama, etc.).
-        # Not egress — no envelope, no hold_and_propose, no standing lease
-        # (sealed 9fe5e179 / gap 582b1e676fb3). network_authorization, if
-        # supplied, is ignored on this path.
-        task = egress_authorization.canonical_network_task(task, localhost=True)
-    elif allow_net:
+    # allow_localhost is retired — never reaches this point (refused above),
+    # so no queue row is ever built with localhost=True.
+    if allow_net:
         task = egress_authorization.canonical_network_task(
             task, localhost=False
         )
@@ -3154,7 +3179,6 @@ def task_submit(
             # operator's seal — not a terminal — is what mints it. The
             # standing-lease check above is deliberately not required on
             # this path: the seal satisfies the lease for that task.
-            # allow_localhost never reaches here.
             from . import net_authority
 
             if not fields["network_authorization"]["column"]:
@@ -9230,6 +9254,15 @@ def _cmd_sign_net_task(args) -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
+    if args.localhost:
+        print(
+            "Error: --localhost is retired (governance record "
+            "retire-allow-localhost-2026-09-23, amends sealed 9fe5e179). task_submit "
+            "refuses allow_localhost unconditionally now; signing an envelope for it "
+            "would only be discarded. Use sign-net-task without --localhost.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     key_path = Path(args.key).expanduser() if args.key else egress_setup.resolve_private_key_path()
     if key_path is None:
         print(
@@ -9697,6 +9730,15 @@ def _cmd_run_net(args) -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
+    if args.localhost:
+        print(
+            "Error: --localhost is retired (governance record "
+            "retire-allow-localhost-2026-09-23, amends sealed 9fe5e179). task_submit "
+            "refuses allow_localhost unconditionally now; signing an envelope for it "
+            "would only be discarded. Use run-net without --localhost.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     key_path = egress_setup.resolve_private_key_path()
     if key_path is None:
         print(
@@ -9765,8 +9807,7 @@ def _cmd_run_net(args) -> None:
         submit_task,
         agent=args.agent,
         lane=args.lane,
-        allow_net=not args.localhost,
-        allow_localhost=args.localhost,
+        allow_net=True,
         network_authorization=envelope,
     )
     print(json.dumps(result, indent=2))
@@ -10821,7 +10862,7 @@ def _build_parser():
     sign_net_p.add_argument(
         "--localhost",
         action="store_true",
-        help="authorize # allow_localhost instead of full # allow_net",
+        help="RETIRED 2026-09-23 (amends sealed 9fe5e179) — always refused now",
     )
     sign_net_input = sign_net_p.add_mutually_exclusive_group(required=True)
     sign_net_input.add_argument("--task", default="", help="exact task text to authorize")
@@ -10987,7 +11028,7 @@ def _build_parser():
     run_net_p.add_argument(
         "--localhost",
         action="store_true",
-        help="authorize # allow_localhost instead of full # allow_net",
+        help="RETIRED 2026-09-23 (amends sealed 9fe5e179) — always refused now",
     )
 
     grant_p = subparsers.add_parser(

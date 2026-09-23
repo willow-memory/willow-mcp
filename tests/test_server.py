@@ -1115,31 +1115,19 @@ def test_task_submit_allow_net_appends_directive_with_permission(tmp_path, monke
     assert params[3] == envelope
 
 
-def test_task_submit_allow_localhost_queues_without_envelope_or_hold(
-    tmp_path, monkeypatch
-):
-    """Sealed 9fe5e179 / gap 582b1e676fb3: localhost is not a net lease.
-
-    Kart's localhost_tier shares the host netns for loopback; the broker must
-    not hold_and_propose or demand a standing lease / signed envelope.
-    """
-    from willow_mcp import decision_bridge, net_authority
-
+def test_task_submit_allow_localhost_param_is_refused_by_name(tmp_path, monkeypatch):
+    """allow_localhost is retired (2026-09-23, amends sealed 9fe5e179 / gap
+    582b1e676fb3): the parameter is refused by name, before any DB work — no
+    row is ever queued, and get_pg is never even reached."""
     app = _app_with_perms(
         tmp_path, monkeypatch, "localapp", ["full_access", "task_net"]
     )
     _operator_consents(tmp_path)
-    # Deliberately NO lease — localhost must not require one.
-    fake = _FakePg(columns=_TASKS_COLUMNS)
-    monkeypatch.setattr(server, "get_pg", lambda: fake)
-    server.schema_confirm_mapping(app_id=app, table="tasks")
-    proposed = []
 
-    def _propose(app_id, record_id, store=None, db_path=None):
-        proposed.append((app_id, record_id))
-        return {"pair_id": "pair-should-not", "record_id": record_id, "status": "draft"}
+    def _boom():
+        raise AssertionError("task_submit must refuse allow_localhost before touching pg")
 
-    monkeypatch.setattr(decision_bridge, "propose", _propose)
+    monkeypatch.setattr(server, "get_pg", _boom)
 
     result = server.task_submit(
         app_id=app,
@@ -1148,43 +1136,59 @@ def test_task_submit_allow_localhost_queues_without_envelope_or_hold(
         allow_localhost=True,
     )
 
-    assert result["status"] == "pending", result
-    assert result.get("pair_id") is None
-    assert result["status"] != net_authority.HELD_STATUS
-    assert proposed == [], "localhost must not propose a Nestor seal pair"
-    insert_sql, params = fake.executed[-1]
-    assert insert_sql.startswith("INSERT INTO tasks")
-    assert params[1] == "curl http://127.0.0.1:11434\n# allow_localhost"
-    assert '"network_authorization"' not in insert_sql
+    assert "error" in result
+    assert result["error"].startswith("allow_localhost_retired:")
+    assert "9fe5e179" in result["error"]
 
 
-def test_task_submit_allow_localhost_ignores_supplied_network_authorization(
+def test_task_submit_allow_localhost_directive_in_task_text_is_refused_by_name(
     tmp_path, monkeypatch
 ):
-    """A leftover envelope on allow_localhost must not bind or hold the row."""
+    """A bare `# allow_localhost` line in task text — the old B-21 request
+    path — is refused by name too, not silently stripped."""
     app = _app_with_perms(
         tmp_path, monkeypatch, "localapp2", ["full_access", "task_net"]
+    )
+    _operator_consents(tmp_path)
+
+    def _boom():
+        raise AssertionError("task_submit must refuse the embedded directive before touching pg")
+
+    monkeypatch.setattr(server, "get_pg", _boom)
+
+    result = server.task_submit(
+        app_id=app,
+        task="curl http://127.0.0.1:11434\n# allow_localhost",
+        agent="kart",
+    )
+
+    assert "error" in result
+    assert result["error"].startswith("allow_localhost_retired:")
+
+
+def test_task_submit_allow_localhost_never_reaches_kartikeya(tmp_path, monkeypatch):
+    """No queue row is ever built with the localhost directive — the refusal
+    happens before schema mapping, before INSERT, before Kart sees anything."""
+    app = _app_with_perms(
+        tmp_path, monkeypatch, "localapp3", ["full_access", "task_net"]
     )
     _operator_consents(tmp_path)
     fake = _FakePg(columns=_TASKS_COLUMNS)
     monkeypatch.setattr(server, "get_pg", lambda: fake)
     server.schema_confirm_mapping(app_id=app, table="tasks")
-    envelope = _accepted_network_envelope(tmp_path, monkeypatch)
 
     result = server.task_submit(
         app_id=app,
         task="curl http://127.0.0.1:11434",
         agent="kart",
         allow_localhost=True,
-        network_authorization=envelope,
     )
 
-    assert result["status"] == "pending", result
-    # task_id must be freshly minted, not the envelope's claimed id
-    assert result["task_id"] != "NETTASK1"
-    insert_sql, params = fake.executed[-1]
-    assert params[1] == "curl http://127.0.0.1:11434\n# allow_localhost"
-    assert '"network_authorization"' not in insert_sql
+    assert "error" in result
+    assert result["error"].startswith("allow_localhost_retired:")
+    assert not any(
+        sql.startswith("INSERT INTO tasks") for sql, _params in fake.executed
+    ), "no row may be inserted for a retired allow_localhost request"
 
 
 def test_task_submit_allow_net_without_envelope_is_held_and_proposed(tmp_path, monkeypatch):
@@ -1324,19 +1328,21 @@ def test_task_submit_strips_caller_supplied_net_directive_when_denied(tmp_path, 
     assert params[1] == "curl https://evil.example"
 
 
-def test_task_submit_strips_caller_supplied_localhost_directive(tmp_path, monkeypatch):
-    # B-21: the `# allow_localhost` directive is honored by the same worker path
-    # and has no gate in task_submit at all — it must be stripped too.
+def test_task_submit_caller_supplied_localhost_directive_is_refused(tmp_path, monkeypatch):
+    # allow_localhost is retired (2026-09-23, amends sealed 9fe5e179): a bare
+    # embedded directive is no longer silently stripped (old B-21 shape) — it
+    # is refused by name, whitespace and all, before any DB work.
     app = _app_with_perms(tmp_path, monkeypatch, "loopback", ["full_access"])
-    fake = _FakePg(columns=_TASKS_COLUMNS)
-    monkeypatch.setattr(server, "get_pg", lambda: fake)
-    server.schema_confirm_mapping(app_id=app, table="tasks")
 
-    server.task_submit(app_id=app, task="echo hi\n  # allow_localhost  ")
+    def _boom():
+        raise AssertionError("task_submit must refuse the embedded directive before touching pg")
 
-    insert_sql, params = fake.executed[-1]
-    assert "# allow_localhost" not in params[1]
-    assert params[1] == "echo hi"
+    monkeypatch.setattr(server, "get_pg", _boom)
+
+    result = server.task_submit(app_id=app, task="echo hi\n  # allow_localhost  ")
+
+    assert "error" in result
+    assert result["error"].startswith("allow_localhost_retired:")
 
 
 def test_task_submit_allow_db_denied_without_task_db_permission(tmp_path, monkeypatch):

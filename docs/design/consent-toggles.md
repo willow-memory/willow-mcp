@@ -329,6 +329,19 @@ implemented three times, inconsistently, with no key behind it.
 > was making — that a destination class is being governed by ad-hoc code rather
 > than by a key — still stands, and the recommendation below is untouched.
 
+> **Superseded by retirement (2026-09-23).** `# allow_localhost` itself is
+> retired — governance record `retire-allow-localhost-2026-09-23`, Nestor
+> pair `3ef0211f`, amends the sealed 9fe5e179 this whole section was arguing
+> against. Loki's audit (dispatch 7173C72A, finding U1) confirmed exactly
+> what this section already showed: the sandbox shares the host netns
+> unfiltered, so the "loopback is not egress" premise was false. Rather than
+> split `network_requested` onto a new `consent.lan` key as recommended
+> below, the operator chose to retire the directive outright until a real
+> loopback-only tier (network-off sandbox + allowlisted forwarders, a new
+> `task_localhost` manifest capability) is built. The `consent.lan` analysis
+> below stays as the design record for that future tier; it does not describe
+> current behavior — `# allow_localhost` reaches nothing now, gated or not.
+
 ### Recommendation: **ENFORCE**
 
 `lan` names a real destination class that three live code paths reach and that
