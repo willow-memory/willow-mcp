@@ -47,13 +47,17 @@ class PgpFingerprintConflict(RuntimeError):
 class PgpSourceUnreadable(RuntimeError):
     """The trust-config file could not be trusted as a source of truth —
     it exists but could not be read, its ownership/permissions do not meet
-    the trust-root shape, or its ``WILLOW_PGP_FINGERPRINT`` value does not
-    parse as a fingerprint. Loki audit A38D41C2, F4: *unreachable is not
-    empty*. A missing file (this box never configured PGP at all) still
-    resolves to unset — that is the legitimate bootstrap state. But a file
-    that EXISTS and cannot be trusted must never be read as though it said
-    nothing, because that silently turns enforcement off exactly when
-    something has gone wrong with the one thing enforcement depends on."""
+    the trust-root shape, its ``WILLOW_PGP_FINGERPRINT`` value does not
+    parse as a fingerprint, or (Loki re-audit 93D0F057, N2) it is simply
+    MISSING on a box that has a resolvable trust owner. Loki audit
+    A38D41C2, F4: *unreachable is not empty*. Enforcement may be off only
+    because the trust owner wrote that down (the file exists, trust-owner-
+    owned, with an explicit empty value) — never because something is
+    missing, unreadable, malformed, or owned by the wrong uid. The ONLY
+    box where a missing file still legitimately means "never configured"
+    is one with NO resolvable trust owner at all (Kart, dev, any box that
+    never ran ``trust_root_setup``) — there, "off" is the only state that
+    could ever have existed."""
 
 
 #: Guards ``_trust_config_cache`` — ``expected_fingerprint()`` is hot
@@ -76,13 +80,28 @@ def _trust_config_path() -> Path:
 
 def _trust_config_ownership_ok(path: Path) -> None:
     """The trust-config file (and its parent) must not be writable by
-    anyone but its owner, and must be owned by this process's own euid or
-    the resolved trust owner. No signature check here — unlike
-    ``paths.trusted_read``'s trust-owner-plus-signature branch, THIS file
-    is the fingerprint a signature would need to verify against, so
-    checking its own signature would be circular. Ownership plus no
-    group/other write is the whole check; raises :class:`PgpSourceUnreadable`
-    rather than returning a bool, so a caller cannot forget to check it."""
+    anyone but its owner. Ownership itself is checked STRICTLY against the
+    trust owner when one can be resolved — Loki re-audit 93D0F057, N2: the
+    prior cut also accepted a file owned by THIS PROCESS'S OWN euid, which
+    is right for ``paths.trusted_read``'s general shape (an authorized
+    root/operator process reading its own files) but wrong here, because
+    the process asking "should I enforce PGP?" is routinely the BROKER
+    itself (uid 1000) — the one party a trust root must never let certify
+    its own trust. A broker-created ``trust.env`` (self-owned) is no
+    longer accepted merely because it matches this process's euid.
+
+    When no trust owner can be resolved at all (``paths._trust_owner_uid()``
+    is ``None`` — no distinct trust-owner identity exists on this box:
+    Kart, a dev sandbox, any single-uid deployment that never ran
+    ``trust_root_setup``), there is no meaningful "someone else" to
+    require, so self-ownership is accepted — the same carve-out
+    ``paths.trusted_read`` already makes for that case.
+
+    No signature check here — unlike ``paths.trusted_read``'s trust-owner-
+    plus-signature branch, THIS file is the fingerprint a signature would
+    need to verify against, so checking its own signature would be
+    circular. Raises :class:`PgpSourceUnreadable` rather than returning a
+    bool, so a caller cannot forget to check it."""
     from . import paths
 
     euid = os.geteuid()
@@ -102,10 +121,21 @@ def _trust_config_ownership_ok(path: Path) -> None:
             "wider) and retry."
         )
     trust_owner_uid = paths._trust_owner_uid()
-    if info.st_uid not in (euid, trust_owner_uid):
+    if trust_owner_uid is not None:
+        if info.st_uid != trust_owner_uid:
+            raise PgpSourceUnreadable(
+                f"{path} is owned by uid {info.st_uid}, not the trust "
+                f"owner's uid ({trust_owner_uid}) — refusing to trust it. "
+                "This process's own uid is never an acceptable substitute "
+                "here, even when it matches: the party asking whether to "
+                "enforce PGP must never be able to author its own answer."
+            )
+    elif info.st_uid != euid:
         raise PgpSourceUnreadable(
-            f"{path} is owned by uid {info.st_uid}, neither this process's "
-            f"own uid ({euid}) nor the trust owner's — refusing to trust it"
+            f"{path} is owned by uid {info.st_uid}, and no trust owner is "
+            f"configured on this box to compare against (only this "
+            f"process's own uid, {euid}, would be acceptable here) — "
+            "refusing to trust it."
         )
 
 
@@ -150,21 +180,80 @@ def _parse_trust_config_text(text: str, *, path: Path) -> str:
     return candidate
 
 
+def _trust_config_dir_already_provisioned(dir_path: Path) -> bool:
+    """Is ``constitutional/`` ITSELF already trust-owner-owned — the
+    signal that install.sh's step 1 has provisioned trust for THIS
+    ``$WILLOW_HOME`` specifically, as opposed to a trust owner merely
+    existing SOMEWHERE on the host.
+
+    Loki re-audit 93D0F057, N2: keying "trust.env should exist" off
+    "``paths._trust_owner_uid()`` resolves to something" is too broad — a
+    real ``willow-operator`` account can exist on a box (or in a sandbox
+    that mirrors one) whose test fixtures never touch ``$WILLOW_HOME/
+    constitutional/`` at all, and every one of those would start raising
+    for a directory that was simply never meant to hold a trust file.
+    Keying off THIS directory's own ownership is local to the
+    ``$WILLOW_HOME`` actually in play, matching how install.sh actually
+    provisions trust (chown constitutional/ to the trust owner in step 1,
+    before anything writes trust.env into it).
+
+    Returns ``False`` (never provisioned here) on any stat failure —
+    including "does not exist at all", which is legitimate bootstrap, not
+    an error to surface from a probe function."""
+    from . import paths
+
+    trust_owner_uid = paths._trust_owner_uid()
+    if trust_owner_uid is None:
+        return False
+    try:
+        return dir_path.stat().st_uid == trust_owner_uid
+    except OSError:
+        return False
+
+
 def _read_trust_config_fingerprint() -> str:
     """``WILLOW_PGP_FINGERPRINT=`` from the trust-config file. Three
-    states, never collapsed (Loki A38D41C2, F4):
+    states, never collapsed (Loki A38D41C2 F4; tightened by Loki 93D0F057
+    N2 — "enforcement may be off only because the trust owner wrote that
+    down, never because something is missing"):
 
-    * the file does not exist at all — legitimate bootstrap: this box has
-      never configured PGP. Returns ``""``.
+    * the file does not exist, and ``constitutional/`` itself has not
+      been provisioned for trust (see
+      :func:`_trust_config_dir_already_provisioned`) — legitimate
+      bootstrap: this ``$WILLOW_HOME`` has never been through
+      install.sh's step 1 at all. Returns ``""``.
+    * the file does not exist, but ``constitutional/`` IS already
+      trust-owner-owned — install.sh's step 1 has run against this exact
+      ``$WILLOW_HOME``, and its later step always writes trust.env (with
+      a real fingerprint, or an explicit empty value as the trust owner's
+      own deliberate "no enforcement" statement). Its absence now means
+      either install stopped between those two steps, or something
+      removed it after — raises :class:`PgpSourceUnreadable` rather than
+      silently disabling enforcement.
+
+      RESIDUAL GAP, named plainly rather than hidden: the broker owns
+      ``$WILLOW_HOME`` itself, so it can rename ``constitutional/`` away
+      ENTIRELY (a rename needs write only on the PARENT, which the
+      broker's uid holds) and put an empty, self-owned directory of the
+      same name back — at that point THIS check also sees "never
+      provisioned" and returns unset. No purely local, file-permission-
+      based scheme can close that: the parent the broker owns is above
+      anything trust.env's own mode could ever protect. What WOULD close
+      it is a marker the broker's uid cannot remove or recreate — a
+      second signal living outside ``$WILLOW_HOME`` entirely (root-owned
+      ``/etc``, or a sealed ledger entry) that a verifier cross-checks
+      against. That is a deploy/architecture change, not a code fix
+      inside this module, and out of this dispatch's scope; recorded as
+      a gap rather than silently left unfixed.
     * the file exists but cannot be trusted (unreadable, wrong ownership/
       permissions, or a malformed value) — raises
-      :class:`PgpSourceUnreadable` rather than returning ``""``. This is
-      the fix: before, any of these collapsed into "unset", silently
-      turning enforcement off.
+      :class:`PgpSourceUnreadable`.
     * the file exists, is trustworthy, and has a fingerprint (or an
-      explicitly empty value, the template shape before a key is first
-      generated) — returns it (or ``""`` for the empty-value case, which
-      is legitimate, not a parse failure).
+      explicitly empty value — the trust owner's own written statement
+      that enforcement is off, install.sh's template shape before a key
+      is first generated) — returns it (or ``""`` for the empty-value
+      case, which is legitimate, not a parse failure: the trust owner
+      wrote it down).
 
     Cached by (path, inode, mtime_ns, size); see the module-level
     lock/cache docstring for why those four fields.
@@ -174,6 +263,20 @@ def _read_trust_config_fingerprint() -> str:
     if not path.exists():
         with _trust_config_cache_lock:
             _trust_config_cache = None
+        if _trust_config_dir_already_provisioned(path.parent):
+            raise PgpSourceUnreadable(
+                f"{path} does not exist, but {path.parent} is already "
+                "trust-owner-owned — this $WILLOW_HOME has been through "
+                "install's trust provisioning step, which always writes "
+                "this file (even with an explicit empty value for "
+                "deliberate no-enforcement). Its absence now means "
+                "either install stopped partway through, or something "
+                "removed it after. Refusing to treat a missing file as a "
+                "legitimate 'off' either way: enforcement is off ONLY "
+                "when the trust owner wrote that down in this file, "
+                "never because it is absent. Run install.sh (or restore "
+                "constitutional/) and retry."
+            )
         return ""
     _trust_config_ownership_ok(path)  # raises PgpSourceUnreadable, never silent
     try:
@@ -224,9 +327,22 @@ def expected_fingerprint() -> str:
     A trust-config file that exists but cannot be trusted (unreadable,
     wrong ownership, malformed value) raises :class:`PgpSourceUnreadable`
     rather than resolving as unset — *unreachable is not empty* (Loki
-    A38D41C2, F4).
+    A38D41C2, F4). The SAME rule applies to a malformed PROCESS-env value
+    (Loki 93D0F057, N6: ``WILLOW_PGP_FINGERPRINT='<fpr>  # x'`` in the
+    environment used to return that raw, non-hex string, which
+    :func:`pgp_enabled`'s own regex check then silently rejected —
+    enforcement off, with nothing raised anywhere. A non-empty process-env
+    value that does not parse as a fingerprint now raises here too, before
+    it ever reaches a truthiness check that could quietly discard it.
     """
     env_value = (os.environ.get("WILLOW_PGP_FINGERPRINT") or "").strip().upper()
+    if env_value and not _FP_RE.match(env_value):
+        raise PgpSourceUnreadable(
+            f"WILLOW_PGP_FINGERPRINT in the process environment does not "
+            f"look like a 40-hex-character fingerprint ({env_value!r}) — "
+            "refusing to silently treat a malformed value as 'no key "
+            "configured'."
+        )
     file_value = _read_trust_config_fingerprint()
     if env_value and file_value and env_value != file_value:
         raise PgpFingerprintConflict(

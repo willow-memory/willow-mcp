@@ -20,7 +20,7 @@ import os
 
 import pytest
 
-from willow_mcp import pgp
+from willow_mcp import paths, pgp
 
 _FPR_A = "9B6F87BEB4AE56E2" + "0" * 24
 _FPR_B = "DEE471967EBCFA46" + "1" * 24
@@ -30,6 +30,14 @@ _FPR_B = "DEE471967EBCFA46" + "1" * 24
 def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    # Most of this file tests parsing/caching/conflict logic, not the N2
+    # ownership-strictness rule specifically (which has its own dedicated
+    # tests below, each overriding this back to a real uid). Kart's own
+    # sandbox happens to have a real `willow-operator` account, so without
+    # this override every self-created trust.env in this file would be
+    # rejected by the N2 fix before the test ever got to what it means to
+    # test.
+    monkeypatch.setattr(paths, "_trust_owner_uid", lambda: None)
     yield
 
 
@@ -229,3 +237,111 @@ def test_cache_picks_up_a_same_size_rewrite(tmp_path):
     assert len(_FPR_A) == len(_FPR_B)
     _write_trust_env(tmp_path, _FPR_B)
     assert pgp.expected_fingerprint() == _FPR_B
+
+
+# ── Loki re-audit 93D0F057, N2: enforcement may be off only because the
+# trust owner wrote that down, never because trust.env is missing,
+# unreadable, malformed, or owned by the wrong uid. ────────────────────
+
+def test_self_owned_trust_env_is_refused_when_a_real_trust_owner_exists(tmp_path, monkeypatch):
+    """The core N2 fix: a trust-config file owned by THIS PROCESS's own
+    euid used to be accepted unconditionally. That is exactly what would
+    let the broker create its own trust.env and have it trusted. When a
+    real trust owner uid is resolvable, only THAT uid is acceptable —
+    self-ownership is no longer a substitute, even though the file here
+    literally is self-owned (the test process created it)."""
+    _write_trust_env(tmp_path, _FPR_A)
+    monkeypatch.setattr(paths, "_trust_owner_uid", lambda: os.geteuid() + 1)
+    with pytest.raises(pgp.PgpSourceUnreadable, match="not the trust owner"):
+        pgp.expected_fingerprint()
+
+
+def test_self_owned_trust_env_is_accepted_when_no_trust_owner_exists(tmp_path, monkeypatch):
+    """The carve-out: on a box with NO resolvable trust-owner identity at
+    all (Kart, dev, anything that never ran trust_root_setup), there is no
+    "someone else" to require, so self-ownership is the only option and
+    is accepted — matching paths.trusted_read's own carve-out for this
+    case."""
+    _write_trust_env(tmp_path, _FPR_A)
+    monkeypatch.setattr(paths, "_trust_owner_uid", lambda: None)
+    assert pgp.expected_fingerprint() == _FPR_A
+
+
+def test_missing_trust_env_raises_when_constitutional_dir_already_provisioned(tmp_path, monkeypatch):
+    """N2's other half: on a $WILLOW_HOME whose constitutional/ directory
+    is ALREADY trust-owner-owned (install's step 1 has provisioned trust
+    here), trust.env simply not existing must no longer resolve as
+    legitimate "unset" — a completed install always writes this file, so
+    its absence means either install stopped partway through, or
+    something removed it (the broker owns $WILLOW_HOME and can rename
+    constitutional/ away — see the module docstring for why that specific
+    attack is not fully closeable here). Refuse rather than silently
+    disable. A real chown to the trust owner needs root, so this
+    monkeypatches the provisioned-signal function directly rather than
+    the underlying stat."""
+    assert not (tmp_path / "constitutional").exists()
+    monkeypatch.setattr(pgp, "_trust_config_dir_already_provisioned", lambda d: True)
+    with pytest.raises(pgp.PgpSourceUnreadable, match="does not exist"):
+        pgp.expected_fingerprint()
+
+
+def test_missing_trust_env_is_still_unset_when_constitutional_dir_never_provisioned(tmp_path):
+    """The far more common legitimate "off because absent" case: this
+    $WILLOW_HOME has never been through install's trust provisioning at
+    all (a fresh checkout, a dev sandbox, most of this test suite's own
+    fixtures) — nothing could ever have written this file down as
+    configured or explicitly off, so unset is correct."""
+    assert not (tmp_path / "constitutional").exists()
+    assert pgp.expected_fingerprint() == ""
+
+
+def test_provisioned_signal_is_keyed_to_this_willow_home_not_the_host_account(tmp_path, monkeypatch):
+    """The bug this design avoids: a real trust-owner account can exist
+    SOMEWHERE on the host (or a sandbox mirroring one) without this
+    specific $WILLOW_HOME/constitutional/ ever having been provisioned —
+    that must still resolve as legitimate unset, not a refusal. This is
+    exactly what broke the very first version of this fix against Kart's
+    own sandbox, which does carry a real willow-operator account."""
+    monkeypatch.setattr(paths, "_trust_owner_uid", lambda: 994)
+    assert not (tmp_path / "constitutional").exists()
+    assert pgp.expected_fingerprint() == ""
+
+
+def test_missing_trust_env_raised_even_with_a_matching_process_env_pin(tmp_path, monkeypatch):
+    """A process-env pin does not rescue a missing trust-config file on a
+    $WILLOW_HOME that should have one — the file itself must exist and
+    say so."""
+    monkeypatch.setattr(pgp, "_trust_config_dir_already_provisioned", lambda d: True)
+    os.environ["WILLOW_PGP_FINGERPRINT"] = _FPR_A
+    try:
+        with pytest.raises(pgp.PgpSourceUnreadable):
+            pgp.expected_fingerprint()
+    finally:
+        del os.environ["WILLOW_PGP_FINGERPRINT"]
+
+
+# ── Loki re-audit 93D0F057, N6: a malformed PROCESS-env value must also
+# raise, not merely a malformed file value. ─────────────────────────────
+
+def test_malformed_process_env_value_raises_rather_than_silently_disabling(tmp_path):
+    """WILLOW_PGP_FINGERPRINT='<fpr>  # x' in the process environment
+    (no trust.env at all) used to return the raw non-hex string;
+    pgp_enabled()'s own regex check then silently rejected it, turning
+    enforcement off with nothing raised anywhere. F4's malformed-value
+    fix covered the FILE only — this is the same rule applied to the
+    process environment."""
+    os.environ["WILLOW_PGP_FINGERPRINT"] = f"{_FPR_A}  # stray comment"
+    try:
+        with pytest.raises(pgp.PgpSourceUnreadable):
+            pgp.expected_fingerprint()
+    finally:
+        del os.environ["WILLOW_PGP_FINGERPRINT"]
+
+
+def test_malformed_process_env_value_raises_even_when_pgp_enabled_is_called(tmp_path):
+    os.environ["WILLOW_PGP_FINGERPRINT"] = "not-a-fingerprint-at-all"
+    try:
+        with pytest.raises(pgp.PgpSourceUnreadable):
+            pgp.pgp_enabled()
+    finally:
+        del os.environ["WILLOW_PGP_FINGERPRINT"]

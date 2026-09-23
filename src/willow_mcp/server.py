@@ -7600,7 +7600,9 @@ def _derive_problems(store: dict, postgres: dict, manifest: dict, mode: str,
                 f"(the manifest is present and valid — PGP enforcement is on and it "
                 f"has no verifying signature). If {_mpath}'s directory is not writable "
                 f"by you, sign to a scratch path and install the .sig as its owner. "
-                f"To turn enforcement off instead, unset WILLOW_PGP_FINGERPRINT."
+                f"Enforcement is governed by $WILLOW_HOME/constitutional/trust.env, "
+                f"not the process environment — unsetting WILLOW_PGP_FINGERPRINT "
+                f"here does not turn it off."
             ),
             gate.MANIFEST_UNPARSEABLE: f"repair the JSON in {_mpath}",
         }.get(manifest.get("reason"),
@@ -11303,8 +11305,11 @@ def _main():
         print(
             "willow-mcp: refusing to start — "
             f"{len(_manifest_verify_problems)} manifest(s) failed PGP verification. "
-            "Re-sign with `willow-mcp sign-manifest <app_id>` from a host terminal, "
-            "or unset WILLOW_PGP_FINGERPRINT to run without enforcement.",
+            "Re-sign with `willow-mcp sign-manifest <app_id>` from a host terminal. "
+            "Enforcement is governed by $WILLOW_HOME/constitutional/trust.env, not "
+            "the process environment (Loki re-audit 93D0F057, N2) — unsetting "
+            "WILLOW_PGP_FINGERPRINT here does not turn it off; only the trust "
+            "owner writing an explicit empty value into trust.env does.",
             file=sys.stderr,
         )
         raise SystemExit(1)
