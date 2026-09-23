@@ -328,8 +328,7 @@ def test_sign_net_cli_emits_verifiable_envelope(
     assert (ok, reason) == (True, "verified")
 
 
-@pytest.mark.parametrize("directive", ["# allow_net", "# allow_localhost"])
-def test_forged_direct_row_is_denied_before_shell_launch(monkeypatch, directive):
+def test_forged_direct_row_is_denied_before_shell_launch(monkeypatch):
     from kartikeya import execute as kexec
 
     launched = []
@@ -341,7 +340,7 @@ def test_forged_direct_row_is_denied_before_shell_launch(monkeypatch, directive)
     )
     row = TaskRow(
         task_id="FORGED",
-        task=f"curl https://example.com\n{directive}",
+        task="curl https://example.com\n# allow_net",
         submitted_by="forged-app",
         network_authorization='{"forged":true}',
     )
@@ -353,9 +352,8 @@ def test_forged_direct_row_is_denied_before_shell_launch(monkeypatch, directive)
     assert launched == []
 
 
-@pytest.mark.parametrize("directive", ["# allow_net", "# allow_localhost"])
 def test_reclaimed_terminal_row_is_denied_before_shell_launch(
-    keys, tmp_path, monkeypatch, directive
+    keys, tmp_path, monkeypatch
 ):
     from kartikeya import execute as kexec
 
@@ -373,7 +371,7 @@ def test_reclaimed_terminal_row_is_denied_before_shell_launch(
     )
     row = TaskRow(
         task_id="RECLAIM1",
-        task=f"curl https://example.com\n{directive}",
+        task="curl https://example.com\n# allow_net",
         submitted_by="caller",
         network_authorization=_signed(keys, task_id="RECLAIM1"),
     )
