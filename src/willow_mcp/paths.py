@@ -213,55 +213,52 @@ def operator_secrets_root() -> Path:
 
 def trust_config_path() -> Path:
     """The single source of truth for ``WILLOW_PGP_FINGERPRINT`` —
-    ``trust.env``, in the vault beside the box's other keys
-    (:func:`dispatch_signing_key_path`, ``vault.key``, ``vault.db``), not
-    inside a github checkout's ``$WILLOW_HOME`` when a real
-    ``WILLOW_VAULT_BOX`` is configured. Operator ruling (dispatch FA4F79AC,
-    rework #3 of one-signing-key, 2026-09-23, verbatim): "it should be in
-    the vault with the rest of the keys" — chosen over Loki's own
-    alternative (a root-owned ``/etc/willow-mcp/trust.env``).
+    ``trust.env``, always at ``$WILLOW_HOME/constitutional/trust.env``.
+    Beside the box's other keys in the sense the operator ruling asked for
+    (dispatch FA4F79AC, verbatim: "it should be in the vault with the rest
+    of the keys") — but resolved WITHOUT consulting ``WILLOW_VAULT_BOX`` or
+    :func:`operator_secrets_root` at all.
 
-    Lands in a ``constitutional/`` subdirectory of the vault, not at the
-    vault's own top level, for the same reason ``$WILLOW_HOME/constitutional/``
-    already exists as its own trust-owner-owned subdirectory rather than
-    chowning ``$WILLOW_HOME`` itself: :func:`operator_secrets_root`'s other
-    contents (``dispatch_signing_key_path()``, ``vault.key``, ``vault.db``)
-    are the BROKER's own secrets — the broker creates and rewrites them, so
-    their parent directory must stay broker-writable, and a directory the
-    broker can write to is a directory it can rename an entry out of. Only
-    a dedicated, separately-owned subdirectory inside the vault can carry a
-    different ownership than the vault's own top level.
+    Rework #4 (dispatch 10F9E837, Loki audit 23DE8AA9, F-C): rework #3
+    routed this through :func:`operator_secrets_root`, which reads
+    ``os.environ['WILLOW_VAULT_BOX']`` — a variable the BROKER's own
+    process sets, same as any other env var. "The vault" is meant to be a
+    single, root-chosen answer to "where is the file that decides what
+    this box trusts"; an env var any process can set is instead a second
+    lever the broker holds on top of the file's own ownership/signature
+    checks, and Loki measured the exact failure mode: a recipe that sets
+    ``WILLOW_VAULT_BOX`` only in ``$H/env`` (root-writable, broker-owned)
+    is a value the broker can also unset or repoint, at which point THIS
+    reader and ``install.sh``'s own resolution (root's sudo environment,
+    normally stripped of anything the invoking user exported) can silently
+    disagree about which file is authoritative — install.sh writing one
+    path while a broker convinces itself a DIFFERENT path is the trust
+    source, or vice versa.
 
-    THE RENAME-AWAY HOLE (Loki audit D06A0EF3): closed only when
-    ``WILLOW_VAULT_BOX`` is configured to a location whose own parent chain
-    the broker's uid cannot write — i.e. NOT the default. When
-    ``WILLOW_VAULT_BOX`` is unset (:func:`operator_secrets_root` falls back
-    to :func:`willow_home`, which is broker-owned, mode 700, by
-    definition — it is the broker's own working home), this resolves to
-    exactly the same path as before this rework
-    (``$WILLOW_HOME/constitutional/trust.env``) and the hole is NOT closed
-    — named plainly, not hidden: the broker can still rename
-    ``$WILLOW_HOME`` itself since it owns the parent. The same is true even
-    with ``WILLOW_VAULT_BOX`` set, AS LONG AS the vault box's own directory
-    sits under a parent the broker's uid can write (e.g. a vault box that
-    is merely another directory under the broker's own ``$HOME``, or is
-    ``$WILLOW_HOME`` itself, as on the box this rework was built against —
-    see ``deploy/manifest-grant/install.sh``'s own comment on the point).
+    ``$WILLOW_HOME`` itself is not the same kind of lever: every reader
+    that shares a box must already agree on ``$WILLOW_HOME`` for anything
+    to work at all (a mismatched ``$WILLOW_HOME`` is "talking to a
+    different box," not a subtle trust bypass a single process can pull
+    off while still participating normally in the SAME box's operations).
+    Anchoring here to ``willow_home()`` alone — no second variable layered
+    on top — makes the subpath (``constitutional/trust.env``) a true
+    module constant: the only remaining variable is the address every
+    other read/write in this codebase already depends on.
 
-    CLOSING IT FOR REAL requires a root provisioning step outside this
-    module's reach: ``WILLOW_VAULT_BOX`` set to a directory whose own
-    parent (and every ancestor above that, up to ``/``) is NOT owned or
-    group/other-writable by the broker's uid — e.g. a box-provisioned
-    directory under ``/var/lib`` or ``/opt``, owned by the trust owner (or
-    root), with the broker granted write ONLY on its own subdirectory
-    inside it (mirroring the ``constitutional/`` split this function
-    already makes) for its unrelated secrets. That is a root, once,
-    install-time act — see ``install.sh``'s vault-provisioning step and
-    INSTALL.md's "Provisioning a new box" section for the exact chown/mode.
-    Nothing in this module can perform or verify that step; it can only
-    resolve the path a correctly-provisioned vault would use.
+    THE RENAME-AWAY HOLE (Loki audit D06A0EF3) is UNCHANGED by this fix,
+    and still open on the default box: ``$WILLOW_HOME`` is broker-owned,
+    mode 700, so the broker can still rename ``constitutional/`` away and
+    recreate it empty (a rename needs write only on the PARENT). Closing
+    THAT hole needs ``$WILLOW_HOME`` itself to resolve to a root-provisioned
+    location outside the broker's own writable tree for every process that
+    shares this box — a deploy/architecture change (e.g. a root-owned
+    bind-mount or symlink target for ``$WILLOW_HOME``, established once,
+    outside any single process's env), out of this dispatch's scope,
+    recorded as a gap rather than silently left unfixed. It is NOT
+    achieved by layering a second, independently-set variable on top of
+    ``$WILLOW_HOME`` — that was F-C's own finding.
     """
-    return operator_secrets_root() / "constitutional" / "trust.env"
+    return willow_home() / "constitutional" / "trust.env"
 
 
 def charter_repo() -> Path | None:

@@ -341,8 +341,29 @@ def _load_active_register() -> dict:
     from the caller (the request half already copied it, running as the
     broker, which CAN read the sidecar); ``revoke`` only ever mutates
     ``active[]``. Making the docstrings' "never looks the proposal up
-    itself" literally true, not just intended."""
-    active_doc = _envelopes._load(_envelopes.registry_path())
+    itself" literally true, not just intended.
+
+    F-A (dispatch 10F9E837, Loki audit 23DE8AA9): a register that does
+    not exist AT ALL is treated as ``{"active": []}`` — legitimate
+    bootstrap, the same state an empty-but-present register would carry —
+    rather than propagating ``paths.trusted_read``'s "source path
+    missing" refusal. A truly fresh ``$WILLOW_HOME`` (no register ever
+    written) hit this on install's own step 1d seed: ``trusted_read``
+    correctly refuses to authenticate content that is not there, but
+    there is nothing to authenticate when nothing has been written yet —
+    the same bootstrap distinction :func:`_register_writable` already
+    makes for a missing DIRECTORY (returns writable/ok rather than
+    refusing). Extending it to a missing FILE inside an existing,
+    writable (or not-yet-existing) directory is safe: the two real
+    callers of this function (the ``envelope.ratify`` trust-owner apply
+    half, and install's own seed) both go on to WRITE the register via
+    :func:`_save_active`, which creates it correctly owned and signed
+    either way — there is no path here where "missing" could be mistaken
+    for signed, trustworthy content this process merely failed to read."""
+    path = _envelopes.registry_path()
+    if not path.exists():
+        return {"active": []}
+    active_doc = _envelopes._load(path)
     return {"active": active_doc.get("active") or []}
 
 
@@ -937,6 +958,19 @@ def ratify_proposal_row(
     alongside ``ratified_via``; the caller composes ``ratified_via`` (the
     packet's own shape: ``"frank ledger entry <citation_id>"``) rather
     than this function guessing at it.
+
+    F-A (dispatch 10F9E837, Loki audit 23DE8AA9): a TRULY fresh box (no
+    ``constitutional/pre-approved.json`` at all yet — nothing has ever
+    been written there, not even by a prior seed) used to raise from
+    :func:`_load_active_register` itself, before this function's own body
+    ever ran — ``envelopes._load`` -> ``paths.trusted_read`` treats a
+    missing source path as a hard refusal (correctly, for a file that is
+    SUPPOSED to already exist). That refusal is right for every OTHER
+    reader of the register, which has no business proceeding if the
+    register vanished after having existed — but wrong for install's own
+    bootstrap seed, the ONE caller that is establishing the register's
+    first row. See :func:`_load_active_register`'s own docstring for the
+    fix.
 
     ``sign_as`` (dispatch FA4F79AC, M1): threaded straight through to
     :func:`_save_active`'s own parameter of the same name — see its

@@ -102,8 +102,20 @@ def seed(envelope_authoring, envelopes, *, sign_as: "str | None" = None) -> dict
     value, the same one install.sh is about to publish — instead of
     consulting the not-yet-published trust config. See
     `envelope_authoring._save_active`'s own docstring for the full
-    argument."""
-    registry = envelopes._load(envelopes.registry_path())
+    argument.
+
+    F-A (dispatch 10F9E837, Loki audit 23DE8AA9): a TRULY fresh
+    `$WILLOW_HOME` — no register has EVER been written, not even an empty
+    one — used to raise `PermissionError` right here, one call before
+    `ratify_proposal_row` (whose own `_load_active_register` got the same
+    fix, for its OTHER caller, the real `envelope.ratify` apply half).
+    `envelopes._load` -> `paths.trusted_read` correctly refuses to
+    authenticate a file that is not there; there is nothing to
+    authenticate on a box that has never written one. Mirrors
+    `_load_active_register`'s own fix exactly: missing means
+    ``{"active": []}``, legitimate bootstrap, not a refusal."""
+    reg_path = envelopes.registry_path()
+    registry = envelopes._load(reg_path) if reg_path.exists() else {"active": []}
     active = list(registry.get("active") or [])
     existing = find_active_grant(active)
     if existing is not None:
