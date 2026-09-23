@@ -162,7 +162,8 @@ def test_mark_done_wraps_jsonb_result_and_stamps_completed(queue, pg):
     sql, params = pg.executed[-1]
     assert sql.startswith("UPDATE tasks SET")
     assert "now()" in sql  # completed_at stamped
-    assert params[0] == "completed"
+    # retry_eligible is False for a completed task — nothing to retry
+    assert params[0] is False
     # jsonb column -> psycopg2 Json wrapper, not a raw string
     assert type(params[2]).__name__ == "Json"
     assert params[-2:] == ("T1", queue.claim_owner)
@@ -184,6 +185,87 @@ def test_mark_done_plain_text_result_when_column_not_jsonb(pg, monkeypatch):
 def test_mark_done_rejects_unknown_terminal_state(queue):
     with pytest.raises(ValueError, match="completed\\|failed"):
         queue.mark_done("T1", status="running", result="")
+
+
+# ── permanent refusals are terminal on the first attempt ───────────────────
+# Loki 506FD78E: kartikeya's execute_task_row returns the same "failed"
+# status for a transient error and a named policy refusal alike. Before this
+# fix, mark_done retried both — a refused `# allow_localhost` row would be
+# refused three times (attempts 1/3, 2/3, 3/3) before finally landing as
+# failed. These cover the whole class, not just that one string.
+
+def test_is_permanent_refusal_recognizes_the_named_classes():
+    # allow_localhost — matched by its error prefix (execute.py's
+    # _localhost_retired_result, which predates kart_scan)
+    assert tq._is_permanent_refusal(
+        json.dumps({"error": "allow_localhost_retired: allow_localhost was retired"})
+    )
+    # any kart_scan security block — tree-rewrite, hook-tamper,
+    # systemd-manager, ... all share this key (task_scan.check_kart_task)
+    assert tq._is_permanent_refusal(
+        json.dumps(
+            {
+                "error": "[KART-SECURITY] refuses to rewrite the working tree",
+                "kart_scan": {"category": "tree_rewrite_on_read_only_root"},
+            }
+        )
+    )
+    assert tq._is_permanent_refusal(
+        json.dumps({"error": "...", "kart_scan": {"category": "hook_tamper"}})
+    )
+    # a denied or missing network authorization envelope
+    assert tq._is_permanent_refusal(
+        json.dumps({"error": "verifier refused: no lease", "context": "egress_denied"})
+    )
+    # a transient failure — timeout, OOM, a flaky command — still retries
+    assert not tq._is_permanent_refusal(json.dumps({"error": "timeout"}))
+    assert not tq._is_permanent_refusal(json.dumps({"stdout": "hi"}))
+    # malformed/non-object results fail open to "retry", same as before
+    assert not tq._is_permanent_refusal("not json")
+    assert not tq._is_permanent_refusal(json.dumps(["not", "a", "dict"]))
+
+
+def test_mark_done_allow_localhost_retired_is_not_retry_eligible(queue, pg):
+    queue.mark_done(
+        "T1",
+        status="failed",
+        result=json.dumps(
+            {"error": "allow_localhost_retired: allow_localhost was retired 2026-09-23"}
+        ),
+    )
+    _sql, params = pg.executed[-1]
+    assert params[0] is False
+
+
+def test_mark_done_tree_rewrite_kart_scan_is_not_retry_eligible(queue, pg):
+    queue.mark_done(
+        "T1",
+        status="failed",
+        result=json.dumps(
+            {
+                "error": "[KART-SECURITY] refuses to rewrite the working tree",
+                "kart_scan": {"category": "tree_rewrite_on_read_only_root"},
+            }
+        ),
+    )
+    _sql, params = pg.executed[-1]
+    assert params[0] is False
+
+
+def test_mark_done_egress_denied_is_not_retry_eligible(queue, pg):
+    queue.mark_done(
+        "T1",
+        status="failed",
+        result=json.dumps({"error": "verifier refused: no lease", "context": "egress_denied"}),
+    )
+    _sql, params = pg.executed[-1]
+    assert params[0] is False
+
+
+def test_mark_done_transient_failure_is_still_retry_eligible(queue, pg):
+    queue.mark_done("T1", status="failed", result=json.dumps({"error": "timeout"}))
+    _sql, params = pg.executed[-1]
+    assert params[0] is True
 
 
 def test_reap_stale_recovers_a_dead_owner(queue, pg, monkeypatch):

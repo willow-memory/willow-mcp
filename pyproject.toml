@@ -68,24 +68,12 @@ dependencies = [
     # is regression-tested rather than trusted to the pin
     # (tests/test_b65_work_root_sandbox.py).
     #
-    # PENDING (Loki 506FD78E F1, not applied in this commit): the fix for
-    # governance record retire-allow-localhost-2026-09-23 (amends sealed
-    # 9fe5e179) lands in kartikeya's next release. kartikeya's manifest sits
-    # at 0.3.1 as of this commit and the fix commit is typed `fix(kart):`, so
-    # release-please cuts 0.3.2. Do NOT raise this floor to `>=0.3.2` in the
-    # same PR as that kartikeya commit: this repo's CI installs kartikeya
-    # from PyPI (`pip install -e ".[test]" jeles`, .github/workflows/tests.yml),
-    # and 0.3.2 is unpublished until kartikeya's own release PR merges and
-    # release.yml publishes it — naming an unpublished floor here breaks CI
-    # with an unresolvable dependency, not a security test failure. Deploy
-    # order, same as the runtime worker: kartikeya releases and publishes
-    # 0.3.2 FIRST; only then does a follow-up willow-mcp commit raise this
-    # floor to `kartikeya>=0.3.2,<1.0.0` and land. Until that floor lands, an
-    # installed kartikeya below 0.3.2 still maps `# allow_localhost` to host
-    # networking even though this broker refuses to queue it (F1: the hole
-    # is closed in the code that runs on THIS box's queue, not on a stale
-    # worker importing an old kartikeya from an unrelated venv).
-    "kartikeya>=0.0.12,<1.0.0",
+    # Floor raised to 0.3.2 for retire-allow-localhost-2026-09-23 (amends
+    # sealed 9fe5e179, Loki 506FD78E F1): 0.3.2 is the first published
+    # kartikeya release whose executor itself refuses `# allow_localhost`
+    # rather than mapping it to host networking, so an old kartikeya in some
+    # other venv can no longer undo this broker's refusal.
+    "kartikeya>=0.3.2,<1.0.0",
     # Jeles the Librarian — the ~60 named institutional and academic collections
     # behind `willow_institutional_search`. A hard dependency rather than an
     # extra because the tool is registered unconditionally: an optional import

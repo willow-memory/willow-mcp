@@ -64,6 +64,48 @@ def _parse_claim_owner(owner: str) -> tuple[str, int] | None:
         return None
 
 
+def _is_permanent_refusal(result: str) -> bool:
+    """True when a *failed* task's result names a policy refusal, not a
+    transient failure — a timeout, an OOM, a flaky command still retries.
+
+    kartikeya's `execute_task_row` returns the same terminal `"failed"`
+    status for every one of these; this queue backend is the only place
+    that then decides whether `"failed"` gets retried, so the class has to
+    be recognized here rather than by matching one string (Loki 506FD78E:
+    the worker retried `allow_localhost_retired` up to `max_attempts`
+    before this fix, and the same bug applies to every other named,
+    permanent refusal kartikeya can return):
+
+    - a `kart_scan` security block (`tree_rewrite_on_read_only_root`,
+      `hook_tamper`, `systemd_manager`, and any other scan category —
+      `task_scan.check_kart_task`'s refusal shape always carries this key)
+    - a denied or missing network authorization envelope
+      (`context: "egress_denied"` — `execute.py`'s `_network_denial` and
+      its inline sibling both set this)
+    - the retired `allow_localhost` directive (`execute.py`'s
+      `_localhost_retired_result`, which predates `kart_scan` and carries
+      no shared key with the other two, so it is matched by its named
+      error prefix instead)
+
+    A result that fails to parse as a JSON object is not recognized as
+    permanent — it retries, same as before this fix.
+    """
+    try:
+        parsed = json.loads(result)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    if "kart_scan" in parsed:
+        return True
+    if parsed.get("context") == "egress_denied":
+        return True
+    error = parsed.get("error")
+    if isinstance(error, str) and error.startswith("allow_localhost_retired:"):
+        return True
+    return False
+
+
 def _require_kartikeya():
     try:
         import kartikeya  # noqa: F401
@@ -246,8 +288,15 @@ class PgTaskQueue(TaskQueue):
                 stored = Json(result)
         else:
             stored = result
+        # A permanent refusal (named policy block, denied network envelope,
+        # retired allow_localhost — see _is_permanent_refusal) is never
+        # retry-eligible, no matter how far under max_attempts it sits: it
+        # was refused on its merits, not by accident, and refusing it again
+        # would read the same way twice while looking like the queue is
+        # broken.
+        retry_eligible = status == "failed" and not _is_permanent_refusal(result)
         retrying = (
-            f"%s = 'failed' AND COALESCE({self._q('attempts')}, 0) "
+            f"%s AND COALESCE({self._q('attempts')}, 0) "
             f"< COALESCE({self._q('max_attempts')}, 3)"
         )
         sets = [
@@ -263,12 +312,12 @@ class PgTaskQueue(TaskQueue):
             f'{self._q("claimed_at")} = NULL',
         ]
         params = [
-            status,
+            retry_eligible,
             status,
             stored,
-            status,
+            retry_eligible,
             self.retry_delay_seconds,
-            status,
+            retry_eligible,
         ]
         cur = self._pg.cursor()
         cur.execute(
