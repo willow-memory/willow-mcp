@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **session-end:** stage-1 corpus-lens + reconciler stub receipts ([9ed7283](https://github.com/willow-memory/willow-mcp/commit/9ed7283d1bb11bd58aa0568c1ca53282a4edb6d8))
 * **session-end:** stage-1 corpus-lens + reconciler stub receipts ([90897fc](https://github.com/willow-memory/willow-mcp/commit/90897fc1d8aef211e84909321faea39feb5f2e8d))
 
 
