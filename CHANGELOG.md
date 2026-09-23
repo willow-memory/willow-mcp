@@ -36,11 +36,10 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **task_submit:** amend allow_localhost retirement per Loki 506FD78E ([7b491cc](https://github.com/willow-memory/willow-mcp/commit/7b491cc0610abcf6cce0aa01dbdd6e8944b1b414))
-* **task_submit:** retire allow_localhost — it granted full internet with no lease ([055f6b2](https://github.com/willow-memory/willow-mcp/commit/055f6b2daeccac87f2a862560b3ba502a65ec579))
-* **task_submit:** retire allow_localhost — it granted full internet with no lease ([57b2cc1](https://github.com/willow-memory/willow-mcp/commit/57b2cc1151528e635285c1c766e0a81e545af0e6))
 * **worker:** narrow the permanent-refusal set per Loki 615C332F ([5e5802b](https://github.com/willow-memory/willow-mcp/commit/5e5802b3cb8a4ac7a55f5d750dab6b844a2245d6))
 * **worker:** raise the kartikeya floor to 0.3.2, make permanent refusals terminal ([5a9afec](https://github.com/willow-memory/willow-mcp/commit/5a9afec5384769495a0d417c4b1173884f79a23b))
+* **task_submit:** amend allow_localhost retirement per Loki 506FD78E ([7b491cc](https://github.com/willow-memory/willow-mcp/commit/7b491cc0610abcf6cce0aa01dbdd6e8944b1b414))
+* **task_submit:** retire allow_localhost — it granted full internet with no lease ([57b2cc1](https://github.com/willow-memory/willow-mcp/commit/57b2cc1151528e635285c1c766e0a81e545af0e6))
 
 ## [2.81.2](https://github.com/willow-memory/willow-mcp/compare/v2.81.1...v2.81.2) (2026-09-23)
 
