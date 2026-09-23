@@ -27,12 +27,11 @@ Run in order:
 
 | Step | Tool | Pass criteria |
 |------|------|---------------|
-| 1 | `session_enter("willow", session_id)` | `entry_mode: human_orchestrator` — read `message`, `agent_doc_section`, and `orientation.desk_attention` (open CI/title reviews + complete packets waiting `verify_handoff`; silent when quiet) |
+| 1 | `session_enter("willow", session_id)` | `entry_mode: human_orchestrator` — read `message`, `agent_doc_section` |
 | 2 | `diagnostic_summary(app_id="willow")` | `broken` → stop and report; `ok` or `degraded` → continue |
 | 3 | `dispatch_list(app_id="willow", …)` | Desk view — pending / working / complete packets |
-| 4 | `human_required_list(app_id="willow", status="open")` | Treat open `kind=review` rows (CI red / title fail) as desk work — same weight as commitments; `orientation.desk_attention.review` already capped the top slice |
-| 5 | `commitment_surface(app_id="willow")` | What may be worth the operator's attention now |
-| 6 | `willow-mcp grove-listen --app-id willow --quiet &` then tail its log | Grove listener up — see **Grove listener** below |
+| 4 | `commitment_surface(app_id="willow")` | What may be worth the operator's attention now |
+| 5 | `willow-mcp grove-listen --app-id willow --quiet &` then tail its log | Grove listener up — see **Grove listener** below |
 
 Work in **whatever mode the user asks for** (governance, portfolio, commitments, dispatch, build). No lane declaration required at open.
 
