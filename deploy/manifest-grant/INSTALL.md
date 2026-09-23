@@ -31,50 +31,48 @@ register under the broker's process environment even though the file on disk
 was signed correctly.
 
 The fingerprint's one source of truth is now
-**`$VAULT/constitutional/trust.env`** — trust-owner-owned, world-readable,
+**`$H/constitutional/trust.env`** — trust-owner-owned, world-readable,
 `0644` — **not** `$H/env` (which is `0600` and holds every provider API
 key; a fingerprint is public, only a key's private half is a secret, so it
-does not belong behind that mode). `$VAULT` is `$WILLOW_VAULT_BOX` when the
-operator has configured one, else `$H` itself
-(`src/willow_mcp/paths.py:operator_secrets_root()`, mirrored in
-`install.sh` as `VAULT="${WILLOW_VAULT_BOX:-$H}"`).
+does not belong behind that mode).
 
-**Rework #3 (dispatch `FA4F79AC`, 2026-09-23) — the vault, not `$H` bare.**
-Operator ruling, verbatim: "it should be in the vault with the rest of the keys."
-`trust.env` moves into its own `constitutional/` subdirectory of
-the vault — beside `dispatch_signing.key`, `vault.key`, `vault.db` (the
-box's other keys) at the vault's top level, but not IN that top level
-directly, because those three are the BROKER's own secrets and their
-parent must stay broker-writable for the broker to keep managing them;
-only a dedicated, separately-owned subdirectory can carry different
-ownership. See `paths.trust_config_path()`'s own docstring for the exact
-argument.
+**Rework #3 (dispatch `FA4F79AC`) tried "the vault" as a separately
+configured `WILLOW_VAULT_BOX`; rework #4 (dispatch `10F9E837`, Loki audit
+`23DE8AA9`, finding F-C) reverted it.** The problem F-C measured: this
+document's own "module constant" claim was false — `paths.trust_config_path()`
+resolved through `os.environ['WILLOW_VAULT_BOX']`, a variable the BROKER's
+own process sets, same as any other env var. That is not a root-chosen
+single answer to "which file decides what this box trusts" — it is a
+SECOND lever the broker holds, on top of the file's own ownership and
+signature checks. Worse, `install.sh`'s own resolution (root's `sudo`
+environment, normally stripped of anything the invoking user exported)
+and the broker's resolution (its own process env) could disagree once
+`WILLOW_VAULT_BOX` was set anywhere other than `$H` — install.sh writing
+trust.env to one path while a broker reads a DIFFERENT one as
+authoritative. `trust.env` is now resolved from `$WILLOW_HOME` alone, no
+second variable layered on top — `install.sh` mirrors this exactly
+(`TRUST_ENV="$H/constitutional/trust.env"`, no `WILLOW_VAULT_BOX`
+indirection at all). See `paths.trust_config_path()`'s own docstring for
+the full argument.
 
-**Whether this closes Loki's rename-away finding (audit `D06A0EF3`)
-depends entirely on how `$VAULT` is provisioned — read this before relying
-on it.** The hole: `$H` is owned by the broker's own uid, mode `700`, so
-the broker can rename `$H/constitutional` away entirely and put an empty,
-self-owned directory of the same name back — `constitutional/` then reads
-as "never provisioned," trust.env as "legitimately absent," and
-enforcement as off. Moving trust.env to `$VAULT/constitutional/trust.env`
-closes this ONLY when `$VAULT` itself sits under a parent chain the
-broker's uid cannot write — which is **NOT** the case when
-`WILLOW_VAULT_BOX` is unset, or set to `$H` (both leave `$VAULT == $H`,
-broker-owned, unchanged from before this rework — this is the box's actual
-state as of 2026-09-23). It also is not fully closed even with a genuinely
-separate `WILLOW_VAULT_BOX`, unless that directory's OWN top level is
-root-provisioned outside the broker's reach — which additionally requires
-relocating the broker's own vault secrets to a broker-owned subdirectory
-of it, a larger change out of this dispatch's scope (see "Provisioning a
-new box: closing the rename-away hole for real" below). Named plainly, not
-claimed and left broken: on today's box, this rework moves trust.env to
-the SAME path it already occupied (`$VAULT` resolves to `$H`) — the
-rename-away hole is UNCHANGED, not closed, by this rework alone. What it
-DOES do: give a real, root-provisioned vault (when the operator sets one
-up per the section below) a place to put trust.env that closes the hole,
-and stop tests from ever reaching the path through an environment variable
-the broker could set (a module constant, `paths.trust_config_path()`,
-only).
+**The rename-away hole (Loki audit `D06A0EF3`) is UNCHANGED by either
+rework and still open on this box.** `$H` is owned by the broker's own
+uid, mode `700`, so the broker can rename `$H/constitutional` away
+entirely and put an empty, self-owned directory of the same name back —
+`constitutional/` then reads as "never provisioned," trust.env as
+"legitimately absent," and enforcement as off. Loki's own alternative
+(audit `D06A0EF3`) was a root-owned `/etc/willow-mcp/trust.env`; the
+operator's "vault" ruling asked for a different location than `/etc`, but
+F-C showed that an ENV-VAR-CHOSEN location cannot deliver the property a
+location needs to deliver here, no matter where it points. Closing the
+hole for real needs `$WILLOW_HOME` ITSELF — the one address every process
+sharing this box already has to agree on for anything to work — to
+resolve to a root-provisioned location outside the broker's own writable
+tree (e.g. a root-owned bind-mount or symlink target, established once,
+outside any single process's env), never a second, independently-set
+variable on top of it. That is a larger deploy/architecture change, out
+of this dispatch's scope; `install.sh` reports `$H`'s ownership every run
+rather than silently assuming it is closed.
 
 `pgp.expected_fingerprint()` reads `trust.env`, consults the process
 environment only to catch a leftover pin that DISAGREES with it, and
@@ -82,38 +80,13 @@ refuses loudly (naming both values and both sources) rather than silently
 trusting either side when they conflict — see `pgp.PgpFingerprintConflict`.
 A `trust.env` that is MISSING, unreadable, owned by the wrong uid, or
 carries a malformed value is ALSO refused rather than silently treated as
-"no enforcement" — see `pgp.PgpSourceUnreadable` — on any vault
+"no enforcement" — see `pgp.PgpSourceUnreadable` — on any `$WILLOW_HOME`
 `install.sh` has already provisioned for trust. Enforcement is off only
 when the trust owner wrote that down (an explicit empty value in
 `trust.env`), never because something is missing. `install.sh` strips the
 serve unit's own stale pin every run (`strip_pgp_pin`, shared by the plain
 install and `--rotate`) so nothing but `trust.env` sets this variable on the
 box going forward.
-
-### Provisioning a new box: closing the rename-away hole for real
-
-Loki's own alternative (audit `D06A0EF3`) was a root-owned
-`/etc/willow-mcp/trust.env`; the operator chose the vault instead. To get
-the SAME property there: set `WILLOW_VAULT_BOX` to a directory whose own
-parent — and every ancestor above that, up to `/` — is NOT owned or
-group/other-writable by the broker's uid (e.g. `/var/lib/willow-mcp/vault`,
-under root-owned `/var/lib`, never a directory under the broker's own
-`$HOME`). Provision it as root, once, at install time:
-
-    install -d -o root -g willow-operator -m 0751 /var/lib/willow-mcp/vault
-    # then move the broker's OWN secrets into a subdirectory it can still
-    # write, so the vault's own top level can stay out of its reach:
-    install -d -o <broker-uid> -g <broker-uid> -m 0700 /var/lib/willow-mcp/vault/broker
-    # relocate dispatch_signing.key, vault.key, vault.db there and repoint
-    # the broker at the new paths (paths.py's operator_secrets_root()-based
-    # resolvers) — NOT done by this rework; recorded as the follow-on gap
-    # that actually closes D06A0EF3, not merely narrows it.
-    export WILLOW_VAULT_BOX=/var/lib/willow-mcp/vault   # in $H/env, for the broker to read
-
-`install.sh` itself only provisions `$VAULT/constitutional/` (the
-trust-owner-owned subdirectory trust.env lives in) and reports, every run,
-whether `$VAULT`'s own directory is broker-owned — it does not perform the
-broker-secrets relocation above, which is a larger, deliberate act.
 
 This document is now the human-readable account of what `install.sh` does
 and why, in the same order the script runs it — read it to know what the
@@ -133,8 +106,7 @@ running anything if your box looks the same:
   cut of this fix — see `B291C0C7`'s own history)
 * the active envelope register (`constitutional/pre-approved.json`) is
   hand-signed under `9B6F…`
-* `$VAULT/constitutional/trust.env` does **not exist yet** (`$VAULT` is
-  `$H` on this box — `WILLOW_VAULT_BOX` is not set to anything else)
+* `$H/constitutional/trust.env` does **not exist yet**
 
 Numbered steps, walked from this exact state, with what is DOWN during
 each one and for how long — no step below claims a stronger guarantee
@@ -243,6 +215,63 @@ honestly. What it fixes is narrower and sufficient: install's OWN forward
 progress no longer depends on the trust it has not finished establishing
 yet, so the box always reaches step 6 and completes, rather than
 deadlocking on itself indefinitely partway through its own bootstrap.
+
+### F-A: a TRULY fresh install (dispatch `10F9E837`, Loki audit `23DE8AA9`)
+
+The `sign_as` fix above closed M1 for any box that already has a register
+(`constitutional/pre-approved.json`) — which includes today's box, and
+was what `hanuman`'s own first reproduction (dispatch `FA4F79AC`) tested
+without noticing it had pre-created that file. Loki's re-audit caught the
+gap: a box with NO register at all — nothing has ever written one, not
+even a prior seed — still failed at step 1d, one call earlier than M1's
+original failure. `seed()` → `envelope_authoring.ratify_proposal_row` →
+`_load_active_register()` → `envelopes._load` → `paths.trusted_read`
+raised `PermissionError: source path missing` for the register file
+itself, regardless of `sign_as` — a correct refusal for a file that
+disappeared after existing, wrong for a file that has simply never been
+written yet. Fixed at the same seam: `_load_active_register()` now treats
+a register that does not exist AT ALL as `{"active": []}` — legitimate
+bootstrap, mirroring `_register_writable()`'s own existing carve-out for
+a missing DIRECTORY. Both real callers (the `envelope.ratify` apply half,
+and install's own seed) go on to WRITE the register via `_save_active`
+regardless, so there is no state where "missing" could be mistaken for
+signed content this process merely failed to authenticate.
+
+### F-B: a failed `--rotate` retire, and the rerun that used to revert it
+(dispatch `10F9E837`, Loki audit `23DE8AA9`)
+
+If `--rotate`'s final retire of the OLD key fails (`as_to gpg ...
+--delete-secret-and-public-key` can fail for reasons unrelated to
+trust — a locked keyring, a transient error), the prior cut only printed
+a `WARNING:` and moved on. The next PLAIN install then re-resolved `$FPR`
+at step 1b by a `$KEY_UID` substring search of `GNUPGHOME_TO`, which
+returns the FIRST match — the rotated key's own generated UID carries a
+timestamp suffix (`"$KEY_UID <timestamp>"`), so the substring search kept
+finding the OLDER, pre-rotation key first. That plain install then
+re-signed every governed file under the OLD key, republished it to
+`trust.env`, and — because the two fingerprints now differed — DELETED
+the NEW key as "the old one," silently reverting a completed rotation and
+destroying the replacement key in the same run.
+
+Fixed two ways, together:
+
+1. **Step 1b now prefers `trust.env`'s own fingerprint whenever its secret
+   key is still present in `GNUPGHOME_TO`**, before ever falling back to
+   the `$KEY_UID` substring search. `trust.env` is the one source of
+   truth for "what does this box trust" — every path that resolves a
+   fingerprint on an already-provisioned box must agree with it, not
+   guess by a name pattern that can match more than one key.
+2. **A failed retire is now a named, persisted state, not a warning the
+   process forgets the instant it exits.** `sign_and_publish_trust`
+   writes the un-retired fingerprint to `$H/constitutional/.stale_trust_key`
+   when the delete fails; `retire_stale_key_if_marked()` (called at the
+   top of both the plain install and `--rotate`, right after
+   `GNUPGHOME_TO` exists) retries that retire on every subsequent run,
+   clearing the marker on success and reprinting the same named warning
+   — never silently — on repeat failure. Trust itself is never at risk
+   either way: fix (1) means step 1b keeps trusting whatever `trust.env`
+   already names regardless of whether the stale key's retire ever
+   succeeds.
 
 ### N1: the syscall-table residual (Loki audit `D06A0EF3`)
 

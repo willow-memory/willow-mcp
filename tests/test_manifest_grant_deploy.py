@@ -217,6 +217,34 @@ def _install_sh_retires_before_verify(install_sh_text: str) -> bool:
     return idx_delete < idx_verify
 
 
+_F_B_REQUIRED_MARKERS = (
+    "TRUST_ENV_FPR", "STALE_KEY_MARKER", "retire_stale_key_if_marked",
+    "list-secret-keys",
+)
+
+
+def _install_sh_missing_f_b_markers(install_sh_text: str) -> list[str]:
+    """F-B (dispatch 10F9E837, Loki audit 23DE8AA9): step 1b must prefer
+    trust.env's own fingerprint (checked via list-secret-keys) over the
+    $KEY_UID substring lookup, and a failed retire must persist as a named
+    marker a later run retries -- not merely print a warning."""
+    body = _script_body(install_sh_text)
+    return [marker for marker in _F_B_REQUIRED_MARKERS if marker not in body]
+
+
+def _install_sh_step_1b_prefers_trust_env_fpr(install_sh_text: str) -> bool:
+    """True (correct) only when the TRUST_ENV_FPR check appears BEFORE the
+    $KEY_UID substring lookup in step 1b -- the ordering that actually
+    prevents the F-B reversion (checking trust.env first, falling back to
+    the substring search only when its key is gone)."""
+    body = _script_body(install_sh_text)
+    idx_prefer = body.find("TRUST_ENV_FPR=")
+    idx_fallback = body.find('gpg --batch --list-keys --with-colons "$KEY_UID"')
+    if idx_prefer == -1 or idx_fallback == -1:
+        return False
+    return idx_prefer < idx_fallback
+
+
 def _install_sh_missing_pgp_dropin_strip(install_sh_text: str) -> bool:
     body = _script_body(install_sh_text)
     return "willow-mcp-serve.service.d/pgp.conf" not in body
@@ -371,9 +399,36 @@ def test_plant_every_deploy_scan_helper_catches_its_violation():
 
     assert _install_md_missing_vault_ruling_and_closure("nothing about a vault here") is True
     assert _install_md_missing_vault_ruling_and_closure(
-        'it should be in the vault with the rest of the keys" -- not closed by '
-        "default; see Provisioning a new box"
+        "rework #4, Loki audit 23DE8AA9, F-C reverted WILLOW_VAULT_BOX -- a broker-settable "
+        "variable is a worse problem; the rename-away hole is UNCHANGED and still open"
     ) is False
+
+    assert _install_md_missing_f_a_explanation("nothing about a fresh install here") is True
+    assert _install_md_missing_f_a_explanation(
+        "F-A: a truly fresh install, no register at all, dispatch 10F9E837, "
+        "_load_active_register treats it as active: []"
+    ) is False
+
+    assert _install_md_missing_f_b_explanation("nothing about a failed retire here") is True
+    assert _install_md_missing_f_b_explanation(
+        "F-B: a failed retire, dispatch 10F9E837, .stale_trust_key, "
+        "step 1b prefers trust.env's own fingerprint"
+    ) is False
+
+    assert _install_sh_missing_f_b_markers("set -euo pipefail\nnothing here") == list(
+        _F_B_REQUIRED_MARKERS
+    )
+    assert _install_sh_missing_f_b_markers(
+        "set -euo pipefail\n" + " ".join(_F_B_REQUIRED_MARKERS)
+    ) == []
+
+    assert _install_sh_step_1b_prefers_trust_env_fpr(
+        'set -euo pipefail\nTRUST_ENV_FPR=x\ngpg --batch --list-keys --with-colons "$KEY_UID"\n'
+    ) is True
+    assert _install_sh_step_1b_prefers_trust_env_fpr(
+        'set -euo pipefail\ngpg --batch --list-keys --with-colons "$KEY_UID"\nTRUST_ENV_FPR=x\n'
+    ) is False
+    assert _install_sh_step_1b_prefers_trust_env_fpr("neither marker present") is False
 
 
 def test_all_five_files_present():
@@ -434,10 +489,39 @@ def _install_md_still_claims_a_stop_anywhere_leaves_the_box_as_it_was(text: str)
 
 
 def _install_md_missing_vault_ruling_and_closure(text: str) -> bool:
+    """F-C (dispatch 10F9E837, Loki audit 23DE8AA9): the document must
+    explain that the WILLOW_VAULT_BOX-based location was reverted (not
+    silently dropped), name F-C, and still state honestly that the
+    rename-away hole is unchanged and open — never claim the reverted
+    recipe closed it."""
+    lowered = text.lower()
     return not (
-        "it should be in the vault with the rest of the keys" in text
-        and "not closed" in text.lower()
-        and "Provisioning a new box" in text
+        "23de8aa9" in lowered
+        and "f-c" in lowered
+        and "willow_vault_box" in lowered
+        and ("reverted" in lowered or "revert" in lowered)
+        and "unchanged" in lowered
+        and "still open" in lowered
+    )
+
+
+def _install_md_missing_f_a_explanation(text: str) -> bool:
+    lowered = text.lower()
+    return not (
+        "f-a" in lowered
+        and "10f9e837" in lowered
+        and "fresh install" in lowered
+        and "_load_active_register" in text
+    )
+
+
+def _install_md_missing_f_b_explanation(text: str) -> bool:
+    lowered = text.lower()
+    return not (
+        "f-b" in lowered
+        and "10f9e837" in lowered
+        and ".stale_trust_key" in lowered
+        and "trust.env" in lowered
     )
 
 
@@ -481,12 +565,40 @@ def test_install_md_no_longer_claims_a_stop_anywhere_leaves_the_box_exactly_as_i
 
 
 def test_install_md_documents_the_vault_ruling_and_its_closure_condition():
-    """The location work: the operator's ruling is named verbatim, and the
-    document does not silently claim the rename-away hole is closed —
-    it states the actual condition (a genuinely separate, root-provisioned
-    WILLOW_VAULT_BOX) and names today's box as NOT meeting it."""
+    """F-C (dispatch 10F9E837): the document explains that the
+    WILLOW_VAULT_BOX-based location was reverted, names F-C, and states
+    the rename-away hole is unchanged and still open — never claims the
+    reverted recipe closed it."""
     text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
     assert _install_md_missing_vault_ruling_and_closure(text) is False
+
+
+def test_install_md_documents_f_a_the_fresh_install_fix():
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_missing_f_a_explanation(text) is False
+
+
+def test_install_md_documents_f_b_the_failed_retire_fix():
+    text = (_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")
+    assert _install_md_missing_f_b_explanation(text) is False
+
+
+def test_install_sh_has_the_f_b_markers_and_ordering():
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    assert _install_sh_missing_f_b_markers(text) == []
+    assert _install_sh_step_1b_prefers_trust_env_fpr(text) is True
+
+
+def test_install_sh_no_longer_resolves_trust_env_through_vault_box():
+    """F-C: install.sh's own TRUST_ENV resolution must not READ
+    $WILLOW_VAULT_BOX at all (the bare word may still appear in comments
+    explaining why it was reverted) -- a fixed $H/constitutional/trust.env,
+    matching paths.trust_config_path() exactly."""
+    text = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
+    body = _script_body(text)
+    assert 'TRUST_ENV="$H/constitutional/trust.env"' in body
+    assert "$WILLOW_VAULT_BOX" not in body
+    assert "${WILLOW_VAULT_BOX" not in body
 
 
 def test_every_file_cites_both_sealed_pairs():

@@ -140,27 +140,33 @@ ETC=/etc/willow-mcp
 # agreed (Loki A38D41C2, F8).
 #
 # Rework #3 (dispatch FA4F79AC, 2026-09-23; operator ruling, verbatim: "it
-# should be in the vault with the rest of the keys"): TRUST_ENV now lives
-# under the VAULT ($WILLOW_VAULT_BOX when the operator has configured one
-# outside $H, else $H itself -- src/willow_mcp/paths.py's
-# operator_secrets_root(), matched here in bash), in its OWN
-# trust-owner-owned constitutional/ subdirectory -- same convention as
-# $H/constitutional/, never the vault's own top level, because the vault's
-# top level ALSO holds the broker's own secrets (dispatch_signing.key,
-# vault.key, vault.db) which must stay broker-writable. Trust-owner-owned,
-# 0644, WORLD-READABLE: every verifying process (broker, serve, desk, the
-# trust-owner apply unit, this script) reads the SAME file, and only the
-# trust owner (or root) can write it.
+# should be in the vault with the rest of the keys") routed TRUST_ENV
+# through a separately-configured WILLOW_VAULT_BOX. Rework #4 (dispatch
+# 10F9E837, Loki audit 23DE8AA9, F-C) reverted that: WILLOW_VAULT_BOX is a
+# variable the BROKER's own process env can set too, and once it is set
+# anywhere other than $H, this script (root, sudo environment, normally
+# stripped) and the broker (its own env) can resolve DIFFERENT files as
+# "the" trust source -- worse than the rename-away hole it tried to close.
+# TRUST_ENV is a fixed $H/constitutional/trust.env, exactly matching
+# src/willow_mcp/paths.py's trust_config_path() (no env-var indirection on
+# either side) -- trust-owner-owned, 0644, WORLD-READABLE: every verifying
+# process (broker, serve, desk, the trust-owner apply unit, this script)
+# reads the SAME file at the SAME fixed path, and only the trust owner (or
+# root) can write it.
 #
-# THE RENAME-AWAY HOLE (Loki audit D06A0EF3) is closed ONLY when VAULT
-# differs from $H and VAULT's own directory is root-provisioned outside any
-# path the broker's uid can write -- NOT the case by default (VAULT_BOX
-# unset, or set to $H, both leave VAULT == $H, broker-owned 700, unchanged
-# from before this rework). See paths.trust_config_path()'s own docstring
-# for the exact condition and INSTALL.md's "Provisioning a new box" section
-# for the root step that closes it where it CAN be closed.
-VAULT="${WILLOW_VAULT_BOX:-$H}"
-TRUST_ENV="$VAULT/constitutional/trust.env"
+# THE RENAME-AWAY HOLE (Loki audit D06A0EF3) is UNCHANGED by this and still
+# open: $H is broker-owned, mode 700, so the broker can rename
+# constitutional/ away and recreate it empty. See paths.trust_config_path()'s
+# own docstring and INSTALL.md for the argument and the (larger,
+# out-of-scope) root step that would close it.
+TRUST_ENV="$H/constitutional/trust.env"
+# F-B (Loki audit 23DE8AA9): a --rotate whose old-key retire fails
+# (warned, not persisted) used to be silently reverted by the next plain
+# install, which deleted the NEW key -- see sign_and_publish_trust's own
+# retire branch and step 1b below. This marker is the named state that
+# survives a warning: the fingerprint a failed retire could not remove,
+# retried at the top of every run until it succeeds.
+STALE_KEY_MARKER="$H/constitutional/.stale_trust_key"
 KEY_UID='willow-mcp manifest-grant (trust owner) <manifest-grant@willow-operator-box>'
 HERE=$(cd "$(dirname "$0")" && pwd)
 CHECKOUT=$(cd "$HERE/../.." && pwd)   # deploy/manifest-grant/ -> checkout root
@@ -412,6 +418,34 @@ restart_broker() {
   say "  session will conflict with $TRUST_ENV and refuse to boot."
 }
 
+# retire_stale_key_if_marked: F-B (Loki audit 23DE8AA9) -- a failed retire
+# used to be ONLY a printed WARNING, forgotten the moment the script exited.
+# sign_and_publish_trust's retire branch now records the fingerprint it
+# could not remove at $STALE_KEY_MARKER instead; this function retries that
+# retire at the top of every run (plain install and --rotate both call it,
+# right after GNUPGHOME_TO exists), clearing the marker on success and
+# reprinting the SAME named warning (not a silent no-op) on repeat failure.
+# Idempotent, harmless when no marker exists.
+retire_stale_key_if_marked() {
+  [ -f "$STALE_KEY_MARKER" ] || return 0
+  local stale
+  stale=$(cat "$STALE_KEY_MARKER" 2>/dev/null || true)
+  if [ -z "$stale" ]; then
+    rm -f "$STALE_KEY_MARKER"
+    return 0
+  fi
+  say "== retiring the previous trust-owner key a prior run could not remove ($stale)"
+  if as_to gpg --batch --yes --delete-secret-and-public-key "$stale" 2>/dev/null; then
+    rm -f "$STALE_KEY_MARKER"
+    say "  retired $stale -- $STALE_KEY_MARKER cleared"
+  else
+    say "  STILL could not retire $stale from $GNUPGHOME_TO -- $STALE_KEY_MARKER remains;"
+    say "  retire it by hand (as_to gpg --batch --yes --delete-secret-and-public-key $stale)"
+    say "  or rerun once the cause is fixed. Trust itself is unaffected either way: step 1b"
+    say "  always prefers whatever fingerprint \$TRUST_ENV already names."
+  fi
+}
+
 # sign_and_publish_trust: the ONE code path for "change what is trusted" --
 # Loki re-audit 93D0F057, N1: the plain install used to publish trust.env at
 # step 1b and re-sign at step 6, many steps and several stop points later
@@ -446,8 +480,18 @@ sign_and_publish_trust() {
   if [ -n "$old_fpr" ] && [ "$old_fpr" != "$new_fpr" ]; then
     if as_to gpg --batch --yes --delete-secret-and-public-key "$old_fpr"; then
       say "  retired previous trust-owner key $old_fpr from $GNUPGHOME_TO"
+      [ -f "$STALE_KEY_MARKER" ] && rm -f "$STALE_KEY_MARKER"
     else
-      say "  WARNING: could not retire $old_fpr from $GNUPGHOME_TO -- retire it by hand (as_to gpg --batch --yes --delete-secret-and-public-key $old_fpr)"
+      # F-B (Loki audit 23DE8AA9): a bare warning here used to be the ONLY
+      # record of this failure -- forgotten the instant the script exited,
+      # and step 1b's OLD key-UID lookup would then find $old_fpr again on
+      # the next plain install and silently revert this rotation. Persist
+      # it as a named state retire_stale_key_if_marked() retries every run.
+      printf '%s\n' "$old_fpr" > "$STALE_KEY_MARKER"
+      say "  WARNING: could not retire $old_fpr from $GNUPGHOME_TO -- recorded at"
+      say "  $STALE_KEY_MARKER; the next run retries it automatically, and \$TRUST_ENV"
+      say "  still names $new_fpr regardless (step 1b will not revert to $old_fpr)."
+      say "  Retire it by hand any time: as_to gpg --batch --yes --delete-secret-and-public-key $old_fpr"
     fi
   fi
 }
@@ -507,6 +551,7 @@ if [ -n "$ROTATE" ]; then
   # is left in GNUPGHOME (never deleted) until every governed file verifies
   # under the new one, below.
   install -d -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 700 "$(dirname "$GNUPGHOME_TO")" "$GNUPGHOME_TO"
+  retire_stale_key_if_marked
   ROTATE_UID="$KEY_UID $(date -u +%Y%m%dT%H%M%SZ)"
   as_to gpg --batch --pinentry-mode loopback --passphrase '' \
     --quick-gen-key "$ROTATE_UID" ed25519 sign never
@@ -683,36 +728,29 @@ if [ -f "$REG" ]; then
   chmod 644 "$REG"
 fi
 
-# ---- vault provisioning: trust.env's OWN directory (dispatch FA4F79AC) ----
-# TRUST_ENV lives at $VAULT/constitutional/trust.env, never $H/constitutional
-# alone -- see TRUST_ENV's own definition above for why (the vault, beside
-# the box's other keys). When $VAULT == $H (the default: WILLOW_VAULT_BOX
-# unset, or set to $H) this is the SAME directory already provisioned two
-# lines up -- idempotent, no separate step needed. When $VAULT differs, its
-# own constitutional/ subdirectory needs the same trust-owner ownership.
-if [ "$VAULT" != "$H" ]; then
-  install -d -m 755 "$VAULT"
-  install -d -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 755 "$VAULT/constitutional"
-  chown "$TRUST_OWNER:$TRUST_OWNER" "$VAULT/constitutional"
-  chmod 755 "$VAULT/constitutional"
-fi
-# RENAME-AWAY CHECK (Loki audit D06A0EF3), read-only -- a rename needs write
-# on the PARENT, so what actually matters is $VAULT's OWN ownership, not
-# constitutional/'s. Report the true state rather than claim a close this
-# script cannot perform: fully closing it needs $VAULT itself provisioned
-# outside any path the broker's uid can write, WITH the broker's own
-# secrets (dispatch_signing.key, vault.key, vault.db) relocated to a
-# broker-owned subdirectory of $VAULT it can still write -- a larger,
-# deliberate root act, not something this idempotent installer run should
-# do silently on every invocation. See INSTALL.md's "Provisioning a new
-# box" section for that step.
-VAULT_UID=$(stat -c %u "$VAULT")
-if [ "$VAULT_UID" = "$OPERATOR_UID" ]; then
-  say "  NOTE: $VAULT (trust.env's vault) is owned by the broker (uid $OPERATOR_UID) --"
-  say "  the rename-away hole (Loki D06A0EF3) is NOT closed by this location alone."
-  say "  See INSTALL.md's 'Provisioning a new box' section for the root step that closes it."
+# RENAME-AWAY, still open (Loki audit D06A0EF3), read-only report -- $H is
+# broker-owned mode 700 (the broker's own working home), so the broker can
+# rename constitutional/ away and recreate it empty; a rename needs write
+# only on the PARENT. Rework #3 (dispatch FA4F79AC) tried closing this by
+# routing TRUST_ENV through a separately-configured WILLOW_VAULT_BOX --
+# reverted by rework #4 (dispatch 10F9E837, Loki audit 23DE8AA9, F-C): a
+# location a broker's own process env can steer is a worse problem than
+# the one it tried to solve. TRUST_ENV is back to a fixed
+# $H/constitutional/trust.env, matching paths.trust_config_path() exactly
+# (no env-var indirection on either side). Closing the rename-away hole
+# for real needs $H ITSELF to resolve to a root-provisioned location for
+# every process that shares this box -- a larger deploy/architecture
+# change, out of this dispatch's scope; reported here, not silently
+# assumed closed.
+H_UID=$(stat -c %u "$H")
+if [ "$H_UID" = "$OPERATOR_UID" ]; then
+  say "  NOTE: $H is owned by the broker (uid $OPERATOR_UID) -- the rename-away hole"
+  say "  (Loki D06A0EF3) is NOT closed. Closing it needs \$WILLOW_HOME itself to resolve"
+  say "  to a root-provisioned location outside the broker's own writable tree, not an"
+  say "  env-var override any process (including the broker) can set -- see F-C, Loki"
+  say "  audit 23DE8AA9, and INSTALL.md."
 else
-  say "  $VAULT (trust.env's vault) is not broker-owned -- the rename-away hole is closed"
+  say "  $H is not broker-owned -- the rename-away hole is closed"
 fi
 # federation.ratify (row 23) writes mcp_apps/_federation/servers.json —
 # already under mcp_apps/, already trust-owner-owned by the recursive chown
@@ -727,14 +765,33 @@ fi
 # "3.", unchanged in content, only in position.
 say "== 1b. signing key owned by $TRUST_OWNER"
 install -d -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 700 "$(dirname "$GNUPGHOME_TO")" "$GNUPGHOME_TO"
-FPR=$(as_to gpg --batch --list-keys --with-colons "$KEY_UID" 2>/dev/null | awk -F: '/^fpr/{print $10; exit}' || true)
-if [ -z "$FPR" ]; then
-  as_to gpg --batch --pinentry-mode loopback --passphrase '' \
-    --quick-gen-key "$KEY_UID" ed25519 sign never
-  FPR=$(as_to gpg --batch --list-keys --with-colons "$KEY_UID" | awk -F: '/^fpr/{print $10; exit}')
-  say "generated $FPR"
+retire_stale_key_if_marked
+
+# F-B (Loki audit 23DE8AA9): on a box that already HAS a $TRUST_ENV, that
+# file already names the one fingerprint this box trusts -- prefer it
+# explicitly over guessing by $KEY_UID substring, which returns the FIRST
+# matching key GNUPGHOME_TO happens to hold. That lookup used to win even
+# after a --rotate: the rotated key's UID is "$KEY_UID <timestamp>", so a
+# plain install's substring search still found the OLDER key first,
+# re-signed everything under it, republished it to $TRUST_ENV, and then
+# deleted the NEWER key as "old_fpr" -- silently reverting a completed
+# rotation. $TRUST_ENV is the one source of truth; every path that resolves
+# a fingerprint on an already-provisioned box must agree with it.
+TRUST_ENV_FPR=$(grep -E '^WILLOW_PGP_FINGERPRINT=' "$TRUST_ENV" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+FPR=""
+if [ -n "$TRUST_ENV_FPR" ] && as_to gpg --batch --list-secret-keys --with-colons "$TRUST_ENV_FPR" >/dev/null 2>&1; then
+  FPR="$TRUST_ENV_FPR"
+  say "  $TRUST_ENV already names $FPR, and its secret key is present -- using it (F-B)"
 else
-  say "key already present: $FPR"
+  FPR=$(as_to gpg --batch --list-keys --with-colons "$KEY_UID" 2>/dev/null | awk -F: '/^fpr/{print $10; exit}' || true)
+  if [ -z "$FPR" ]; then
+    as_to gpg --batch --pinentry-mode loopback --passphrase '' \
+      --quick-gen-key "$KEY_UID" ed25519 sign never
+    FPR=$(as_to gpg --batch --list-keys --with-colons "$KEY_UID" | awk -F: '/^fpr/{print $10; exit}')
+    say "generated $FPR"
+  else
+    say "key already present: $FPR"
+  fi
 fi
 # public half into the broker's keyring, trusted ultimately (the gate verifies against it)
 as_to gpg --batch --armor --export "$FPR" | sudo -u "$OPERATOR" gpg --batch --import
