@@ -2908,8 +2908,9 @@ def task_submit(
     per-task envelope passed as `network_authorization`. The envelope binds the
     submitter, task id, agent, normalized task hash, network scope, expiry, and
     nonce. The signed task id is the queue primary key, preventing the envelope
-    from authorizing a second row. `# allow_net` and `# allow_localhost` remain
-    requests, never authority.
+    from authorizing a second row. `# allow_net` remains a request, never
+    authority. `# allow_localhost` is retired outright (see below) — it is
+    not merely un-authoritative, it is refused.
 
     Local Postgres access (socket mount + PG/POSTGRES env) requires `allow_db=True`
     and the separate `task_db` manifest capability — not granted by task_queue or
@@ -3058,7 +3059,8 @@ def task_submit(
         # Key 3: has the operator issued a live lease for THIS app? (B-32)
         # A capability that never expires is indistinguishable from one that was
         # self-granted an hour ago; a lease has a clock and an issuer.
-        # allow_localhost skips this — a local process is not a net lease.
+        # allow_localhost is retired and never reaches this point at all
+        # (refused by name earlier in this function).
         lease_state = lease.read_lease(app_id)
         # Decision c8572a92: a submission with NO envelope takes the held path
         # below, where the operator's seal stands in for the lease for that
