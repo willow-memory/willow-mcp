@@ -30,15 +30,38 @@ Dependency-free (no ``willow_mcp`` import), same convention as
 ``sync_constitutional.py`` — this runs as root (resign) or the operator
 (check) before/without the package necessarily being on that interpreter's
 path.
+
+Rework (Loki audit A38D41C2, F7): the first cut rolled back only on a
+caught ``Exception``. ``KeyboardInterrupt`` (Ctrl-C) and a delivered
+``SIGTERM`` are not ``Exception`` subclasses in Python — either one landing
+mid-batch skipped rollback entirely and left the box half-rotated (measured:
+Kart probe P8, ``sigs [NEW, NEW, OLD]``). ``resign_all`` now (1) installs a
+``SIGTERM`` handler that raises the same way Ctrl-C already does, so both
+signals drive the identical rollback path, and (2) catches ``BaseException``
+in the per-file loop, not ``Exception`` — the only things that still escape
+are ``SystemExit`` calls this module itself never makes and a small set of
+truly unrecoverable interpreter states rollback cannot help with anyway.
+``.sig`` writes are also no longer a direct ``write_bytes`` (a partial write
+on the live path is observable to a concurrent reader mid-write, and is not
+atomic against a crash); each write goes to a sibling temp file and
+``os.replace``s over the live path, both under the SAME directory flock
+``pgp.signed_pair_lock`` uses elsewhere in this codebase — reimplemented
+locally here (dependency-free) rather than imported, same convention as
+``sync_constitutional.py``. ``verify_fn`` now also checks WHICH key signed,
+not merely that ``gpg --verify`` exited 0 — a signature that verifies but
+was minted under the wrong key must not be reported as success.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 
 class ResignFailed(Exception):
@@ -52,15 +75,73 @@ class ResignFailed(Exception):
         )
 
 
+class _Interrupted(BaseException):
+    """Raised by the SIGTERM handler installed in ``resign_all`` so a
+    delivered SIGTERM drives the exact same rollback path Ctrl-C
+    (``KeyboardInterrupt``) already does — neither is an ``Exception``
+    subclass, which is exactly the gap F7 measured."""
+
+
 def _sig_path(path: Path) -> Path:
     return path.parent / f"{path.name}.sig"
 
 
+@contextmanager
+def _sig_lock(path: Path) -> Iterator[None]:
+    """Same directory-flock discipline as ``willow_mcp.pgp.signed_pair_lock``
+    — reimplemented locally (dependency-free, matching this module's own
+    convention) rather than imported. Locking the CONTAINING directory,
+    not the file itself, lets a publisher replace the file (a rename
+    cannot replace the inode a lock is held on) while a concurrent reader
+    (the broker, mid-verify) waits rather than observing a torn write."""
+    import fcntl
+
+    directory = path.parent
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _write_sig_atomic(sig_path: Path, sig_bytes: bytes) -> None:
+    """Write ``sig_bytes`` to ``sig_path`` via a sibling temp file plus
+    ``os.replace`` (atomic on the same filesystem), under ``_sig_lock`` so
+    no concurrent reader can observe a partially-written file."""
+    with _sig_lock(sig_path):
+        tmp = sig_path.with_name(f"{sig_path.name}.tmp-{os.getpid()}")
+        tmp.write_bytes(sig_bytes)
+        os.replace(tmp, sig_path)
+
+
 def _restore(sig_path: Path, prev_sig: "bytes | None") -> None:
-    if prev_sig is None:
-        sig_path.unlink(missing_ok=True)
-    else:
-        sig_path.write_bytes(prev_sig)
+    with _sig_lock(sig_path):
+        if prev_sig is None:
+            sig_path.unlink(missing_ok=True)
+            return
+        tmp = sig_path.with_name(f"{sig_path.name}.tmp-{os.getpid()}")
+        tmp.write_bytes(prev_sig)
+        os.replace(tmp, sig_path)
+
+
+@contextmanager
+def _sigterm_trap() -> Iterator[None]:
+    """Install a SIGTERM handler that raises ``_Interrupted`` for the
+    duration of the ``with`` block, restoring whatever handler was there
+    before on the way out (there is no reason to keep an unusual SIGTERM
+    behavior once the batch this trap exists to protect has finished)."""
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def _handler(signum, frame):  # noqa: ANN001 — signal handler signature
+        raise _Interrupted(f"received signal {signum}")
+
+    signal.signal(signal.SIGTERM, _handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def resign_all(
@@ -78,6 +159,11 @@ def resign_all(
     path that does not exist is reported ``skipped_absent`` and never
     touched — rotate has nothing to re-sign for a manifest that was never
     created.
+
+    Catches ``BaseException`` (F7) — Ctrl-C and a trapped SIGTERM
+    (``_sigterm_trap``, installed for the duration of this call) both
+    raise something that is NOT an ``Exception`` subclass, and both must
+    still trigger the exact same rollback ``Exception`` already gets.
     """
     existing = [f for f in files if f.is_file()]
     pre_sig: "dict[Path, bytes | None]" = {
@@ -90,18 +176,22 @@ def resign_all(
         "skipped_absent": [str(f) for f in files if f not in existing],
     }
     signed_so_far: "list[Path]" = []
-    for f in existing:
-        try:
-            sig_bytes = sign_fn(f)
-            if not verify_fn(f, sig_bytes):
-                raise RuntimeError("signature did not verify immediately after signing")
-        except Exception as exc:
-            for done in signed_so_far:
-                _restore(_sig_path(done), pre_sig[done])
-            raise ResignFailed(str(f), str(exc)) from exc
-        _sig_path(f).write_bytes(sig_bytes)
-        signed_so_far.append(f)
-        report["signed"].append(str(f))
+    with _sigterm_trap():
+        for f in existing:
+            try:
+                sig_bytes = sign_fn(f)
+                if not verify_fn(f, sig_bytes):
+                    raise RuntimeError(
+                        "signature did not verify immediately after signing "
+                        "(or verified under the wrong key)"
+                    )
+            except BaseException as exc:
+                for done in signed_so_far:
+                    _restore(_sig_path(done), pre_sig[done])
+                raise ResignFailed(str(f), str(exc)) from exc
+            _write_sig_atomic(_sig_path(f), sig_bytes)
+            signed_so_far.append(f)
+            report["signed"].append(str(f))
     return report
 
 
@@ -169,16 +259,37 @@ def _make_sign_fn(trust_owner: str, gnupg_home: str, fingerprint: str) -> "Calla
     return sign_fn
 
 
-def _make_verify_fn(trust_owner: str, gnupg_home: str) -> "Callable[[Path, bytes], bool]":
+def _make_verify_fn(
+    trust_owner: str, gnupg_home: str, expected_fingerprint: str
+) -> "Callable[[Path, bytes], bool]":
+    """Rework (Loki audit A38D41C2, F7): the first cut only checked that
+    `gpg --verify` exited 0 — a signature that verifies but was minted
+    under a DIFFERENT key (a stale gpg-agent cache, a `--local-user`
+    typo, a second key sharing the box) would still pass. `--status-fd=1`
+    is parsed for `VALIDSIG` the same way `_signer_fingerprint` already
+    does for `--check`, and the signer must match `expected_fingerprint`
+    — the fingerprint this batch is signing FOR, not whatever `gpg`
+    happened to use."""
+    expected = expected_fingerprint.strip().upper()
+
     def verify_fn(path: Path, sig_bytes: bytes) -> bool:
         proc = subprocess.run(
             [
                 "sudo", "-u", trust_owner, f"GNUPGHOME={gnupg_home}",
-                "gpg", "--batch", "--verify", "-", str(path),
+                "gpg", "--batch", "--verify", "--status-fd=1", "-", str(path),
             ],
             input=sig_bytes, capture_output=True,
         )
-        return proc.returncode == 0
+        if proc.returncode != 0:
+            return False
+        stdout_text = (proc.stdout or b"").decode("utf-8", errors="replace")
+        for line in stdout_text.splitlines():
+            if line.startswith("[GNUPG:] VALIDSIG"):
+                parts = line.split()
+                if len(parts) >= 12 and parts[11].upper() == expected:
+                    return True
+                return False
+        return False
 
     return verify_fn
 
@@ -219,7 +330,7 @@ def main(argv: "list[str] | None" = None) -> int:
               file=sys.stderr)
         return 2
     sign_fn = _make_sign_fn(args.sign_as, args.gnupg_home, args.fingerprint)
-    verify_fn = _make_verify_fn(args.sign_as, args.gnupg_home)
+    verify_fn = _make_verify_fn(args.sign_as, args.gnupg_home, args.fingerprint)
     try:
         report = resign_all(args.files, sign_fn, verify_fn)
     except ResignFailed as exc:

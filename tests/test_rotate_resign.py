@@ -114,6 +114,92 @@ def test_resign_all_removes_sig_on_rollback_when_none_existed_before(tmp_path):
         assert not (tmp_path / f"{f.name}.sig").exists()
 
 
+def test_resign_all_rolls_back_on_keyboardinterrupt_mid_batch(tmp_path):
+    """Loki audit A38D41C2, F7: KeyboardInterrupt is not an Exception
+    subclass in Python — the first cut's `except Exception` let Ctrl-C
+    mid-batch skip rollback entirely (measured: sigs left [NEW, NEW, OLD]).
+    `resign_all` now catches BaseException, so the same rollback fires."""
+    files = _make_files(tmp_path, ["a.json", "b.json", "c.json"])
+    signer = _FakeSigner()
+
+    calls = {"n": 0}
+    real_sign = signer.sign_fn
+
+    def sign_fn(path):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise KeyboardInterrupt()
+        return real_sign(path)
+
+    with pytest.raises(rotate_resign.ResignFailed):
+        rotate_resign.resign_all(files, sign_fn, signer.verify_fn)
+    for f in files:
+        sig = tmp_path / f"{f.name}.sig"
+        assert sig.read_bytes() == f"OLDSIG:{f.name}".encode(), (
+            f"{f.name}.sig was not restored after a simulated Ctrl-C"
+        )
+
+
+def test_resign_all_rolls_back_on_simulated_sigterm(tmp_path):
+    """The other half of F7: a delivered SIGTERM must drive the exact same
+    rollback path as Ctrl-C. `_sigterm_trap` installs a handler (for the
+    duration of `resign_all`) that raises `_Interrupted` — raised directly
+    here rather than via a real `os.kill`/`signal.raise_signal` round trip,
+    which would be timing-sensitive under a test runner that may install
+    its own signal handling (pytest-timeout)."""
+    files = _make_files(tmp_path, ["a.json", "b.json"])
+    signer = _FakeSigner()
+
+    calls = {"n": 0}
+    real_sign = signer.sign_fn
+
+    def sign_fn(path):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise rotate_resign._Interrupted("simulated SIGTERM")
+        return real_sign(path)
+
+    with pytest.raises(rotate_resign.ResignFailed):
+        rotate_resign.resign_all(files, sign_fn, signer.verify_fn)
+    for f in files:
+        sig = tmp_path / f"{f.name}.sig"
+        assert sig.read_bytes() == f"OLDSIG:{f.name}".encode()
+
+
+def test_sigterm_trap_installs_and_restores_the_handler(tmp_path):
+    """`_sigterm_trap` must restore whatever handler was there before on
+    the way out — it should not leave the process with a permanently
+    altered SIGTERM handler after `resign_all` returns."""
+    import signal
+
+    previous = signal.getsignal(signal.SIGTERM)
+    with rotate_resign._sigterm_trap():
+        during = signal.getsignal(signal.SIGTERM)
+        assert during is not previous
+    after = signal.getsignal(signal.SIGTERM)
+    assert after is previous
+
+
+def test_resign_all_leaves_no_temp_files_behind_on_success(tmp_path):
+    """The .sig write goes to a sibling temp file and os.replace()s over
+    the live path (atomic, and never observable mid-write) — after a
+    successful run, no `.tmp-*` sibling should remain."""
+    files = _make_files(tmp_path, ["a.json", "b.json"])
+    signer = _FakeSigner()
+    rotate_resign.resign_all(files, signer.sign_fn, signer.verify_fn)
+    leftover = list(tmp_path.glob("*.tmp-*"))
+    assert leftover == [], f"temp file(s) left behind: {leftover}"
+
+
+def test_resign_all_leaves_no_temp_files_behind_on_rollback(tmp_path):
+    files = _make_files(tmp_path, ["a.json", "b.json"])
+    signer = _FakeSigner(fail_signing_for={str(files[1])})
+    with pytest.raises(rotate_resign.ResignFailed):
+        rotate_resign.resign_all(files, signer.sign_fn, signer.verify_fn)
+    leftover = list(tmp_path.glob("*.tmp-*"))
+    assert leftover == [], f"temp file(s) left behind after rollback: {leftover}"
+
+
 def test_check_all_reports_absent_unsigned_ok_and_mismatch(tmp_path, monkeypatch):
     ok = tmp_path / "ok.json"
     ok.write_text("ok\n")

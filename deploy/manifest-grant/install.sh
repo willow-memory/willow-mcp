@@ -22,8 +22,11 @@
 #   sudo bash install.sh --check    # detect-only, change nothing
 #
 # Idempotent: every step converges; re-running after a stop is the intended
-# recovery. Nothing here reads the broker's env file except the two values
-# the unit needs (WILLOW_PG_DB) and the fingerprint it writes back.
+# recovery. Nothing here reads the broker's env file ($H/env, 0600, provider
+# secrets) except WILLOW_PG_DB. The signing fingerprint lives in its own
+# trust-owner-owned, world-readable file (dispatch 0CB0C85C:
+# $WILLOW_HOME/constitutional/trust.env) — a fingerprint is public, only a
+# key's private half is a secret, so it does not belong beside provider keys.
 #
 # Amendment (pair 1bd6fd29, install.sh audit pass): two prior steps guessed at
 # names an auditor would flag —
@@ -129,6 +132,17 @@ H=/home/$OPERATOR/sean-data-vault/willow-operator-box
 TRUST_OWNER=willow-operator
 GNUPGHOME_TO=/var/lib/willow-mcp/manifest-grant/gnupg
 ETC=/etc/willow-mcp
+# Dispatch 0CB0C85C (amending B291C0C7/E29CCFC7): a fingerprint is public --
+# only a key's PRIVATE half is a secret. $H/env is 0600 (every provider API
+# key); the trust-owner apply unit (uid willow-operator) cannot read it, so a
+# second copy in /etc/willow-mcp/manifest-grant.env existed only so that unit
+# could see the fingerprint -- and nothing ever checked the two copies still
+# agreed (Loki A38D41C2, F8). TRUST_ENV lives beside the active register and
+# syscall table (constitutional/ is already trust-owner-owned, 0755) --
+# trust-owner-owned, 0644, WORLD-READABLE: every verifying process (broker,
+# serve, desk, the trust-owner apply unit, this script) reads the SAME file,
+# and only the trust owner (or root) can write it.
+TRUST_ENV="$H/constitutional/trust.env"
 KEY_UID='willow-mcp manifest-grant (trust owner) <manifest-grant@willow-operator-box>'
 HERE=$(cd "$(dirname "$0")" && pwd)
 CHECKOUT=$(cd "$HERE/../.." && pwd)   # deploy/manifest-grant/ -> checkout root
@@ -209,6 +223,19 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Loki audit A38D41C2, F6: a flag combination must mean what it says, or
+# refuse rather than silently doing something else. `--retire` alone (no
+# `--rotate`) used to be parsed and then ignored, falling through into the
+# full mutating plain install; `--check --rotate` used to mutate anyway,
+# because `--check`'s own gate only fired AFTER `--rotate` had already
+# exited. Both are refused up front, before anything is touched.
+if [ "${#RETIRE_FPRS[@]}" -gt 0 ] && [ -z "$ROTATE" ]; then
+  stop "--retire only makes sense with --rotate (there is no key being replaced to retire the old one for). Did you mean: sudo bash install.sh --rotate --retire ${RETIRE_FPRS[0]}?"
+fi
+if [ -n "$CHECK_ONLY" ] && [ -n "$ROTATE" ]; then
+  stop "--check and --rotate are mutually exclusive: --check inspects and changes nothing, --rotate mutates. Use --check-signatures first if you want a read-only pre-check, then --rotate."
+fi
+
 # ---------------------------------------------------------------- preflight
 [ "$(id -u)" = 0 ] || stop "run as root (sudo bash install.sh)"
 [ -d "$H" ] || stop "operator box not found at $H"
@@ -234,9 +261,93 @@ governed_files() {
   printf '%s\n' "$H/constitutional/syscall-table.json"
   printf '%s\n' "$H/mcp_apps/_federation/servers.json"
   printf '%s\n' "$H/constitutional/frank_head_anchor.json"
+  # Loki audit A38D41C2, F10: an UNRATIFIED seed's signature IS the
+  # ratification act on a trust root (seed_loader.py: pending status is
+  # "advisory only", never mirrored or promoted) -- re-signing a pending
+  # seed under the trust owner's key during a routine key rotation would
+  # silently ratify it. Only seeds whose own ratification.status is
+  # "ratified" are governed; a seed this can't parse is treated as NOT
+  # ratified (skip, never include on a read failure).
   for s in "$H"/seeds/*.json; do
-    [ -e "$s" ] && printf '%s\n' "$s"
+    [ -e "$s" ] || continue
+    if "$PY" - "$s" <<'PYEOF'
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+status = str((doc.get("seed") or {}).get("ratification", {}).get("status") or "pending").lower()
+sys.exit(0 if status == "ratified" else 1)
+PYEOF
+    then
+      printf '%s\n' "$s"
+    fi
   done
+}
+
+# strip_pgp_pin: the serve unit's own WILLOW_PGP_FINGERPRINT= pin, if any.
+# Dispatch B291C0C7, fixed for real shape per Loki audit A38D41C2 F1: called
+# from BOTH the plain-install flow (step 3) and --rotate (F5 -- a standalone
+# --rotate used to exit before step 3 ever ran, so it never stripped a pin
+# and never restarted the broker even though its own final message told the
+# operator to). One function, one behavior, no drift between the two
+# callers.
+strip_pgp_pin() {
+  say "== strip the serve unit's own WILLOW_PGP_FINGERPRINT pin, if any"
+  local dropin="/home/$OPERATOR/.config/systemd/user/willow-mcp-serve.service.d/pgp.conf"
+  if [ ! -f "$dropin" ]; then
+    say "  no pin found at $dropin"
+    return 0
+  fi
+  # Loki A38D41C2, F1 (BLOCKING): the real drop-in line is
+  # Environment="WILLOW_PGP_FINGERPRINT=..." (systemd's Environment=
+  # directive, optionally quoted) -- NOT a bare WILLOW_PGP_FINGERPRINT= at
+  # line start. The old regex matched nothing on the real file, deleted
+  # nothing, and printed "stripped" anyway. Both shapes are matched now,
+  # and the strip is VERIFIED afterward -- a step that reports success it
+  # did not achieve is worse than no step at all.
+  sed -i -E \
+    -e '/^WILLOW_PGP_FINGERPRINT=/d' \
+    -e '/^Environment="?WILLOW_PGP_FINGERPRINT=/d' \
+    "$dropin"
+  if grep -qE '(^|=)"?WILLOW_PGP_FINGERPRINT=' "$dropin"; then
+    stop "$dropin still names WILLOW_PGP_FINGERPRINT after the strip -- the regex did not match its actual shape. Not reporting success; fix strip_pgp_pin() in install.sh and rerun. Contents: $(cat "$dropin")"
+  fi
+  local remainder
+  remainder=$(grep -vE '^\s*(#|\[Service\]\s*$|\s*$)' "$dropin" || true)
+  if [ -z "$remainder" ]; then
+    rm -f "$dropin"
+    say "  removed $dropin (it pinned WILLOW_PGP_FINGERPRINT and nothing else) -- verified gone"
+  else
+    say "  stripped WILLOW_PGP_FINGERPRINT= from $dropin (other settings left in place) -- verified gone"
+  fi
+  as_op systemctl --user daemon-reload
+}
+
+# restart_broker: an env/trust change, not a pull -- the reloader will not do
+# this one. Shared by the plain install and --rotate (F5), same reason as
+# strip_pgp_pin above. Only reaches the --user SERVE unit; a stdio-attached
+# desk (an editor/CLI session) is not a systemd unit this script can signal
+# at all, and — Loki A38D41C2, F2 — reconnecting that session does NOT pick
+# up a new fingerprint if the project's own .mcp.json pins one in its env
+# block: that pin must be removed (desk-owned; see INSTALL.md) before a
+# reconnect helps.
+restart_broker() {
+  say "== broker restart (trust config changed)"
+  local restarted=""
+  local u
+  for u in "${BROKER_UNIT_CANDIDATES[@]}"; do
+    if as_op systemctl --user list-unit-files --no-legend "$u" 2>/dev/null | grep -q "^$u"; then
+      as_op systemctl --user restart "$u" && say "  restarted $u" && restarted=1
+      break
+    fi
+  done
+  [ -n "$restarted" ] || say "  no known willow-mcp --user service found (${BROKER_UNIT_CANDIDATES[*]}) — restart the broker by hand if it runs another way"
+  say "  NOTE: a stdio-attached desk (an editor/CLI session, not the --user unit)"
+  say "  cannot be restarted by this script. If its project's .mcp.json pins"
+  say "  WILLOW_PGP_FINGERPRINT in the env block, reconnecting is NOT enough --"
+  say "  that pin must be removed first (desk-owned), or the reconnected"
+  say "  session will conflict with $TRUST_ENV and refuse to boot."
 }
 
 # ---------------------------------------------------------- --check-signatures
@@ -248,8 +359,18 @@ governed_files() {
 # reader (paths.trusted_read, run by the broker) exercises.
 if [ -n "$CHECK_SIGNATURES" ]; then
   say "== --check-signatures: which fingerprint does each governed file verify under"
-  CUR_FPR=$(grep -E '^WILLOW_PGP_FINGERPRINT=' "$H/env" | tail -1 | cut -d= -f2- || true)
-  [ -n "$CUR_FPR" ] || stop "WILLOW_PGP_FINGERPRINT not set in $H/env — nothing to check against"
+  CUR_FPR=$(grep -E '^WILLOW_PGP_FINGERPRINT=' "$TRUST_ENV" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  [ -n "$CUR_FPR" ] || stop "WILLOW_PGP_FINGERPRINT not set in $TRUST_ENV — nothing to check against"
+  # Loki A38D41C2, F8: root can read BOTH $H/env (0600) and $TRUST_ENV
+  # (0644) -- this is the one place that CAN catch the two copies drifting
+  # apart, since neither the broker nor the trust-owner apply unit alone
+  # can see both. A leftover WILLOW_PGP_FINGERPRINT= line in $H/env after
+  # migration means either the migration in step 1b never ran on this box,
+  # or something wrote it back -- surfaced here, not silently ignored.
+  STALE_HOME_FPR=$(grep -E '^(export[[:space:]]+)?WILLOW_PGP_FINGERPRINT=' "$H/env" 2>/dev/null | tail -1 | sed -E 's/^(export[[:space:]]+)?WILLOW_PGP_FINGERPRINT=//' || true)
+  if [ -n "$STALE_HOME_FPR" ]; then
+    say "  WARNING: $H/env still names WILLOW_PGP_FINGERPRINT=$STALE_HOME_FPR -- the fingerprint's one source is now $TRUST_ENV ($CUR_FPR). A leftover value in \$H/env is inert to pgp.py (which no longer reads that file for this key) UNLESS something exports it into a process's own environment, in which case it competes with $TRUST_ENV and pgp.expected_fingerprint() refuses. Remove the line from $H/env (rerun a plain install to migrate it automatically) or confirm nothing sources it."
+  fi
   mapfile -t FILES < <(governed_files)
   as_op "$PY" "$HERE/rotate_resign.py" --check --fingerprint "$CUR_FPR" "${FILES[@]}"
   exit $?
@@ -263,12 +384,12 @@ fi
 # why re-signing is one atomic batch, not N independent gpg calls, and why the
 # old key is retired ONLY after every file verifies under the new one.
 if [ -n "$ROTATE" ]; then
-  say "== --rotate: generate a new trust-owner signing key, re-sign everything, retire what's named"
+  say "== --rotate: generate a new trust-owner signing key, re-sign everything, THEN switch trust, THEN retire"
 
   # 1. a NEW key, always — the whole point of --rotate is a fresh key, never
   # reusing whatever the trust owner's GNUPGHOME already holds. The OLD key
-  # is left in GNUPGHOME (never deleted) until step 6 below confirms the
-  # rotation actually landed.
+  # is left in GNUPGHOME (never deleted) until every governed file verifies
+  # under the new one, below.
   install -d -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 700 "$(dirname "$GNUPGHOME_TO")" "$GNUPGHOME_TO"
   ROTATE_UID="$KEY_UID $(date -u +%Y%m%dT%H%M%SZ)"
   as_to gpg --batch --pinentry-mode loopback --passphrase '' \
@@ -276,45 +397,54 @@ if [ -n "$ROTATE" ]; then
   NEW_FPR=$(as_to gpg --batch --list-keys --with-colons "$ROTATE_UID" | awk -F: '/^fpr/{print $10; exit}')
   [ -n "$NEW_FPR" ] || stop "key generation appeared to succeed but no fingerprint was found for it"
   say "  generated $NEW_FPR"
-  OLD_FPR=$(grep -E '^WILLOW_PGP_FINGERPRINT=' "$H/env" | tail -1 | cut -d= -f2- || true)
-  say "  previous fingerprint (from $H/env): ${OLD_FPR:-<none>}"
+  OLD_FPR=$(grep -E '^WILLOW_PGP_FINGERPRINT=' "$TRUST_ENV" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  say "  previous fingerprint (from $TRUST_ENV): ${OLD_FPR:-<none>}"
 
-  # 2. write the new fingerprint to $H/env and $ETC/manifest-grant.env — one
-  # value, one write path (the same render step 4 below performs, run here
-  # too so a --rotate needs no separate re-run of plain install to pick it
-  # up in the systemd env file).
-  if grep -qE '^WILLOW_PGP_FINGERPRINT=' "$H/env"; then
-    sed -i -E "s|^WILLOW_PGP_FINGERPRINT=.*|WILLOW_PGP_FINGERPRINT=$NEW_FPR|" "$H/env"
-  else
-    printf 'WILLOW_PGP_FINGERPRINT=%s\n' "$NEW_FPR" >> "$H/env"
-  fi
-  install -d -m 755 "$ETC"
-  ENV_TMP=$(mktemp)
-  sed -E -e "s|^WILLOW_PGP_FINGERPRINT=.*|WILLOW_PGP_FINGERPRINT=$NEW_FPR|" \
-         -e "s|^WILLOW_PG_DB=.*|WILLOW_PG_DB=$PG_DB|" "$HERE/manifest-grant.env" > "$ENV_TMP"
-  install -o root -g "$TRUST_OWNER" -m 640 "$ENV_TMP" "$ETC/manifest-grant.env"
-  rm -f "$ENV_TMP"
-  say "  wrote $NEW_FPR to $H/env and $ETC/manifest-grant.env"
-
-  # 3. the public half into the operator's keyring
+  # 2. the public half into the operator's keyring. This does NOT switch
+  # trust by itself — pgp.expected_fingerprint() decides trust by reading
+  # $TRUST_ENV, never by which keys happen to sit in a keyring — so importing
+  # early, before anything is re-signed, is safe: the running broker still
+  # trusts $OLD_FPR (from $TRUST_ENV, untouched so far) throughout steps 2-3.
   as_to gpg --batch --armor --export "$NEW_FPR" | sudo -u "$OPERATOR" gpg --batch --import
   echo "$NEW_FPR:6:" | sudo -u "$OPERATOR" gpg --batch --import-ownertrust
   say "  imported $NEW_FPR into $OPERATOR's keyring"
 
-  # 4/5. re-sign and verify every governed file — one atomic batch
+  # 3. re-sign and verify every governed file — one atomic batch
   # (rotate_resign.py: a failure on file N rolls back every file this run
-  # already re-signed, not just N).
+  # already re-signed, not just N; Ctrl-C/SIGTERM mid-batch roll back too —
+  # Loki A38D41C2, F7). $TRUST_ENV is NOT touched yet, so the running broker
+  # still trusts $OLD_FPR while this runs. If this step fails or is
+  # interrupted, $TRUST_ENV was never written, so there is NOTHING to revert
+  # by hand — the box is exactly as it was before --rotate started, which is
+  # the fix for F3 (the old cut wrote $TRUST_ENV/$H/env FIRST, so a running
+  # broker's trust flipped to the new key before anything was signed under
+  # it — "the register is signed by a key the broker does not trust", the
+  # 2026-09-23 incident, verbatim).
   mapfile -t FILES < <(governed_files)
-  say "  re-signing ${#FILES[@]} governed path(s) under $NEW_FPR"
+  say "  re-signing ${#FILES[@]} governed path(s) under $NEW_FPR (trust NOT switched yet)"
   if ! "$PY" "$HERE/rotate_resign.py" --sign-as "$TRUST_OWNER" --gnupg-home "$GNUPGHOME_TO" \
        --fingerprint "$NEW_FPR" "${FILES[@]}"; then
-    stop "re-signing failed — rotate_resign.py already restored every file it touched this run to its previous signature. $H/env and $ETC/manifest-grant.env were already written as $NEW_FPR above, though: revert those two by hand (set them back to ${OLD_FPR:-the previous value}) or rerun --rotate before trusting anything that reads $NEW_FPR. The old key ($OLD_FPR) was NOT retired."
+    stop "re-signing failed — rotate_resign.py already restored every file it touched this run to its previous signature, and \$TRUST_ENV was never written, so the box is exactly as it was before --rotate started. The old key ($OLD_FPR) was NOT retired. Nothing to revert by hand; fix the failure above and rerun --rotate."
   fi
   as_op "$PY" "$HERE/rotate_resign.py" --check --fingerprint "$NEW_FPR" "${FILES[@]}" \
-    || stop "post-rotate verification found a file that does not verify under $NEW_FPR — see the table above. The old key ($OLD_FPR) was NOT retired; fix the mismatch and rerun --check-signatures before rerunning --rotate."
-  say "  every governed file verifies under $NEW_FPR"
+    || stop "post-rotate verification found a file that does not verify under $NEW_FPR — see the table above. \$TRUST_ENV was never written, so the box still trusts $OLD_FPR and nothing is half-switched. The old key was NOT retired; fix the mismatch and rerun --rotate."
+  say "  every governed file verifies under $NEW_FPR — safe to switch trust now"
 
-  # 6. only now — everything verifies — retire the old keys.
+  # 4. ONLY NOW — everything is already signed AND verified under the new
+  # key — switch trust: write $TRUST_ENV. This is the narrowest possible
+  # window where $TRUST_ENV's write could be interrupted mid-write; if it
+  # is, the file becomes unreadable/malformed, which pgp.py now (F4) fails
+  # CLOSED on rather than silently disabling enforcement — never a state
+  # where the register is trusted-but-wrongly-signed, which is what F3
+  # measured.
+  TRUST_TMP=$(mktemp)
+  printf 'WILLOW_PGP_FINGERPRINT=%s\n' "$NEW_FPR" > "$TRUST_TMP"
+  install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$TRUST_TMP" "$TRUST_ENV"
+  rm -f "$TRUST_TMP"
+  say "  wrote $NEW_FPR to $TRUST_ENV — trust switched"
+
+  # 5. only now — trust has switched and every file already verifies —
+  # retire the old keys.
   if [ -n "$OLD_FPR" ] && [ "$OLD_FPR" != "$NEW_FPR" ]; then
     if as_to gpg --batch --yes --delete-secret-and-public-key "$OLD_FPR"; then
       say "  retired previous trust-owner key $OLD_FPR from $GNUPGHOME_TO"
@@ -330,11 +460,19 @@ if [ -n "$ROTATE" ]; then
     fi
   done
 
+  # 6. strip the serve unit's own pin and restart it — Loki A38D41C2, F5:
+  # a standalone --rotate used to exit here without ever doing either, even
+  # though the final message told the operator to restart. Shared functions
+  # with the plain-install flow below (strip_pgp_pin/restart_broker) so the
+  # two paths cannot drift apart again.
+  strip_pgp_pin
+  restart_broker
+
   say
   say "done. New fingerprint: $NEW_FPR."
   say "v1 PGP session-attestation sidecars signed under the old key are now invalid — see INSTALL.md."
-  say "Restart the broker (systemctl --user restart willow-mcp-serve.service) and reconnect any"
-  say "stdio-attached desk session by hand to pick up $NEW_FPR."
+  say "Any stdio-attached desk session still needs reconnecting by hand — see the restart_broker"
+  say "note above if its project's .mcp.json pins a fingerprint."
   exit 0
 fi
 
@@ -487,11 +625,28 @@ fi
 # public half into the broker's keyring, trusted ultimately (the gate verifies against it)
 as_to gpg --batch --armor --export "$FPR" | sudo -u "$OPERATOR" gpg --batch --import
 echo "$FPR:6:" | sudo -u "$OPERATOR" gpg --batch --import-ownertrust
-# the broker's env must name the SAME fingerprint
-if grep -qE '^WILLOW_PGP_FINGERPRINT=' "$H/env"; then
-  sed -i -E "s|^WILLOW_PGP_FINGERPRINT=.*|WILLOW_PGP_FINGERPRINT=$FPR|" "$H/env"
-else
-  printf 'WILLOW_PGP_FINGERPRINT=%s\n' "$FPR" >> "$H/env"
+
+# Dispatch 0CB0C85C: the fingerprint's one source is $TRUST_ENV
+# (trust-owner-owned, world-readable — constitutional/ is already
+# trust-owner-owned by step 1, above), never $H/env (0600, secrets). Written
+# by root, then chowned to the trust owner — same shape as the register.
+TRUST_TMP=$(mktemp)
+printf 'WILLOW_PGP_FINGERPRINT=%s\n' "$FPR" > "$TRUST_TMP"
+install -o "$TRUST_OWNER" -g "$TRUST_OWNER" -m 644 "$TRUST_TMP" "$TRUST_ENV"
+rm -f "$TRUST_TMP"
+say "  published $FPR to $TRUST_ENV"
+
+# Migration (0CB0C85C): leave nothing behind in $H/env — a second copy is
+# the defect this whole PR removes. Fails closed rather than silently
+# discarding: if $H/env still names a DIFFERENT fingerprint, stop and ask
+# the operator to reconcile by hand rather than guessing which is right.
+OLD_HOME_FPR=$(grep -E '^(export[[:space:]]+)?WILLOW_PGP_FINGERPRINT=' "$H/env" 2>/dev/null | tail -1 | sed -E 's/^(export[[:space:]]+)?WILLOW_PGP_FINGERPRINT=//' || true)
+if [ -n "$OLD_HOME_FPR" ] && [ "$OLD_HOME_FPR" != "$FPR" ]; then
+  stop "$H/env still names WILLOW_PGP_FINGERPRINT=$OLD_HOME_FPR, disagreeing with $TRUST_ENV's $FPR — this is exactly the split brain this PR removes. Reconcile by hand (decide which is right, edit $H/env, then rerun) rather than letting install.sh silently discard one."
+fi
+if grep -qE '^(export[[:space:]]+)?WILLOW_PGP_FINGERPRINT=' "$H/env"; then
+  sed -i -E '/^(export[[:space:]]+)?WILLOW_PGP_FINGERPRINT=/d' "$H/env"
+  say "  removed WILLOW_PGP_FINGERPRINT from $H/env (now $TRUST_ENV only)"
 fi
 
 # ---- gap c1395b307421: sync + SIGN syscall-table.json, in the SAME ACT
@@ -562,39 +717,27 @@ rm -f "/home/$OPERATOR/.config/systemd/user/willow-mcp-manifest-grant.service" \
 as_op systemctl --user daemon-reload
 
 # -------------------------------------------- 3. strip stale per-file pgp pins
-# Dispatch B291C0C7 ("one signing key, one source of truth"): $H/env is the
-# only place WILLOW_PGP_FINGERPRINT is ever set now — pgp.expected_fingerprint()
-# refuses at first use if the process environment disagrees with it, never
-# silently prefers either. A systemd drop-in pinning it a SECOND place is
-# exactly the split brain measured 2026-09-23: install.sh rewrote $H/env's
-# copy to the new key while this drop-in still carried the old one, and
-# whichever file a given process happened to load decided whether it trusted
-# the register. Idempotent — a no-op once the pin is gone.
-say "== 3. strip the serve unit's own WILLOW_PGP_FINGERPRINT pin, if any"
-PGP_DROPIN="/home/$OPERATOR/.config/systemd/user/willow-mcp-serve.service.d/pgp.conf"
-if [ -f "$PGP_DROPIN" ]; then
-  REMAINDER=$(grep -vE '^\s*(#|\[Service\]\s*$|\s*$|WILLOW_PGP_FINGERPRINT=)' "$PGP_DROPIN" || true)
-  if [ -z "$REMAINDER" ]; then
-    rm -f "$PGP_DROPIN"
-    say "  removed $PGP_DROPIN (it pinned WILLOW_PGP_FINGERPRINT and nothing else)"
-  else
-    sed -i -E '/^WILLOW_PGP_FINGERPRINT=/d' "$PGP_DROPIN"
-    say "  stripped WILLOW_PGP_FINGERPRINT= from $PGP_DROPIN (other settings left in place)"
-  fi
-  as_op systemctl --user daemon-reload
-else
-  say "  no pin found at $PGP_DROPIN"
-fi
-# Deliberately NOT giving the serve unit EnvironmentFile=$H/env here: that
-# file holds every provider API key, and pgp.py's one-source-of-truth read
-# makes the pin unnecessary — the broker never needs WILLOW_PGP_FINGERPRINT
-# in its own process environment at all once it, too, is on this pgp.py.
+# Dispatch B291C0C7 ("one signing key, one source of truth"): $TRUST_ENV is
+# the only place WILLOW_PGP_FINGERPRINT is ever set now —
+# pgp.expected_fingerprint() refuses at first use if the process environment
+# disagrees with it, never silently prefers either. A systemd drop-in
+# pinning it a SECOND place is exactly the split brain measured 2026-09-23.
+# strip_pgp_pin is shared with --rotate above (Loki A38D41C2, F5) — see its
+# definition for the F1 fix (the real drop-in shape) and the verify-after-
+# strip discipline.
+strip_pgp_pin
 
 # ---------------------------------------------------------- 4. env file, units
 say "== 4. $ETC and system units"
 install -d -m 755 "$ETC"
 ENV_TMP=$(mktemp)
-sed -E -e "s|^WILLOW_PGP_FINGERPRINT=.*|WILLOW_PGP_FINGERPRINT=$FPR|" \
+# Dispatch 0CB0C85C: WILLOW_PGP_FINGERPRINT is no longer rendered into this
+# file at all — the trust-owner apply unit now reads $TRUST_ENV directly
+# (trust-owner-owned, world-readable; the SAME file everything else reads),
+# so the second copy this file used to carry — the exact drift Loki audit
+# A38D41C2's F8 measured, since uid willow-operator could never read $H/env
+# to check it against the source — is gone, not merely re-synced.
+sed -E -e '/^WILLOW_PGP_FINGERPRINT=/d' \
        -e "s|^WILLOW_PG_DB=.*|WILLOW_PG_DB=$PG_DB|" "$HERE/manifest-grant.env" > "$ENV_TMP"
 install -o root -g "$TRUST_OWNER" -m 640 "$ENV_TMP" "$ETC/manifest-grant.env"
 rm -f "$ENV_TMP"
@@ -711,24 +854,10 @@ REMAINING=$(find "$H/manifest_grants/pending" -maxdepth 1 -name '*.json' | wc -l
 [ "$REMAINING" = 0 ] || stop "pending/ still holds $REMAINING request(s); refusing to enable the timer"
 
 # ------------------------------- restart the broker: an env change, not a pull
-# F7: this restarts the --user SERVE unit only. A stdio-attached desk (a
-# per-session subprocess the desk's own MCP client spawned — Claude Code,
-# Cursor, any editor session) is NOT a systemd unit this script can reach at
-# all; it keeps running with the OLD WILLOW_PGP_FINGERPRINT in its own
-# process environment until the operator reconnects that session by hand.
-# Said here rather than implied by this step's success.
-say "== broker restart (WILLOW_PGP_FINGERPRINT changed in $H/env)"
-RESTARTED=""
-for u in "${BROKER_UNIT_CANDIDATES[@]}"; do
-  if as_op systemctl --user list-unit-files --no-legend "$u" 2>/dev/null | grep -q "^$u"; then
-    as_op systemctl --user restart "$u" && say "  restarted $u" && RESTARTED=1
-    break
-  fi
-done
-[ -n "$RESTARTED" ] || say "  no known willow-mcp --user service found (${BROKER_UNIT_CANDIDATES[*]}) — restart the broker by hand if it runs another way"
-say "  NOTE: a stdio-attached desk (an editor/CLI session, not the --user unit)"
-say "  cannot be restarted by this script — it must reconnect (restart the"
-say "  session) by hand to pick up the new WILLOW_PGP_FINGERPRINT."
+# F7 (Loki audit BFCC5C79): restarts the --user SERVE unit only — see
+# restart_broker's own definition (shared with --rotate, Loki A38D41C2 F5)
+# for the stdio-desk caveat.
+restart_broker
 
 # --------------------------------------------------------- 7. start, first tick
 say "== 7. enable and tick once"

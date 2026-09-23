@@ -112,13 +112,22 @@ def _install_sh_6b_before_restart(install_sh_text: str) -> bool:
     Loki audit BFCC5C79, F7: restarting first lets a freshly-restarted
     broker accept a new request into pending/ before 6b can withdraw the
     stale ones, and the blanket withdrawal cannot tell them apart by
-    content alone."""
+    content alone.
+
+    Dispatch E29CCFC7 (Loki A38D41C2, F5): the restart is now a shared
+    ``restart_broker`` function, defined once near the top of the script
+    (before step 0) and CALLED at the plain-install flow's own position
+    (after 6b) and again from --rotate. A plain substring search for the
+    function's own name would find the DEFINITION first, always "before"
+    6b regardless of where it's actually invoked — this looks for the bare
+    call line (``restart_broker`` with no ``()`` after it, which only the
+    call site has) instead."""
     body = _script_body(install_sh_text)
     idx_6b = body.find("6b. withdraw every request")
-    idx_restart = body.find("broker restart (WILLOW_PGP_FINGERPRINT changed")
-    if idx_6b == -1 or idx_restart == -1:
+    idx_restart_call = body.find("\nrestart_broker\n")
+    if idx_6b == -1 or idx_restart_call == -1:
         return False
-    return idx_6b < idx_restart
+    return idx_6b < idx_restart_call
 
 
 def _service_unit_missing(text: str) -> list[str]:
@@ -261,10 +270,10 @@ def test_plant_every_deploy_scan_helper_catches_its_violation():
     ) == []
 
     assert _install_sh_6b_before_restart(
-        "...6b. withdraw every request...\n...broker restart (WILLOW_PGP_FINGERPRINT changed..."
+        "set -euo pipefail\n...6b. withdraw every request...\nrestart_broker\n"
     ) is True
     assert _install_sh_6b_before_restart(
-        "...broker restart (WILLOW_PGP_FINGERPRINT changed...\n...6b. withdraw every request..."
+        "set -euo pipefail\nrestart_broker\n...6b. withdraw every request..."
     ) is False
     assert _install_sh_6b_before_restart("neither marker present") is False
 
