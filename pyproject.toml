@@ -213,7 +213,7 @@ test = [
     "coverage",
     "PyYAML>=6.0,<7.0",
     "jsonschema>=4.0,<5.0",
-    "ruff==0.16.7",
+    "ruff==0.16.8",
     # The fleet's convention set has one home — willow-reconciler publishes it
     # (`reconciler conventions --json`, `reconciler.conventions.conventions()`)
     # and tests/test_fleet_conventions.py READS it rather than restating it
