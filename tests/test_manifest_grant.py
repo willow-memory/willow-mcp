@@ -1963,7 +1963,7 @@ def test_federated_group_revoked_between_request_and_apply_is_edrift(
     mf.ratify(spec, ratified_by="operator", reason="test")
     group = f"mcp:{spec.id}:node9_explain"
     _charter(tmp_path, monkeypatch, apps=("kart",), groups=(group,))
-    _manifest(home, "kart")
+    kart_path = _manifest(home, "kart")
     _seal(home, store, seats=("kart",), groups=(group,), kr=ring_with_sean)
 
     pg = _FakeGovernancePg()
@@ -1983,6 +1983,12 @@ def test_federated_group_revoked_between_request_and_apply_is_edrift(
     assert applied["processed"][0]["error"] == "edrift"
     status = mgx.manifest_grant_status("pair-mg-1", grants_root=home / "manifest_grants")
     assert status["state"] == "failed"
+    # Loki audit B0AB4656, F3c: the revoke here happens BEFORE the per-seat
+    # loop even starts (apply's own step 3b re-check), so kart's manifest
+    # must never have been touched at all.
+    kart_manifest = json.loads(kart_path.read_text())
+    assert kart_manifest["permissions"] == []
+    assert not _receipts(pg)
 
 
 def test_mcp_federation_group_still_eperm_with_widened_grammar(
@@ -1996,6 +2002,140 @@ def test_mcp_federation_group_still_eperm_with_widened_grammar(
     out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
     assert out["error"] == "EPERM"
     assert "mcp_federation" in out["escalating"]
+
+
+@pytest.mark.parametrize("escalating_group", ["full_access", "mcp_federation"])
+def test_escalation_group_mixed_with_federated_group_is_eperm(
+    home, tmp_path, monkeypatch, store, ring_with_sean, escalating_group,
+):
+    """Loki audit B0AB4656, F3b: an escalation-class group mixed with an
+    `mcp:` group in the SAME pair is still EPERM — the escalation check
+    runs on the whole `groups` set, not just bare names."""
+    spec = _fed_spec()
+    mf.ratify(spec, ratified_by="operator", reason="test")
+    groups = (f"mcp:{spec.id}:node9_explain", escalating_group)
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=groups)
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=groups, kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EPERM"
+    assert escalating_group in out["escalating"]
+    assert not _pending_files(home / "manifest_grants")
+
+
+def test_orchestrator_target_refusal_enforced_at_apply_not_just_request(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit B0AB4656, F3a: the request side is bypassed here on
+    purpose (the helper is stubbed out for the request call only) to prove
+    APPLY enforces its OWN copy of the orchestrator-target rule
+    independently, rather than trusting a pending file that slipped past
+    request time. willow's manifest must stay untouched and no receipt
+    written."""
+    _charter(tmp_path, monkeypatch, grantee="willow", apps=("willow",), groups=("grove_write",))
+    willow_path = _manifest(home, "willow")
+    _seal(home, store, seats=("willow",), groups=("grove_write",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+
+    real_refusal = mgx._orchestrator_target_refusal
+    monkeypatch.setattr(mgx, "_orchestrator_target_refusal", lambda apps, groups: None)
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-mg-1", ledger=ledger, store=store,
+        apps_root=home / "mcp_apps", grants_root=home / "manifest_grants",
+    )
+    assert req["ok"] is True, req
+    monkeypatch.setattr(mgx, "_orchestrator_target_refusal", real_refusal)
+
+    applied = mgx.manifest_grant_apply(
+        ledger=ledger, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants",
+    )
+    assert applied["ok"] is False
+    result = applied["processed"][0]
+    assert result["error"] == "EPERM"
+    willow_manifest = json.loads(willow_path.read_text())
+    assert willow_manifest["permissions"] == []
+    assert not _receipts(pg)
+
+
+# ── F1 (Loki audit B0AB4656, medium): rollback of a federated grant must
+#    not itself depend on the server still being ratified ─────────────────
+
+def test_mid_apply_revoke_rolls_back_and_reports_edrift(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """The exact Loki sequence: seats kart,ada and one federated group; the
+    server is revoked right after kart's grant lands, before ada's. Before
+    the fix, ada's grant-time registry re-check raised a bare ValueError
+    (`eunexpected`, never `edrift`), and the rollback of kart's
+    already-granted group failed too — `set_permission`'s REMOVE half
+    re-checked the registry the same as its GRANT half, so an unratified
+    server could never be stripped back off. Both seats' manifests must end
+    up exactly as they started, no `manifest_granted` receipt, and the
+    reported error is `edrift`."""
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    spec = _fed_spec()
+    mf.ratify(spec, ratified_by="operator", reason="test")
+    group = f"mcp:{spec.id}:node9_explain"
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart", "ada"), groups=(group,))
+    kart_path = _manifest(home, "kart")
+    ada_path = _manifest(home, "ada")
+    _seal(home, store, seats=("kart", "ada"), groups=(group,), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-mg-1",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert req["ok"] is True, req
+
+    from willow_mcp import manifest_admin
+
+    real_set_permission = manifest_admin.set_permission
+
+    def _revoke_right_after_kart(app_id, perm, granted, **kwargs):
+        result = real_set_permission(app_id, perm, granted, **kwargs)
+        if app_id == "kart" and granted:
+            mf.revoke_ratification(spec.id)
+        return result
+
+    monkeypatch.setattr(manifest_admin, "set_permission", _revoke_right_after_kart)
+    applied = mgx.manifest_grant_apply(
+        ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+
+    assert applied["ok"] is False
+    result = applied["processed"][0]
+    assert result["error"] == "edrift"
+    assert not result.get("rollback_failed")
+    kart_manifest = json.loads(kart_path.read_text())
+    ada_manifest = json.loads(ada_path.read_text())
+    assert kart_manifest["permissions"] == []
+    assert ada_manifest["permissions"] == []
+    assert not _receipts(pg)
+    status = mgx.manifest_grant_status("pair-mg-1", grants_root=grants_root)
+    assert status["state"] == "failed"
+
+
+def test_removing_a_federated_grant_for_an_unratified_server_succeeds(
+    home, tmp_path, monkeypatch,
+):
+    """Loki audit B0AB4656, F1, second required test: an operator-style
+    removal (`manifest_admin.set_permission(..., granted=False)`) of an
+    `mcp:` group succeeds even when nothing ratifies that server — removal
+    never re-checks the registry, only the grant half does. The name must
+    still be well-formed to be removed."""
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    from willow_mcp import manifest_admin
+
+    group = "mcp:0123456789ab:node9_explain"
+    path = _manifest(home, "kart", permissions=[group])
+    manifest_admin.set_permission("kart", group, False)
+    manifest = json.loads(path.read_text())
+    assert manifest["permissions"] == []
     assert not _pending_files(home / "manifest_grants")
 
 

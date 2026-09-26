@@ -1502,6 +1502,25 @@ def _apply_one_seat(app_id: str, groups: list[str], *, apps_root: Path) -> dict:
         if revoke["failed"]:
             out["rollback_failed"] = revoke["failed"]
         return out
+    except ValueError as exc:
+        # Loki audit B0AB4656, F1: a federated server ratified when the
+        # sealed pair was bound (and re-checked at the top of `_apply_one`,
+        # step 3b) can still be revoked mid-loop, between one seat's grant
+        # and the next's — `manifest_admin.set_permission` re-runs
+        # `validate_permission` on every GRANT, which raises `ValueError`
+        # for an unratified server, never `RuntimeError`. This is DRIFT —
+        # the same word this module already uses for a seat's manifest
+        # moving out from under a pending request — never `eunexpected`.
+        # The rollback below now succeeds even for an already-unratified
+        # `mcp:` group: `set_permission`'s REMOVE half no longer re-checks
+        # the registry (manifest_admin.py, same audit), so an earlier
+        # seat's federated grant in this same request is actually undone
+        # rather than left stuck with a ROLLBACK FAILED.
+        revoke = _revoke_groups(app_id, granted_now)
+        out = {"ok": False, "app_id": app_id, "error": "edrift", "reason": str(exc)}
+        if revoke["failed"]:
+            out["rollback_failed"] = revoke["failed"]
+        return out
     except Exception as exc:  # noqa: BLE001 — never let an exception escape a citation already inked
         revoke = _revoke_groups(app_id, granted_now)
         out = {"ok": False, "app_id": app_id, "error": "eunexpected",
