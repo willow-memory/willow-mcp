@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from willow_mcp import keyring as keyring_mod
 from willow_mcp import manifest_grant_executor as mgx
+from willow_mcp import mcp_federation as mf
 from willow_mcp import net_signer as ns
 from willow_mcp import seal_handler
 from willow_mcp.db import Store
@@ -1872,3 +1873,207 @@ def test_the_ratify_prescription_scan_catches_a_planted_violation():
         "d3f79320ccb5) lands; a sudo -u willow-operator invocation is NOT "
         "a working alternative"
     )
+
+
+# ── federated per-tool grants: `mcp:<server_id>:<tool>` (sealed Nestor pair
+#    `3445116c`, operator, 2026-09-26, ruling A; gap `133e17b1291f`,
+#    recurrence of `6ff907987c41`) ────────────────────────────────────────
+
+def _fed_spec(name="node9", command="true"):
+    """Same shape as `tests/test_mcp_federation.py`'s own `_spec` helper — a
+    stub stdio server whose only purpose is to have a real, ratifiable
+    `server_id`."""
+    resolved = mf._resolved_command_path(command)
+    return mf.McpServerSpec(
+        id=mf._stable_id(resolved, name), name=name, command=command,
+        env_keys=(), source_path="/repo/.mcp.json",
+    )
+
+
+# — grammar: `_RULING_RE` / `_parse_ruling_text` accept the federated shape —
+
+def test_federated_group_shape_parses():
+    text = "willow-manifest-grant-v1 seats=kart groups=mcp:0123456789ab:node9_explain"
+    assert mgx._parse_ruling_text(text) == {
+        "apps": ["kart"], "groups": ["mcp:0123456789ab:node9_explain"],
+    }
+
+
+def test_mixed_bare_and_federated_groups_parses():
+    """A non-orchestrator seat may mix a bare group with a federated one in
+    the same pair."""
+    text = ("willow-manifest-grant-v1 seats=kart "
+            "groups=grove_read,mcp:0123456789ab:node9_explain")
+    assert mgx._parse_ruling_text(text) == {
+        "apps": ["kart"], "groups": ["grove_read", "mcp:0123456789ab:node9_explain"],
+    }
+
+
+@pytest.mark.parametrize("group", [
+    "mcp:0123456789a:node9_explain",     # 11 hex chars
+    "mcp:0123456789abc:node9_explain",   # 13 hex chars
+    "mcp:0123456789AB:node9_explain",    # uppercase hex
+    "mcp:0123456789ab:",                 # empty tool
+    "mcp:x:y",                           # id not hex at all
+])
+def test_malformed_federated_group_shapes_do_not_parse(group):
+    text = f"willow-manifest-grant-v1 seats=kart groups={group}"
+    assert mgx._parse_ruling_text(text) is None
+
+
+def test_d23a3726_style_text_still_parses_after_grammar_widen():
+    """Regression: widening `_RULING_RE` for the federated shape must not
+    change how pair d23a3726's own (all-bare-name) grammar line parses."""
+    text = ("willow-manifest-grant-v1 seats=hanuman,loki,jeles,ada,skirnir,heimdallr,binder "
+            "groups=grove_read,grove_write")
+    assert mgx._parse_ruling_text(text) == {
+        "apps": ["hanuman", "loki", "jeles", "ada", "skirnir", "heimdallr", "binder"],
+        "groups": ["grove_read", "grove_write"],
+    }
+
+
+# — registry check (`manifest_admin.validate_permission`), request + apply —
+
+def test_validate_federated_groups_helper_reports_named_errno():
+    assert mgx._validate_federated_groups(["store_read"], errno="EINVAL") is None
+    out = mgx._validate_federated_groups(["mcp:0123456789ab:tool"], errno="EINVAL")
+    assert out["error"] == "EINVAL"
+    assert "0123456789ab" in out["reason"]
+    out2 = mgx._validate_federated_groups(["mcp:0123456789ab:tool"], errno="edrift")
+    assert out2["error"] == "edrift"
+
+
+def test_unratified_federated_group_refused_at_request(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    group = "mcp:0123456789ab:node9_explain"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=(group,))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=(group,), kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EINVAL"
+    assert "no ratified server" in out["reason"]
+    assert not _pending_files(home / "manifest_grants")
+
+
+def test_federated_group_revoked_between_request_and_apply_is_edrift(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    spec = _fed_spec()
+    mf.ratify(spec, ratified_by="operator", reason="test")
+    group = f"mcp:{spec.id}:node9_explain"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=(group,))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=(group,), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-mg-1", ledger=ledger, store=store,
+        apps_root=home / "mcp_apps", grants_root=home / "manifest_grants",
+    )
+    assert req["ok"] is True, req
+
+    assert mf.revoke_ratification(spec.id) is True
+
+    applied = mgx.manifest_grant_apply(
+        ledger=ledger, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants",
+    )
+    assert applied["ok"] is False
+    assert applied["processed"][0]["error"] == "edrift"
+    status = mgx.manifest_grant_status("pair-mg-1", grants_root=home / "manifest_grants")
+    assert status["state"] == "failed"
+
+
+def test_mcp_federation_group_still_eperm_with_widened_grammar(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """`mcp_federation` (no colon — a bare escalation-class group name, not a
+    federated per-tool grant) stays EPERM regardless of the grammar widen."""
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=("mcp_federation",))
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("mcp_federation",), kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EPERM"
+    assert "mcp_federation" in out["escalating"]
+    assert not _pending_files(home / "manifest_grants")
+
+
+# — orchestrator seat as TARGET (ruling A): only federated groups —
+
+def test_orchestrator_target_refusal_helper():
+    refusal = mgx._orchestrator_target_refusal(["willow"], ["grove_write"])
+    assert refusal["error"] == "EPERM"
+    assert refusal["non_federated"] == ["grove_write"]
+    assert mgx._orchestrator_target_refusal(
+        ["willow"], ["mcp:0123456789ab:node9_explain"]) is None
+    assert mgx._orchestrator_target_refusal(["kart"], ["grove_write"]) is None
+
+
+def test_orchestrator_target_with_non_federated_group_is_eperm_at_request(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    _charter(tmp_path, monkeypatch, grantee="willow", apps=("willow",), groups=("grove_write",))
+    _manifest(home, "willow")
+    _seal(home, store, seats=("willow",), groups=("grove_write",), kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EPERM"
+    assert out["non_federated"] == ["grove_write"]
+    assert not _pending_files(home / "manifest_grants")
+
+
+def test_orchestrator_target_with_federated_group_is_granted_end_to_end(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    spec = _fed_spec(name="node9")
+    mf.ratify(spec, ratified_by="operator", reason="test")
+    granted_tool = f"mcp:{spec.id}:node9_explain"
+    sibling_tool = f"mcp:{spec.id}:node9_status"
+
+    _charter(tmp_path, monkeypatch, grantee="willow", apps=("willow",), groups=(granted_tool,))
+    _manifest(home, "willow")
+    _seal(home, store, seats=("willow",), groups=(granted_tool,), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req, applied = _request_and_apply(
+        home, store, ledger, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants",
+    )
+    assert applied["ok"] is True, applied
+
+    from willow_mcp import gate
+    assert gate.permitted("willow", granted_tool) is True
+    assert gate.permitted("willow", sibling_tool) is False
+
+
+# — end to end: ratify → seal → request → apply → gate.permitted, exactly —
+
+def test_end_to_end_federated_grant_gates_exactly_the_granted_tools(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Acceptance (proposal 2026-09-26-manifest-grant-federated-tools.md):
+    ratify a stub stdio server, then seal/request/apply a grant naming one
+    bare group and one federated group; `gate.permitted` is true for exactly
+    the granted tools and false for an ungranted sibling."""
+    spec = _fed_spec(name="node9")
+    mf.ratify(spec, ratified_by="operator", reason="test")
+    granted_tool = f"mcp:{spec.id}:node9_explain"
+    sibling_tool = f"mcp:{spec.id}:node9_status"
+    groups = ("store_read", granted_tool)
+
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=groups)
+    _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=groups, kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req, applied = _request_and_apply(
+        home, store, ledger, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants",
+    )
+    assert applied["ok"] is True, applied
+    assert len(_receipts(pg)) == 1
+
+    from willow_mcp import gate
+    assert gate.permitted("kart", "store_get") is True
+    assert gate.permitted("kart", granted_tool) is True
+    assert gate.permitted("kart", sibling_tool) is False

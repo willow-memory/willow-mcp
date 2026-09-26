@@ -214,9 +214,23 @@ ESCALATION_GROUPS = frozenset({
 #: reads" split :mod:`net_authority` uses for network authority. Bumped by
 #: name if the bound field set ever changes.
 RULING_FORMAT = "willow-manifest-grant-v1"
+
+#: One `groups=` item: today's bare group name, OR a federated per-tool grant
+#: `mcp:<12-hex server_id>:<tool>` (gap `133e17b1291f`, proposal
+#: 2026-09-26-manifest-grant-federated-tools.md, ruling A). The 12-hex id is
+#: `mcp_federation._stable_id()`'s own shape; the tool half mirrors
+#: `gate.federated_tool_permission()`'s `[A-Za-z0-9_.\-]{1,64}`. Kept as its
+#: own named piece so `_RULING_RE` reads as "seats, then a comma-separated
+#: list of ONE of these two shapes" rather than a single sprawling character
+#: class — a bare name and a federated grant are validated identically by
+#: this grammar (a strict shape check); the registry lookup that tells a
+#: well-formed-but-unratified id apart from a real one is a separate check
+#: downstream (`manifest_admin.validate_permission`), never folded into the
+#: regex itself.
+_GROUP_ITEM_RE = r"(?:[A-Za-z0-9_\-]+|mcp:[0-9a-f]{12}:[A-Za-z0-9_.\-]{1,64})"
 _RULING_RE = re.compile(
     r"^" + re.escape(RULING_FORMAT) + r" seats=(?P<seats>[A-Za-z0-9_,\-]+) "
-    r"groups=(?P<groups>[A-Za-z0-9_,\-]+)$"
+    r"groups=(?P<groups>" + _GROUP_ITEM_RE + r"(?:," + _GROUP_ITEM_RE + r")*)$"
 )
 
 
@@ -380,6 +394,61 @@ def _seats_and_groups(record: dict) -> dict:
     if not isinstance(groups, list) or not groups or not all(isinstance(g, str) and g for g in groups):
         return _refuse("EINVAL", "governance record's 'groups' must be a non-empty list of group-name strings")
     return {"ok": True, "apps": list(seats), "groups": list(groups)}
+
+
+def _validate_federated_groups(groups: list[str], *, errno: str) -> Optional[dict]:
+    """Every ``mcp:<server_id>:<tool>`` group, re-checked against the
+    ratification registry (``manifest_admin.validate_permission`` — the same
+    typo/registry guard the CLI's own ``allow-permission`` already goes
+    through). A bare group name is skipped here entirely; its membership is
+    whatever ``KNOWN_PERMISSIONS``/the envelope bounds already decide.
+
+    ``errno`` lets the two call sites report the SAME underlying refusal
+    differently, on purpose (proposal 2026-09-26-manifest-grant-federated-
+    tools.md): at REQUEST time an unratified id is a plain input problem
+    (``EINVAL``, naming the id); at APPLY time the id was fine when sealed
+    and requested — a server ratified then, revoked since, is DRIFT
+    (``edrift``), the same word this module already uses for a seat's
+    manifest moving out from under a pending request."""
+    from . import manifest_admin
+
+    for g in groups:
+        if not g.startswith("mcp:"):
+            continue
+        try:
+            manifest_admin.validate_permission(g)
+        except ValueError as exc:
+            return _refuse(errno, f"{g!r}: {exc}")
+    return None
+
+
+def _orchestrator_target_refusal(apps: list[str], groups: list[str]) -> Optional[dict]:
+    """Ruling A (proposal 2026-09-26-manifest-grant-federated-tools.md,
+    operator, 2026-09-26): the orchestrator seat may be a manifest.grant
+    TARGET now — but only for federated per-tool groups. A pair naming the
+    orchestrator seat (``human_session.is_orchestrator_app`` /
+    ``ORCHESTRATOR_APP_ID``) alongside so much as one non-``mcp:`` group is
+    refused outright, regardless of seal or envelope bounds — the confirming
+    act for a federated grant is the operator's OWN seal (a separate, earlier
+    ratification of the server itself), never this verb's bounds check
+    alone. Every other seat is unchanged: this check is a no-op unless the
+    orchestrator is among ``apps``. Checked at REQUEST and again at APPLY
+    (the same re-verify-fresh rule every other precondition here follows)."""
+    from .human_session import is_orchestrator_app
+
+    if not any(is_orchestrator_app(a) for a in apps):
+        return None
+    non_federated = sorted(g for g in groups if not g.startswith("mcp:"))
+    if not non_federated:
+        return None
+    return _refuse(
+        "EPERM",
+        "the orchestrator seat may only receive federated mcp:<server_id>:<tool> "
+        f"groups through manifest.grant; non-federated group(s) {non_federated!r} "
+        "are refused regardless of seal or envelope bounds (proposal "
+        "2026-09-26-manifest-grant-federated-tools.md, ruling A)",
+        non_federated=non_federated,
+    )
 
 
 def _load_sealed_ruling(pair_id: str, *, db_path: Optional[Path] = None) -> dict:
@@ -1279,6 +1348,14 @@ def _manifest_grant_request_locked(
             escalating=escalating,
         )
 
+    orch_refusal = _orchestrator_target_refusal(apps, groups)
+    if orch_refusal is not None:
+        return orch_refusal
+
+    federated_refusal = _validate_federated_groups(groups, errno="EINVAL")
+    if federated_refusal is not None:
+        return federated_refusal
+
     if ledger is None:
         return _refuse(
             "EAMBIG",
@@ -1562,6 +1639,23 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
                       f"pair_id={pair_id!r} names escalation-class group(s) {escalating!r} at "
                       "apply time — refused regardless of what request-time checked",
                       escalating=escalating)
+
+    # 3b. Orchestrator-as-target (ruling A) and the federated registry check
+    # — both re-verified fresh at apply, never trusted from request time
+    # alone (the same "a pending request can sit for minutes" reasoning the
+    # seal and escalation-set re-checks above already follow). A server
+    # ratified when requested but revoked before this tick runs is drift on
+    # the registry, not a grammar or escalation problem — refused `edrift`,
+    # the same word this module already uses for a seat's manifest moving
+    # out from under a pending request.
+    orch_refusal = _orchestrator_target_refusal(apps, groups)
+    if orch_refusal is not None:
+        return _fail(orch_refusal["error"], orch_refusal["reason"],
+                     **{k: v for k, v in orch_refusal.items() if k not in ("ok", "error", "reason")})
+
+    federated_refusal = _validate_federated_groups(groups, errno="edrift")
+    if federated_refusal is not None:
+        return _fail(federated_refusal["error"], federated_refusal["reason"])
 
     # 4. The envelope + citation actually exist in FRANK, granted, for this
     # exact pair — never re-derived, never assumed from the file's own say-so
