@@ -2080,8 +2080,13 @@ def test_mid_apply_revoke_rolls_back_and_reports_edrift(
     group = f"mcp:{spec.id}:node9_explain"
     grants_root = home / "manifest_grants"
     _charter(tmp_path, monkeypatch, apps=("kart", "ada"), groups=(group,))
-    kart_path = _manifest(home, "kart")
-    ada_path = _manifest(home, "ada")
+    # Loki audit 94548F7A, F1 probe: a non-empty starting permissions list on
+    # BOTH seats — "restored" must mean the ORIGINAL list, in the ORIGINAL
+    # order, not merely "ends up empty" (which a bare `== []` assertion
+    # could not tell apart from "never had anything to begin with").
+    starting_perms = ["store_read", "grove_read"]
+    kart_path = _manifest(home, "kart", permissions=list(starting_perms))
+    ada_path = _manifest(home, "ada", permissions=list(starting_perms))
     _seal(home, store, seats=("kart", "ada"), groups=(group,), kr=ring_with_sean)
 
     pg = _FakeGovernancePg()
@@ -2113,8 +2118,10 @@ def test_mid_apply_revoke_rolls_back_and_reports_edrift(
     assert not result.get("rollback_failed")
     kart_manifest = json.loads(kart_path.read_text())
     ada_manifest = json.loads(ada_path.read_text())
-    assert kart_manifest["permissions"] == []
-    assert ada_manifest["permissions"] == []
+    # Restored to exactly the starting list, in the starting order — not
+    # just "empty," and not merely set-equal.
+    assert kart_manifest["permissions"] == starting_perms
+    assert ada_manifest["permissions"] == starting_perms
     assert not _receipts(pg)
     status = mgx.manifest_grant_status("pair-mg-1", grants_root=grants_root)
     assert status["state"] == "failed"
@@ -2137,6 +2144,44 @@ def test_removing_a_federated_grant_for_an_unratified_server_succeeds(
     manifest = json.loads(path.read_text())
     assert manifest["permissions"] == []
     assert not _pending_files(home / "manifest_grants")
+
+
+def test_misspelled_bare_group_at_apply_is_einval_not_edrift(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit 94548F7A, L1: a misspelled bare group name passes the
+    grammar and the request (the pre-existing gap `d43ff389b11f` — bare
+    names are never checked against `KNOWN_PERMISSIONS` at request time,
+    left alone here) and only fails at APPLY, inside
+    `manifest_admin.set_permission`'s own 'unknown permission' check. That
+    `ValueError` is not drift — neither the federation registry nor the
+    target moved; only the name was ever wrong. `EINVAL`, naming the
+    group — never `edrift`."""
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    typo = "store_raed"
+    grants_root = home / "manifest_grants"
+    _charter(tmp_path, monkeypatch, apps=("kart",), groups=(typo,))
+    kart_path = _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=(typo,), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-mg-1",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert req["ok"] is True, req
+
+    applied = mgx.manifest_grant_apply(
+        ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert applied["ok"] is False
+    result = applied["processed"][0]
+    assert result["error"] == "EINVAL"
+    assert typo in result["reason"]
+    kart_manifest = json.loads(kart_path.read_text())
+    assert kart_manifest["permissions"] == []
+    assert not _receipts(pg)
 
 
 # — orchestrator seat as TARGET (ruling A): only federated groups —

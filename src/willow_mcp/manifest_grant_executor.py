@@ -1462,7 +1462,7 @@ def _apply_one_seat(app_id: str, groups: list[str], *, apps_root: Path) -> dict:
     root directly under ``signed_pair_lock``; there is no sudo bridge to
     cross. (A uid split, if the operator ever performs one, would need
     ``privileged_publisher`` here — gap ``85716b25d9a8``.)"""
-    from . import manifest_admin, pgp
+    from . import manifest_admin, mcp_federation, pgp
 
     pre = _seat_pre_state(app_id, apps_root)
     if not pre.get("ok"):
@@ -1516,8 +1516,32 @@ def _apply_one_seat(app_id: str, groups: list[str], *, apps_root: Path) -> dict:
         # the registry (manifest_admin.py, same audit), so an earlier
         # seat's federated grant in this same request is actually undone
         # rather than left stuck with a ROLLBACK FAILED.
+        #
+        # Loki audit 94548F7A, L1 (low): a bare `ValueError` here is not
+        # ALWAYS drift — `validate_permission`'s "unknown permission" for a
+        # misspelled bare group (grammar and request both let a typo
+        # through today — the separate, pre-existing gap `d43ff389b11f`)
+        # raises the exact same exception type, and every other ValueError
+        # source inside this loop (`_validate_app_id`, `read_manifest`'s
+        # malformed-file guard, a decode error inside `publish_signed_pair`)
+        # would too. `edrift` means the row 18 sense of the word — the
+        # REGISTRY or the TARGET moved out from under this request — never
+        # "any ValueError." `g` (the loop variable above) still names
+        # whichever group this particular attempt was on: `edrift` only
+        # when `g` is itself a well-formed `mcp:<server_id>:<tool>` name
+        # AND that exact server is no longer ratified RIGHT NOW; anything
+        # else — a typo, a malformed name that slipped past an earlier
+        # check, any other cause — is `EINVAL`, naming the group. Both
+        # branches roll back identically and write no receipt either way.
         revoke = _revoke_groups(app_id, granted_now)
-        out = {"ok": False, "app_id": app_id, "error": "edrift", "reason": str(exc)}
+        parts = g.split(":")
+        is_federated_drift = (
+            g.startswith("mcp:") and len(parts) == 3 and parts[1]
+            and not mcp_federation.is_ratified(parts[1])
+        )
+        errno = "edrift" if is_federated_drift else "EINVAL"
+        out = {"ok": False, "app_id": app_id, "error": errno,
+               "reason": str(exc) if errno == "edrift" else f"{g!r}: {exc}"}
         if revoke["failed"]:
             out["rollback_failed"] = revoke["failed"]
         return out
