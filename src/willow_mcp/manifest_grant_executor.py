@@ -421,7 +421,14 @@ def _validate_federated_groups(groups: list[str], *, errno: str) -> Optional[dic
     caller, before either call site's own error handling ever ran. Guarded:
     any exception from this read is its own named ``EUNREACH`` failure,
     returned through the same ordinary dict path as an unratified id —
-    never raised."""
+    never raised.
+
+    Loki audit 303453DA, R2: ``UnicodeDecodeError`` IS-A ``ValueError`` in
+    Python, so it matched the ``except ValueError`` clause below before this
+    one was added — landing as a misleading ``errno`` (``edrift``/``EINVAL``
+    depending on the caller) rather than the ``EUNREACH`` every other
+    registry-read failure gets. Listed first, ahead of ``except ValueError``,
+    so the more specific clause wins."""
     from . import manifest_admin
 
     for g in groups:
@@ -429,6 +436,11 @@ def _validate_federated_groups(groups: list[str], *, errno: str) -> Optional[dic
             continue
         try:
             manifest_admin.validate_permission(g)
+        except UnicodeDecodeError as exc:
+            return _refuse(
+                "EUNREACH",
+                f"registry unreadable while validating {g!r}: {type(exc).__name__}: {exc}",
+            )
         except ValueError as exc:
             return _refuse(errno, f"{g!r}: {exc}")
         except Exception as exc:  # noqa: BLE001 — the registry read itself, never a grammar/ratification verdict, is what's failing here
@@ -1866,8 +1878,17 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
         try:
             outcome = _apply_one_seat(seat, groups, apps_root=apps_root)
         except Exception as exc:  # noqa: BLE001 — never let one seat's exception escape this loop and leave earlier seats un-rolled-back
+            # Loki audit 303453DA, R1: an exception whose own `__str__`
+            # raises (a poorly-written custom exception, or one built with
+            # arguments its message formatting cannot handle) must never
+            # itself escape HERE, inside the net meant to catch exactly
+            # this class of surprise — `f"{exc}"` calls `__str__` eagerly.
+            try:
+                msg = f"{type(exc).__name__}: {exc}"
+            except Exception:
+                msg = type(exc).__name__
             outcome = {"ok": False, "app_id": seat, "error": "eunexpected",
-                       "reason": f"{type(exc).__name__}: {exc}"}
+                       "reason": msg}
         if not outcome.get("ok"):
             refused.append(outcome)
             rolled_back: list[str] = []

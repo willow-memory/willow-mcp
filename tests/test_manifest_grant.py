@@ -2278,6 +2278,7 @@ def test_registry_read_raising_during_classification_is_eunreach_full_rollback(
 @pytest.mark.parametrize("exc_factory", [
     lambda: RuntimeError("PgpSourceUnreadable: trust.env unreadable"),
     lambda: OSError("cannot read trust.env"),
+    lambda: UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
 ])
 def test_registry_read_raising_at_apply_pre_check_is_eunreach_no_seat_touched(
     home, tmp_path, monkeypatch, store, ring_with_sean, exc_factory,
@@ -2286,12 +2287,13 @@ def test_registry_read_raising_at_apply_pre_check_is_eunreach_no_seat_touched(
     named: `_apply_one`'s own step-3b pre-check (`_validate_federated_groups`,
     run BEFORE the per-seat loop even starts) makes the exact same
     unguarded `mcp_federation.is_ratified` call — a `RuntimeError`/`OSError`
-    there used to escape `_apply_one` entirely (a `UnicodeDecodeError`
-    happened to survive only because it IS-A `ValueError`, catchable by
-    the pre-existing `except ValueError`, and landed as a misleading
-    `edrift` rather than `EUNREACH`). Guarded the same way: a named
-    `EUNREACH`, no seat touched at all (the check runs before granting
-    anything), zero receipts."""
+    there used to escape `_apply_one` entirely. `UnicodeDecodeError` IS-A
+    `ValueError` in Python, so it used to be caught by the pre-existing
+    `except ValueError` and land as a misleading `edrift`/`EINVAL` rather
+    than `EUNREACH` — fixed (Loki audit 303453DA, R2) with an
+    `except UnicodeDecodeError` listed ahead of `except ValueError`. All
+    three now land the same way: a named `EUNREACH`, no seat touched at
+    all (the check runs before granting anything), zero receipts."""
     monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
     spec = _fed_spec()
     mf.ratify(spec, ratified_by="operator", reason="test")
@@ -2322,6 +2324,75 @@ def test_registry_read_raising_at_apply_pre_check_is_eunreach_no_seat_touched(
     assert result["error"] == "EUNREACH"
     kart_manifest = json.loads(kart_path.read_text())
     assert kart_manifest["permissions"] == starting_perms
+    assert not _receipts(pg)
+
+
+class _UnstringifiableFault(Exception):
+    """An exception whose own `__str__` raises — the Loki 303453DA, R1
+    probe. `f"{exc}"` calls this eagerly; a naive any-exception net that
+    builds its reason that way raises a NEW exception while trying to
+    report the first one, escaping the very net meant to catch it."""
+
+    def __str__(self):
+        raise RuntimeError("this exception's own __str__ blows up")
+
+
+def test_exception_with_broken_str_does_not_escape_rollback(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Loki audit 303453DA, R1: `_apply_one`'s any-exception net (the
+    structural fix from C1) used to build its reason with an eager
+    `f"{type(exc).__name__}: {exc}"`. Injected via `_seat_pre_state` (called
+    BEFORE `_apply_one_seat`'s own try block, whose every internal branch
+    ALSO stringifies its exception and would hit the identical trap first,
+    re-wrapping it into a different, stringifiable exception before it ever
+    reached the code under test) so the ORIGINAL unstringifiable exception
+    is what the net actually has to handle. Seat 1 (kart) is still rolled
+    back to its exact non-empty pre-state, 0 receipts, and a named errno —
+    never a raised exception from formatting the reason itself."""
+    monkeypatch.delenv("WILLOW_PGP_FINGERPRINT", raising=False)
+    grants_root = home / "manifest_grants"
+    starting_perms = ["store_read"]
+    _charter(tmp_path, monkeypatch, apps=("kart", "ada"), groups=("grove_read",))
+    kart_path = _manifest(home, "kart", permissions=list(starting_perms))
+    ada_path = _manifest(home, "ada", permissions=list(starting_perms))
+    _seal(home, store, seats=("kart", "ada"), groups=("grove_read",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-mg-1",
+        ledger=ledger, store=store, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert req["ok"] is True, req
+
+    real_seat_pre_state = mgx._seat_pre_state
+    ada_calls = {"n": 0}
+
+    def _fault_pre_state(app_id, apps_root):
+        # First call for "ada" is the step-5 drift re-check (must succeed);
+        # second is `_apply_one_seat`'s own pre-state, before its try block.
+        if app_id == "ada":
+            ada_calls["n"] += 1
+            if ada_calls["n"] == 2:
+                raise _UnstringifiableFault("boom")
+        return real_seat_pre_state(app_id, apps_root)
+
+    monkeypatch.setattr(mgx, "_seat_pre_state", _fault_pre_state)
+    applied = mgx.manifest_grant_apply(
+        ledger=ledger, apps_root=home / "mcp_apps", grants_root=grants_root,
+    )
+    assert applied["ok"] is False
+    result = applied["processed"][0]
+    assert result["error"] == "eunexpected"
+    # `_apply_one`'s own reason wraps the per-seat outcome's reason (built by
+    # the new safe-formatting fallback, `type(exc).__name__`) into a bigger
+    # sentence — the point is that NEITHER layer raised while formatting it.
+    assert "_UnstringifiableFault" in result["reason"]
+    kart_manifest = json.loads(kart_path.read_text())
+    ada_manifest = json.loads(ada_path.read_text())
+    assert kart_manifest["permissions"] == starting_perms
+    assert ada_manifest["permissions"] == starting_perms
     assert not _receipts(pg)
 
 
