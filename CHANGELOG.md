@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **node9:** shadow mode — node9 verdicts beside the willow gates, shape-only HMAC ledger ([13fd5f1](https://github.com/willow-memory/willow-mcp/commit/13fd5f15be8f3f300e10d249693cb7c2da02b976))
 * **node9:** shadow mode — side-effect-free node9 verdicts beside the willow gates, shape-only HMAC ledger ([2628d47](https://github.com/willow-memory/willow-mcp/commit/2628d47cca56d662c5883b4cab50fb7030f98354))
 
 ## [2.83.0](https://github.com/willow-memory/willow-mcp/compare/v2.82.0...v2.83.0) (2026-09-27)
