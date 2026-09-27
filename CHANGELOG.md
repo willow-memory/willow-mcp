@@ -31,6 +31,21 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.83.0](https://github.com/willow-memory/willow-mcp/compare/v2.82.0...v2.83.0) (2026-09-27)
+
+
+### Added
+
+* **manifest-grant:** widen grammar for federated mcp:<id>:<tool> grants ([044e024](https://github.com/willow-memory/willow-mcp/commit/044e0247d512268faaedf5bed91ea504a8db4421))
+
+
+### Fixed
+
+* **manifest-grant:** safe reason formatting; UnicodeDecodeError to EUNREACH before ValueError ([0b0f59a](https://github.com/willow-memory/willow-mcp/commit/0b0f59afca525a9bba0ad5c678de0fd1b7981366))
+* **manifest-grant:** any exception mid-seat-loop rolls back every earlier seat ([862da40](https://github.com/willow-memory/willow-mcp/commit/862da408ecf52f630ea64a3fe004e87bf3b216ac))
+* **manifest-grant:** edrift only for a revoked federated server, EINVAL otherwise ([9c4246e](https://github.com/willow-memory/willow-mcp/commit/9c4246ebcbd27389ed9b3aa06249172621b9d415))
+* **manifest-grant:** federated-grant rollback must not re-check the registry on revoke ([63eb334](https://github.com/willow-memory/willow-mcp/commit/63eb33418792caf593a949dc8a13ae490d0c5564))
+
 ## [2.82.0](https://github.com/willow-memory/willow-mcp/compare/v2.81.3...v2.82.0) (2026-09-23)
 
 
