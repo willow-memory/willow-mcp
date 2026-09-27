@@ -49,8 +49,9 @@ _REAL_SUBPROCESS_RUN = subprocess.run
 KNOWN_PERMISSIONS = frozenset(PERMISSION_GROUPS) | CAPABILITY_PERMISSIONS
 
 
-def validate_permission(perm: str) -> str:
-    """Return `perm` if an operator may grant it, else raise `ValueError`.
+def validate_permission(perm: str, *, require_ratified: bool = True) -> str:
+    """Return `perm` if an operator may grant (or remove) it, else raise
+    `ValueError`.
 
     Two shapes are legal, and they are checked differently on purpose:
 
@@ -67,6 +68,20 @@ def validate_permission(perm: str) -> str:
     be kept from drifting apart: a grant naming an unratified server would sit
     in a manifest looking effective and deny at every call, which is the silent
     shape this module exists to refuse.
+
+    `require_ratified=False` (Loki audit B0AB4656, F1): REMOVING a permission
+    must never depend on the server still being ratified. A federated grant
+    can be revoked between a server's ratification and the moment something
+    strips it from a manifest — an operator's own `deny-permission`, or a
+    `manifest.grant` rollback undoing a seat this same apply already granted
+    earlier in the same request, after the server was revoked mid-loop. Both
+    are removals, and a removal that itself re-checks the registry can never
+    strip an `mcp:` name for a server that is no longer ratified — the exact
+    shape that used to leave a receipt-less grant stuck on an earlier seat
+    with no way to clear it through this same path. The SHAPE check (a
+    `mcp:<server_id>:<tool>` name must still be well-formed — three non-empty
+    colon-separated parts) is unconditional either way; only the registry
+    lookup is skipped for a removal.
     """
     if perm in KNOWN_PERMISSIONS:
         return perm
@@ -77,14 +92,17 @@ def validate_permission(perm: str) -> str:
             f"'mcp:<server_id>:<tool>'"
         )
 
-    from . import mcp_federation
-
     parts = perm.split(":")
     if len(parts) != 3 or not parts[1] or not parts[2]:
         raise ValueError(
             f"malformed federated permission {perm!r} — expected exactly "
             f"'mcp:<server_id>:<tool>' with both parts non-empty"
         )
+    if not require_ratified:
+        return perm
+
+    from . import mcp_federation
+
     server_id = parts[1]
     if not mcp_federation.is_ratified(server_id):
         ratified = [
@@ -601,7 +619,13 @@ def set_permission(
     *unrestricted* — materializing an empty manifest here would turn a
     no-op revoke into a store-access grant nobody asked for.
     """
-    validate_permission(perm)
+    # Loki audit B0AB4656, F1: only a GRANT re-checks the registry. A
+    # removal must always be able to strip an `mcp:` name whose server was
+    # ratified when it was granted but has since been revoked — including
+    # from a `manifest.grant` rollback undoing an earlier seat in the same
+    # apply after the server dropped out mid-loop. The shape check still
+    # runs either way (see `validate_permission`'s own docstring).
+    validate_permission(perm, require_ratified=granted)
     existed = manifest_path(app_id).is_file()
     manifest = read_manifest(app_id)
     perms = list(manifest.get("permissions") or [])
