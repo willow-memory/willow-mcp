@@ -2970,6 +2970,59 @@ def task_submit(
     gates, not laundering an ask through whichever seat happens to be
     trusted enough to reach ``task_submit``.
     """
+    result = _task_submit_impl(
+        app_id, task, agent, lane, allow_net, allow_localhost, allow_db,
+        network_authorization, db_authorization, anticipated_gates,
+    )
+    # node9 shadow mode (sealed a6d054b3, amended node9-shadow-hybrid-ledger-
+    # 2026-09-27 per Loki 53741054 F10): fires AFTER every existing gate has
+    # decided, accepted or refused — both are recorded, `held_net_authorization`
+    # as its own distinct willow status, never as "allow". Never blocks, never
+    # prompts, never changes `result`, never waited on (spawn_shadow is
+    # fire-and-forget). The import itself is now inside this try/except too —
+    # F10 found the un-guarded import could raise AFTER _task_submit_impl had
+    # already enqueued the task, turning a queued task into a visible error
+    # for the caller.
+    try:
+        from . import node9_shadow
+
+        res_dict = result if isinstance(result, dict) else {}
+        if res_dict.get("status") == "held_net_authorization":
+            willow_verdict = "held"
+        elif "error" in res_dict:
+            willow_verdict = "block"
+        else:
+            willow_verdict = "allow"
+        node9_shadow.spawn_shadow(
+            surface="kart",
+            seat=app_id,
+            command=task,
+            willow_verdict=willow_verdict,
+            willow_reason=res_dict.get("error", ""),
+        )
+    except Exception:  # noqa: BLE001 — the shadow must never affect task_submit.
+        pass
+    return result
+
+
+def _task_submit_impl(
+    app_id: str,
+    task: str,
+    agent: str = "kart",
+    lane: str = "fast",
+    allow_net: bool = False,
+    allow_localhost: bool = False,
+    allow_db: bool = False,
+    network_authorization: str = "",
+    db_authorization: str = "",
+    anticipated_gates: Optional[list[str]] = None,
+) -> dict:
+    """Implementation body of `task_submit`, split out so node9 shadow mode
+    (sealed a6d054b3) can wrap the call and see the result of every gate
+    below — accepted or refused — without being embedded in each of this
+    function's many early returns. See `task_submit`'s docstring for the
+    full contract; this function's behavior is unchanged from before the
+    split."""
     # allow_localhost is retired (operator ruling 2026-09-23, governance record
     # retire-allow-localhost-2026-09-23, Nestor pair 3ef0211f; amends sealed
     # 9fe5e179 / gap 582b1e676fb3 — Loki 7173C72A finding U1). Refused by name,
@@ -10316,6 +10369,71 @@ def _cmd_set_permission(args, *, granted: bool) -> None:
     print(f"  permissions now: {manifest['permissions']}")
 
 
+def _cmd_node9_shadow(args) -> None:
+    """`willow-mcp node9-shadow install` — vendor a pinned node + node9-ai
+    plus the shim into `$WILLOW_HOME/venvs/node9/` (sealed `a6d054b3`,
+    amended `node9-shadow-hybrid-ledger-2026-09-27` per Loki `53741054`
+    F5/F11: every execution runs the VENDORED copy by absolute path, never
+    PATH, and the installed tree — including its own root directory — is
+    read-only afterward). Operator/host act, like `grant-net`: Kart cannot
+    write `venvs/`, so this never runs from a sandboxed task.
+    """
+    from . import node9_shadow
+
+    if args.node9_shadow_action == "install":
+        try:
+            result = node9_shadow.install_shim(
+                force=args.force,
+                source_node=args.source_node or None,
+                source_node9_ai=args.source_node9_ai or None,
+            )
+        except (OSError, ValueError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            raise SystemExit(1)
+        print(f"node9 shadow shim installed at {result['shim_path']}")
+        print(f"  shadow-home: {result['shadow_home']}")
+        print(f"  node:        {result['node_bin']}")
+        print(f"  node9-ai:    {result['node9_script']} (version {result['version']})")
+        for p in result["wrote"]:
+            print(f"  wrote: {p}")
+        return
+    print(f"Error: unknown node9-shadow action {args.node9_shadow_action!r}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _cmd_shadow_report(args) -> None:
+    """`willow-mcp shadow-report node9 [--since DATE] [--prune] [--selftest]`
+    — counts by agreement class, per rule and per surface, from
+    `$WILLOW_HOME/shadow/node9.jsonl` (sealed `a6d054b3`). Read-only except
+    that `--prune` (or the default) drains rows older than 30 days under the
+    ledger's own lock (Loki `53741054` F6: pruning never runs on the hot
+    path — only here, or via `python -m willow_mcp.node9_shadow --prune`).
+    `--selftest` (Loki `1CCE0D9B`) instead runs the recorder once for real
+    and reports whether a row actually appeared; the plain report's header
+    always shows the last selftest result, whenever it last ran.
+    """
+    from . import node9_shadow
+
+    if args.target != "node9":
+        print(f"Error: unknown shadow-report target {args.target!r}", file=sys.stderr)
+        raise SystemExit(1)
+    if args.selftest:
+        # Loki 1CCE0D9B (INFO): tells "no traffic yet" apart from "the
+        # recorder cannot run at all" — runs the recorder once, for real,
+        # on a fixed benign command through the actual spawn_shadow() path.
+        result = node9_shadow.run_selftest()
+        if result["ok"]:
+            print(f"recorder ok (row appeared, ran at {result['ran_at']})")
+            return
+        print(f"recorder FAILED: {result.get('error')} (ran at {result['ran_at']})", file=sys.stderr)
+        raise SystemExit(1)
+    report = node9_shadow.build_report(since=args.since or None, prune=not args.no_prune)
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+    print(node9_shadow.render_report(report))
+
+
 def main():
     """Entry point. Wraps `_main` so a downstream reader closing early
     (`willow-mcp gates | head`, `... | grep -q`) exits clean instead of an
@@ -10636,6 +10754,8 @@ _COMMANDS: dict[str, str] = {
     "compile-agents": "_cmd_compile_agents",
     "compile-persona": "_cmd_compile_persona",
     "project": "_cmd_project",
+    "node9-shadow": "_cmd_node9_shadow",
+    "shadow-report": "_cmd_shadow_report",
 }
 
 
@@ -11290,6 +11410,57 @@ def _build_parser():
         help="registry project id (default: all projects)",
     )
     project_p.add_argument("--dry-run", action="store_true", help="preview writes only")
+
+    node9_shadow_p = subparsers.add_parser(
+        "node9-shadow",
+        help="node9 shadow mode (sealed a6d054b3): install the pinned, read-only shim",
+    )
+    node9_shadow_p.add_argument(
+        "node9_shadow_action",
+        choices=["install"],
+        help="install copies the shim + shadow-home into $WILLOW_HOME/venvs/node9/",
+    )
+    node9_shadow_p.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an already-installed shim",
+    )
+    node9_shadow_p.add_argument(
+        "--source-node",
+        default="",
+        help="real node binary to vendor (e.g. an fnm-managed node); required unless "
+             "WILLOW_MCP_NODE9_SHADOW_SOURCE_NODE is set",
+    )
+    node9_shadow_p.add_argument(
+        "--source-node9-ai",
+        default="",
+        help="node9-ai package directory to vendor (containing bin/node9.js); required "
+             "unless WILLOW_MCP_NODE9_SHADOW_SOURCE_NODE9_AI is set",
+    )
+
+    shadow_report_p = subparsers.add_parser(
+        "shadow-report",
+        help="node9 shadow mode (sealed a6d054b3): agreement-class counts from the ledger",
+    )
+    shadow_report_p.add_argument("target", choices=["node9"], help="which shadow ledger to report")
+    shadow_report_p.add_argument(
+        "--since",
+        default="",
+        help="ISO date/datetime — only rows at or after this time",
+    )
+    shadow_report_p.add_argument("--json", action="store_true", help="print raw JSON, no summary")
+    shadow_report_p.add_argument(
+        "--no-prune",
+        action="store_true",
+        help="skip the locked prune sweep this command normally runs first",
+    )
+    shadow_report_p.add_argument(
+        "--selftest",
+        action="store_true",
+        help="run the recorder once on a fixed benign command through the real spawn "
+             "path and print 'recorder ok' or the failure — tells 'no traffic' apart "
+             "from 'the recorder is broken'",
+    )
 
     return parser
 

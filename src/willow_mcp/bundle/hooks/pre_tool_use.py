@@ -1957,6 +1957,29 @@ def _is_task_submit(tool_name: str) -> bool:
     return tool_name == "task_submit" or tool_name.endswith("__task_submit")
 
 
+def _shadow_bash(command: str, willow_verdict: str, willow_reason: str) -> None:
+    """node9 shadow mode (sealed a6d054b3, amended node9-shadow-hybrid-
+    ledger-2026-09-27), Bash surface. Called AFTER this hook has already
+    reached its own verdict — never before, never in a way that can change
+    it. spawn_shadow() is fire-and-forget (a detached grandchild does the
+    actual node9 call and ledger write) and itself never raises, but this
+    call site adds its own belt-and-braces try/except so an import failure
+    at hook-load time can never turn an allow/block/warn into an unhandled
+    traceback."""
+    try:
+        from willow_mcp import node9_shadow
+
+        node9_shadow.spawn_shadow(
+            surface="bash",
+            seat=os.environ.get("WILLOW_APP_ID", ""),
+            command=command,
+            willow_verdict=willow_verdict,
+            willow_reason=willow_reason,
+        )
+    except Exception:
+        pass
+
+
 def main() -> None:
     try:
         raw = sys.stdin.read()
@@ -1973,6 +1996,13 @@ def main() -> None:
     )
 
     if is_cursor_shell_event(payload):
+        # node9 shadow mode (sealed a6d054b3) does NOT cover this branch —
+        # Loki 53741054 F11. Cursor's native shell surface is a documented
+        # gap, not a silent one: the shadow judges Bash-tool calls and Kart
+        # task text (task_submit); a shell command routed through Cursor's
+        # own dialect never reaches either, and adding it here would need
+        # its own review of run_cursor_shell_guards' verdict shape rather
+        # than a copy-paste of _shadow_bash.
         command = extract_shell_command(payload)
         if command.strip():
             from willow_mcp.cursor_hook_io import run_cursor_shell_guards
@@ -2029,6 +2059,7 @@ def main() -> None:
             or check_bash(command)
         )
         if reason:
+            _shadow_bash(command, "block", reason)
             if cursor_dialect:
                 from willow_mcp.cursor_hook_io import cursor_permission_for_guard
 
@@ -2041,6 +2072,7 @@ def main() -> None:
             routed = check_bash_routing(command)
             if routed:
                 decision, route_reason = routed
+                _shadow_bash(command, decision, route_reason)
                 if cursor_dialect:
                     from willow_mcp.cursor_hook_io import cursor_permission_for_guard
 
@@ -2054,11 +2086,13 @@ def main() -> None:
                     from willow_mcp.cursor_hook_io import emit_claude_warn
 
                     emit_claude_warn(route_reason)
-            elif cursor_dialect:
-                from willow_mcp.cursor_hook_io import emit_cursor_permission
+            else:
+                _shadow_bash(command, "allow", "")
+                if cursor_dialect:
+                    from willow_mcp.cursor_hook_io import emit_cursor_permission
 
-                emit_cursor_permission("allow")
-                sys.exit(0)
+                    emit_cursor_permission("allow")
+                    sys.exit(0)
     elif _is_file_write(tool_name) or _is_file_write(tool_base):
         reason = check_owned_db_file_write(tool_input) or check_trust_root_write(tool_input)
         if reason:
