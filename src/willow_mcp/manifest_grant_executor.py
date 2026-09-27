@@ -214,9 +214,23 @@ ESCALATION_GROUPS = frozenset({
 #: reads" split :mod:`net_authority` uses for network authority. Bumped by
 #: name if the bound field set ever changes.
 RULING_FORMAT = "willow-manifest-grant-v1"
+
+#: One `groups=` item: today's bare group name, OR a federated per-tool grant
+#: `mcp:<12-hex server_id>:<tool>` (gap `133e17b1291f`, proposal
+#: 2026-09-26-manifest-grant-federated-tools.md, ruling A). The 12-hex id is
+#: `mcp_federation._stable_id()`'s own shape; the tool half mirrors
+#: `gate.federated_tool_permission()`'s `[A-Za-z0-9_.\-]{1,64}`. Kept as its
+#: own named piece so `_RULING_RE` reads as "seats, then a comma-separated
+#: list of ONE of these two shapes" rather than a single sprawling character
+#: class — a bare name and a federated grant are validated identically by
+#: this grammar (a strict shape check); the registry lookup that tells a
+#: well-formed-but-unratified id apart from a real one is a separate check
+#: downstream (`manifest_admin.validate_permission`), never folded into the
+#: regex itself.
+_GROUP_ITEM_RE = r"(?:[A-Za-z0-9_\-]+|mcp:[0-9a-f]{12}:[A-Za-z0-9_.\-]{1,64})"
 _RULING_RE = re.compile(
     r"^" + re.escape(RULING_FORMAT) + r" seats=(?P<seats>[A-Za-z0-9_,\-]+) "
-    r"groups=(?P<groups>[A-Za-z0-9_,\-]+)$"
+    r"groups=(?P<groups>" + _GROUP_ITEM_RE + r"(?:," + _GROUP_ITEM_RE + r")*)$"
 )
 
 
@@ -380,6 +394,90 @@ def _seats_and_groups(record: dict) -> dict:
     if not isinstance(groups, list) or not groups or not all(isinstance(g, str) and g for g in groups):
         return _refuse("EINVAL", "governance record's 'groups' must be a non-empty list of group-name strings")
     return {"ok": True, "apps": list(seats), "groups": list(groups)}
+
+
+def _validate_federated_groups(groups: list[str], *, errno: str) -> Optional[dict]:
+    """Every ``mcp:<server_id>:<tool>`` group, re-checked against the
+    ratification registry (``manifest_admin.validate_permission`` — the same
+    typo/registry guard the CLI's own ``allow-permission`` already goes
+    through). A bare group name is skipped here entirely; its membership is
+    whatever ``KNOWN_PERMISSIONS``/the envelope bounds already decide.
+
+    ``errno`` lets the two call sites report the SAME underlying refusal
+    differently, on purpose (proposal 2026-09-26-manifest-grant-federated-
+    tools.md): at REQUEST time an unratified id is a plain input problem
+    (``EINVAL``, naming the id); at APPLY time the id was fine when sealed
+    and requested — a server ratified then, revoked since, is DRIFT
+    (``edrift``), the same word this module already uses for a seat's
+    manifest moving out from under a pending request.
+
+    Loki audit 3A3F1DD8, C1: ``validate_permission``'s own registry read
+    (``mcp_federation.is_ratified`` -> ... -> ``pgp.expected_fingerprint``,
+    called outside its own try in ``mcp_federation.py``) can itself raise
+    ``PgpSourceUnreadable``/``PgpFingerprintConflict`` (``RuntimeError``
+    subclasses), a bare ``OSError``, or a ``UnicodeDecodeError`` — none of
+    which is a ``ValueError``, so an un-widened ``except ValueError`` here
+    let that exception escape uncaught, past this function and past its
+    caller, before either call site's own error handling ever ran. Guarded:
+    any exception from this read is its own named ``EUNREACH`` failure,
+    returned through the same ordinary dict path as an unratified id —
+    never raised.
+
+    Loki audit 303453DA, R2: ``UnicodeDecodeError`` IS-A ``ValueError`` in
+    Python, so it matched the ``except ValueError`` clause below before this
+    one was added — landing as a misleading ``errno`` (``edrift``/``EINVAL``
+    depending on the caller) rather than the ``EUNREACH`` every other
+    registry-read failure gets. Listed first, ahead of ``except ValueError``,
+    so the more specific clause wins."""
+    from . import manifest_admin
+
+    for g in groups:
+        if not g.startswith("mcp:"):
+            continue
+        try:
+            manifest_admin.validate_permission(g)
+        except UnicodeDecodeError as exc:
+            return _refuse(
+                "EUNREACH",
+                f"registry unreadable while validating {g!r}: {type(exc).__name__}: {exc}",
+            )
+        except ValueError as exc:
+            return _refuse(errno, f"{g!r}: {exc}")
+        except Exception as exc:  # noqa: BLE001 — the registry read itself, never a grammar/ratification verdict, is what's failing here
+            return _refuse(
+                "EUNREACH",
+                f"registry unreadable while validating {g!r}: {type(exc).__name__}: {exc}",
+            )
+    return None
+
+
+def _orchestrator_target_refusal(apps: list[str], groups: list[str]) -> Optional[dict]:
+    """Ruling A (proposal 2026-09-26-manifest-grant-federated-tools.md,
+    operator, 2026-09-26): the orchestrator seat may be a manifest.grant
+    TARGET now — but only for federated per-tool groups. A pair naming the
+    orchestrator seat (``human_session.is_orchestrator_app`` /
+    ``ORCHESTRATOR_APP_ID``) alongside so much as one non-``mcp:`` group is
+    refused outright, regardless of seal or envelope bounds — the confirming
+    act for a federated grant is the operator's OWN seal (a separate, earlier
+    ratification of the server itself), never this verb's bounds check
+    alone. Every other seat is unchanged: this check is a no-op unless the
+    orchestrator is among ``apps``. Checked at REQUEST and again at APPLY
+    (the same re-verify-fresh rule every other precondition here follows)."""
+    from .human_session import is_orchestrator_app
+
+    if not any(is_orchestrator_app(a) for a in apps):
+        return None
+    non_federated = sorted(g for g in groups if not g.startswith("mcp:"))
+    if not non_federated:
+        return None
+    return _refuse(
+        "EPERM",
+        "the orchestrator seat may only receive federated mcp:<server_id>:<tool> "
+        f"groups through manifest.grant; non-federated group(s) {non_federated!r} "
+        "are refused regardless of seal or envelope bounds (proposal "
+        "2026-09-26-manifest-grant-federated-tools.md, ruling A)",
+        non_federated=non_federated,
+    )
 
 
 def _load_sealed_ruling(pair_id: str, *, db_path: Optional[Path] = None) -> dict:
@@ -1279,6 +1377,14 @@ def _manifest_grant_request_locked(
             escalating=escalating,
         )
 
+    orch_refusal = _orchestrator_target_refusal(apps, groups)
+    if orch_refusal is not None:
+        return orch_refusal
+
+    federated_refusal = _validate_federated_groups(groups, errno="EINVAL")
+    if federated_refusal is not None:
+        return federated_refusal
+
     if ledger is None:
         return _refuse(
             "EAMBIG",
@@ -1385,7 +1491,7 @@ def _apply_one_seat(app_id: str, groups: list[str], *, apps_root: Path) -> dict:
     root directly under ``signed_pair_lock``; there is no sudo bridge to
     cross. (A uid split, if the operator ever performs one, would need
     ``privileged_publisher`` here — gap ``85716b25d9a8``.)"""
-    from . import manifest_admin, pgp
+    from . import manifest_admin, mcp_federation, pgp
 
     pre = _seat_pre_state(app_id, apps_root)
     if not pre.get("ok"):
@@ -1422,6 +1528,75 @@ def _apply_one_seat(app_id: str, groups: list[str], *, apps_root: Path) -> dict:
         revoke = _revoke_groups(app_id, granted_now)
         out = {"ok": False, "app_id": app_id, "error": _classify_set_permission_error(exc),
                "reason": str(exc)}
+        if revoke["failed"]:
+            out["rollback_failed"] = revoke["failed"]
+        return out
+    except ValueError as exc:
+        # Loki audit B0AB4656, F1: a federated server ratified when the
+        # sealed pair was bound (and re-checked at the top of `_apply_one`,
+        # step 3b) can still be revoked mid-loop, between one seat's grant
+        # and the next's — `manifest_admin.set_permission` re-runs
+        # `validate_permission` on every GRANT, which raises `ValueError`
+        # for an unratified server, never `RuntimeError`. This is DRIFT —
+        # the same word this module already uses for a seat's manifest
+        # moving out from under a pending request — never `eunexpected`.
+        # The rollback below now succeeds even for an already-unratified
+        # `mcp:` group: `set_permission`'s REMOVE half no longer re-checks
+        # the registry (manifest_admin.py, same audit), so an earlier
+        # seat's federated grant in this same request is actually undone
+        # rather than left stuck with a ROLLBACK FAILED.
+        #
+        # Loki audit 94548F7A, L1 (low): a bare `ValueError` here is not
+        # ALWAYS drift — `validate_permission`'s "unknown permission" for a
+        # misspelled bare group (grammar and request both let a typo
+        # through today — the separate, pre-existing gap `d43ff389b11f`)
+        # raises the exact same exception type, and every other ValueError
+        # source inside this loop (`_validate_app_id`, `read_manifest`'s
+        # malformed-file guard, a decode error inside `publish_signed_pair`)
+        # would too. `edrift` means the row 18 sense of the word — the
+        # REGISTRY or the TARGET moved out from under this request — never
+        # "any ValueError." `g` (the loop variable above) still names
+        # whichever group this particular attempt was on: `edrift` only
+        # when `g` is itself a well-formed `mcp:<server_id>:<tool>` name
+        # AND that exact server is no longer ratified RIGHT NOW; anything
+        # else — a typo, a malformed name that slipped past an earlier
+        # check, any other cause — is `EINVAL`, naming the group. Both
+        # branches roll back identically and write no receipt either way.
+        #
+        # Loki audit 3A3F1DD8, C1 (medium): the classification's OWN
+        # registry read (`mcp_federation.is_ratified` -> `get_ratified` ->
+        # `_read_registry_file` -> `pgp.pgp_enabled`/`pgp.expected_fingerprint`,
+        # the latter called outside its own try in mcp_federation.py) can
+        # itself raise — `PgpSourceUnreadable`/`PgpFingerprintConflict`
+        # (both `RuntimeError` subclasses) when trust.env is unreadable,
+        # malformed, or conflicting, or a bare OSError/UnicodeDecodeError
+        # reading it. Unguarded, that exception used to escape THIS
+        # `except` block entirely — past the seat's own revoke above (which
+        # already ran and is fine), past `_apply_one_seat`, and out of
+        # `_apply_one`'s per-seat loop BEFORE the rollback of every earlier
+        # seat could run (the exact `_apply_one` structural fix, same
+        # audit, is the other half of closing this — this guard means the
+        # common case never needs it). Guarded here: a registry read that
+        # itself fails is its own named failure, `EUNREACH`, returned
+        # through the same ordinary dict path as every other outcome —
+        # never raised.
+        revoke = _revoke_groups(app_id, granted_now)
+        parts = g.split(":")
+        well_formed_federated = bool(g.startswith("mcp:") and len(parts) == 3 and parts[1])
+        errno = "EINVAL"
+        reason = f"{g!r}: {exc}"
+        if well_formed_federated:
+            try:
+                server_ratified = mcp_federation.is_ratified(parts[1])
+            except Exception as registry_exc:  # noqa: BLE001 — the registry read itself, never the seat's own failure, is what's being classified here
+                errno = "EUNREACH"
+                reason = (f"registry unreadable while classifying {g!r}: "
+                          f"{type(registry_exc).__name__}: {registry_exc}")
+            else:
+                if not server_ratified:
+                    errno = "edrift"
+                    reason = str(exc)
+        out = {"ok": False, "app_id": app_id, "error": errno, "reason": reason}
         if revoke["failed"]:
             out["rollback_failed"] = revoke["failed"]
         return out
@@ -1563,6 +1738,23 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
                       "apply time — refused regardless of what request-time checked",
                       escalating=escalating)
 
+    # 3b. Orchestrator-as-target (ruling A) and the federated registry check
+    # — both re-verified fresh at apply, never trusted from request time
+    # alone (the same "a pending request can sit for minutes" reasoning the
+    # seal and escalation-set re-checks above already follow). A server
+    # ratified when requested but revoked before this tick runs is drift on
+    # the registry, not a grammar or escalation problem — refused `edrift`,
+    # the same word this module already uses for a seat's manifest moving
+    # out from under a pending request.
+    orch_refusal = _orchestrator_target_refusal(apps, groups)
+    if orch_refusal is not None:
+        return _fail(orch_refusal["error"], orch_refusal["reason"],
+                     **{k: v for k, v in orch_refusal.items() if k not in ("ok", "error", "reason")})
+
+    federated_refusal = _validate_federated_groups(groups, errno="edrift")
+    if federated_refusal is not None:
+        return _fail(federated_refusal["error"], federated_refusal["reason"])
+
     # 4. The envelope + citation actually exist in FRANK, granted, for this
     # exact pair — never re-derived, never assumed from the file's own say-so
     # (Loki audit 3, finding 2: a hand-written file naming citation_id
@@ -1671,7 +1863,32 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
     pending_receipts: list[tuple[dict, dict]] = []
 
     for seat in apps:
-        outcome = _apply_one_seat(seat, groups, apps_root=apps_root)
+        # Loki audit 3A3F1DD8, C1 (medium): `_apply_one_seat` is documented
+        # to always return a dict, never raise — but that is a documented
+        # CONTRACT, not something Python enforces, and C1 found a real path
+        # that broke it (a classification helper's own registry read
+        # raising a `pgp` exception, unguarded, from inside an `except`
+        # block that already thought it was done). ANY exception escaping
+        # this call, whatever its type or source, must never skip rollback
+        # of every seat already granted earlier in THIS request — closing
+        # the class this bug belongs to, not just the one instance found.
+        # Shaped exactly like `_apply_one_seat`'s own worst-case return (no
+        # `granted`/`changed`) so the ordinary `if not outcome.get("ok")`
+        # rollback path below handles it identically, with no special case.
+        try:
+            outcome = _apply_one_seat(seat, groups, apps_root=apps_root)
+        except Exception as exc:  # noqa: BLE001 — never let one seat's exception escape this loop and leave earlier seats un-rolled-back
+            # Loki audit 303453DA, R1: an exception whose own `__str__`
+            # raises (a poorly-written custom exception, or one built with
+            # arguments its message formatting cannot handle) must never
+            # itself escape HERE, inside the net meant to catch exactly
+            # this class of surprise — `f"{exc}"` calls `__str__` eagerly.
+            try:
+                msg = f"{type(exc).__name__}: {exc}"
+            except Exception:
+                msg = type(exc).__name__
+            outcome = {"ok": False, "app_id": seat, "error": "eunexpected",
+                       "reason": msg}
         if not outcome.get("ok"):
             refused.append(outcome)
             rolled_back: list[str] = []
