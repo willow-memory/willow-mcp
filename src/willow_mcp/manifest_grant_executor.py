@@ -409,7 +409,19 @@ def _validate_federated_groups(groups: list[str], *, errno: str) -> Optional[dic
     (``EINVAL``, naming the id); at APPLY time the id was fine when sealed
     and requested — a server ratified then, revoked since, is DRIFT
     (``edrift``), the same word this module already uses for a seat's
-    manifest moving out from under a pending request."""
+    manifest moving out from under a pending request.
+
+    Loki audit 3A3F1DD8, C1: ``validate_permission``'s own registry read
+    (``mcp_federation.is_ratified`` -> ... -> ``pgp.expected_fingerprint``,
+    called outside its own try in ``mcp_federation.py``) can itself raise
+    ``PgpSourceUnreadable``/``PgpFingerprintConflict`` (``RuntimeError``
+    subclasses), a bare ``OSError``, or a ``UnicodeDecodeError`` — none of
+    which is a ``ValueError``, so an un-widened ``except ValueError`` here
+    let that exception escape uncaught, past this function and past its
+    caller, before either call site's own error handling ever ran. Guarded:
+    any exception from this read is its own named ``EUNREACH`` failure,
+    returned through the same ordinary dict path as an unratified id —
+    never raised."""
     from . import manifest_admin
 
     for g in groups:
@@ -419,6 +431,11 @@ def _validate_federated_groups(groups: list[str], *, errno: str) -> Optional[dic
             manifest_admin.validate_permission(g)
         except ValueError as exc:
             return _refuse(errno, f"{g!r}: {exc}")
+        except Exception as exc:  # noqa: BLE001 — the registry read itself, never a grammar/ratification verdict, is what's failing here
+            return _refuse(
+                "EUNREACH",
+                f"registry unreadable while validating {g!r}: {type(exc).__name__}: {exc}",
+            )
     return None
 
 
@@ -1533,15 +1550,41 @@ def _apply_one_seat(app_id: str, groups: list[str], *, apps_root: Path) -> dict:
         # else — a typo, a malformed name that slipped past an earlier
         # check, any other cause — is `EINVAL`, naming the group. Both
         # branches roll back identically and write no receipt either way.
+        #
+        # Loki audit 3A3F1DD8, C1 (medium): the classification's OWN
+        # registry read (`mcp_federation.is_ratified` -> `get_ratified` ->
+        # `_read_registry_file` -> `pgp.pgp_enabled`/`pgp.expected_fingerprint`,
+        # the latter called outside its own try in mcp_federation.py) can
+        # itself raise — `PgpSourceUnreadable`/`PgpFingerprintConflict`
+        # (both `RuntimeError` subclasses) when trust.env is unreadable,
+        # malformed, or conflicting, or a bare OSError/UnicodeDecodeError
+        # reading it. Unguarded, that exception used to escape THIS
+        # `except` block entirely — past the seat's own revoke above (which
+        # already ran and is fine), past `_apply_one_seat`, and out of
+        # `_apply_one`'s per-seat loop BEFORE the rollback of every earlier
+        # seat could run (the exact `_apply_one` structural fix, same
+        # audit, is the other half of closing this — this guard means the
+        # common case never needs it). Guarded here: a registry read that
+        # itself fails is its own named failure, `EUNREACH`, returned
+        # through the same ordinary dict path as every other outcome —
+        # never raised.
         revoke = _revoke_groups(app_id, granted_now)
         parts = g.split(":")
-        is_federated_drift = (
-            g.startswith("mcp:") and len(parts) == 3 and parts[1]
-            and not mcp_federation.is_ratified(parts[1])
-        )
-        errno = "edrift" if is_federated_drift else "EINVAL"
-        out = {"ok": False, "app_id": app_id, "error": errno,
-               "reason": str(exc) if errno == "edrift" else f"{g!r}: {exc}"}
+        well_formed_federated = bool(g.startswith("mcp:") and len(parts) == 3 and parts[1])
+        errno = "EINVAL"
+        reason = f"{g!r}: {exc}"
+        if well_formed_federated:
+            try:
+                server_ratified = mcp_federation.is_ratified(parts[1])
+            except Exception as registry_exc:  # noqa: BLE001 — the registry read itself, never the seat's own failure, is what's being classified here
+                errno = "EUNREACH"
+                reason = (f"registry unreadable while classifying {g!r}: "
+                          f"{type(registry_exc).__name__}: {registry_exc}")
+            else:
+                if not server_ratified:
+                    errno = "edrift"
+                    reason = str(exc)
+        out = {"ok": False, "app_id": app_id, "error": errno, "reason": reason}
         if revoke["failed"]:
             out["rollback_failed"] = revoke["failed"]
         return out
@@ -1808,7 +1851,23 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
     pending_receipts: list[tuple[dict, dict]] = []
 
     for seat in apps:
-        outcome = _apply_one_seat(seat, groups, apps_root=apps_root)
+        # Loki audit 3A3F1DD8, C1 (medium): `_apply_one_seat` is documented
+        # to always return a dict, never raise — but that is a documented
+        # CONTRACT, not something Python enforces, and C1 found a real path
+        # that broke it (a classification helper's own registry read
+        # raising a `pgp` exception, unguarded, from inside an `except`
+        # block that already thought it was done). ANY exception escaping
+        # this call, whatever its type or source, must never skip rollback
+        # of every seat already granted earlier in THIS request — closing
+        # the class this bug belongs to, not just the one instance found.
+        # Shaped exactly like `_apply_one_seat`'s own worst-case return (no
+        # `granted`/`changed`) so the ordinary `if not outcome.get("ok")`
+        # rollback path below handles it identically, with no special case.
+        try:
+            outcome = _apply_one_seat(seat, groups, apps_root=apps_root)
+        except Exception as exc:  # noqa: BLE001 — never let one seat's exception escape this loop and leave earlier seats un-rolled-back
+            outcome = {"ok": False, "app_id": seat, "error": "eunexpected",
+                       "reason": f"{type(exc).__name__}: {exc}"}
         if not outcome.get("ok"):
             refused.append(outcome)
             rolled_back: list[str] = []
