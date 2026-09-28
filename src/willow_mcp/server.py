@@ -225,7 +225,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 148 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 149 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -3635,6 +3635,40 @@ def task_list(app_id: str, agent: str = "kart", limit: int = 10,
     return result
 
 
+def _lane_running_task_ids(app_id: str, agent: str, lane: str) -> "list[str] | None":
+    """Task ids with status 'running' for ``(agent, lane)`` — not an MCP
+    tool; an internal read ``package_upgrade_executor`` calls (F8d) before
+    restarting a worker unit tied to that lane, since a restart kills
+    whatever that lane's worker is mid-task outright (``worker.py`` has no
+    SIGTERM handler). Returns ``None`` (never an empty list) when the queue
+    cannot be read at all — unmapped schema, no Postgres — so a caller can
+    tell "confirmed idle" apart from "could not check" and fail closed on
+    the latter, rather than silently treating "could not check" as "safe
+    to restart"."""
+    pg = get_pg()
+    if not pg:
+        return None
+    mapping = sp.resolve(pg, app_id, "tasks", _TASK_FIELDS)
+    if "error" in mapping:
+        return None
+    fields = mapping["fields"]
+    id_col = fields["task_id"]["column"]
+    status_col = fields["status"]["column"]
+    agent_col = fields["agent"]["column"]
+    lane_col = fields["lane"]["column"]
+    if id_col is None or status_col is None or agent_col is None or lane_col is None:
+        return None
+    cur = pg.cursor()
+    cur.execute(
+        f'SELECT "{id_col}" FROM tasks WHERE "{status_col}" = \'running\' '  # nosec B608 - column names come from the confirmed schema_profile field mapping, not request input; agent/lane are bound params
+        f'AND "{agent_col}" = %s AND "{lane_col}" = %s',
+        (agent, lane),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return [r[0] for r in rows]
+
+
 # ── Knowledge extension tools ──────────────────────────────────────────────────
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -5863,6 +5897,71 @@ def unit_install_execute(
         )
     except Exception as exc:
         return {"ok": False, "installed": False, "error": f"unit_install_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def package_upgrade_execute(
+    app_id: str,
+    repo: str,
+    tag: str,
+    venv: str,
+    envelope_id: str = "",
+    project: str = "",
+    task_id: str = "",
+    force_restart: bool = False,
+) -> dict:
+    """Install `tag` of `repo` into `venv` (a name under `$WILLOW_HOME/venvs`),
+    offline, performed by THIS process under the `package.upgrade` envelope
+    that governs `app_id` (verb 25, gap c1b4a8d006dc — UNSEALED, no Nestor
+    pair id yet; see syscall-table.json row 25's own note). Refuses before
+    any citation: malformed repo/tag/venv (`EINVAL`), no verified clone / the
+    tag missing locally or not reachable from `origin/HEAD` (`ENOSRC`), venv
+    not a bare name under the venvs root or absent (`EVENV`), this process
+    cannot write the venv — owner uid reported, never escalated (`EPERM`), the
+    package has no known importer row (`ENOIMPORTERS`), a declared dependency
+    not already satisfied in the venv (`EDEPS`), no recognised build backend
+    or none configured for this box (`EBUILD`), or a unit this upgrade would
+    restart has a Kart task running on its own lane and `force_restart` was
+    not passed (`EBUSY`). Then, all cited: `git archive <sha>` (the tag's own
+    resolved commit, never the tag name), the wheel is built by SUBMITTING A
+    REAL KART TASK — network-isolated, no broker env — and awaiting it; the
+    broker never runs pip wheel, a build backend, or a build-python probe
+    itself. The built wheel is then verified deterministically against the
+    archived source (byte-identical modules, no extra content, matching
+    METADATA and console_scripts) before a single byte of it is installed,
+    because the build venv Kart can write to is not trusted to be honest.
+    Only the verified wheel is installed — `pip install --no-index --no-deps
+    --isolated`, offline throughout — verified again in a fresh subprocess
+    against the tag's declared version (`EVERIFY` + rollback on mismatch),
+    then the systemd `--user` worker units the code graph shows import the
+    package are restarted, and `serve_reload_required` is reported when the
+    broker's own serve process imports it too (never restarted directly —
+    propose-then-seal through the reloader). Every failure from the citation
+    onward writes a FRANK receipt. Returns before/after versions, the wheel's
+    sha256, the Kart build task id, the FRANK `package_upgrade` citation id,
+    and each restarted unit's before/after `NRestarts`."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import package_upgrade_executor
+        from .governance_ledger import GovernanceLedger
+
+        return package_upgrade_executor.execute_package_upgrade(
+            app_id,
+            repo=repo,
+            tag=tag,
+            venv=venv,
+            envelope_id=envelope_id,
+            project=project or repo,
+            session=_current_orchestrator_session(),
+            task_id=task_id,
+            ledger=GovernanceLedger(pg),
+            force_restart=force_restart,
+        )
+    except Exception as exc:
+        return {"ok": False, "upgraded": False, "error": f"package_upgrade_execute_failed: {exc}"}
 
 
 @mcp.tool(annotations=_ANNO_READ)
