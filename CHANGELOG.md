@@ -31,6 +31,15 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.86.1](https://github.com/willow-memory/willow-mcp/compare/v2.86.0...v2.86.1) (2026-09-28)
+
+
+### Fixed
+
+* **heartbeat:** a sandboxed task never publishes worker liveness ([720d9b9](https://github.com/willow-memory/willow-mcp/commit/720d9b9d022195ab541bc0747b7efb390b2b8b5e))
+* **heartbeat:** close the phantom source, real namespace test, any-non-empty in_kart_sandbox ([702eaed](https://github.com/willow-memory/willow-mcp/commit/702eaed998116945ef3099eac759a54c985fe75b))
+* no worker heartbeat from inside a Kart sandbox ([f217c04](https://github.com/willow-memory/willow-mcp/commit/f217c04b7c8f35c79ba44558185b9c26890d958f))
+
 ## [2.86.0](https://github.com/willow-memory/willow-mcp/compare/v2.85.0...v2.86.0) (2026-09-28)
 
 
