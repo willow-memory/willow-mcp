@@ -36,14 +36,21 @@ by the rule above, so the additive-only sync above refused it and held
 #662's row 25 (``package.upgrade``) hostage behind a row it never touches.
 This module now also accepts a SEALED AMENDMENT: a changed row is applied,
 not refused, when a ``projects_willow_governance_decisions`` record of
-``kind="syscall_row_amend"`` names this exact row id/verb, is
-``status="sealed"`` with a ``nestor_pair_id``/``nestor_verifier`` (the same
-shape ``seal_handler.on_seal`` writes), independently confirms sealed in
-Nestor's own ledger (:func:`net_authority.read_sealed_pair`), and names
-``from_sha256``/``to_sha256`` matching this module's own hash of the row's
-structural fields exactly. See :func:`diff_changed_rows` (the read-only
-preview an operator uses to prepare that record), :func:`_find_amendment`,
-and :func:`_confirm_amendment`. An unsealed modification, or a changed row
+``kind="syscall_row_amend"`` POINTS (via ``nestor_pair_id``) at a sealed
+Nestor pair whose signature VERIFIES against this process's own keyring
+(:func:`net_signer.verify_seal`, the same code path
+:func:`reloader.find_sealing_decision` uses — Loki audit E79FCAE7 F5), and
+whose sealed CONCLUSION carries exactly one ``syscall-row-amend:
+id=<int> verb=<verb> from=<64-hex> to=<64-hex>`` line naming this exact
+row id/verb and this module's own hash of the row's structural fields,
+exactly. The authority is the SEALED TEXT ITSELF — never a SOIL side field
+merely asserting an id/verb/hash, which is at most a pointer, checked for
+internal consistency but never trusted as a substitute for the seal (Loki
+audit 573273BD, F1: the prior build let any sealed pair plus any SOIL
+record authorize any row change). See :func:`diff_changed_rows` (the
+read-only preview an operator uses to prepare that record — it also emits
+the exact line to seal), :func:`_find_amendment_candidates`, and
+:func:`_confirm_amendment`. An unsealed modification, or a changed row
 with no matching decision at all, is refused exactly as before — this is
 additive, never a relaxation.
 
@@ -185,12 +192,50 @@ def _extract_seal_id(note: str) -> str:
 #: additive-only sync refused it and held #662's row 25 hostage behind it.
 AMENDMENT_KIND = "syscall_row_amend"
 
+#: The exact line a sealed CONCLUSION must carry to authorize one row
+#: change — parsed here, and emitted by :func:`diff_changed_rows` /
+#: :func:`_amend_line` so an operator copies one string into the decision
+#: they seal (build item 7). Coupled to :func:`_confirm_amendment`'s parse;
+#: keep both in sync.
+_AMEND_LINE_RE = re.compile(
+    r"^syscall-row-amend:\s*id=(\d+)\s+verb=(\S+)\s+from=([0-9a-fA-F]{64})\s+to=([0-9a-fA-F]{64})\s*$",
+    re.MULTILINE,
+)
+
+
+def _amend_line(row_id: int, verb: str, from_sha256: str, to_sha256: str) -> str:
+    """The one string a sealed conclusion must contain, verbatim, to
+    authorize ``row_id``/``verb``'s change from ``from_sha256`` to
+    ``to_sha256``. The single source of that format — :func:`_AMEND_LINE_RE`
+    parses exactly what this emits."""
+    return f"syscall-row-amend: id={row_id} verb={verb} from={from_sha256} to={to_sha256}"
+
+
+def _ring_from_keyring(kr) -> dict[str, dict]:
+    """The ``verify_seal`` ring shape (``{name: {key, kind, revoked_at,
+    compromised}}``), built from the process's OWN keyring — the same shape
+    :func:`reloader._ring_from_keyring` builds, duplicated here (a few
+    lines) rather than imported, so this module carries no dependency on a
+    file another packet owns."""
+    return {
+        e.name: {"key": e.key, "kind": e.kind, "revoked_at": e.revoked_at, "compromised": e.compromised}
+        for e in kr.entries()
+    }
+
 
 def _canonical_json(obj) -> str:
-    """Sorted keys, no whitespace — the one serialization every hash in
-    this module is computed over, so a hash written into a governance
-    decision by hand (or by a different process) still compares equal to
-    the one this module computes, byte for byte."""
+    """Sorted keys, no whitespace, ``ensure_ascii=True`` (``json.dumps``'
+    own default) — the one serialization every hash in this module is
+    computed over, so a hash written into a governance decision by hand
+    (or by a different process) still compares equal to the one this
+    module computes, byte for byte. ``ensure_ascii=True`` is load-bearing,
+    not incidental (Loki 573273BD F6): row 18 (``manifest.grant``) carries
+    non-ASCII characters in its ``bounds`` description text, and hashing
+    the SAME row structure with ``ensure_ascii=False`` produces a DIFFERENT
+    sha256. An operator preparing a sealed amendment must copy the hash
+    this function actually emits (via :func:`diff_changed_rows`) — never
+    recompute it with a different ``json.dumps`` call, and never retype it
+    by hand."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
@@ -255,30 +300,36 @@ def diff_changed_rows(*, live_path: Optional[Path] = None,
             lval, bval = lv.get(field), bv.get(field)
             if lval != bval:
                 field_diff[field] = {"from": lval, "to": bval}
+        from_sha256 = _row_hash(lv)
+        to_sha256 = _row_hash(bv)
         rows.append({
             "id": vid,
             "verb": lv.get("verb"),
             "diff": field_diff,
-            "from_sha256": _row_hash(lv),
-            "to_sha256": _row_hash(bv),
+            "from_sha256": from_sha256,
+            "to_sha256": to_sha256,
+            # Build item 7: the exact line to put in the sealed decision,
+            # so the desk copies one string rather than assembling it by
+            # hand from the fields above.
+            "amend_line": _amend_line(vid, lv.get("verb"), from_sha256, to_sha256),
         })
     return {"ok": True, "rows": rows}
 
 
-def _find_amendment(store: Store, row_id: int, verb: str) -> Optional[dict]:
-    """The governance decision naming this row/verb as a
-    :data:`AMENDMENT_KIND` amendment, sealed or not — the caller confirms
-    sealedness. ``Store`` has no field index (same note as
-    ``seal_handler._find_governance_record``), so this is a plain scan; the
-    FIRST match wins, which is exactly right for the one row this build
-    targets and is a known narrowing if a row ever needs a second,
-    disambiguated amendment later."""
-    for rec in store.all(seal_handler.GOVERNANCE_COLLECTION):
-        if (rec.get("kind") == AMENDMENT_KIND
-                and rec.get("id") == row_id
-                and rec.get("verb") == verb):
-            return rec
-    return None
+def _find_amendment_candidates(store: Store) -> list[dict]:
+    """Every governance decision of :data:`AMENDMENT_KIND` — the kind
+    filter is the ONLY thing that admits a record as a candidate here.
+    ``id``/``verb``/``from_sha256``/``to_sha256`` side fields on a record
+    are no longer trusted as authority (the sealed text pointed to by
+    ``nestor_pair_id`` is), so pre-filtering candidates on them would let a
+    stale or wrong-looking record hide a valid one behind it (Loki
+    573273BD F4), or let a mutant that dropped the kind check pass
+    unnoticed (F3). Every candidate returned here is checked by the
+    multi-candidate loop in :func:`sync_syscall_table_from_bundle`;
+    ``Store`` has no field index (same note as
+    ``seal_handler._find_governance_record``), so this is a plain scan."""
+    return [rec for rec in store.all(seal_handler.GOVERNANCE_COLLECTION)
+            if rec.get("kind") == AMENDMENT_KIND]
 
 
 def _confirm_amendment(rec: dict, *, live_row: dict, bundle_row: dict,
@@ -287,58 +338,153 @@ def _confirm_amendment(rec: dict, *, live_row: dict, bundle_row: dict,
     ``live_row -> bundle_row``. Every guard is checked and named on
     failure, in order:
 
-    1. the decision names this exact ``id``/``verb`` (defense in depth —
-       :func:`_find_amendment` already filtered on these, but a caller
-       reusing this on a hand-fetched record gets the same check);
-    2. the decision is ``status == "sealed"`` with a ``nestor_pair_id`` and
-       a ``nestor_verifier`` — the same shape ``seal_handler.on_seal``
-       writes, so an unsealed (or never-seen-by-the-watcher) record is
-       refused, never trusted on a bare SOIL field;
-    3. the named pair independently confirms sealed in Nestor's OWN ledger
-       (:func:`net_authority.read_sealed_pair`) — the SOIL record's
-       ``status`` string is not the trust boundary by itself, the same
-       discipline ``read_sealed_pair``'s own docstring states;
-    4. ``from_sha256``/``to_sha256`` on the decision equal this module's own
-       hash of the live/bundle row, exactly — a decision naming a different
-       hash is refused BY NAME, never silently accepted as "close enough".
+    1. ``rec`` is kind :data:`AMENDMENT_KIND` (defense in depth — a caller
+       gathering candidates via :func:`_find_amendment_candidates` already
+       filtered on this) and carries a ``nestor_pair_id`` — the ONLY thing
+       an amendment record contributes to its own authority.
+    2. the named pair is confirmed sealed in Nestor's OWN ledger
+       (:func:`net_authority.read_sealed_pair`) — ``rec["status"]`` and
+       ``rec["nestor_verifier"]`` are never consulted; the SOIL record is a
+       pointer, not the trust boundary (Loki 573273BD F1).
+    3. the sealed bytes VERIFY against this process's own keyring
+       (:func:`net_signer.verify_seal`, ``max_age_s=None`` — a governance
+       decision does not go stale on a calendar, same as
+       :func:`reloader.find_sealing_decision`). No keyring, an unknown
+       verifier, or a bad signature all refuse here — the SAME code path
+       Loki E79FCAE7 F5 put in ``reloader.py``, reused rather than
+       re-implemented.
+    4. the sealed CONCLUSION (``target_text``) carries EXACTLY ONE
+       ``syscall-row-amend: id=<int> verb=<verb> from=<64hex> to=<64hex>``
+       line (:data:`_AMEND_LINE_RE`) — zero lines means this pair
+       authorizes no row change; two or more (even naming this row twice,
+       or a second row) is refused outright, because one sealed pair
+       authorizes exactly one row change, never a set (Loki 573273BD F1,
+       probe P3).
+    5. that one line's ``id``/``verb`` match ``live_row`` exactly, and its
+       ``from``/``to`` match this module's OWN hash of
+       ``live_row``/``bundle_row`` exactly — a line naming a different row,
+       or different hashes, is refused BY NAME, never accepted as "close
+       enough".
+    6. ``rec``'s own ``id``/``verb``/``from_sha256``/``to_sha256`` fields,
+       when present, agree with what the sealed text itself said — a SOIL
+       record that disagrees with its own sealed pair is refused as a
+       confusing artifact, even though the sealed text (not these fields)
+       is what did the authorizing.
+
+    Every guard through step 5 is checked ONLY from the sealed bytes and
+    the keyring — never from ``rec``'s own side fields. That is the fix for
+    Loki 573273BD F1: the prior build trusted ``rec["status"] == "sealed"``
+    and ``rec["nestor_verifier"]`` as if they were the seal, so a record
+    naming any existing sealed pair (or a hand-written row with
+    ``seal_sig='x'``) authorized any row change.
     """
     row_id = live_row.get("id")
     verb = live_row.get("verb")
 
-    if rec.get("id") != row_id or rec.get("verb") != verb:
+    if rec.get("kind") != AMENDMENT_KIND:
         return False, (
-            f"row {row_id}: matching governance decision {rec.get('_id')!r} names "
-            f"id={rec.get('id')!r} verb={rec.get('verb')!r}, not "
-            f"({row_id!r}, {verb!r}) — refusing")
+            f"row {row_id} ({verb}): governance decision {rec.get('_id')!r} is kind "
+            f"{rec.get('kind')!r}, not {AMENDMENT_KIND!r} — refusing")
 
-    if (rec.get("status") != "sealed" or not rec.get("nestor_pair_id")
-            or not rec.get("nestor_verifier")):
+    pair_id = rec.get("nestor_pair_id")
+    if not pair_id:
         return False, (
-            f"row {row_id} ({verb}): governance decision {rec.get('_id')!r} is not "
-            f"sealed (status={rec.get('status')!r}) — refusing the amendment")
+            f"row {row_id} ({verb}): governance decision {rec.get('_id')!r} carries no "
+            f"nestor_pair_id — refusing")
 
-    pair_id = rec["nestor_pair_id"]
     db_path = nestor_db_path if nestor_db_path is not None else seal_handler._nestor_db_path()
-    ledger_state = net_authority.read_sealed_pair(pair_id, db_path)
-    if ledger_state.get("state") != "populated":
+    pair = net_authority.read_sealed_pair(pair_id, db_path)
+    if pair.get("state") != "populated":
         return False, (
             f"row {row_id} ({verb}): sealed pair {pair_id!r} is not confirmed sealed "
-            f"in the Nestor ledger (state={ledger_state.get('state')!r}: "
-            f"{ledger_state.get('why') or ledger_state.get('cause') or 'unknown'})")
+            f"in the Nestor ledger (state={pair.get('state')!r}: "
+            f"{pair.get('why') or pair.get('cause') or 'unknown'})")
+
+    from . import keyring as _keyring
+    from . import net_signer
+
+    try:
+        ring_kr = _keyring.get_keyring()
+    except _keyring.KeyringError as exc:
+        return False, (
+            f"row {row_id} ({verb}): WILLOW_KEYRING is configured but could not be "
+            f"loaded: {exc} — refusing")
+    if ring_kr is None:
+        return False, (
+            f"row {row_id} ({verb}): no keyring configured (WILLOW_KEYRING) — a seal "
+            f"cannot be verified without a ring to verify it against — refusing")
+    ring = _ring_from_keyring(ring_kr)
+
+    sealed = {"source_norm": pair.get("source_norm"), "target_text": pair.get("target_text"),
+              "verifier": pair.get("verifier"), "seal_sig": pair.get("seal_sig"),
+              "created_at": pair.get("created_at")}
+    ok, why, field = net_signer.verify_seal(sealed, ring, max_age_s=None)
+    if not ok:
+        return False, (
+            f"row {row_id} ({verb}): sealed pair {pair_id!r} does not verify "
+            f"({field}: {why}) — refusing")
+
+    lines = _AMEND_LINE_RE.findall(pair.get("target_text") or "")
+    if len(lines) != 1:
+        return False, (
+            f"row {row_id} ({verb}): sealed pair {pair_id!r}'s conclusion names "
+            f"{len(lines)} syscall-row-amend line(s), not exactly one — one sealed "
+            f"pair authorizes exactly one row change — refusing")
+
+    amend_id_s, amend_verb, amend_from, amend_to = lines[0]
+    amend_id = int(amend_id_s)
+    amend_from = amend_from.lower()
+    amend_to = amend_to.lower()
+
+    if amend_id != row_id or amend_verb != verb:
+        return False, (
+            f"row {row_id} ({verb}): sealed pair {pair_id!r}'s syscall-row-amend line "
+            f"names id={amend_id} verb={amend_verb!r}, not ({row_id!r}, {verb!r}) — "
+            f"refusing")
 
     from_hash = _row_hash(live_row)
-    if rec.get("from_sha256") != from_hash:
+    if amend_from != from_hash:
         return False, (
-            f"row {row_id} ({verb}): governance decision {rec.get('_id')!r} names "
-            f"from_sha256={rec.get('from_sha256')!r}, which does not match the live "
-            f"row's own hash {from_hash!r} — refused by name")
+            f"row {row_id} ({verb}): sealed pair {pair_id!r}'s syscall-row-amend line "
+            f"names from={amend_from!r}, which does not match the live row's own hash "
+            f"{from_hash!r} — refused by name")
 
     to_hash = _row_hash(bundle_row)
-    if rec.get("to_sha256") != to_hash:
+    if amend_to != to_hash:
         return False, (
-            f"row {row_id} ({verb}): governance decision {rec.get('_id')!r} names "
-            f"to_sha256={rec.get('to_sha256')!r}, which does not match the bundle "
-            f"row's own hash {to_hash!r} — refused by name")
+            f"row {row_id} ({verb}): sealed pair {pair_id!r}'s syscall-row-amend line "
+            f"names to={amend_to!r}, which does not match the bundle row's own hash "
+            f"{to_hash!r} — refused by name")
+
+    soil_id = rec.get("id")
+    if soil_id is not None:
+        if isinstance(soil_id, str) and soil_id.strip().lstrip("-").isdigit():
+            soil_id = int(soil_id)
+        if not isinstance(soil_id, int):
+            return False, (
+                f"row {row_id} ({verb}): governance decision {rec.get('_id')!r} carries "
+                f"a non-integer id {rec.get('id')!r}, not comparable to the sealed "
+                f"text's id={amend_id} — refusing")
+        if soil_id != amend_id:
+            return False, (
+                f"row {row_id} ({verb}): governance decision {rec.get('_id')!r}'s own id "
+                f"field ({soil_id!r}) disagrees with its own sealed text's id "
+                f"({amend_id}) — refusing")
+    if rec.get("verb") is not None and rec.get("verb") != amend_verb:
+        return False, (
+            f"row {row_id} ({verb}): governance decision {rec.get('_id')!r}'s own verb "
+            f"field ({rec.get('verb')!r}) disagrees with its own sealed text's verb "
+            f"({amend_verb!r}) — refusing")
+    if rec.get("from_sha256") is not None and rec.get("from_sha256") != amend_from:
+        return False, (
+            f"row {row_id} ({verb}): governance decision {rec.get('_id')!r}'s own "
+            f"from_sha256 field ({rec.get('from_sha256')!r}) disagrees with its own "
+            f"sealed text's from hash ({amend_from!r}) — refusing")
+    if rec.get("to_sha256") is not None and rec.get("to_sha256") != amend_to:
+        return False, (
+            f"row {row_id} ({verb}): governance decision {rec.get('_id')!r}'s own "
+            f"to_sha256 field ({rec.get('to_sha256')!r}) disagrees with its own sealed "
+            f"text's to hash ({amend_to!r}) — refusing")
 
     return True, ""
 
@@ -489,25 +635,61 @@ def sync_syscall_table_from_bundle(
     amended: list[dict] = []
     if changed:
         st = store if store is not None else Store()
+        try:
+            candidates = _find_amendment_candidates(st)
+        except Exception as exc:  # noqa: BLE001 — a broken governance-decision
+            # read must fail the sync CLOSED, same as any other refusal path
+            # here: the live table stays untouched and the reason is inked
+            # (Loki 573273BD F5 — an exception used to escape this function
+            # entirely instead of becoming a named refusal).
+            reason = (f"could not read governance decisions to check "
+                      f"amendment(s) for row(s) {changed}: "
+                      f"{type(exc).__name__}: {exc}")
+            result = {"ok": False, "refused": True, "reason": reason}
+            receipt = _ink_refusal(ledger, project, actor, reason=reason,
+                                    live_path=live_path, bundle_path=bundle_path,
+                                    live_rows=live_rows, bundle_rows=bundle_rows)
+            if receipt:
+                result.update(receipt)
+            return result
+
         unauthorized: list[str] = []
         for vid in changed:
             live_row, bundle_row = live_rows[vid], bundle_rows[vid]
-            rec = _find_amendment(st, vid, live_row.get("verb"))
-            if rec is None:
-                unauthorized.append(
-                    f"row {vid} ({live_row.get('verb')}): no sealed "
-                    f"{AMENDMENT_KIND} governance decision found")
-                continue
-            ok, why = _confirm_amendment(
-                rec, live_row=live_row, bundle_row=bundle_row,
-                nestor_db_path=nestor_db_path)
-            if not ok:
-                unauthorized.append(why)
+            verb = live_row.get("verb")
+            row_reasons: list[str] = []
+            confirmed_pair_id = None
+            # Every candidate of AMENDMENT_KIND is checked — accept on the
+            # first that verifies. A stale or planted record earlier in the
+            # list must not shadow a valid one later (Loki 573273BD F4).
+            for rec in candidates:
+                try:
+                    ok, why = _confirm_amendment(
+                        rec, live_row=live_row, bundle_row=bundle_row,
+                        nestor_db_path=nestor_db_path)
+                except Exception as exc:  # noqa: BLE001 — one bad candidate
+                    # record must not crash the sync, or block a later valid
+                    # one; it is simply not an authorization (Loki 573273BD
+                    # F5, the old AttributeError-at-:308 crash).
+                    ok, why = False, (
+                        f"row {vid} ({verb}): error checking governance "
+                        f"decision {rec.get('_id')!r}: {type(exc).__name__}: {exc}")
+                if ok:
+                    confirmed_pair_id = rec.get("nestor_pair_id")
+                    break
+                row_reasons.append(why)
+            if confirmed_pair_id is None:
+                if row_reasons:
+                    unauthorized.append("; ".join(row_reasons))
+                else:
+                    unauthorized.append(
+                        f"row {vid} ({verb}): no sealed "
+                        f"{AMENDMENT_KIND} governance decision found")
                 continue
             amended.append({
-                "id": vid, "verb": live_row.get("verb"),
-                "from_sha256": rec["from_sha256"], "to_sha256": rec["to_sha256"],
-                "pair_id": rec["nestor_pair_id"],
+                "id": vid, "verb": verb,
+                "from_sha256": _row_hash(live_row), "to_sha256": _row_hash(bundle_row),
+                "pair_id": confirmed_pair_id,
             })
 
         if unauthorized:
