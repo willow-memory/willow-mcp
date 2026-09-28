@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* unit_status desk verb; install/reload refuse restart loops and dead units ([0881a63](https://github.com/willow-memory/willow-mcp/commit/0881a63edd6a29db703aafcca6a541c8bd08c6f5))
 * unit_status desk verb; install/reload refuse restart loops and dead units ([7c37499](https://github.com/willow-memory/willow-mcp/commit/7c374993eac76dedbd575d160392c19833bd4007))
 
 ## [2.84.1](https://github.com/willow-memory/willow-mcp/compare/v2.84.0...v2.84.1) (2026-09-28)
