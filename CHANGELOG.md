@@ -36,7 +36,7 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* package_upgrade_execute, a brokered install of a tagged fleet release built in Kart and verified against a private source (syscall row 25) ([7f79fd1](https://github.com/willow-memory/willow-mcp/commit/7f79fd156b66eca1edbb1aa06ec4653afde3b0e5))
+* package.upgrade -- brokered offline install of a tagged release into a venv ([d7ac697](https://github.com/willow-memory/willow-mcp/commit/d7ac697cd4009fb71b403950b8d43c38d28c2f23))
 
 
 ### Fixed
