@@ -23,12 +23,14 @@ from willow_mcp import blockers
 def quiet(monkeypatch):
     """Every gate open, so a test can turn exactly one off."""
     monkeypatch.setattr(blockers, "_check_attestation", lambda a, s: None)
+    monkeypatch.setattr(blockers, "_check_manifest_readable", lambda a: None)
     monkeypatch.setattr(blockers, "_check_lease", lambda a: None)
     monkeypatch.setattr(blockers, "_check_consent", lambda: None)
     monkeypatch.setattr(blockers, "_check_worker", lambda: None)
     monkeypatch.setattr(blockers, "_check_postgres", lambda: None)
     monkeypatch.setattr(blockers, "_CHECKS", (
         ("session_unattested", blockers._check_attestation),
+        ("manifest_unreadable", blockers._check_manifest_readable),
         ("no_egress_lease", blockers._check_lease),
         ("consent_internet_off", blockers._check_consent),
         ("no_live_worker", blockers._check_worker),
@@ -68,7 +70,7 @@ def test_an_unset_home_env_is_flagged_as_such(quiet, monkeypatch):
 def test_every_item_names_an_effect_and_a_fix(quiet, monkeypatch):
     """A blocker the reader cannot connect to a symptom gets skimmed past."""
     monkeypatch.setattr(blockers, "_check_lease",
-                        lambda a: blockers._item("x", "s", "e", "f"))
+                        lambda a: blockers._item("x", "s", "e", "f", "egress"))
     monkeypatch.setattr(blockers, "_CHECKS",
                         (("no_egress_lease", blockers._check_lease),))
     item = blockers.collect("willow", "s1")["items"][0]
@@ -129,6 +131,7 @@ def test_an_unattested_orchestrator_session_is_blocked(tmp_path, monkeypatch):
         json.dumps({"app_id": "willow", "session_id": "s1"}), encoding="utf-8")
     found = blockers._check_attestation("willow", "s1")
     assert found and found["id"] == "session_unattested"
+    assert found["scope"] == "entry"
     assert "envelope_propose" in found["effect"]
     assert "sign-session s1" in found["fix"]
     # The remedy must carry the environment the operator's shell does not have.
@@ -192,9 +195,16 @@ def test_no_verifier_configured_reports_nothing(tmp_path, monkeypatch):
     ("malformed", "malformed"),
     ("mismatch", "different app_id"),
 ])
-def test_every_non_active_lease_state_blocks(monkeypatch, status, fragment):
+def test_every_non_active_lease_state_blocks(home, monkeypatch, status, fragment):
     monkeypatch.setattr(blockers, "_check_lease", blockers._check_lease)
     import willow_mcp.lease as lease
+
+    # A readable manifest that IS net-bearing: this test is about the lease
+    # STATUS branch, not about manifest readability (that is
+    # test_an_unreadable_manifest_is_not_read_as_net_bearing, below).
+    apps = home / "mcp_apps" / "kart"
+    apps.mkdir(parents=True)
+    (apps / "manifest.json").write_text(json.dumps({"permissions": ["task_net"]}))
 
     monkeypatch.setattr(lease, "read_lease", lambda a: {
         "status": status, "expires_at": "2026-09-05T06:57:46Z",
@@ -204,6 +214,7 @@ def test_every_non_active_lease_state_blocks(monkeypatch, status, fragment):
     assert found["id"] == "no_egress_lease"
     assert fragment in found["summary"]
     assert "git push" in found["effect"]
+    assert found["scope"] == "egress"
 
 
 def test_an_active_lease_does_not_block(monkeypatch):
@@ -243,12 +254,17 @@ def test_expired_lease_still_blocks_when_manifest_carries_task_net(home, monkeyp
     assert found is not None
     assert found["id"] == "no_egress_lease"
     assert "corpus_host_card" in found["effect"]
+    assert found["scope"] == "egress"
 
 
-def test_an_unreadable_lease_blocks_with_a_chmod_fix_not_a_regrant(monkeypatch):
+def test_an_unreadable_lease_blocks_with_a_chmod_fix_not_a_regrant(home, monkeypatch):
     """Gap d90246688413: the fix for a lease this process cannot read is a
     mode change. Telling the operator to re-issue reproduces the same file."""
     import willow_mcp.lease as lease
+
+    apps = home / "mcp_apps" / "kart"
+    apps.mkdir(parents=True)
+    (apps / "manifest.json").write_text(json.dumps({"permissions": ["task_net"]}))
 
     monkeypatch.setattr(lease, "read_lease", lambda a: {
         "status": "unreadable", "path": "/box/mcp_apps/_net_leases/kart.json",
@@ -261,6 +277,54 @@ def test_an_unreadable_lease_blocks_with_a_chmod_fix_not_a_regrant(monkeypatch):
     assert "chmod 644 /box/mcp_apps/_net_leases/kart.json" in found["fix"]
     assert "grant-net" not in found["fix"].split("Do NOT")[0]
     assert found["path"] == "/box/mcp_apps/_net_leases/kart.json"
+    assert found["scope"] == "egress"
+
+
+def test_an_unreadable_manifest_is_not_read_as_net_bearing(home, monkeypatch):
+    """An absent (or unparseable, or unsigned) manifest is not evidence a seat
+    needs the internet -- it is evidence the gate could not even look. That
+    fact is now `manifest_unreadable`'s job, not `no_egress_lease`'s (the
+    Loki-wake defect: a manifest the gate could not read used to surface as
+    a dead egress lease and refuse entry for a seat that needed no network
+    at all)."""
+    import willow_mcp.lease as lease
+
+    monkeypatch.setattr(lease, "read_lease", lambda a: {
+        "status": "expired", "expires_at": "2020-01-01T00:00:00+00:00",
+    })
+    # No manifest written for "ghost" at all -- home/mcp_apps/ghost/ does
+    # not exist.
+    assert blockers._check_lease("ghost") is None
+
+
+def test_an_unreadable_manifest_yields_its_own_entry_blocker(home, monkeypatch):
+    found = blockers._check_manifest_readable("ghost")
+    assert found is not None
+    assert found["id"] == "manifest_unreadable"
+    assert found["scope"] == "entry"
+
+
+def test_collect_reports_manifest_unreadable_not_a_lease_item(home, monkeypatch):
+    """End-to-end through collect(): a seat whose manifest cannot be read
+    gets `manifest_unreadable` (scope entry), never `no_egress_lease`."""
+    import willow_mcp.consent as consent
+    import willow_mcp.db as db
+    import willow_mcp.heartbeat as heartbeat
+    import willow_mcp.lease as lease
+
+    monkeypatch.setattr(lease, "read_lease", lambda a: {
+        "status": "expired", "expires_at": "2020-01-01T00:00:00+00:00",
+    })
+    monkeypatch.setattr(consent, "read_consent", lambda: {"consent": {"internet": True}})
+    monkeypatch.setattr(heartbeat, "read_workers", lambda: {"alive": 1})
+    monkeypatch.setattr(db, "get_pg", lambda: object())
+
+    out = blockers.collect("ghost", "s1")
+    ids = _ids(out)
+    assert "manifest_unreadable" in ids
+    assert "no_egress_lease" not in ids
+    item = out["items"][ids.index("manifest_unreadable")]
+    assert item["scope"] == "entry"
 
 
 def test_consent_off_says_the_lease_will_not_help(monkeypatch):
@@ -271,6 +335,7 @@ def test_consent_off_says_the_lease_will_not_help(monkeypatch):
         "source": "canonical"})
     found = blockers._check_consent()
     assert "will not help" in found["effect"]
+    assert found["scope"] == "egress"
 
 
 def test_a_stopped_worker_says_the_queue_never_drains(monkeypatch):
@@ -282,6 +347,7 @@ def test_a_stopped_worker_says_the_queue_never_drains(monkeypatch):
     found = blockers._check_worker()
     assert found["id"] == "no_live_worker"
     assert "never drains" in found["effect"]
+    assert found["scope"] == "entry"
 
 
 def test_a_live_worker_does_not_block(monkeypatch):
@@ -298,6 +364,7 @@ def test_unreachable_postgres_carries_the_recorded_reason(monkeypatch):
     monkeypatch.setattr(db, "last_pg_error", lambda: 'database "willow" does not exist')
     found = blockers._check_postgres()
     assert 'does not exist' in found["error"]
+    assert found["scope"] == "entry"
 
 
 # ── degradation ──────────────────────────────────────────────────────────────
@@ -321,7 +388,7 @@ def test_one_broken_check_does_not_hide_the_others(quiet, monkeypatch):
 
     monkeypatch.setattr(blockers, "_check_worker", _boom)
     monkeypatch.setattr(blockers, "_check_consent",
-                        lambda: blockers._item("consent_internet_off", "s", "e", "f"))
+                        lambda: blockers._item("consent_internet_off", "s", "e", "f", "egress"))
     monkeypatch.setattr(blockers, "_CHECKS", (
         ("no_live_worker", blockers._check_worker),
         ("consent_internet_off", blockers._check_consent),
@@ -337,5 +404,6 @@ def test_collect_never_raises_even_with_every_check_broken(quiet, monkeypatch):
     monkeypatch.setattr(blockers, "_CHECKS", tuple(
         (name, _boom) for name, _ in blockers._CHECKS))
     out = blockers.collect("willow", "s1")
-    assert out["count"] == 5
+    assert out["count"] == len(blockers._CHECKS)
     assert all(i["id"].endswith("_check_failed") for i in out["items"])
+    assert all(i["scope"] == "entry" for i in out["items"])

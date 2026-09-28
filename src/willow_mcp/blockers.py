@@ -45,10 +45,28 @@ from typing import Any, Callable
 _HOME_KEY = "resolved_home"
 
 
-def _item(id_: str, summary: str, effect: str, fix: str, **extra: Any) -> dict:
+#: Valid values for `scope`. "entry": the seat itself cannot work — a
+#: specialist's `session_enter` should refuse. "egress": only acts that leave
+#: the box are closed; local work and loopback tools are unaffected, and a
+#: specialist's entry must not refuse on this alone (issue: an egress lease
+#: was refusing Ratatosk wakes that needed no network at all).
+_ENTRY = "entry"
+_EGRESS = "egress"
+_SCOPES = (_ENTRY, _EGRESS)
+
+
+def _item(id_: str, summary: str, effect: str, fix: str, scope: str, **extra: Any) -> dict:
     """One blocker. `effect` names what will actually refuse — a blocker the
-    reader cannot connect to a symptom gets skimmed past."""
-    return {"id": id_, "summary": summary, "effect": effect, "fix": fix, **extra}
+    reader cannot connect to a symptom gets skimmed past.
+
+    `scope` is required — not optional — so no blocker can be constructed
+    without declaring whether it stops the seat from working at all
+    (``"entry"``) or only stops it from reaching the network (``"egress"``).
+    """
+    if scope not in _SCOPES:
+        raise ValueError(f"_item: scope must be one of {_SCOPES}, got {scope!r}")
+    return {"id": id_, "summary": summary, "effect": effect, "fix": fix,
+            "scope": scope, **extra}
 
 
 # ── the checks ───────────────────────────────────────────────────────────────
@@ -93,7 +111,32 @@ def _check_attestation(app_id: str, session_id: str) -> dict | None:
         "envelope_propose and envelope_ratify refuse; nothing can be authored "
         "or granted until it is attested",
         remedy.attestation_command(session_id, keyring_on=remedy.keyring_on()),
+        _ENTRY,  # blocks local authoring outright, not just leaving the box
         denial=denial,
+    )
+
+
+def _check_manifest_readable(app_id: str) -> dict | None:
+    """Distinct from `_check_lease`: a manifest the gate cannot read is not
+    evidence the seat needs the internet — it is evidence the gate could not
+    even look. Reported here, separately, using the same `manifest_diagnosis`
+    surface `whoami`/`diagnostic_summary` already use for a seat's own
+    self-report (never through `_load_manifest`'s reason-free enforcement
+    path, and never about anyone else's app_id)."""
+    from . import gate
+
+    if gate._load_manifest(app_id) is not None:
+        return None
+    reason, detail = gate.manifest_diagnosis(app_id)
+    return _item(
+        "manifest_unreadable",
+        f"this seat's manifest could not be read — {detail}",
+        "every gated tool call is denied for this app_id until the manifest "
+        "reads — this is an entry problem, not a network one",
+        f"fix per the diagnosis ({reason}): create it, fix its JSON, or "
+        f"re-sign it (willow-mcp sign-manifest {app_id})",
+        _ENTRY,
+        reason=reason,
     )
 
 
@@ -122,7 +165,8 @@ def _check_lease(app_id: str) -> dict | None:
         "(corpus_search, corpus_ask, corpus_host_card, …) do not need a lease. "
         "A Kart task carrying allow_net needs MORE than this lease: an "
         "operator-signed per-task envelope too, so granting the lease alone "
-        "will not unblock git push"
+        "will not unblock git push. Local work and loopback tools are "
+        "unaffected — this closes only what leaves the box"
     )
     if status == "unreadable":
         # Measured 2026-09-10 (gap d90246688413): a root-issued lease landed
@@ -141,6 +185,7 @@ def _check_lease(app_id: str) -> dict | None:
         f"no active egress lease for {app_id!r} — {detail}",
         effect,
         fix,
+        _EGRESS,
         status=status,
         expires_at=row.get("expires_at"),
         path=row.get("path"),
@@ -157,9 +202,10 @@ def _check_consent() -> dict | None:
         "consent_internet_off",
         "standing consent for internet is not granted",
         "sits underneath the lease — granting a lease will not help while this "
-        "is off",
+        "is off. Local work and loopback tools are unaffected",
         f"edit the canonical settings at {check.get('canonical_path')}; note the "
         f"flat consent.json is a mirror and editing it does nothing",
+        _EGRESS,
         source=check.get("source"),
     )
 
@@ -176,6 +222,10 @@ def _check_worker() -> dict | None:
         "task_submit accepts the task and it stays pending forever — the queue "
         "does not refuse, it simply never drains",
         "start a worker, or run one pass with willow-mcp worker --once",
+        # Entry, not egress: a builder seat's local work (git, tests) is
+        # driven through Kart tasks, so a dead worker stalls work entirely —
+        # nothing here is specific to leaving the box.
+        _ENTRY,
         readiness=check.get("readiness"),
         by_lane=check.get("by_lane"),
     )
@@ -193,6 +243,9 @@ def _check_postgres() -> dict | None:
         "return unavailable; the SQLite task fallback is used instead",
         "check the socket and WILLOW_PG_DB — the resolved dbname is named in "
         "the error below",
+        # Entry, not egress: this is a local socket, not a route off the box,
+        # and it takes out reads a builder seat needs regardless of network.
+        _ENTRY,
         error=db.last_pg_error(),
     )
 
@@ -201,6 +254,7 @@ def _check_postgres() -> dict | None:
 #: an unattested session stops authoring before a dead lease stops pushing.
 _CHECKS: tuple[tuple[str, Callable[..., dict | None]], ...] = (
     ("session_unattested", _check_attestation),
+    ("manifest_unreadable", _check_manifest_readable),
     ("no_egress_lease", _check_lease),
     ("consent_internet_off", _check_consent),
     ("no_live_worker", _check_worker),
@@ -220,7 +274,7 @@ def collect(app_id: str, session_id: str = "") -> dict:
         try:
             if name == "session_unattested":
                 found = check(app_id, session_id)
-            elif name in ("no_egress_lease",):
+            elif name in ("no_egress_lease", "manifest_unreadable"):
                 found = check(app_id)
             else:
                 found = check()
@@ -230,6 +284,9 @@ def collect(app_id: str, session_id: str = "") -> dict:
                 f"the {name} check could not run: {e}",
                 "this gate's state is unknown, not clear",
                 "read the gate directly; do not assume it is open",
+                # Fail closed: an unknown gate state is treated as an entry
+                # blocker, never assumed to be merely an egress concern.
+                _ENTRY,
             ))
             continue
         if found:
@@ -246,6 +303,7 @@ def collect(app_id: str, session_id: str = "") -> dict:
             f"WILLOW_HOME could not be resolved: {e}",
             "every path this seat writes is in doubt",
             "set WILLOW_HOME explicitly to the live home",
+            _ENTRY,
         ))
 
     return {
