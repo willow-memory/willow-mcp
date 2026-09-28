@@ -884,20 +884,30 @@ def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "", runner:
             dispatch_id, "working", accepted_session_id=session_id,
             already_locked=True,
         )
-    if session_id:
-        from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
-        session_bind(
-            app_id, session_id, dispatch_id, "working",
-            verifier=from_verifier,
-        )
-        if from_verifier:
-            # Adds this specialist session to the attribution cache so its
-            # own gate misses (via _auto_propose_on_gate_miss) succeed
-            # rather than short-circuiting on is_session_attributed=False.
-            # Lazy import: human_session pulls keyring, and dispatch.py
-            # is imported early enough that a top-level import loops.
-            from . import human_session as _hs
-            _hs._remember_attributed(session_id)
+        # G3 (Loki 6FC22847): session_bind used to run AFTER this lock was
+        # released -- a withdraw winning the very next acquisition of this
+        # same lock in that window saw status "working" with
+        # accepted_session_id already recorded but no session record yet
+        # on disk, so _sessions_bound_to (which reads session files, not
+        # status.json) found nothing bound. Binding here, still under the
+        # same lock as the status write, closes that window: by the time
+        # any other caller can acquire this lock, both the packet's
+        # accepted_session_id and the session record agree.
+        if session_id:
+            from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
+            session_bind(
+                app_id, session_id, dispatch_id, "working",
+                verifier=from_verifier,
+            )
+            if from_verifier:
+                # Adds this specialist session to the attribution cache so
+                # its own gate misses (via _auto_propose_on_gate_miss)
+                # succeed rather than short-circuiting on
+                # is_session_attributed=False. Lazy import: human_session
+                # pulls keyring, and dispatch.py is imported early enough
+                # that a top-level import loops.
+                from . import human_session as _hs
+                _hs._remember_attributed(session_id)
     return dispatch_read(dispatch_id)
 
 
@@ -1144,28 +1154,54 @@ def session_enter(
             "dispatch_id": did,
             "message": "packet was withdrawn by the orchestrator; it cannot be entered",
         }
+
+    # G2 (Loki 6FC22847): an empty/missing session_id used to reach the
+    # re-entry branch below (`elif session_id:` was simply skipped) and
+    # fall all the way through to the result -- full assignment,
+    # held_by_other_session left False, and the bearer accepted_session_id
+    # handed back -- without EITHER the runner check or the
+    # held-by-another-session check ever running. Refuse before any of
+    # that: a dispatch entry always names the session entering it.
+    if not (session_id or "").strip():
+        return {
+            "entry_mode": "dispatch",
+            "error": "EINVAL",
+            "dispatch_id": did,
+            "message": "session_id is required to enter a dispatch packet",
+        }
+
+    # N1B / G2 (Loki 6FC22847): the runner check now runs before ANY status
+    # branch -- it used to sit only inside the re-entry branch (reachable
+    # solely when session_id was truthy), so a runner mismatch on a fresh
+    # accept relied entirely on dispatch_accept's own later, redundant
+    # check. Checking here first makes it uniform for the pending-accept
+    # and re-entry paths alike; it can run unconditionally now that
+    # session_id is guaranteed non-empty above.
+    pkt_runner = (pkt["meta"].get("runner") or "seat").strip().lower()
+    caller_runner = (runner or "seat").strip().lower()
+    if pkt_runner != caller_runner:
+        return {
+            "entry_mode": "dispatch",
+            "error": "ERUNNER",
+            "dispatch_id": did,
+            "expected": pkt_runner,
+            "got": caller_runner,
+            "message": (
+                f"packet {did!r} is runner={pkt_runner!r}; caller "
+                f"passed runner={caller_runner!r} -- refused, no bind, "
+                f"no status change"
+            ),
+        }
+
     held_by_other_session = False
     if cur == "pending":
         accept_result = dispatch_accept(did, app_id, session_id, runner=runner)
         if accept_result.get("error"):
-            if accept_result["error"] == "ERUNNER":
-                # N1 (dispatch 1AD03A64): a runner mismatch on a fresh
-                # accept is not "held by another session" -- surface it
-                # verbatim, it has its own remedy (enter with the right
-                # runner).
-                return {
-                    "entry_mode": "dispatch",
-                    "error": "ERUNNER",
-                    "dispatch_id": did,
-                    "message": accept_result.get("message", ""),
-                    "expected": accept_result.get("expected"),
-                    "got": accept_result.get("got"),
-                }
-            # N4 (Loki 10A39E21 N4): a concurrent accept can lose the race
-            # (invalid_transition) between this call's own dispatch_read
-            # above and its dispatch_accept just now -- re-read rather than
-            # let `pkt` become the bare error dict and fall through below
-            # as a success-shaped, empty entry.
+            # The runner check just above already excludes ERUNNER here --
+            # any error reaching this point is the N4 (Loki 10A39E21 N4)
+            # concurrent-accept race: re-read rather than let `pkt` become
+            # the bare error dict and fall through below as a
+            # success-shaped, empty entry.
             pkt = dispatch_read(did)
             if pkt.get("error"):
                 return {"entry_mode": "dispatch", "error": pkt["error"], "dispatch_id": did}
@@ -1184,45 +1220,22 @@ def session_enter(
                 }
         else:
             pkt = accept_result
-    elif session_id:
-        # N1B (Loki ADC80409): the runner check dispatch_accept enforces on
-        # a FRESH accept (below, cur == "pending") was never enforced on
-        # RE-ENTRY into an already-working packet -- a listener could
-        # dispatch_accept a seat packet with an empty session_id (the
-        # tool's own default), then re-enter here with runner="ratatosk"
-        # and pick up the full assignment, held_by_other_session=False,
-        # reachable by a late/redelivered/backlogged WAKE. Same refusal
-        # shape as dispatch_accept's: no bind, no status change.
-        pkt_runner = (pkt["meta"].get("runner") or "seat").strip().lower()
-        caller_runner = (runner or "seat").strip().lower()
-        if pkt_runner != caller_runner:
-            return {
-                "entry_mode": "dispatch",
-                "error": "ERUNNER",
-                "dispatch_id": did,
-                "expected": pkt_runner,
-                "got": caller_runner,
-                "message": (
-                    f"packet {did!r} is runner={pkt_runner!r}; caller "
-                    f"passed runner={caller_runner!r} -- refused, no bind, "
-                    f"no status change"
-                ),
-            }
-        # Re-entry into an already-accepted packet (specialist reconnecting
-        # or continuing after a hop). Bite 1 (dispatch 9BA76253, rework of
-        # 2E590F1B/262F89A1 F2): a re-entry is only ever a continuation of
-        # the SAME accepting session -- not a chance for a second session
-        # (the ratatosk listener's own child process is the motivating
-        # case) to silently pick up attribution/binding for a packet it
-        # never actually accepted. `accepted_session_id` is recorded ONLY
-        # by dispatch_accept (see its docstring); when it is present and
-        # names a DIFFERENT session than this one, this call does not bind
-        # -- no session_bind, no attribution lift -- and the caller is told
-        # the packet is held by another session. An empty/absent
-        # `accepted_session_id` (a legacy packet accepted before this
-        # field existed, or one accepted with no session_id at all) has
-        # nothing recorded to protect, so re-entry there keeps the
-        # pre-existing permissive behavior.
+    else:
+        # Re-entry into an already-accepted (or since-cleared) packet.
+        # session_id is guaranteed non-empty above. Bite 1 (dispatch
+        # 9BA76253, rework of 2E590F1B/262F89A1 F2): a re-entry is only
+        # ever a continuation of the SAME accepting session -- not a
+        # chance for a second session (the ratatosk listener's own child
+        # process is the motivating case) to silently pick up
+        # attribution/binding for a packet it never actually accepted.
+        # `accepted_session_id` is recorded ONLY by dispatch_accept (see
+        # its docstring); when it is present and names a DIFFERENT session
+        # than this one, this call does not bind -- no session_bind, no
+        # attribution lift -- and the caller is told the packet is held by
+        # another session. An empty/absent `accepted_session_id` (a legacy
+        # packet accepted before this field existed, or one accepted with
+        # no session_id at all) has nothing recorded to protect, so
+        # re-entry there keeps the pre-existing permissive behavior.
         accepted_session_id = str(pkt.get("status", {}).get("accepted_session_id") or "")
         if accepted_session_id and accepted_session_id != session_id:
             held_by_other_session = True
@@ -1258,16 +1271,17 @@ def session_enter(
         "status": pkt.get("status", {}).get("status"),
         # Bite 1 (dispatch 9BA76253): surfaced so a re-entering caller can
         # tell "you are not the accepting session" apart from an ordinary
-        # continuation -- see the elif branch above.
+        # continuation -- see the else branch above.
         "held_by_other_session": held_by_other_session,
         **persona_context(app_id),
         **seed_context(app_id),
     }
-    # N3 (Loki 10A39E21 N3): accepted_session_id is a bearer value --
-    # withhold it from a caller that does not already hold it. The holder
-    # (not held_by_other_session) still gets it back, same as before.
-    if not held_by_other_session:
-        result["accepted_session_id"] = pkt.get("status", {}).get("accepted_session_id", "")
+    # G1 (Loki 6FC22847): accepted_session_id is a bearer value -- never
+    # return it from session_enter to anyone, including the holder. The
+    # holder already knows its own session_id; there is no legitimate
+    # reader of this field here (dispatch_read/dispatch_list withhold it
+    # too -- see server.py's dispatch_read wrapper and dispatch_list's row
+    # shape above).
     return result
 
 
@@ -1457,8 +1471,31 @@ def dispatch_withdraw(
         forced_over: list[str] = []
         if cur == "working":
             bound = _sessions_bound_to(pkt["meta"].get("to_app", ""), did)
-            if bound:
-                session_ids = [str(r.get("session_id")) for r in bound]
+            session_ids = [str(r.get("session_id")) for r in bound]
+            # G3 (Loki 6FC22847): accepted_session_id on status.json is now
+            # written inside the SAME lock dispatch_accept holds for the
+            # session_bind that follows it (see dispatch_accept) -- but a
+            # packet's on-disk accepted_session_id can still be the only
+            # record of a claim in flight the instant this withdraw wins
+            # the lock. Treat a non-empty accepted_session_id as bound even
+            # when no session record backs it yet: EBUSY, not a torn
+            # "withdrawn packet with a session still coming".
+            accepted_session_id = str(pkt.get("status", {}).get("accepted_session_id") or "")
+            if accepted_session_id and accepted_session_id not in session_ids:
+                # A session record's ABSENCE (not_found) is the narrow
+                # accept-race window this exists for -- nothing on disk yet
+                # to disprove the claim, so treat it as bound. A session
+                # record that DOES exist but is no longer "working" (e.g.
+                # "idle", written by session_bind when a seat legitimately
+                # releases the packet after a human closeout) means the
+                # claim was explicitly released -- this stale
+                # accepted_session_id must not resurrect it as bound
+                # forever; _sessions_bound_to above already covers the
+                # still-working case.
+                rec = session_read(pkt["meta"].get("to_app", ""), accepted_session_id)
+                if rec.get("error"):
+                    session_ids.append(accepted_session_id)
+            if session_ids:
                 if force and is_orchestrator_app(by_app):
                     forced_over = session_ids
                 else:

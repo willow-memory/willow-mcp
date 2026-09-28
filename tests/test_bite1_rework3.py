@@ -205,12 +205,17 @@ def test_n3_dispatch_read_withholds_accepted_session_id_from_non_holder(home):
     assert not d.get("status", {}).get("accepted_session_id"), d
 
 
-def test_n3_dispatch_read_still_shows_it_to_the_holder_app(home):
+def test_n3_dispatch_read_withholds_accepted_session_id_from_the_holder_too(home):
+    """G1 (Loki 6FC22847): supersedes the old holder-sees-it behavior above --
+    accepted_session_id is now withheld from dispatch_read for every caller,
+    including the packet's own to_app/holder. The holder already knows its
+    own session_id; there is no legitimate reader of this bearer value
+    through the read verb."""
     _man(home)
     p1 = _send()
     _enter(home, "sess-A", p1)
     d = srv.dispatch_read("loki", p1)
-    assert d.get("status", {}).get("accepted_session_id") == "sess-A", d
+    assert not d.get("status", {}).get("accepted_session_id"), d
 
 
 # -- F3B: unique archive dirs even within the same wall-clock second

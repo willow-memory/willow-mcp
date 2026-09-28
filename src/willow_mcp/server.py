@@ -5114,8 +5114,12 @@ def dispatch_read(app_id: str, dispatch_id: str) -> dict:
     # from anyone but the packet's own to_app (the only party that could
     # legitimately hold it). The orchestrator, a citation-grant reader, or
     # any other party reads the packet without it.
-    to_app = (pkt.get("meta", {}).get("to_app") or "").strip().lower()
-    if (app_id or "").strip().lower() != to_app and pkt.get("status", {}).get("accepted_session_id"):
+    # G1 (Loki 6FC22847): accepted_session_id is a bearer value -- withhold
+    # it from EVERY caller of this read verb, including the packet's own
+    # to_app/holder. The holder already knows its own session_id (it is
+    # the value it passed to dispatch_accept/session_enter); there is no
+    # legitimate reader of this field through dispatch_read.
+    if pkt.get("status", {}).get("accepted_session_id"):
         pkt = {**pkt, "status": {k: v for k, v in pkt["status"].items() if k != "accepted_session_id"}}
     return pkt
 
