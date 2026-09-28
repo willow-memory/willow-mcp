@@ -14,12 +14,14 @@ import json
 import os
 import sqlite3
 import stat
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from willow_mcp import constitutional
 from willow_mcp import keyring as keyring_mod
+from willow_mcp import net_authority
 from willow_mcp import net_signer as ns
 
 
@@ -877,3 +879,223 @@ def test_diff_changed_rows_is_empty_when_tables_agree(tables):
 
     out = constitutional.diff_changed_rows(live_path=live, bundle_path=bundle)
     assert out == {"ok": True, "rows": []}
+
+
+# ── L1 (Loki B940141B F-L1): the amend-line parser is no looser than the
+# line it emits -- re.ASCII refuses non-ASCII digits, [ \t] in place of \s
+# refuses a line split across newlines, while tabs, extra spaces, CRLF and
+# uppercase hashes all still parse. ────────────────────────────────────────────
+
+def test_amend_regex_rejects_fields_split_across_newlines():
+    text = ("syscall-row-amend:\nid=18\nverb=manifest.grant\nfrom=" + "a" * 64
+            + "\nto=" + "b" * 64)
+    assert constitutional._AMEND_LINE_RE.search(text) is None
+
+
+def test_amend_regex_rejects_non_ascii_digits():
+    text = "syscall-row-amend: id=\u0661\u0668 verb=manifest.grant from=" + "a" * 64 + " to=" + "b" * 64
+    assert constitutional._AMEND_LINE_RE.search(text) is None
+
+
+def test_amend_regex_accepts_tabs():
+    text = ("syscall-row-amend:\tid=18\tverb=manifest.grant\tfrom=" + "a" * 64
+            + "\tto=" + "b" * 64)
+    m = constitutional._AMEND_LINE_RE.search(text)
+    assert m is not None and m.group(1) == "18"
+
+
+def test_amend_regex_accepts_extra_spaces():
+    text = ("syscall-row-amend:  id=18  verb=manifest.grant  from=" + "a" * 64
+            + "  to=" + "b" * 64)
+    assert constitutional._AMEND_LINE_RE.search(text) is not None
+
+
+def test_amend_regex_accepts_crlf_line_ending():
+    text = ("prose\r\nsyscall-row-amend: id=18 verb=manifest.grant from=" + "a" * 64
+            + " to=" + "b" * 64 + "\r\nmore")
+    assert constitutional._AMEND_LINE_RE.search(text) is not None
+
+
+def test_amend_regex_accepts_uppercase_hashes():
+    text = "syscall-row-amend: id=18 verb=manifest.grant from=" + "A" * 64 + " to=" + "B" * 64
+    assert constitutional._AMEND_LINE_RE.search(text) is not None
+
+
+# ── Loki B940141B isolation tests: one guard standing alone, adopted from
+# Loki's B940141B Kart tasks (Z6CYQDFK, 5XBAVNSV). ────────────────────────
+
+def _iso_rows():
+    return (_row(18, "manifest.grant", bounds={"apps": "old"}),
+            _row(18, "manifest.grant", bounds={"apps": "new"}))
+
+
+def _iso_sync(tables, tmp_path, kr, *, target_text=None, rec=None, created_at=None, recs=None):
+    live, bundle = tables
+    lv, bv = _iso_rows()
+    _write_table(live, [lv])
+    _write_table(bundle, [bv])
+    from_hash, to_hash = constitutional._row_hash(lv), constitutional._row_hash(bv)
+    tt = target_text if target_text is not None else constitutional._amend_line(
+        18, "manifest.grant", from_hash, to_hash)
+    nestor_db = tmp_path / "nestor.db"
+    sig = _sign_seal(kr, "sean campbell", "amend a syscall row", tt)
+    kw = {"created_at": created_at} if created_at else {}
+    _nestor_pair(nestor_db, "pairABC", source_norm="amend a syscall row",
+                 target_text=tt, verifier="sean campbell", seal_sig=sig, **kw)
+    before = live.read_text()
+    ledger = _FakeLedger()
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, ledger=ledger,
+        store=_FakeGovStore(recs if recs is not None else [rec or _gov_record()]),
+        nestor_db_path=nestor_db)
+    return out, live.read_text() != before, ledger, (from_hash, to_hash)
+
+
+def test_iso_verb_only_mismatch_is_refused(tables, tmp_path, ring_with_sean):
+    """M1v: the verb check alone, id correct."""
+    lv, bv = _iso_rows()
+    tt = constitutional._amend_line(18, "other.verb",
+                                     constitutional._row_hash(lv), constitutional._row_hash(bv))
+    out, changed, _, _ = _iso_sync(tables, tmp_path, ring_with_sean, target_text=tt)
+    assert out["ok"] is False and changed is False
+
+
+def test_iso_kind_at_confirm_alone_refuses(tmp_path, ring_with_sean):
+    """M8k: the kind check inside _confirm_amendment, isolated from the
+    candidate-list kind filter (which would otherwise shadow it)."""
+    lv, bv = _iso_rows()
+    nestor_db = tmp_path / "nestor.db"
+    _sealed_amend_pair(nestor_db, ring_with_sean, "pairABC", row_id=18, verb="manifest.grant",
+                        from_hash=constitutional._row_hash(lv), to_hash=constitutional._row_hash(bv))
+    ok, _why = constitutional._confirm_amendment(
+        _gov_record(kind="other"), live_row=lv, bundle_row=bv, nestor_db_path=nestor_db)
+    assert ok is False
+
+
+def test_iso_soil_verb_disagrees_is_refused(tables, tmp_path, ring_with_sean):
+    """M7v."""
+    out, changed, _, _ = _iso_sync(tables, tmp_path, ring_with_sean, rec=_gov_record(verb="x"))
+    assert out["ok"] is False and changed is False
+
+
+def test_iso_soil_from_disagrees_is_refused(tables, tmp_path, ring_with_sean):
+    """M7f."""
+    out, changed, _, _ = _iso_sync(tables, tmp_path, ring_with_sean, rec=_gov_record(from_sha256="ab" * 32))
+    assert out["ok"] is False and changed is False
+
+
+def test_iso_soil_to_disagrees_is_refused(tables, tmp_path, ring_with_sean):
+    """M7t."""
+    out, changed, _, _ = _iso_sync(tables, tmp_path, ring_with_sean, rec=_gov_record(to_sha256="ab" * 32))
+    assert out["ok"] is False and changed is False
+
+
+def test_iso_soil_string_id_is_coerced_and_applies(tables, tmp_path, ring_with_sean):
+    """M7c: a SOIL id given as the string '18' is coerced to compare equal."""
+    out, changed, _, _ = _iso_sync(tables, tmp_path, ring_with_sean, rec=_gov_record(id="18"))
+    assert out["ok"] is True and changed is True
+
+
+def test_iso_old_seal_still_applies(tables, tmp_path, ring_with_sean):
+    """M2a: verify_seal is called with max_age_s=None -- a seal sealed long
+    ago (here 400 days) must still authorize at restart, not just at seal
+    time. created_at is set explicitly here so 'today' cannot silently
+    hide a dropped max_age_s=None."""
+    old = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
+    out, changed, _, _ = _iso_sync(tables, tmp_path, ring_with_sean, created_at=old)
+    assert out["ok"] is True and changed is True, out
+
+
+def test_iso_uppercase_hashes_still_apply(tables, tmp_path, ring_with_sean):
+    """M10: the .lower() normalization of the amend line's hex hashes."""
+    lv, bv = _iso_rows()
+    tt = constitutional._amend_line(18, "manifest.grant",
+                                     constitutional._row_hash(lv).upper(),
+                                     constitutional._row_hash(bv).upper())
+    out, changed, _, _ = _iso_sync(tables, tmp_path, ring_with_sean, target_text=tt)
+    assert out["ok"] is True and changed is True, out
+
+
+def test_iso_amend_line_prefixed_inline_in_a_sentence_is_refused(tables, tmp_path, ring_with_sean):
+    """M11: the ^ anchor -- a line with text before it on the same line."""
+    lv, bv = _iso_rows()
+    tt = "I approve " + constitutional._amend_line(
+        18, "manifest.grant", constitutional._row_hash(lv), constitutional._row_hash(bv))
+    out, changed, _, _ = _iso_sync(tables, tmp_path, ring_with_sean, target_text=tt)
+    assert out["ok"] is False and changed is False
+
+
+def test_iso_amend_line_suffixed_inline_in_a_sentence_is_refused(tables, tmp_path, ring_with_sean):
+    """M11b: the $ anchor -- a line with text after it on the same line."""
+    lv, bv = _iso_rows()
+    tt = constitutional._amend_line(
+        18, "manifest.grant", constitutional._row_hash(lv), constitutional._row_hash(bv)) + " and also more"
+    out, changed, _, _ = _iso_sync(tables, tmp_path, ring_with_sean, target_text=tt)
+    assert out["ok"] is False and changed is False
+
+
+def test_iso_raising_candidate_does_not_block_a_valid_one(tables, tmp_path, ring_with_sean, monkeypatch):
+    """M9/M12: the per-candidate except -- a candidate whose
+    read_sealed_pair call raises must not shadow a later valid candidate."""
+    orig = net_authority.read_sealed_pair
+
+    def boom(pid, db):
+        if pid == "boom":
+            raise RuntimeError("kaboom")
+        return orig(pid, db)
+
+    monkeypatch.setattr(net_authority, "read_sealed_pair", boom)
+    out, changed, _, _ = _iso_sync(
+        tables, tmp_path, ring_with_sean,
+        recs=[_gov_record(_id="b", nestor_pair_id="boom"), _gov_record(_id="g")])
+    assert out["ok"] is True and changed is True, out
+
+
+def test_iso_raising_candidate_alone_is_refused_and_inked(tables, tmp_path, ring_with_sean, monkeypatch):
+    """M12's twin: the raising candidate alone, with no valid one after
+    it -- still refused and inked, never raised."""
+    def boom(pid, db):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(net_authority, "read_sealed_pair", boom)
+    out, changed, ledger, _ = _iso_sync(
+        tables, tmp_path, ring_with_sean, recs=[_gov_record(nestor_pair_id="boom")])
+    assert out["ok"] is False and changed is False
+    assert [r["event_type"] for r in ledger.rows] == ["constitutional_sync_refused"]
+
+
+def test_iso_unsealed_amendment_outcome_only(tables, tmp_path, ring_with_sean):
+    """M4n, outcome-only twin of test_unsealed_amendment_is_refused: proves
+    net_authority's status!=sealed guard at the outcome level rather than
+    by matching refusal wording."""
+    live, bundle = tables
+    lv, bv = _iso_rows()
+    _write_table(live, [lv])
+    _write_table(bundle, [bv])
+    nestor_db = tmp_path / "nestor.db"
+    _sealed_amend_pair(nestor_db, ring_with_sean, "pairABC", row_id=18, verb="manifest.grant",
+                        from_hash=constitutional._row_hash(lv), to_hash=constitutional._row_hash(bv),
+                        status="proposed")
+    before = live.read_text()
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, store=_FakeGovStore([_gov_record()]),
+        nestor_db_path=nestor_db)
+    assert out["ok"] is False and live.read_text() == before
+
+
+def test_iso_bad_signature_outcome_only(tables, tmp_path, ring_with_sean):
+    """M2, outcome-only twin of test_bad_signature_does_not_authorize."""
+    live, bundle = tables
+    lv, bv = _iso_rows()
+    _write_table(live, [lv])
+    _write_table(bundle, [bv])
+    tt = constitutional._amend_line(18, "manifest.grant",
+                                     constitutional._row_hash(lv), constitutional._row_hash(bv))
+    nestor_db = tmp_path / "nestor.db"
+    _nestor_pair(nestor_db, "pairABC", source_norm="amend a syscall row",
+                 target_text=tt, verifier="sean campbell", seal_sig="00" * 64)
+    before = live.read_text()
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, store=_FakeGovStore([_gov_record()]),
+        nestor_db_path=nestor_db)
+    assert out["ok"] is False and live.read_text() == before

@@ -198,8 +198,8 @@ AMENDMENT_KIND = "syscall_row_amend"
 #: they seal (build item 7). Coupled to :func:`_confirm_amendment`'s parse;
 #: keep both in sync.
 _AMEND_LINE_RE = re.compile(
-    r"^syscall-row-amend:\s*id=(\d+)\s+verb=(\S+)\s+from=([0-9a-fA-F]{64})\s+to=([0-9a-fA-F]{64})\s*$",
-    re.MULTILINE,
+    r"^syscall-row-amend:[ \t]*id=(\d+)[ \t]+verb=(\S+)[ \t]+from=([0-9a-fA-F]{64})[ \t]+to=([0-9a-fA-F]{64})[ \t]*\r?$",
+    re.MULTILINE | re.ASCII,
 )
 
 
@@ -261,8 +261,11 @@ def diff_changed_rows(*, live_path: Optional[Path] = None,
     The desk's path from here: read this, ``store_put`` a
     ``projects_willow_governance_decisions`` record naming ``kind``,
     ``id``, ``verb``, ``from_sha256``, ``to_sha256`` for the row(s) it wants
-    to amend, ``decision_propose`` it into Nestor, and the operator seals it
-    there. Nothing in this function, or in that path up to the seal itself,
+    to amend, then ``decision_propose(conclusion=<amend_line>)`` on that
+    ``kind=syscall_row_amend`` record — the sealed CONCLUSION itself
+    must carry the exact ``amend_line`` this function emits (see
+    :func:`_amend_line`), never just the record's own side fields —
+    and the operator seals it there. Nothing in this function, or in that path up to the seal itself,
     seals anything.
 
     Returns ``{"ok": True, "rows": [...]}`` (``rows`` is ``[]`` when the
@@ -528,7 +531,7 @@ def sync_syscall_table_from_bundle(
     ``enforced_by``/``min_ring`` (compared by id AND verb, so a row that
     reused an id under a different verb name is a modification, not a
     match) — UNLESS a sealed :data:`AMENDMENT_KIND` governance decision
-    authorizes that exact row's change (see :func:`_find_amendment` /
+    authorizes that exact row's change (see :func:`_find_amendment_candidates` /
     :func:`_confirm_amendment` and the module docstring). ``note`` and
     ``summary`` are excluded from the structural comparison — see
     :func:`_structural` — so a row whose prose was corrected in the same PR
@@ -634,8 +637,8 @@ def sync_syscall_table_from_bundle(
     # decision at all, is refused exactly as before.
     amended: list[dict] = []
     if changed:
-        st = store if store is not None else Store()
         try:
+            st = store if store is not None else Store()
             candidates = _find_amendment_candidates(st)
         except Exception as exc:  # noqa: BLE001 — a broken governance-decision
             # read must fail the sync CLOSED, same as any other refusal path
