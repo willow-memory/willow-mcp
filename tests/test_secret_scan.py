@@ -99,3 +99,35 @@ def test_clean_result_is_returned_unchanged():
     out, kinds = secret_scan.redact_egress(payload)
     assert out == payload
     assert kinds == []
+
+
+def test_shared_egress_never_applies_label_or_kv_heuristics():
+    """Loki 0DFFEFA6 B3: `*_KEY=`/`*_TOKEN=`/`*_SECRET=`/`password=` label
+    heuristics belong ONLY to the journal-scoped redactor
+    (`secret_scan.redact_journal_tail`, exercised via
+    `unit_status.journal_tail`), never this shared funnel every tool
+    response passes through — they over-redact ordinary field names and even
+    a credential SOURCE (`env:VAR`), which the README's own guarantee says a
+    tool MAY return."""
+    payload = {
+        "a": "Column(Integer, primary_key=True)",
+        "b": "order_by(sort_key=lambda r: r.id)",
+        "c": "password=None",
+        "d": "OPENAI_API_KEY=env:OPENAI_API_KEY",
+        # Loki 58BC828C F1: a journal-only POSITIVE — a value the journal
+        # redactor WOULD redact. Every other entry here is one the
+        # now-precise journal pattern set also passes through, so a mutant
+        # routing `redact_egress` through `_JOURNAL_PATTERNS` (the exact
+        # B3-class regression) survived until this one was added: it is a
+        # real, high-confidence journal hit, and the shared funnel must
+        # still leave it alone.
+        "e": "DB_PASSWORD=hunter2",
+    }
+    out, kinds = secret_scan.redact_egress(payload)
+    assert out == payload
+    assert kinds == []
+    # Prove the journal-only positive actually differs from the shared set —
+    # otherwise this test cannot tell the two funnels apart either.
+    journal_redacted, journal_kinds = secret_scan.redact_journal_tail(payload["e"])
+    assert journal_kinds == ["labelled_secret_kv"]
+    assert "hunter2" not in journal_redacted
