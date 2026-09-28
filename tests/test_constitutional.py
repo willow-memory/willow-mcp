@@ -792,6 +792,35 @@ def test_soil_record_disagreeing_with_sealed_text_is_refused(tables, tmp_path, r
     assert live.read_text() == before
 
 
+def test_no_keyring_configured_does_not_authorize(tables, tmp_path):
+    """No keyring at all -- a seal cannot be verified without a ring to
+    verify it against, so this refuses exactly like an unverifiable seal,
+    never like "no amendment exists"."""
+    assert keyring_mod.get_keyring() is None  # sanity: no ring fixture in play
+    live, bundle = tables
+    row18_live = _row(18, "manifest.grant", bounds={"apps": "old"})
+    row18_bundle = _row(18, "manifest.grant", bounds={"apps": "new"})
+    _write_table(live, [row18_live])
+    _write_table(bundle, [row18_bundle])
+    before = live.read_text()
+
+    from_hash = constitutional._row_hash(row18_live)
+    to_hash = constitutional._row_hash(row18_bundle)
+    target_text = constitutional._amend_line(18, "manifest.grant", from_hash, to_hash)
+    nestor_db = tmp_path / "nestor.db"
+    _nestor_pair(nestor_db, "pairABC", source_norm="amend a syscall row",
+                 target_text=target_text, verifier="sean campbell",
+                 seal_sig="deadbeef" * 8)
+    gov = _FakeGovStore([_gov_record(nestor_pair_id="pairABC")])
+
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, store=gov, nestor_db_path=nestor_db)
+
+    assert out["ok"] is False and out["refused"] is True
+    assert "no keyring configured" in out["reason"]
+    assert live.read_text() == before
+
+
 def test_governance_read_exception_is_refused_and_inked_not_raised(tables, tmp_path):
     """F5 (Loki 573273BD): an exception while gathering amendment
     candidates (here, the store itself raising) must fail the sync
