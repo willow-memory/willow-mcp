@@ -225,7 +225,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 148 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 149 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -2722,6 +2722,34 @@ def gap_get(app_id: str, gap_id: str) -> dict:
     return gap_backlog.get_gap(gap_id)
 
 
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("gap_touching")
+def gap_touching(app_id: str, paths: Optional[list] = None, project: str = "",
+                  limit: int = gap_backlog.MAX_TOUCHING_ROWS) -> dict:
+    """B1 of docs/design/gaps-in-soil.md §4.2: open/resolved backlog gaps
+    whose own text touches any of `paths` (repo-relative), read-time —
+    no edge store, no migration, no model in the path. Three labelled
+    tiers, most confident first: (1) `exact` — one of `paths` appears
+    verbatim in the gap's topic+question; a `paths` entry ending in "/"
+    also matches a file named under that directory; (2) `symbol` — an
+    identifier in the gap's text resolves to exactly one symbol in
+    `project`'s code_graph DB, and that symbol's file is one of `paths`;
+    (3) `project+stem` (weaker, at most 5 rows) — the gap's topic pins
+    `project` and a token of one of `paths`' basenames is one of the
+    gap's own tokens. Tier 3 is what finds a gap like 07aa99036f09, which
+    names no file at all. `promoted` gaps are never returned.
+
+    Three-state (INVARIANTS §1): `state` is `populated`, `empty`, or
+    `unreachable` (with `reason`) — a backlog read failure is never
+    folded into an empty result. `tier2_health` reports the code_graph
+    lookup's own state separately (`indexed`/`unindexed`/`unreachable`/
+    `budget_exhausted`/`not_attempted`). Bounded: at most 25 rows and a
+    16 KB serialized page, with `truncated` set true when either bound —
+    or the tier-3 cap itself — cuts the page short. There is no cursor
+    parameter; a truncated page has no next page to ask for. Read-only."""
+    return gap_backlog.touching(paths, project=project, limit=limit)
+
+
 @mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("gap_resolve")
 def gap_resolve(app_id: str, gap_id: str, note: str = "") -> dict:
@@ -4714,6 +4742,89 @@ def _auto_propose_on_gate_miss(
 _VERB_CITATION_PROJECT = "governance"
 
 
+# Loki A4836541 B1: shared "no recipient text without recipient permission"
+# guard for the gaps_touching auto-attach on dispatch_send and session_enter.
+# EZTLPBXF: a hanuman seat scoped to [dispatch_read, dispatch_write,
+# knowledge_read] -- lacking gap_read/gap_touching entirely -- received full
+# gap topic+question text at session_enter, while a direct gap_list call for
+# the same seat was correctly denied. The attach must fail exactly the same
+# way gap_list does, for the same seat, checked against the RECIPIENT
+# (to_app / the entering app_id), never the sender.
+_WITHHELD_GAPS_TOUCHING = {
+    "state": "withheld", "items": [], "truncated": False, "total": 0,
+    "tier2_health": "not_attempted",
+}
+
+
+def _gaps_touching_block(recipient: str, paths: list, project: str) -> dict:
+    """Compute the FULL `gaps_touching` block (with `items`) for `paths`,
+    gated on whether `recipient` may hold `gap_touching` at all (Loki
+    A4836541 B1). Withheld, not merely empty, when the gate refuses -- the
+    recipient still learns something was withheld rather than seeing
+    indistinguishable silence. Best-effort beyond the gate check: a
+    backlog failure is shown (three-state), never allowed to fail the
+    caller (session_enter -- the only caller of this one; see
+    `_gaps_touching_summary` for dispatch_send's sender-facing, text-free
+    summary, Loki 28B97C69 B1b)."""
+    from . import gate
+
+    if not gate.permitted(recipient, "gap_touching"):
+        return dict(_WITHHELD_GAPS_TOUCHING)
+    try:
+        return gap_backlog.touching(paths, project=project)
+    except Exception as exc:
+        return {
+            "state": "unreachable",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "items": [],
+            "truncated": False,
+            "total": 0,
+            "tier2_health": "not_attempted",
+        }
+
+
+# Loki 28B97C69 B1b: dispatch_send gated its attach on the RECIPIENT
+# (to_app) but returned the computed block to the CALLER -- the only
+# reader of dispatch_send's return value. BFECHFHC: a hanuman seat with no
+# gap permissions got a binder-addressed packet's full gap topic+question
+# text back, because the gate checked to_app, not the caller. The fix:
+# dispatch_send never returns gap TEXT at all. It returns at most a
+# text-free summary (`state`, `total`, `tier2_health` -- no `items`, no
+# `truncated`, which exist only to bound a page of text this shape does
+# not carry), gated on the CALLER holding gap_touching -- the same seat
+# that receives this return value.
+_WITHHELD_GAPS_TOUCHING_SUMMARY = {
+    "state": "withheld", "total": 0, "tier2_health": "not_attempted",
+}
+
+
+def _gaps_touching_summary(caller: str, paths: list, project: str) -> dict:
+    """The sender-facing summary dispatch_send attaches: `state`, `total`,
+    `tier2_health` only -- never `items` (no gap text ever rides this
+    return value). Gated on `caller` (the app_id that invoked
+    dispatch_send), never the recipient -- the recipient's own full block
+    comes from session_enter via `_gaps_touching_block`, gated separately
+    on the recipient."""
+    from . import gate
+
+    if not gate.permitted(caller, "gap_touching"):
+        return dict(_WITHHELD_GAPS_TOUCHING_SUMMARY)
+    try:
+        full = gap_backlog.touching(paths, project=project)
+    except Exception as exc:
+        return {
+            "state": "unreachable",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "total": 0,
+            "tier2_health": "not_attempted",
+        }
+    return {
+        "state": full["state"],
+        "total": full["total"],
+        "tier2_health": full["tier2_health"],
+    }
+
+
 # ── Dispatch packet stack (filesystem — no Postgres required) ─────────────────
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -4729,6 +4840,7 @@ def dispatch_send(
     priority: str = "normal",
     context_refs: Optional[list] = None,
     envelope_id: str = "",
+    project: str = "",
 ) -> dict:
     """Create a dispatch packet assigning work to another agent: writes
     meta.json + assignment.md with status 'pending' under
@@ -4746,6 +4858,12 @@ def dispatch_send(
     ``EAMBIG`` names your options in ``envelope_ids``. It can only select
     among envelopes that already govern you — naming one that does not
     returns ``ENOENT``, so it disambiguates and never widens.
+
+    `project` (optional) names the project this assignment concerns —
+    Loki A4836541 H1: threaded into the `gaps_touching` block's tier 3
+    (project+stem) and tier 2's per-project code_graph DB, neither of
+    which can fire without it. Leave empty and both tiers degrade the
+    same way they did before this parameter existed.
 
     A packet addressed to its own sender is refused ``EINVAL`` before the
     envelope gate runs (no quota spent): it is the shape a seat would use to
@@ -4821,7 +4939,13 @@ def dispatch_send(
             from_verifier = str(rec.get("verifier") or "").strip()
             if from_verifier:
                 from_session = orch_session
-    return dispatch_stack.dispatch_send(
+    # docs/design/gaps-in-soil.md B1 §4.2 / Loki 28B97C69 H1b: extract the
+    # paths this assignment names ONCE, at send time, and record them (with
+    # `project`) on the signed packet meta -- so session_enter recomputes
+    # the recipient's block from what the PACKET names, never from the
+    # specialist's own entering workspace.
+    touched_paths = gap_backlog.paths_in_text(assignment_md)
+    result = dispatch_stack.dispatch_send(
         from_app=app_id,
         to_app=to_app,
         assignment_md=assignment_md,
@@ -4833,7 +4957,16 @@ def dispatch_send(
         context_refs=context_refs,
         from_verifier=from_verifier,
         from_session=from_session,
+        gaps_project=project,
+        gaps_paths=touched_paths,
     )
+    if not result.get("error"):
+        # Loki 28B97C69 B1b: dispatch_send returns no gap TEXT at all --
+        # at most a text-free summary, gated on the CALLER (app_id, the
+        # only reader of this return value), never the recipient. The
+        # recipient's own full block (with items) is session_enter's job.
+        result["gaps_touching"] = _gaps_touching_summary(app_id, touched_paths, project)
+    return result
 
 
 @mcp.tool(annotations=_ANNO_READ)
@@ -5153,6 +5286,28 @@ def session_enter(
         }
     if result.get("error"):
         return result
+
+    if result.get("entry_mode") == "dispatch" and result.get("assignment"):
+        # docs/design/gaps-in-soil.md B1 §4.2 / Loki 28B97C69 H1b: use the
+        # PACKET's own project and paths -- recorded on the signed meta at
+        # send time -- not the specialist's entering workspace. A packet
+        # about `ratatosk` entered from `willows-grove` must not lose its
+        # tier-3 match just because the specialist opened a different repo.
+        # A packet sent before this shipped carries no gaps_project/
+        # gaps_paths (both default empty on the packet); fall back to the
+        # entering workspace's project and a fresh extraction from the
+        # assignment text, exactly as before, so it still gets a block.
+        # Gated on the ENTERING app_id holding gap_touching (Loki A4836541
+        # B1) -- that is the recipient here, not a sender.
+        packet_project = result.get("gaps_project") or (
+            (result.get("project") or {}).get("name") or ""
+        )
+        packet_paths = result.get("gaps_paths") or gap_backlog.paths_in_text(
+            result["assignment"]
+        )
+        result["gaps_touching"] = _gaps_touching_block(
+            app_id, packet_paths, packet_project,
+        )
 
     from .human_session import is_orchestrator_app
     if is_orchestrator_app(app_id):
