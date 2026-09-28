@@ -1172,6 +1172,26 @@ def _check_rate(app_id: str) -> tuple[bool, int]:
         return True, 0
 
 
+def reset_rate_limits() -> None:
+    """willow-mcp #662/486CDA98: `_buckets` is a module-global, in-process
+    token bucket keyed by `app_id`, with no reset anywhere — the module
+    survives for the whole test process, so a bucket one test (or test
+    FILE) drains stays drained for every later test using the same
+    `app_id` ("caller", "hanuman", ...), regardless of which suite subset
+    or file order actually triggers it going below burst. That is the
+    exact class `test_federation_call_grant_on_one_tool_does_not_reach_
+    another` was failing to: not a defect in federation_call or its gate,
+    but leaked rate-limiter state from every EARLIER guarded call in the
+    process sharing its app_id.
+
+    Test-only entry point: tests must reset through this function, never
+    reach into `_buckets` directly — a private dict is not a stable
+    contract, and a bare `.clear()` from a test can't take the lock this
+    function takes on the real caller's behalf."""
+    with _buckets_lock:
+        _buckets.clear()
+
+
 # ── Guarded dispatch (Phase 4a+4b+4c combined) ───────────────────────────────
 
 # Registered-tool-name -> gate-check-name, populated as each @_guarded tool is

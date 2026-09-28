@@ -104,6 +104,27 @@ def home(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    """#662/486CDA98: willow_mcp.server._buckets is a module-global,
+    in-process token bucket keyed by app_id, with no per-test reset
+    anywhere. Any test calling a @_guarded MCP tool (federation_call,
+    package_upgrade_execute, receipts_tail, ...) under a given app_id
+    ("caller", "hanuman", ...) spends tokens from a bucket that survives
+    for the rest of the process; a later test using the SAME app_id can
+    start on an already-exhausted bucket for reasons that have nothing to
+    do with what IT is testing (proved: test_federation_call_grant_on_
+    one_tool_does_not_reach_another failing with {'error': 'rate_limited'}
+    when #662's other test files ran first, never when
+    test_server_federation.py ran alone). Reset through the module's own
+    public reset_rate_limits() — never poke `_buckets` directly, it is
+    not a stable test contract. Runs before EVERY test, autouse, so no
+    test file has to remember to ask for it.
+    """
+    from willow_mcp import server
+    server.reset_rate_limits()
+
+
+@pytest.fixture(autouse=True)
 def _stub_egress_public_key_for_diagnostics(request, monkeypatch, tmp_path):
     """CI has no ~/.config/willow-mcp/egress keys; most tests call _derive_problems.
 
