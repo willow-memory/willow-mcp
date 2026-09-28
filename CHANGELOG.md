@@ -37,7 +37,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 ### Fixed
 
 * an egress lease is a scope, not an entry blocker ([89cd018](https://github.com/willow-memory/willow-mcp/commit/89cd018a0b500c283f1485dcc96cc1fcfbc8fb5c))
-* an egress lease never blocks entry — blockers carry a scope ([1d157cd](https://github.com/willow-memory/willow-mcp/commit/1d157cda818a44d0c8646a59f546fa0658fe3094))
 
 ## [2.84.0](https://github.com/willow-memory/willow-mcp/compare/v2.83.0...v2.84.0) (2026-09-27)
 
