@@ -52,6 +52,7 @@ handoff_write_v4(
   dispatch_id="…",
   findings=[…],
   narrative="…",
+  session_id="…",       # the session_id you gave session_enter
 )
 ```
 

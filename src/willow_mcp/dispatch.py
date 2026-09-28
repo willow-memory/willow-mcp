@@ -235,6 +235,7 @@ def dispatch_send(
     from_session: str = "",
     gaps_project: str = "",
     gaps_paths: Optional[list[str]] = None,
+    runner: str = "seat",
 ) -> dict:
     """Create dispatch/{id}/ with meta, assignment, and status pending.
 
@@ -275,6 +276,15 @@ def dispatch_send(
         return {"error": "dispatch_exists", "dispatch_id": did}
 
     role = (role or to_app).lower()
+    # N1 (dispatch 1AD03A64): listener opt-in. "seat" (default) or
+    # "ratatosk" -- the only two runners this fleet has today. Stored on
+    # the signed meta so dispatch_accept/session_enter can refuse a
+    # mismatched acceptor (ERUNNER) without trusting the caller's own
+    # claim about what it is.
+    runner_norm = (runner or "seat").strip().lower()
+    if runner_norm not in ("seat", "ratatosk"):
+        return {"error": "EINVAL",
+                "message": f"runner must be 'seat' or 'ratatosk', got {runner!r}"}
     rel_assignment = f"dispatch/{did}/assignment.md"
     assignment_text = assignment_md.strip() + "\n"
     meta = {
@@ -315,6 +325,7 @@ def dispatch_send(
         # specialist's entering workspace.
         "gaps_project": (gaps_project or "").strip(),
         "gaps_paths": list(gaps_paths or []),
+        "runner": runner_norm,
     }
     # B-52/#241: sign every field above (HMAC-SHA256, runtime-held key --
     # dispatch_signing.py) so dispatch_read/dispatch_list can tell a packet
@@ -370,7 +381,7 @@ _REQUIRED_META_FIELDS = ("dispatch_id", "from_app", "to_app")
 # symlinked packet dir or member file closes that disclosure path; it does
 # not (and cannot, same-uid) stop the packet from being forged in the first
 # place -- see _meta_is_well_formed's own docstring for that residual.
-PACKET_FILE_NAMES = ("meta.json", "assignment.md", "status.json", "handoff.json", "closeout.md", "refused")
+PACKET_FILE_NAMES = ("meta.json", "assignment.md", "status.json", "handoff.json", "closeout.md", "refused", ".handoff.lock")
 
 
 def packet_symlink_refused(root: Path) -> bool:
@@ -407,7 +418,12 @@ def packet_lock(root: Path):
     first writer once they get it."""
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / ".handoff.lock"
-    fh = open(lock_path, "a+")
+    # N7 (dispatch 1AD03A64): O_NOFOLLOW so a symlink planted at .handoff.lock
+    # (dispatch/ is operator-writable) cannot redirect this open to a file
+    # outside the packet dir -- same disclosure shape PACKET_FILE_NAMES exists
+    # to close for the other packet files, now closed for the lockfile too.
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fh = os.fdopen(fd, "r+")
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         yield
@@ -726,7 +742,9 @@ def dispatch_list(
     }
 
 
-def dispatch_set_status(dispatch_id: str, status: str, **extra: Any) -> dict:
+def dispatch_set_status(
+    dispatch_id: str, status: str, *, already_locked: bool = False, **extra: Any,
+) -> dict:
     if status not in VALID_STATUSES:
         return {"error": "invalid_status", "status": status}
     root = dispatch_dir(dispatch_id)
@@ -737,6 +755,21 @@ def dispatch_set_status(dispatch_id: str, status: str, **extra: Any) -> dict:
     # relying on call-order elsewhere never changing.
     if packet_symlink_refused(root):
         return {"error": "symlinked_packet", "dispatch_id": dispatch_id}
+    # N5 (dispatch 1AD03A64, Loki 10A39E21 N5): dispatch_withdraw/
+    # agent_clear/verify_handoff used to read-modify-write status.json
+    # OUTSIDE packet_lock -- a concurrent accept or close could lose an
+    # update against them. `already_locked=True` is passed ONLY by callers
+    # that already hold packet_lock for this same dispatch_id
+    # (dispatch_accept, handoff_write_v4) -- taking it again here, even in
+    # the same process, would deadlock (flock is per open-file-description,
+    # not per-process). Every other caller gets the lock taken right here.
+    if already_locked:
+        return _dispatch_set_status_locked(dispatch_id, root, status, extra)
+    with packet_lock(root):
+        return _dispatch_set_status_locked(dispatch_id, root, status, extra)
+
+
+def _dispatch_set_status_locked(dispatch_id: str, root: Path, status: str, extra: dict) -> dict:
     path = root / "status.json"
     data = _read_json(path)
     if data is None:
@@ -751,21 +784,32 @@ def dispatch_set_status(dispatch_id: str, status: str, **extra: Any) -> dict:
     meta = _read_json(meta_path)
     if meta:
         meta["status"] = status
-        # B-52/#241: this is a legitimate mutation of meta.json (only reached
-        # through dispatch_accept/handoff_write_v4/agent_clear -- never a raw
-        # write), so re-sign rather than let a lifecycle transition
-        # self-invalidate the packet's own signature. Any OTHER edit to
-        # meta.json -- one that didn't go through this function -- still
-        # invalidates it, which is exactly the tamper evidence this exists
-        # to catch. A legacy packet with no prior signature is signed for
-        # the first time here, same as dispatch_send would have.
         meta["signature"] = dispatch_signing.sign_meta(meta)
         _write_json(meta_path, meta)
     _pg_mirror_status(dispatch_id, status)  # best-effort fleet mirror
     return {"dispatch_id": dispatch_id, "status": status}
 
 
-def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict:
+def _archive_prior_handoff(dispatch_id: str) -> None:
+    """F3 (dispatch 1AD03A64): move a cleared packet's prior handoff.json
+    and closeout.md to history/<utc-ts>/ before a re-accept starts a fresh
+    cycle. Caller must already hold packet_lock. A missing handoff.json
+    (never actually completed, or already archived) is a silent no-op."""
+    root = dispatch_dir(dispatch_id)
+    handoff_path = root / "handoff.json"
+    if not handoff_path.exists():
+        return
+    ts = _utc_now().replace(":", "").replace("-", "")
+    hist_dir = root / "history" / ts
+    hist_dir.mkdir(parents=True, exist_ok=True)
+    import os as _os
+    _os.replace(handoff_path, hist_dir / "handoff.json")
+    closeout_path = root / "closeout.md"
+    if closeout_path.exists():
+        _os.replace(closeout_path, hist_dir / "closeout.md")
+
+
+def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "", runner: str = "seat") -> dict:
     """Specialist takes packet: pending → working.
 
     Bite 1 (dispatch 9BA76253, rework of 2E590F1B/262F89A1 F2): the accept
@@ -794,6 +838,24 @@ def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict
         return pkt
     if pkt["meta"].get("to_app", "").lower() != app_id.lower():
         return {"error": "wrong_recipient", "expected": pkt["meta"].get("to_app")}
+    # N1 (dispatch 1AD03A64): listener opt-in. A packet's runner is fixed at
+    # dispatch_send time; a caller whose own runner doesn't match is refused
+    # here, before the lock -- no bind, no status change, so a listener
+    # racing a real seat for a seat-only packet can never win the accept.
+    pkt_runner = (pkt["meta"].get("runner") or "seat").strip().lower()
+    caller_runner = (runner or "seat").strip().lower()
+    if pkt_runner != caller_runner:
+        return {
+            "error": "ERUNNER",
+            "dispatch_id": dispatch_id,
+            "expected": pkt_runner,
+            "got": caller_runner,
+            "message": (
+                f"packet {dispatch_id!r} is runner={pkt_runner!r}; caller "
+                f"passed runner={caller_runner!r} -- refused, no bind, no "
+                f"status change"
+            ),
+        }
     with packet_lock(dispatch_dir(dispatch_id)):
         # Re-read status UNDER the lock -- a read taken before acquiring it
         # can be stale by the time this caller wins the lock.
@@ -801,15 +863,21 @@ def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict
         if pkt.get("error"):
             return pkt
         cur = pkt.get("status", {}).get("status", "pending")
-        # TODO(ruling): re-accepting a CLEARED packet (a recurring dispatch)
-        # re-enters this same branch and lets a second handoff overwrite the
-        # prior verified one with no sidecar -- Loki 262F89A1 F3. Whether a
-        # cleared packet's prior handoff should be archived or the re-accept
-        # itself refused is an open operator ruling; out of scope for bite 1
-        # (dispatch 9BA76253). Left as-is on purpose.
+        # F3 (dispatch 1AD03A64), operator ruling recorded as SOIL
+        # listener-opt-in-and-reaccept-archive-2026-09-28 ("Archive the old
+        # one"): re-accepting a CLEARED packet (a recurring dispatch) is
+        # allowed, but its prior handoff.json/closeout.md are archived
+        # under history/ FIRST, atomically, under this same lock -- so the
+        # new run always writes fresh and _create_handoff_exclusive never
+        # loses a race against a stale verdict left by the previous cycle.
         if cur not in ("pending", "cleared"):
             return {"error": "invalid_transition", "from": cur, "to": "working"}
-        dispatch_set_status(dispatch_id, "working", accepted_session_id=session_id)
+        if cur == "cleared":
+            _archive_prior_handoff(dispatch_id)
+        dispatch_set_status(
+            dispatch_id, "working", accepted_session_id=session_id,
+            already_locked=True,
+        )
     if session_id:
         from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
         session_bind(
@@ -934,6 +1002,7 @@ def session_enter(
     verifier: str = "",
     attested_at: str = "",
     seal_sig: str = "",
+    runner: str = "seat",
 ) -> dict:
     """Resolve session entry mode: human prompt vs dispatch id path.
 
@@ -1071,7 +1140,44 @@ def session_enter(
         }
     held_by_other_session = False
     if cur == "pending":
-        pkt = dispatch_accept(did, app_id, session_id)
+        accept_result = dispatch_accept(did, app_id, session_id, runner=runner)
+        if accept_result.get("error"):
+            if accept_result["error"] == "ERUNNER":
+                # N1 (dispatch 1AD03A64): a runner mismatch on a fresh
+                # accept is not "held by another session" -- surface it
+                # verbatim, it has its own remedy (enter with the right
+                # runner).
+                return {
+                    "entry_mode": "dispatch",
+                    "error": "ERUNNER",
+                    "dispatch_id": did,
+                    "message": accept_result.get("message", ""),
+                    "expected": accept_result.get("expected"),
+                    "got": accept_result.get("got"),
+                }
+            # N4 (Loki 10A39E21 N4): a concurrent accept can lose the race
+            # (invalid_transition) between this call's own dispatch_read
+            # above and its dispatch_accept just now -- re-read rather than
+            # let `pkt` become the bare error dict and fall through below
+            # as a success-shaped, empty entry.
+            pkt = dispatch_read(did)
+            if pkt.get("error"):
+                return {"entry_mode": "dispatch", "error": pkt["error"], "dispatch_id": did}
+            cur = pkt.get("status", {}).get("status", "pending")
+            accepted_session_id = str(pkt.get("status", {}).get("accepted_session_id") or "")
+            if accepted_session_id and accepted_session_id != session_id:
+                held_by_other_session = True
+            elif accepted_session_id != session_id:
+                # Lost the race and it isn't even bound to us -- surface
+                # the real error rather than pretending success.
+                return {
+                    "entry_mode": "dispatch",
+                    "error": accept_result["error"],
+                    "dispatch_id": did,
+                    "status": cur,
+                }
+        else:
+            pkt = accept_result
     elif session_id:
         # Re-entry into an already-accepted packet (specialist reconnecting
         # or continuing after a hop). Bite 1 (dispatch 9BA76253, rework of
@@ -1099,7 +1205,7 @@ def session_enter(
                 _hs._remember_attributed(session_id)
 
     closeout = closeout_from_meta(pkt.get("meta", {}))
-    return {
+    result = {
         "entry_mode": "dispatch",
         "app_id": app_id,
         "session_id": session_id,
@@ -1125,10 +1231,15 @@ def session_enter(
         # tell "you are not the accepting session" apart from an ordinary
         # continuation -- see the elif branch above.
         "held_by_other_session": held_by_other_session,
-        "accepted_session_id": pkt.get("status", {}).get("accepted_session_id", ""),
         **persona_context(app_id),
         **seed_context(app_id),
     }
+    # N3 (Loki 10A39E21 N3): accepted_session_id is a bearer value --
+    # withhold it from a caller that does not already hold it. The holder
+    # (not held_by_other_session) still gets it back, same as before.
+    if not held_by_other_session:
+        result["accepted_session_id"] = pkt.get("status", {}).get("accepted_session_id", "")
+    return result
 
 
 def session_handoff_write(

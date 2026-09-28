@@ -281,7 +281,8 @@ def test_listener_stub_via_session_enter_never_becomes_canonical(home):
     e2 = ds.session_enter("loki", "sess-listener", did)
     assert e2.get("error") is None
     assert e2["held_by_other_session"] is True
-    assert e2["accepted_session_id"] == "sess-real-loki"
+    # N3 (dispatch 1AD03A64): withheld from a non-holder.
+    assert "accepted_session_id" not in e2
 
     stub_result = ho.handoff_write_v4("loki", did, session_id="sess-listener", **STUB)
     assert stub_result.get("error") == "ESESSION"

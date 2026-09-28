@@ -1132,6 +1132,32 @@ def _current_orchestrator_session() -> str:
         return _orchestrator_session_id
 
 
+# ── Current specialist session, per app_id (N2, dispatch 1AD03A64) ──────────
+# The in-process analogue of `_set_orchestrator_session` above, for a
+# specialist app_id. Same in-process/single-connection assumption -- one
+# willow-mcp process serves one specialist app_id at a time (stdio: one
+# process per seat; serve: one bound identity per connection) -- so "the
+# session bound at session_enter for THIS connection" is exactly the last
+# one recorded here for this app_id. handoff_write_v4 reads this back when
+# a caller omits session_id (Loki 10A39E21 N2: the skill doc's own example
+# omitted it, and no seat doc told callers to pass it).
+
+_specialist_session_lock = threading.Lock()
+_specialist_sessions: dict[str, str] = {}
+
+
+def _set_specialist_session(app_id: str, session_id: str) -> None:
+    if not app_id or not session_id:
+        return
+    with _specialist_session_lock:
+        _specialist_sessions[app_id.strip().lower()] = session_id
+
+
+def _current_specialist_session(app_id: str) -> str:
+    with _specialist_session_lock:
+        return _specialist_sessions.get((app_id or "").strip().lower(), "")
+
+
 # ── Rate limiter (Phase 4b) ──────────────────────────────────────────────────
 
 class _Bucket:
@@ -4895,6 +4921,7 @@ def dispatch_send(
     context_refs: Optional[list] = None,
     envelope_id: str = "",
     project: str = "",
+    runner: str = "seat",
 ) -> dict:
     """Create a dispatch packet assigning work to another agent: writes
     meta.json + assignment.md with status 'pending' under
@@ -5013,6 +5040,7 @@ def dispatch_send(
         from_session=from_session,
         gaps_project=project,
         gaps_paths=touched_paths,
+        runner=runner,
     )
     if not result.get("error"):
         # Loki 28B97C69 B1b: dispatch_send returns no gap TEXT at all --
@@ -5107,13 +5135,19 @@ def dispatch_accept(
     app_id: str,
     dispatch_id: str,
     session_id: str = "",
+    runner: str = "seat",
 ) -> dict:
     """Accept a dispatch packet addressed to you: flips its status pending →
     working and records your session_id against it. Refuses if the packet is
     addressed to a different app (wrong_recipient) or is not currently pending
     (invalid_transition). Read the brief with dispatch_read first; close out
-    with handoff_write_v4 when the work is done."""
-    return dispatch_stack.dispatch_accept(dispatch_id, app_id, session_id)
+    with handoff_write_v4 when the work is done.
+
+    `runner` (dispatch 1AD03A64, N1): "seat" (default) or "ratatosk" --
+    must match the packet's own runner (set at dispatch_send time) or the
+    accept is refused `ERUNNER`, with no bind and no status change. A
+    packet sent before this field existed counts as "seat"."""
+    return dispatch_stack.dispatch_accept(dispatch_id, app_id, session_id, runner=runner)
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
@@ -5171,6 +5205,10 @@ def handoff_write_v4(
     re-entering session overwrite the accepting one's verdict. A packet
     accepted before this field existed (no session_id recorded) skips the
     check entirely — nothing there to compare against."""
+    # N2 (dispatch 1AD03A64): an omitted session_id is resolved from this
+    # connection's own session_enter binding before the ESESSION check
+    # ever sees it -- see `_current_specialist_session`.
+    resolved_session_id = session_id or _current_specialist_session(app_id)
     return handoff_stack.handoff_write_v4(
         app_id,
         dispatch_id,
@@ -5179,7 +5217,7 @@ def handoff_write_v4(
         checklist_resolved=checklist_resolved,
         envelope_clean=envelope_clean,
         no_findings_reason=no_findings_reason,
-        session_id=session_id,
+        session_id=resolved_session_id,
     )
 
 
@@ -5313,6 +5351,7 @@ def session_enter(
     verifier: str = "",
     attested_at: str = "",
     seal_sig: str = "",
+    runner: str = "seat",
 ) -> dict:
     """FIRST CALL of any session. Registers the app/session pair, resolves the
     entry mode (human seat vs dispatched specialist — pass `dispatch_id` when
@@ -5341,6 +5380,7 @@ def session_enter(
             verifier=verifier,
             attested_at=attested_at,
             seal_sig=seal_sig,
+            runner=runner,
         )
     except _session_signing.InvalidSessionSignatureError as exc:
         return {
@@ -5377,6 +5417,11 @@ def session_enter(
     from .human_session import is_orchestrator_app
     if is_orchestrator_app(app_id):
         _set_orchestrator_session(session_id)
+    else:
+        # N2 (dispatch 1AD03A64): record this connection's session so a
+        # seat that omits `session_id` on handoff_write_v4 can still be
+        # resolved from context.
+        _set_specialist_session(app_id, session_id)
 
     from . import gate
 

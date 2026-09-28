@@ -231,7 +231,11 @@ def test_session_enter_reentry_with_different_session_is_held_not_bound(
         project="", workspace="", dispatch_id=did,
     )
     assert result["held_by_other_session"] is True
-    assert result["accepted_session_id"] == "s-hanu-first"
+    # N3 (dispatch 1AD03A64, Loki 10A39E21 N3): the bound id is a bearer
+    # value -- withheld from a caller that does not hold it. It used to be
+    # returned unconditionally; that was exactly the bearer-token exposure
+    # N3 closes.
+    assert "accepted_session_id" not in result
     rec = dispatch.session_read("hanuman", "s-hanu-second")
     assert rec.get("error") == "not_found"
     assert not human_session.is_session_attributed("s-hanu-second")

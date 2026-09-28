@@ -96,6 +96,19 @@ def _sidecar_count(dispatch_id: str) -> int:
         return 0
 
 
+def _history_count(dispatch_id: str) -> int:
+    """How many archived cycles (F3, dispatch 1AD03A64) sit under this
+    packet's history/ -- one subdirectory per re-accept-and-archive. Same
+    never-raises discipline as _sidecar_count."""
+    try:
+        d = dispatch_dir(dispatch_id) / "history"
+        if not d.is_dir():
+            return 0
+        return sum(1 for p in d.iterdir() if p.is_dir())
+    except (OSError, ValueError):
+        return 0
+
+
 def _write_refused_sidecar(dispatch_id: str, writer_app: str, payload: dict,
                            reason: str, *, session_id: str = "") -> str:
     """Write one refused-handoff sidecar next to the packet, atomically and
@@ -184,15 +197,26 @@ def _create_handoff_exclusive(path: Path, data: dict) -> bool:
     about. Returns False (never raises) on losing the create race; the
     caller turns that into ECLOSED plus a sidecar, same as the state-check
     path above it."""
+    # F6 (dispatch 1AD03A64): write to a temp file in the same directory
+    # FIRST, then `os.link` it into place -- `os.link` fails with
+    # FileExistsError exactly like O_EXCL did (same last-line exclusivity),
+    # but no reader can ever observe a zero-length or partially-written
+    # handoff.json, because the temp file is fully written and closed
+    # before the link that makes it visible under its real name.
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, indent=2) + "\n"
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(payload, encoding="utf-8")
     try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        os.link(tmp, path)
+        return True
     except FileExistsError:
         return False
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(payload)
-    return True
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def _eclosed_refusal(dispatch_id: str, app_id: str, session_id: str,
@@ -313,7 +337,9 @@ def handoff_write_v4(
             reason = (
                 f"packet {dispatch_id!r} was accepted by a different "
                 f"session -- this write's session_id does not match the "
-                f"session that called dispatch_accept"
+                f"session that called dispatch_accept. Remedy: pass the "
+                f"session_id you gave session_enter (or dispatch_accept's "
+                f"own return) as handoff_write_v4's session_id argument"
             )
             payload = {
                 "app_id": app_id, "dispatch_id": dispatch_id,
@@ -392,10 +418,17 @@ def handoff_write_v4(
 
         created = _create_handoff_exclusive(root / "handoff.json", handoff)
         if not created:
-            # Lost the create race despite holding packet_lock -- should be
-            # unreachable in normal operation (the lock already serialized
-            # this), but this is the backstop the mutation matrix exercises
-            # directly against O_EXCL with the lock bypassed.
+            # F3 (dispatch 1AD03A64, Loki 10A39E21 F3): this is NOT
+            # unreachable -- a stale handoff.json left by a cleared cycle
+            # that was re-accepted without going through dispatch_accept's
+            # archive step (a legacy packet accepted before F3 shipped, or
+            # the archive step itself failing) lands here while the
+            # packet's real status is 'working', not 'complete'. `cur`
+            # (read under this same lock, above) names what actually
+            # holds, so the refusal is labelled with the packet's real
+            # state instead of a hardcoded 'complete' -- also still the
+            # backstop the mutation matrix exercises directly against
+            # O_EXCL/os.link with the lock bypassed.
             reason = (
                 f"packet {dispatch_id!r} already has a handoff.json -- lost "
                 f"the exclusive-create race"
@@ -403,6 +436,7 @@ def handoff_write_v4(
             return _eclosed_refusal(
                 dispatch_id, app_id, session_id, findings_list, narrative,
                 checklist_resolved, envelope_clean, no_findings_reason, reason,
+                cur=cur,
             )
 
         closeout = _render_closeout(dispatch_id, app_id, handoff, pkt)
@@ -412,6 +446,7 @@ def handoff_write_v4(
             dispatch_id,
             "complete",
             handoff_path=f"dispatch/{dispatch_id}/handoff.json",
+            already_locked=True,
         )
         return {
             "dispatch_id": dispatch_id,
@@ -697,6 +732,7 @@ def verify_handoff(dispatch_id: str) -> dict:
         # still reads only the ORIGINAL handoff for its verdict; sidecars
         # never change `verified`, they are exposed so a race is visible.
         "sidecar_count": _sidecar_count(dispatch_id),
+        "history_count": _history_count(dispatch_id),
         "status": "verified" if verified else "complete",
     }
     if reasons:
