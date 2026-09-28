@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import stat
 
 import pytest
@@ -329,3 +330,233 @@ def test_identical_tables_write_no_frank_ink(tables):
 
     assert out["ok"] is True and out["added"] == []
     assert ledger.rows == []
+
+
+# -- sealed amendment path (gap 82022def338f, ruling A, pair 3445116c) --------
+
+def _nestor_pair(db_path, pair_id, status="sealed", seal_sig="stub-seal-sig"):
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS tm_pairs (
+            id TEXT PRIMARY KEY, source_text TEXT NOT NULL, source_norm TEXT NOT NULL,
+            source_lang TEXT NOT NULL, target_text TEXT NOT NULL, target_lang TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft', verifier TEXT NOT NULL DEFAULT '',
+            weight REAL NOT NULL DEFAULT 1.0, origin TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, seal_sig TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '', superseded_by TEXT NOT NULL DEFAULT '',
+            visibility TEXT NOT NULL DEFAULT 'internal'
+        );
+    """)
+    conn.execute(
+        "INSERT OR REPLACE INTO tm_pairs (id, source_text, source_norm, source_lang, "
+        "target_text, target_lang, status, verifier, created_at, seal_sig) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (pair_id, "amend row 18?", "amend row 18?", "decision", "amend row 18: yes",
+         "decision", status, "sean campbell", "2026-09-28T00:00:00Z", seal_sig),
+    )
+    conn.commit()
+    conn.close()
+
+
+class _FakeGovStore:
+    """Minimal store stand-in: only .all() is used by the amendment path."""
+
+    def __init__(self, records):
+        self._records = records
+
+    def all(self, collection):
+        return list(self._records)
+
+
+def _gov_record(**kw):
+    base = {"_id": "gov1", "kind": "syscall_row_amend",
+            "status": "sealed", "nestor_pair_id": "pairABC",
+            "nestor_verifier": "sean campbell"}
+    base.update(kw)
+    return base
+
+
+def test_sealed_amendment_with_matching_hashes_applies_the_change(tables, tmp_path):
+    live, bundle = tables
+    row18_live = _row(18, "manifest.grant", bounds={"apps": "old description"})
+    row18_bundle = _row(18, "manifest.grant", bounds={"apps": "new description"})
+    _write_table(live, [row18_live])
+    _write_table(bundle, [row18_bundle])
+
+    from_hash = constitutional._row_hash(row18_live)
+    to_hash = constitutional._row_hash(row18_bundle)
+    nestor_db = tmp_path / "nestor.db"
+    _nestor_pair(nestor_db, "pairABC")
+    gov = _FakeGovStore([_gov_record(id=18, verb="manifest.grant",
+                                     from_sha256=from_hash, to_sha256=to_hash)])
+
+    ledger = _FakeLedger()
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, ledger=ledger, project="fleet",
+        store=gov, nestor_db_path=nestor_db)
+
+    assert out["ok"] is True, out
+    assert out["amended"] == [{"id": 18, "verb": "manifest.grant",
+                              "from_sha256": from_hash, "to_sha256": to_hash,
+                              "pair_id": "pairABC"}]
+    written = json.loads(live.read_text())
+    assert written["verbs"][0]["bounds"] == {"apps": "new description"}
+    assert len(ledger.rows) == 1
+    assert ledger.rows[0]["content"]["amended"] == out["amended"]
+
+
+def test_missing_row_with_no_amendment_at_all_is_refused(tables, tmp_path):
+    """The 'refusal of a missing row' guard: no syscall_row_amend decision
+    exists at all for the changed row -- refused exactly as before."""
+    live, bundle = tables
+    row18_live = _row(18, "manifest.grant", bounds={"apps": "old"})
+    row18_bundle = _row(18, "manifest.grant", bounds={"apps": "new"})
+    _write_table(live, [row18_live])
+    _write_table(bundle, [row18_bundle])
+    before = live.read_text()
+
+    gov = _FakeGovStore([])  # nothing at all
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, store=gov,
+        nestor_db_path=tmp_path / "nestor.db")
+
+    assert out["ok"] is False and out["refused"] is True
+    assert "no sealed syscall_row_amend" in out["reason"]
+    assert live.read_text() == before
+
+
+def test_unsealed_amendment_is_refused(tables, tmp_path):
+    """The seal-status guard: a matching decision exists but status is not
+    'sealed' -- refused, live untouched."""
+    live, bundle = tables
+    row18_live = _row(18, "manifest.grant", bounds={"apps": "old"})
+    row18_bundle = _row(18, "manifest.grant", bounds={"apps": "new"})
+    _write_table(live, [row18_live])
+    _write_table(bundle, [row18_bundle])
+    before = live.read_text()
+
+    from_hash = constitutional._row_hash(row18_live)
+    to_hash = constitutional._row_hash(row18_bundle)
+    gov = _FakeGovStore([_gov_record(id=18, verb="manifest.grant", status="proposed",
+                                     from_sha256=from_hash, to_sha256=to_hash)])
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, store=gov,
+        nestor_db_path=tmp_path / "nestor.db")
+
+    assert out["ok"] is False and out["refused"] is True
+    assert "is not sealed" in out["reason"]
+    assert live.read_text() == before
+
+
+def test_amendment_with_wrong_from_hash_is_refused_by_name(tables, tmp_path):
+    live, bundle = tables
+    row18_live = _row(18, "manifest.grant", bounds={"apps": "old"})
+    row18_bundle = _row(18, "manifest.grant", bounds={"apps": "new"})
+    _write_table(live, [row18_live])
+    _write_table(bundle, [row18_bundle])
+    before = live.read_text()
+
+    to_hash = constitutional._row_hash(row18_bundle)
+    nestor_db = tmp_path / "nestor.db"
+    _nestor_pair(nestor_db, "pairABC")
+    gov = _FakeGovStore([_gov_record(id=18, verb="manifest.grant",
+                                     from_sha256="deadbeef" * 8, to_sha256=to_hash)])
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, store=gov, nestor_db_path=nestor_db)
+
+    assert out["ok"] is False and out["refused"] is True
+    assert "does not match the live row's own hash" in out["reason"]
+    assert "refused by name" in out["reason"]
+    assert live.read_text() == before
+
+
+def test_amendment_with_wrong_to_hash_is_refused_by_name(tables, tmp_path):
+    live, bundle = tables
+    row18_live = _row(18, "manifest.grant", bounds={"apps": "old"})
+    row18_bundle = _row(18, "manifest.grant", bounds={"apps": "new"})
+    _write_table(live, [row18_live])
+    _write_table(bundle, [row18_bundle])
+    before = live.read_text()
+
+    from_hash = constitutional._row_hash(row18_live)
+    nestor_db = tmp_path / "nestor.db"
+    _nestor_pair(nestor_db, "pairABC")
+    gov = _FakeGovStore([_gov_record(id=18, verb="manifest.grant",
+                                     from_sha256=from_hash, to_sha256="deadbeef" * 8)])
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, store=gov, nestor_db_path=nestor_db)
+
+    assert out["ok"] is False and out["refused"] is True
+    assert "does not match the bundle row's own hash" in out["reason"]
+    assert "refused by name" in out["reason"]
+    assert live.read_text() == before
+
+
+def test_amendment_id_verb_mismatch_is_refused_directly():
+    """The id/verb-match guard, exercised directly on _confirm_amendment
+    (the through-sync path always pre-filters on id/verb via
+    _find_amendment, so this guard's own unit test calls the helper
+    itself, same as the module's docstring names it)."""
+    live_row = _row(18, "manifest.grant", bounds={"apps": "old"})
+    bundle_row = _row(18, "manifest.grant", bounds={"apps": "new"})
+    rec = _gov_record(id=19, verb="manifest.grant",
+                      from_sha256=constitutional._row_hash(live_row),
+                      to_sha256=constitutional._row_hash(bundle_row))
+    ok, why = constitutional._confirm_amendment(rec, live_row=live_row, bundle_row=bundle_row)
+    assert ok is False
+    assert "names id=19" in why
+
+
+def test_amendment_pair_not_confirmed_in_nestor_ledger_is_refused(tables, tmp_path):
+    """The Nestor-ledger confirmation guard: the SOIL record says sealed but
+    nestor.db disagrees (no such pair) -- refused, never trusted on the
+    SOIL field alone."""
+    live, bundle = tables
+    row18_live = _row(18, "manifest.grant", bounds={"apps": "old"})
+    row18_bundle = _row(18, "manifest.grant", bounds={"apps": "new"})
+    _write_table(live, [row18_live])
+    _write_table(bundle, [row18_bundle])
+    before = live.read_text()
+
+    from_hash = constitutional._row_hash(row18_live)
+    to_hash = constitutional._row_hash(row18_bundle)
+    nestor_db = tmp_path / "nestor.db"
+    # nestor.db exists but has no row for this pair_id at all.
+    _nestor_pair(nestor_db, "some-other-pair")
+    gov = _FakeGovStore([_gov_record(id=18, verb="manifest.grant",
+                                     from_sha256=from_hash, to_sha256=to_hash)])
+    out = constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, store=gov, nestor_db_path=nestor_db)
+
+    assert out["ok"] is False and out["refused"] is True
+    assert "not confirmed sealed in the Nestor ledger" in out["reason"]
+    assert live.read_text() == before
+
+
+def test_diff_changed_rows_preview_names_field_diff_and_hashes(tables):
+    live, bundle = tables
+    row18_live = _row(18, "manifest.grant", bounds={"apps": "old"})
+    row18_bundle = _row(18, "manifest.grant", bounds={"apps": "new"})
+    row14 = _row(14, "agent.lifecycle")
+    _write_table(live, [row14, row18_live])
+    _write_table(bundle, [row14, row18_bundle])
+
+    out = constitutional.diff_changed_rows(live_path=live, bundle_path=bundle)
+
+    assert out["ok"] is True
+    assert len(out["rows"]) == 1
+    row = out["rows"][0]
+    assert row["id"] == 18 and row["verb"] == "manifest.grant"
+    assert row["diff"] == {"bounds": {"from": {"apps": "old"}, "to": {"apps": "new"}}}
+    assert row["from_sha256"] == constitutional._row_hash(row18_live)
+    assert row["to_sha256"] == constitutional._row_hash(row18_bundle)
+
+
+def test_diff_changed_rows_is_empty_when_tables_agree(tables):
+    live, bundle = tables
+    rows = [_row(14), _row(15, "unit.reload")]
+    _write_table(live, rows)
+    _write_table(bundle, rows)
+
+    out = constitutional.diff_changed_rows(live_path=live, bundle_path=bundle)
+    assert out == {"ok": True, "rows": []}
