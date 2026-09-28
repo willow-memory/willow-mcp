@@ -523,22 +523,29 @@ def read_sealed_pair(pair_id: str, db_path: Path) -> dict:
     try:
         row = conn.execute(
             "SELECT source_norm, target_text, verifier, seal_sig, status, superseded_by, "
-            "created_at FROM tm_pairs WHERE id = ?", (pair_id,)).fetchone()
+            "created_at, source_lang FROM tm_pairs WHERE id = ?", (pair_id,)).fetchone()
     except sqlite3.Error as exc:
         return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
     finally:
         conn.close()
     if row is None:
         return {"state": "empty", "why": "pair_absent"}
-    source_norm, target_text, verifier, seal_sig, status, superseded_by, created_at = row
+    source_norm, target_text, verifier, seal_sig, status, superseded_by, created_at, source_lang = row
     if superseded_by:
         return {"state": "empty", "why": "superseded"}
     if status != "sealed":
         return {"state": "empty", "why": f"status={status}"}
     if not seal_sig:
         return {"state": "empty", "why": "unsigned"}
+    # source_lang folded in here (Loki F0C19708, "single query for
+    # source_lang"): a caller that needs to know a pair's TYPE (e.g.
+    # reloader._ruling_sealed wanting source_lang="decision") no longer
+    # needs a second connection/query to learn it -- this is a
+    # database-level field, not part of the signed bytes verify_seal checks
+    # (seal_message covers only source_norm/target_text/verifier).
     return {"state": "populated", "source_norm": source_norm, "target_text": target_text,
-            "verifier": verifier, "seal_sig": seal_sig, "created_at": created_at}
+            "verifier": verifier, "seal_sig": seal_sig, "created_at": created_at,
+            "source_lang": source_lang}
 
 
 # ── the signer, over a socket ─────────────────────────────────────────────────

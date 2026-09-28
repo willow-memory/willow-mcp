@@ -115,7 +115,8 @@ def _api(method: str, url: str, *, bearer: str, body: dict | None = None,
         return {"ok": False, "status": 0, "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def mint_installation_token(repo: str, timeout: int = 20) -> dict[str, Any]:
+def mint_installation_token(repo: str, timeout: int = 20,
+                            permissions: dict[str, str] | None = None) -> dict[str, Any]:
     """Mint a short-lived installation token for ``org/name``.
 
     On success: ``{ok, token, expires_at, permissions, installation_id, mode: "app"}``.
@@ -158,11 +159,14 @@ def mint_installation_token(repo: str, timeout: int = 20) -> dict[str, Any]:
 
     # Restrict the token to this one repository name (not the org slug).
     repo_name = repo.split("/", 1)[1]
+    body: dict[str, Any] = {"repositories": [repo_name]}
+    if permissions:
+        body["permissions"] = permissions
     minted = _api(
         "POST",
         f"{_API}/app/installations/{installation_id}/access_tokens",
         bearer=jwt_token,
-        body={"repositories": [repo_name]},
+        body=body,
         timeout=timeout,
     )
     if not minted.get("ok"):

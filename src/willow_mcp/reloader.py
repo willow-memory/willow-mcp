@@ -224,6 +224,30 @@ def _ring_from_keyring(kr) -> dict[str, dict]:
     }
 
 
+def _load_verify_ring() -> tuple[Optional[dict], Optional[dict]]:
+    """Load the ``verify_seal`` ring from this process's own keyring
+    (``WILLOW_KEYRING``). Returns ``(ring, None)`` on success, or ``(None,
+    unreachable_state)`` when no keyring is configured or a configured one
+    could not be loaded -- the SAME "no ring to check against" verdict
+    either way. Factored out of :func:`find_sealing_decision` (T2, Loki
+    BE590C53) so :func:`_ruling_sealed`'s pinned-pair check shares the
+    identical trust anchor a per-receipt seal already uses, rather than a
+    second, independent guess at how to load one."""
+    from . import keyring as _keyring
+
+    try:
+        ring_kr = _keyring.get_keyring()
+    except _keyring.KeyringError as exc:
+        return None, {"state": "unreachable",
+                      "cause": f"WILLOW_KEYRING={_keyring.keyring_path()!r} is configured but "
+                               f"could not be loaded: {exc}"}
+    if ring_kr is None:
+        return None, {"state": "unreachable",
+                      "cause": "no keyring configured (WILLOW_KEYRING) — a seal cannot be "
+                               "verified without a ring to verify it against"}
+    return _ring_from_keyring(ring_kr), None
+
+
 def find_sealing_decision(receipt_id: str, db_path: Path) -> dict:
     """Look in Nestor's own database for a sealed ``decision`` pair whose
     text names ``receipt_id`` AND whose ``seal_sig`` actually verifies.
@@ -275,31 +299,11 @@ def find_sealing_decision(receipt_id: str, db_path: Path) -> dict:
     if not rows:
         return {"state": "empty"}
 
-    from . import keyring as _keyring
     from . import net_signer
 
-    # T2 (Loki BE590C53): get_keyring() RAISES KeyringError for a
-    # WILLOW_KEYRING that names a path with nothing readable at it (a
-    # missing file, malformed JSON, ...) — it does not return None the way
-    # "unset" does. Left uncaught, that traceback propagated out of
-    # main() on the first tick with a pending receipt: exactly the
-    # three-state collapse this function exists to prevent. Both "no ring
-    # configured" and "a ring is configured but unusable" are the SAME
-    # verdict from a caller's point of view — unreachable, fix the path —
-    # so both land here.
-    try:
-        ring_kr = _keyring.get_keyring()
-    except _keyring.KeyringError as exc:
-        return {"state": "unreachable",
-                "cause": f"WILLOW_KEYRING={_keyring.keyring_path()!r} is configured but could not "
-                         f"be loaded: {exc}",
-                "path": str(db_path)}
-    if ring_kr is None:
-        return {"state": "unreachable",
-                "cause": "no keyring configured (WILLOW_KEYRING) — a seal cannot be verified "
-                         "without a ring to verify it against",
-                "path": str(db_path)}
-    ring = _ring_from_keyring(ring_kr)
+    ring, ring_err = _load_verify_ring()
+    if ring is None:
+        return {**ring_err, "path": str(db_path)}
 
     for pair_id, source_norm, target_text, verifier, seal_sig, created_at in rows:
         sealed = {"source_norm": source_norm, "target_text": target_text,
@@ -560,6 +564,617 @@ def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = No
     return {"ok": True, "act": True, "unit": unit, "env_path": env_path,
             "receipt_id": receipt_id, "receipt": content, "seal": seal, "state_before": state_unit,
             "request_state": request_state}
+
+
+# -- the merge confirm: the operator's merge into master, not a per-restart
+# Nestor seal (gap 55fc7c9681e9; replaces sealed ruling e961aff8) ---------
+#
+# Governing decision: SOIL record RULING_RECORD_ID in
+# projects_willow_governance_decisions, proposed to Nestor. Until that
+# record's own status is "sealed", check_merge() always refuses ENORULING
+# and the sealed-pair path above (check()/run_once()) stays the ONLY live
+# restart path for the pull trigger -- run_once_v2() enforces that gating
+# by construction: it calls run_once() unchanged while unsealed, and only
+# switches to check_merge()/the merge act once the record is sealed.
+
+#: The governance record whose status this module reads to decide whether
+#: the merge-is-confirm path may act at all. Its own seal (via seal_handler
+#: on the ratatosk seal-watch) is what flips run_once_v2() over.
+RULING_RECORD_ID = "reloader-merge-is-confirm-2026-09-28"
+
+#: The ONE Nestor pair this module ever reads to decide whether the merge
+#: path may act -- pinned in code (Loki FAIL 40F02AAD, F2), never a name
+#: the desk supplies or a SOIL record can point at.
+RULING_PAIR_ID = "f13f15d9-5b31-4b20-bffa-7fd5157d9c9b"
+
+#: sha256 of net_signer.seal_message(source_norm, target_text, verifier) --
+#: the pair's own SIGNED bytes -- for the ONE ruling text RULING_PAIR_ID
+#: must carry (N3, Loki F0C19708): without this, a second, validly-signed
+#: decision copied under the SAME id would also pass. Exploiting that
+#: already needs nestor.db write access, and the same writer can already
+#: clear superseded_by, so this is defence in depth, not the primary gate.
+#: Pinned (Loki PASS 0D8EA229): Kart cannot read the live nestor.db (the
+#: sandbox mounts the worktree, not the live WILLOW_HOME/nestor.db, and no
+#: task_db/task_net capability was granted for this build), so the value
+#: below was read from the broker, never invented in Kart. Exact recipe --
+#: the SAME function the gate itself calls, via the read-only Nestor MCP
+#: (nestor_provenance, never a direct nestor.db read, which Kart cannot
+#: reach):
+#:   sealed = nestor_provenance(pair_id=RULING_PAIR_ID)  # signature_valid=true
+#:   hashlib.sha256(net_signer.seal_message(
+#:       sealed["source_norm"], sealed["target_text"], sealed["verifier"]
+#:   )).hexdigest()
+#: When None, the check in _ruling_sealed() is skipped entirely -- every
+#: OTHER gate still applies; only this one defence-in-depth layer is
+#: absent. A WRONG pin fails SAFE (falls back to run_once() below) but is
+#: never SILENT about it -- run_once_v2() writes a named ERULINGTEXT
+#: refusal row (see _ruling_sealed_detail) rather than looking identical
+#: to "the pair simply isn't sealed at all".
+RULING_TEXT_SHA256: Optional[str] = "239d333eb89e1a23a0508a96a9b4041bfd4fdf35d8f493ffe518f3421fcb3976"
+
+#: FRANK event types for the merge-is-confirm path -- distinct from
+#: unit_reload_executor.EVENT ("unit_reload", the sealed-pair path's own
+#: ink) so the two mechanisms' receipts are never ambiguous about which
+#: confirm authorized a restart.
+MERGE_EVENT = "broker_reload"
+MERGE_REFUSAL_EVENT = "broker_reload_refusal"
+
+_API = "https://api.github.com"
+
+#: Conclusions that mean a check-run is CONFIRMED fine. Allowlist, not a
+#: denylist (Loki F8): "stale" -- and anything else GitHub might report
+#: that this reloader does not recognize -- must never count as green
+#: just because it fails to appear on a denylist written before that
+#: value existed.
+_MERGE_OK_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+
+#: The App installation token this path mints needs no more than these
+#: three READ scopes for a merge+checks confirm (Loki F9) -- never the
+#: App's full per-repo default permission set.
+_MERGE_TOKEN_PERMISSIONS = {"checks": "read", "pull_requests": "read", "metadata": "read"}
+
+#: check_merge() errnos that mean "a real pending change exists but is not
+#: yet confirmed" -- the merge-path sibling of _is_open_trigger's ENOSEAL/
+#: EDRIFT/EUNREACH set. run_once_v2() refuses EPARTIAL (never silently
+#: drops the merge trigger) when this is true but act is not. Rework
+#: (Loki 40F02AAD, F3): ENOTMERGED/EDRIFT/ENOTMASTER now count as open
+#: too -- a real, not-yet-confirmed pull must block an env-triggered
+#: restart exactly like ECHECKS/EUNREACH already did, restoring the rule
+#: at _is_open_trigger (:1210 in the pull path).
+_MERGE_OPEN_ERRORS = frozenset({"ECHECKS", "EUNREACH", "ENOTMERGED", "EDRIFT", "ENOTMASTER"})
+
+
+def _ruling_sealed_detail(nestor_db: Path) -> tuple[bool, Optional[str]]:
+    """As :func:`_ruling_sealed`, but also names WHY when the pin itself is
+    the reason for "not sealed" -- ``(False, "text_hash_mismatch")`` is the
+    ONE case :func:`run_once_v2` treats as loud (a named ``ERULINGTEXT``
+    refusal row) rather than silent (indistinguishable from "the pair
+    simply isn't sealed at all"). Every other "not sealed" path returns
+    ``(False, None)``. N3 (Loki PASS 0D8EA229)."""
+    from . import net_authority
+    from . import net_signer
+
+    sealed = net_authority.read_sealed_pair(RULING_PAIR_ID, nestor_db)
+    if sealed.get("state") != "populated":
+        return False, None
+    if sealed.get("source_lang") != "decision":
+        return False, None
+
+    ring, _ring_err = _load_verify_ring()
+    if ring is None:
+        return False, None
+    ok, _reason, _field = net_signer.verify_seal(sealed, ring, max_age_s=None)
+    if not ok:
+        return False, None
+
+    if RULING_TEXT_SHA256 is not None:
+        import hashlib
+
+        signed_text = net_signer.seal_message(
+            sealed["source_norm"], sealed["target_text"], sealed["verifier"])
+        if hashlib.sha256(signed_text).hexdigest() != RULING_TEXT_SHA256:
+            return False, "text_hash_mismatch"
+    return True, None
+
+
+def _ruling_sealed(nestor_db: Path) -> bool:
+    """Whether the PINNED pair RULING_PAIR_ID is a sealed, non-superseded,
+    source_lang='decision' pair in nestor.db AND its seal_sig verifies
+    against this process's own keyring AND (when RULING_TEXT_SHA256 is
+    pinned) its signed text hashes to that pin. Fails CLOSED on every path
+    -- unreachable db, absent/unsealed/superseded pair, the wrong
+    source_lang, no keyring configured, a signature that does not verify,
+    or a text-hash mismatch are ALL "not sealed". Never raises.
+
+    Rework (Loki FAIL 40F02AAD, F2): this used to read a SOIL record's
+    bare status field through an injectable store= parameter -- a
+    {"status": "sealed"} record written into a REAL Store, with no pair
+    and no signature behind it, enabled the merge path and a restart on
+    its own. There is no store parameter any more: the ONLY thing that
+    can ever flip this is a real, verified seal on the one pinned pair
+    id, checked the same way find_sealing_decision already trusts a
+    seal -- net_signer.verify_seal against the keyring, never a
+    caller's say-so.
+
+    Rework 2 (Loki F0C19708): source_lang now rides inside the SAME
+    read_sealed_pair() call/connection that already reads this pair's
+    sealed bytes -- no second sqlite3.connect() just to learn the pair's
+    type ("single query for source_lang"). This is a database-level
+    assertion, not a signed one: seal_message() covers only
+    source_norm/target_text/verifier, so source_lang is checked here, in
+    code, against whatever the row holds. N3 adds the optional signed-text
+    hash pin -- see RULING_TEXT_SHA256 above for why it may be None.
+
+    Rework 3 (Loki PASS 0D8EA229): delegates to _ruling_sealed_detail(),
+    which also names a text-hash mismatch specifically so run_once_v2()
+    can write a loud refusal row for that one case instead of falling
+    back silently."""
+    sealed, _reason = _ruling_sealed_detail(nestor_db)
+    return sealed
+
+
+def _default_merge_api(method: str, url: str, *, bearer: str, body: Optional[dict] = None) -> dict:
+    from . import github_app_credentials as gac
+
+    return gac._api(method, url, bearer=bearer, body=body)
+
+
+def _classify_merge_http_failure(resp: dict) -> tuple[str, str]:
+    status = resp.get("status") or 0
+    reason = str(resp.get("reason") or "")
+    if status == 404:
+        return "not_found", reason
+    if status:
+        return f"http_{status}", reason
+    return "unavailable", reason
+
+
+def _pr_for_commit(repo: str, sha: str, *, api, bearer: str) -> dict:
+    """The merged PR whose base branch is master and whose merge_commit_sha
+    is exactly ``sha`` -- found via GitHub's own commit->PRs read
+    (``GET /repos/{repo}/commits/{sha}/pulls``), the mirror image of the
+    head-sha->PR resolution :func:`pr_checks.read_pr_checks` already does
+    the other way. ``{"state": "populated", "number"}``,
+    ``{"state": "empty"}`` (no such PR -- not merged, wrong base, or this
+    sha is not itself the merge/squash commit), or ``{"state":
+    "unreachable", "reason", "detail"}`` on an HTTP miss."""
+    resp = api("GET", f"{_API}/repos/{repo}/commits/{sha}/pulls", bearer=bearer)
+    if not resp.get("ok"):
+        cause, reason = _classify_merge_http_failure(resp)
+        return {"state": "unreachable", "reason": cause, "detail": reason}
+    items = resp.get("body")
+    items = items if isinstance(items, list) else []
+    # F4 (resolved -- the operator, ruling f13f15d9, "a PR merged into
+    # master"): ANY PR merged into master naming this sha counts,
+    # including release-please's own release PR (merged_by
+    # willow-ci[bot]) and dependabot automerge. This is deliberate, not
+    # an oversight -- the ruling is stated by the merge fact alone, never
+    # by who or what performed it, so no merged_by/user.type allowlist is
+    # applied here.
+    for pr in items:
+        if pr.get("merged_at") and (pr.get("base") or {}).get("ref") == "master" \
+                and pr.get("merge_commit_sha") == sha:
+            return {"state": "populated", "number": pr.get("number")}
+    return {"state": "empty"}
+
+
+def _checks_all_green(repo: str, sha: str, *, api, bearer: str) -> dict:
+    """Every check-run on ``sha`` is conclusive (``status == "completed"``)
+    and none is failure/cancelled/timed_out/action_required/
+    startup_failure. Reuses :func:`pr_checks._fetch_check_runs` -- the same
+    GitHub read path ``pr_checks_read`` uses -- rather than a second,
+    independent implementation of check-run pagination."""
+    from . import pr_checks
+
+    runs, failed = pr_checks._fetch_check_runs(api, repo=repo, sha=sha, bearer=bearer)
+    if failed is not None:
+        cause, reason = _classify_merge_http_failure(failed)
+        return {"state": "unreachable", "reason": cause, "detail": reason}
+    if not runs:
+        return {"state": "empty", "runs": []}
+    if any(r.get("status") != "completed" for r in runs):
+        return {"state": "pending", "runs": runs}
+    bad = [r for r in runs if r.get("conclusion") not in _MERGE_OK_CONCLUSIONS]
+    if bad:
+        return {"state": "failing", "runs": runs, "bad": bad}
+    return {"state": "green", "runs": runs}
+
+
+def _is_consumed_merge(ledger, receipt_id: str, *, repo: str, checkout: str) -> bool:
+    """A MERGE_EVENT receipt already cites ``receipt_id`` -- the merge
+    path's own "never twice" guard, tracked against its OWN event type
+    (never unit_reload_executor.EVENT, which the sealed-pair path owns) so
+    the two mechanisms' idempotence never entangle."""
+    if not receipt_id:
+        return False
+    for row in ledger.all_events(MERGE_EVENT, match={"repo": repo, "checkout": checkout}):
+        if (row.get("content") or {}).get("pull_receipt_id") == receipt_id:
+            return True
+    return False
+
+
+def _pull_request_row(ledger, *, repo: str, checkout: str) -> tuple:
+    """The newest usable ``git_pull`` REQUEST row for ``repo``+``checkout``
+    -- ``(row, style)`` where ``style`` is ``"new"`` (the row carries
+    ``changed``/``remote_sha`` -- :func:`pull_executor.execute_pull` since
+    F1) or ``"legacy"`` (it carries neither -- N2, Loki F0C19708: the
+    broker that performs the FIRST pull landing this merge is still
+    running the OLD in-memory ``pull_executor``, so that row, and every row
+    after it until the broker itself restarts some other way, has this
+    shape). A no-op row (``changed`` present and false) is never a request
+    and is skipped, exactly as the prior ``match={"changed": True}`` query
+    already did; a legacy row cannot self-report no-op vs. real (it has no
+    ``changed`` key at all), so it is always a CANDIDATE request -- the
+    ``after == HEAD`` drift check and the GitHub merged+green confirmation
+    in :func:`check_merge` are what actually gate it, never blind trust in
+    its presence. ``(None, None)`` when nothing at all is on file.
+
+    ``ledger.all_events`` already returns newest-first (the same
+    assumption :func:`_pull_receipts_at` documents), so the first row that
+    is not a skipped no-op is the newest request -- matching the previous
+    ``latest_event(match={"changed": True})`` semantics exactly for
+    new-style rows.
+    """
+    for row in ledger.all_events(urx.PULL_EVENT, match={"repo": repo, "checkout": checkout}):
+        content = row.get("content") or {}
+        if "changed" in content:
+            if not content.get("changed"):
+                continue
+            return row, "new"
+        return row, "legacy"
+    return None, None
+
+
+def check_merge(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None,
+                api=None, token_minter: Optional[Callable] = None) -> dict:
+    """Decide whether the operator's own merge into master is a live
+    confirm to restart onto (gap 55fc7c9681e9). Never restarts anything.
+
+    N1/N2 (Loki F0C19708): drift (HEAD vs. the receipt's after-sha) is
+    checked BEFORE either EALREADY check -- the old order let a
+    consumed-or-active receipt answer EALREADY (not in _MERGE_OPEN_ERRORS)
+    even when HEAD had since moved out from under it, letting an
+    env-triggered restart through onto unconfirmed code; see
+    :func:`_pull_request_row` for the "legacy row" (old-shaped, pre-F1)
+    acceptance path this also gates through the same GitHub confirmation.
+
+    Gated: refuses ``ENORULING`` outright while RULING_RECORD_ID is
+    unsealed -- see :func:`_ruling_sealed`. Once sealed, restarts only when
+    ALL of:
+
+    * the checkout is on branch ``master``  (``ENOTMASTER``);
+    * an unconsumed ``git_pull`` receipt with ``changed: true`` exists for
+      this repo+checkout (``ENORECEIPT``), newer than the unit's own
+      ``ActiveEnterTimestamp`` (``EALREADY``) and not already cited by a
+      prior merge-path restart (``EALREADY``);
+    * that receipt's ``after`` sha equals its own ``remote_sha`` -- a
+      clean fast-forward onto origin/master's HEAD, not a merge commit
+      pull_executor itself constructed some other way (``ENOTMERGED``);
+    * the checkout's CURRENT HEAD still equals that sha -- the tree has
+      not moved again since the pull (``EDRIFT``);
+    * that sha is the merge/squash commit of a PR that GitHub reports
+      merged into ``master`` (``ENOTMERGED``, via :func:`_pr_for_commit`);
+    * every check-run on that sha is conclusive and none failed
+      (``ECHECKS``, via :func:`_checks_all_green`).
+
+    GitHub unreachable at either read is ``EUNREACH`` -- never a restart,
+    logged as its own state (INVARIANTS Section 1), never collapsed into
+    "not merged" or "checks failing".
+    """
+    unit = (config.unit or "").strip()
+    if not urx.is_broker_unit(unit):
+        return _refuse("EINVAL", f"{unit!r} is not the broker's unit -- reload it "
+                                 f"through unit_reload_execute under a unit.reload envelope")
+    if config.checkout is None:
+        return _refuse("EINVAL", f"no broker checkout: set {_ENV_CHECKOUT} or run from an editable install")
+    path = Path(config.checkout).expanduser()
+    if not (path / ".git").exists():
+        return _refuse("EINVAL", f"{path} is not a git checkout (no .git)")
+    if ledger is None:
+        return _refuse("EAMBIG", "no governance ledger: a restart that cannot be matched to a "
+                                 "pull receipt or cited is not performed")
+
+    if not _ruling_sealed(config.nestor_db):
+        return _refuse("ENORULING",
+                       f"pinned ruling pair {RULING_PAIR_ID!r} is not a sealed, verified decision "
+                       f"yet -- the sealed-pair path (decision e961aff8) stays the only live "
+                       f"restart path for the pull trigger until it is")
+
+    branch = urx._git(path, "rev-parse", "--abbrev-ref", "HEAD", runner=runner)
+    if branch.returncode != 0:
+        return _refuse("EINVAL", f"could not read the current branch of {path}")
+    current_branch = (branch.stdout or "").strip()
+    if current_branch != "master":
+        return _refuse("ENOTMASTER", f"{path} is on branch {current_branch!r}, not master -- the "
+                                     f"merge-is-confirm path only ever follows master")
+
+    receipt, style = _pull_request_row(ledger, repo=config.repo, checkout=str(path))
+    if receipt is None:
+        return _refuse("ENORECEIPT", f"no git_pull request receipt for "
+                                     f"repo={config.repo!r} checkout={str(path)!r}")
+    receipt_id = receipt.get("id")
+    if not receipt_id:
+        return _refuse("EAMBIG", "the pull receipt carries no row id; a restart cannot cite it")
+    content = receipt["content"]
+
+    after = content.get("after")
+    if not after:
+        return _refuse("ENOTMERGED",
+                       f"pull receipt {receipt_id} carries no after-sha -- nothing to confirm a "
+                       f"restart onto", receipt_id=receipt_id, receipt=content)
+
+    # N2: a NEW-style row's own remote_sha is checked against the
+    # receipt's OWN content -- no HEAD read needed yet. A LEGACY row (see
+    # _pull_request_row) has no remote_sha field to check at all; its
+    # confirmation is entirely the drift check below plus the GitHub
+    # merged+green read further down -- the SAME confirmation the new
+    # path already required, just without this one extra internal check.
+    if style == "new":
+        remote_sha = content.get("remote_sha")
+        if after != remote_sha:
+            return _refuse("ENOTMERGED",
+                           f"pull receipt {receipt_id}'s after-sha {after!r} does not equal its "
+                           f"own remote_sha {remote_sha!r} -- not a clean landing of "
+                           f"origin/master HEAD", receipt_id=receipt_id, receipt=content)
+
+    head = urx._git(path, "rev-parse", "HEAD", runner=runner)
+    if head.returncode != 0:
+        return _refuse("EINVAL", f"could not read HEAD of {path}")
+    current_head = (head.stdout or "").strip()
+
+    # N1 (Loki F0C19708, HIGH): drift is checked BEFORE either EALREADY
+    # check below. The old order let a consumed-or-active receipt answer
+    # EALREADY first even when HEAD had since moved out from under it (a
+    # terminal `git pull`/checkout with no fresh receipt, plus a due env
+    # trigger) -- EALREADY is not in _MERGE_OPEN_ERRORS, so run_once_v2
+    # restarted the broker onto that unconfirmed HEAD. fe88ce5's own
+    # check() refuses the identical scenario with EDRIFT; this restores
+    # that behaviour on the merge path.
+    if current_head != after:
+        return _refuse("EDRIFT",
+                       f"{path} HEAD is {current_head!r} but pull receipt {receipt_id}'s "
+                       f"after-sha is {after!r} -- the tree moved again since the pull",
+                       receipt_id=receipt_id, receipt=content)
+
+    state = urx.show_unit(unit, runner=runner)
+    if not state.get("ok"):
+        return _refuse("EUNREACH", f"unit state unreachable: {state.get('cause')}",
+                       cause=state.get("cause"), receipt_id=receipt_id)
+
+    active_enter = urx._parse_systemd_timestamp(state.get("ActiveEnterTimestamp"))
+    receipt_at = urx._as_utc(receipt.get("created_at"))
+    if active_enter is not None and receipt_at is not None and active_enter >= receipt_at:
+        return _refuse("EALREADY",
+                       f"{unit} has been active since {state.get('ActiveEnterTimestamp')!r}, "
+                       f"which is no older than pull receipt {receipt_id} -- already on that code",
+                       receipt_id=receipt_id, receipt=content)
+
+    if _is_consumed_merge(ledger, receipt_id, repo=config.repo, checkout=str(path)):
+        return _refuse("EALREADY", f"pull receipt {receipt_id} was already consumed by a prior "
+                                   f"merge-confirm restart", receipt_id=receipt_id)
+
+    from . import github_app_credentials as gac
+    from . import pr_checks
+
+    call = api or _default_merge_api
+    mint = token_minter or gac.mint_installation_token
+    # F9 (Loki 40F02AAD): a read of merge/checks state has no legitimate
+    # use for anything past these three read scopes -- ask for exactly
+    # that, never the App's full per-repo default.
+    auth = mint(config.repo, permissions=_MERGE_TOKEN_PERMISSIONS)
+    if not (auth.get("ok") and auth.get("mode") == "app"):
+        return _refuse("EUNREACH",
+                       f"could not mint a willows-bot installation token: {auth.get('reason')}",
+                       receipt_id=receipt_id)
+    bearer = auth["token"]
+    if not pr_checks.checks_perm_present(auth.get("permissions")):
+        return _refuse("EUNREACH", "willows-bot App token lacks the checks permission",
+                       receipt_id=receipt_id)
+
+    pr = _pr_for_commit(config.repo, current_head, api=call, bearer=bearer)
+    if pr["state"] == "unreachable":
+        return _refuse("EUNREACH",
+                       f"could not resolve the merged PR for {current_head}: {pr.get('detail')}",
+                       receipt_id=receipt_id)
+    if pr["state"] == "empty":
+        return _refuse("ENOTMERGED",
+                       f"{current_head} is not the merge/squash commit of a PR GitHub reports "
+                       f"merged into master", receipt_id=receipt_id)
+
+    checks = _checks_all_green(config.repo, current_head, api=call, bearer=bearer)
+    if checks["state"] == "unreachable":
+        return _refuse("EUNREACH",
+                       f"could not read check-runs for {current_head}: {checks.get('detail')}",
+                       receipt_id=receipt_id, pr_number=pr["number"])
+    if checks["state"] in ("empty", "pending"):
+        return _refuse("ECHECKS", f"check-runs for {current_head} are not all conclusive yet",
+                       receipt_id=receipt_id, pr_number=pr["number"])
+    if checks["state"] == "failing":
+        return _refuse("ECHECKS",
+                       f"check-runs for {current_head} include a failing run: "
+                       f"{[r.get('name') for r in checks['bad']]}",
+                       receipt_id=receipt_id, pr_number=pr["number"])
+
+    return {"ok": True, "act": True, "unit": unit, "repo": config.repo, "checkout": str(path),
+            "receipt_id": receipt_id, "receipt": content, "head": current_head,
+            "pr_number": pr["number"], "check_summary": {"runs": len(checks["runs"])},
+            "state_before": state}
+
+
+def run_once_v2(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None,
+                api=None, token_minter: Optional[Callable] = None,
+                project: str = "willow-mcp") -> dict:
+    """The dispatcher :func:`main` now calls for ``tick``/``check``.
+
+    While RULING_RECORD_ID is unsealed this IS :func:`run_once` unchanged
+    -- the sealed-pair path (decision ``e961aff8``) stays the ONLY live
+    restart path for the pull trigger, exactly as the brief requires.
+    Once sealed, the pull trigger switches to :func:`check_merge` and the
+    sealed-pair path (``check()``) is gated off here rather than deleted
+    -- its module, its tests, and any receipt a PRIOR tick already
+    consumed the old way stay meaningful, and reverting the seal needs no
+    code change to fall back to it. The env trigger (:func:`check_env`,
+    decision ``1bd6fd29``) is unaffected either way and keeps firing on
+    its own schedule -- one restart per tick, at most, for whichever
+    trigger(s) are due, the same rule :func:`run_once` already enforces
+    between its own two triggers.
+
+    Every refusal writes its OWN FRANK ``broker_reload_refusal`` receipt
+    naming the reason code ("Receipts, not seals" -- step 3 of the
+    brief): nothing in this path asks Nestor for a per-restart confirm,
+    so the ledger carries the trail on its own.
+    """
+    def _refused_pairs_on_file() -> set:
+        # N4 (Loki F0C19708): dedup against every (receipt_id, error) pair
+        # already on the ledger for this repo/checkout, not only against
+        # the SINGLE most recent row -- a result flapping between two
+        # errors (e.g. ECHECKS/EUNREACH) used to write a fresh row on
+        # every OTHER tick forever, because each new row differed from the
+        # one right before it even though both errors had already been
+        # seen before.
+        if ledger is None:
+            return set()
+        try:
+            rows = ledger.all_events(MERGE_REFUSAL_EVENT, match={
+                "repo": config.repo, "checkout": str(config.checkout) if config.checkout else None,
+            })
+        except Exception:
+            return set()
+        seen = set()
+        for row in rows:
+            content = row.get("content") or {}
+            seen.add((content.get("receipt_id"), content.get("error")))
+        return seen
+
+    def _write_refusal(*, error: Optional[str], reason: Optional[str],
+                       receipt_id: Optional[str] = None, dedup: bool = True,
+                       **extra) -> Optional[str]:
+        if ledger is None:
+            return None
+        # F4/F5/N4 (Loki 40F02AAD, F0C19708): the SAME (receipt, error)
+        # pair as ANY prior refusal row for this repo/checkout writes
+        # NOTHING -- a 60s timer would otherwise put ~1440 permanent rows a
+        # day on a ledger that can only be annulled, never rewritten, for a
+        # state this same pair has already reported once. L1 (Loki PASS
+        # 0D8EA229): the three REAL restart-attempt failure paths
+        # (systemctl_missing/ETIMEDOUT/ERESTART) pass dedup=False -- each
+        # is a distinct side-effecting attempt against the live unit, not
+        # an idle re-poll of the same unconfirmed state, so N4's
+        # ledger-spam guard must never collapse them into one row.
+        if dedup and (receipt_id, error) in _refused_pairs_on_file():
+            return None
+        try:
+            return ledger.append(project, MERGE_REFUSAL_EVENT, {
+                "actor": ACTOR, "unit": config.unit, "repo": config.repo,
+                "checkout": str(config.checkout) if config.checkout else None,
+                "error": error, "reason": reason, "receipt_id": receipt_id, **extra,
+            })
+        except Exception:
+            return None
+
+    sealed, ruling_reason = _ruling_sealed_detail(config.nestor_db)
+    if not sealed:
+        if ruling_reason == "text_hash_mismatch":
+            # N3 (Loki PASS 0D8EA229): a wrong RULING_TEXT_SHA256 pin fails
+            # SAFE (falls back to run_once() below, never acting on an
+            # unverified text) but must never fail SILENTLY -- this names
+            # the mismatch on the ledger rather than looking identical to
+            # "the pair simply isn't sealed at all".
+            _write_refusal(
+                error="ERULINGTEXT",
+                reason=f"the pinned pair {RULING_PAIR_ID}'s signed text does not hash to "
+                       f"RULING_TEXT_SHA256 -- falling back to the sealed-pair path rather "
+                       f"than acting on an unverified ruling text",
+                receipt_id=None)
+        return run_once(config, ledger=ledger, runner=runner, project=project)
+
+    merge_verdict = check_merge(config, ledger=ledger, runner=runner, api=api,
+                               token_minter=token_minter)
+    env_verdict = check_env(config, ledger=ledger, runner=runner)
+    due_merge = bool(merge_verdict.get("act"))
+    due_env = bool(env_verdict.get("act"))
+    open_merge = due_merge or merge_verdict.get("error") in _MERGE_OPEN_ERRORS
+    open_env = _is_open_trigger(env_verdict)
+
+    if not (due_merge or due_env):
+        out = dict(merge_verdict)
+        out["reloaded"] = False
+        out["env"] = env_verdict
+        out["refusal_receipt_id"] = _write_refusal(
+            error=merge_verdict.get("error"), reason=merge_verdict.get("reason"),
+            receipt_id=merge_verdict.get("receipt_id"))
+        return out
+
+    if (open_merge and not due_merge) or (open_env and not due_env):
+        # F6 (Loki 40F02AAD): the refusal row now carries error="EPARTIAL"
+        # itself, plus BOTH triggers' own errors -- it used to record
+        # error=None here, indistinguishable in the journal from a row
+        # with no error at all.
+        receipt_id = merge_verdict.get("receipt_id") or env_verdict.get("receipt_id")
+        out = {"ok": False, "act": False, "reloaded": False, "error": "EPARTIAL",
+               "reason": "not every open trigger is confirmed -- refusing to restart onto a "
+                         "partially-confirmed state; both triggers are named below",
+               "merge": merge_verdict, "env": env_verdict}
+        out["refusal_receipt_id"] = _write_refusal(
+            error="EPARTIAL", reason=out["reason"], receipt_id=receipt_id,
+            merge_error=merge_verdict.get("error"), env_error=env_verdict.get("error"))
+        return out
+
+    unit = merge_verdict["unit"] if due_merge else env_verdict["unit"]
+    restart_receipt_id = merge_verdict.get("receipt_id") or env_verdict.get("receipt_id")
+    try:
+        restarted = urx._run(["systemctl", "--user", "restart", unit], runner=runner,
+                             timeout=_SYSTEMCTL_TIMEOUT_S)
+    except FileNotFoundError:
+        out = {"ok": False, "act": True, "reloaded": False, "error": "EUNREACH",
+               "reason": "systemctl_missing", "unit": unit, "merge": merge_verdict, "env": env_verdict}
+        # F7 (Loki 40F02AAD): a failed restart writes a refusal receipt
+        # carrying the reason code -- it used to write no ink at all.
+        out["refusal_receipt_id"] = _write_refusal(
+            error=out["error"], reason=out["reason"], receipt_id=restart_receipt_id, dedup=False)
+        return out
+    except subprocess.TimeoutExpired:
+        out = {"ok": False, "act": True, "reloaded": False, "error": "ETIMEDOUT",
+               "reason": f"systemctl restart exceeded {_SYSTEMCTL_TIMEOUT_S}s",
+               "unit": unit, "merge": merge_verdict, "env": env_verdict}
+        out["refusal_receipt_id"] = _write_refusal(
+            error=out["error"], reason=out["reason"], receipt_id=restart_receipt_id, dedup=False)
+        return out
+    if restarted.returncode != 0:
+        tail = (restarted.stderr or restarted.stdout or "").strip()[-300:]
+        out = {"ok": False, "act": True, "reloaded": False, "error": "ERESTART",
+               "reason": tail or f"systemctl restart exited {restarted.returncode}",
+               "unit": unit, "merge": merge_verdict, "env": env_verdict}
+        out["refusal_receipt_id"] = _write_refusal(
+            error=out["error"], reason=out["reason"], receipt_id=restart_receipt_id, dedup=False)
+        return out
+
+    triggers = []
+    out = {"ok": True, "act": True, "reloaded": True, "unit": unit,
+           "merge": merge_verdict, "env": env_verdict,
+           "state_after": urx.show_unit(unit, runner=runner)}
+    if due_merge:
+        triggers.append("merge")
+        try:
+            out["reload_receipt_id"] = ledger.append(project, MERGE_EVENT, {
+                "actor": ACTOR, "unit": unit, "repo": merge_verdict["repo"],
+                "checkout": merge_verdict["checkout"], "pull_receipt_id": merge_verdict["receipt_id"],
+                "head": merge_verdict["head"], "pr_number": merge_verdict["pr_number"],
+                "check_summary": merge_verdict["check_summary"], "decision": RULING_RECORD_ID,
+            })
+        except Exception as exc:  # noqa: BLE001 -- the restart happened; the receipt failing is reported, not hidden
+            out["receipt_error"] = f"{type(exc).__name__}: {exc}"
+    if due_env:
+        triggers.append("env_changed")
+        try:
+            out["env_receipt_id"] = ledger.append(project, urx.EVENT, {
+                "actor": ACTOR, "unit": unit, "env_path": env_verdict["env_path"],
+                "env_receipt_id": env_verdict["receipt_id"], "decision": "1bd6fd29",
+            })
+        except Exception as exc:  # noqa: BLE001 -- the restart happened; the receipt failing is reported, not hidden
+            out["env_receipt_error"] = f"{type(exc).__name__}: {exc}"
+    out["triggers"] = triggers
+    return out
 
 
 #: A safety valve against a pathological ledger, not a curated window.
@@ -1168,8 +1783,10 @@ def main(argv: Optional[list] = None) -> int:
         if args.command == "check":
             out = dict(check(config, ledger=ledger))
             out["env"] = check_env(config, ledger=ledger)
+            out["merge"] = check_merge(config, ledger=ledger)
+            out["ruling_sealed"] = _ruling_sealed(config.nestor_db)
         else:
-            out = run_once(config, ledger=ledger)
+            out = run_once_v2(config, ledger=ledger)
         print(json.dumps(out, default=str, indent=2))
         # Due-and-failed is the only exit that should wake anyone.
         return 1 if (out.get("act") and not out.get("reloaded")) else 0
