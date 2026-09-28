@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* gap_touching, a deterministic view of open gaps touching given paths, fed into dispatch and entry (gaps-in-SOIL B1) ([0a66c1a](https://github.com/willow-memory/willow-mcp/commit/0a66c1aabacd85e65521266019ab63e794084171))
 * **gaps:** gap_touching — read-time gaps-touching-these-paths view (B1) ([1cea845](https://github.com/willow-memory/willow-mcp/commit/1cea845af66e01f1fae566305993e53da7ca2d99))
 
 ## [2.86.1](https://github.com/willow-memory/willow-mcp/compare/v2.86.0...v2.86.1) (2026-09-28)
