@@ -696,6 +696,15 @@ def _pr_for_commit(repo: str, sha: str, *, api, bearer: str) -> dict:
         return {"state": "unreachable", "reason": cause, "detail": reason}
     items = resp.get("body")
     items = items if isinstance(items, list) else []
+    # TODO(ruling): Loki 40F02AAD finding 4, held for the operator -- ANY
+    # PR merged into master naming this sha counts, including
+    # release-please's own release PR (merged_by willow-ci[bot]) and
+    # dependabot automerge. That matches the letter of the sealed ruling
+    # ("a PR merged into master") but not its premise ("the merge is a
+    # ratified human act"), since those bot merges are exempt from
+    # Ratified-by. Left as-is pending an operator decision: allowlist
+    # merged_by (needs GET /pulls/{n}; the list endpoint has no
+    # merged_by), or name the bot release pair explicitly in the ruling.
     for pr in items:
         if pr.get("merged_at") and (pr.get("base") or {}).get("ref") == "master" \
                 and pr.get("merge_commit_sha") == sha:
