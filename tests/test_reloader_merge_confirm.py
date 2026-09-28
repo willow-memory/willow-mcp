@@ -28,6 +28,7 @@ already established.
 """
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -747,3 +748,172 @@ def test_run_once_v2_env_trigger_blocked_by_enotmerged_no_pr_names_the_sha(check
     out = reloader.run_once_v2(config, ledger=ledger, runner=git, api=api, token_minter=_minter())
     assert out["error"] == "EPARTIAL" and out["merge"]["error"] == "ENOTMERGED"
     assert not git.restarts
+
+
+# -- N1 (Loki F0C19708): drift is checked BEFORE either EALREADY check ---------
+
+def test_check_merge_refuses_edrift_before_ealready_when_receipt_consumed_and_head_moved(checkout, sealed_db):
+    """N1 probe (Loki F0C19708, K77FXSNB P1): with the receipt already
+    consumed AND HEAD moved to an unconfirmed sha, check_merge must refuse
+    EDRIFT -- not EALREADY, which is not in _MERGE_OPEN_ERRORS and would
+    let an env-triggered restart through onto the unconfirmed HEAD."""
+    config = _config(checkout, sealed_db)
+    receipt = _pull_receipt(checkout, after="cafef00d")
+    ledger = _FakeLedger(receipt)
+    ledger.append("willow-mcp", reloader.MERGE_EVENT, {
+        "repo": config.repo, "checkout": str(checkout), "pull_receipt_id": receipt["id"],
+    })
+    out = reloader.check_merge(config, ledger=ledger, runner=_Git(head="movedbyterminal"))
+    assert out["error"] == "EDRIFT"
+
+
+def test_run_once_v2_env_trigger_blocked_by_drift_after_consumed_receipt_and_terminal_pull(
+        checkout, sealed_db, monkeypatch):
+    """N1: a receipt already consumed by a prior merge restart, then HEAD
+    moves again with NO fresh receipt (a terminal `git pull`/checkout) --
+    a due env trigger must not restart onto that unconfirmed HEAD."""
+    _stub_env_due(monkeypatch)
+    config = _config(checkout, sealed_db)
+    receipt = _pull_receipt(checkout, after="cafef00d")
+    ledger = _FakeLedger(receipt)
+    ledger.append("willow-mcp", reloader.MERGE_EVENT, {
+        "repo": config.repo, "checkout": str(checkout), "pull_receipt_id": receipt["id"],
+    })
+    git = _Git(head="movedbyterminal")
+    out = reloader.run_once_v2(config, ledger=ledger, runner=git)
+    assert out["error"] == "EPARTIAL" and out["merge"]["error"] == "EDRIFT"
+    assert not git.restarts
+
+
+# -- N2 (Loki F0C19708): survive the first pull after merge (legacy rows) ------
+
+def _legacy_pull_receipt(checkout, *, after="cafef00d", rid="pull-legacy-1", created_at=_AT):
+    """The shape the OLD (pre-F1) pull_executor wrote -- no changed/remote_sha
+    keys at all."""
+    return {"id": rid, "created_at": created_at,
+            "content": {"repo": "willow-memory/willow-mcp", "checkout": str(checkout),
+                        "before": "old", "after": after}}
+
+
+def test_pull_request_row_skips_a_new_style_noop_and_finds_the_legacy_request_beneath_it(checkout):
+    noop = {"id": "git_pull-2", "created_at": _AT, "content": {
+        "repo": "willow-memory/willow-mcp", "checkout": str(checkout),
+        "before": "cafef00d", "after": "cafef00d", "remote_sha": "cafef00d", "changed": False}}
+    legacy = _legacy_pull_receipt(checkout, after="cafef00d", rid="git_pull-1")
+    ledger = _FakeLedger()
+    ledger._rows["git_pull"] = [noop, legacy]  # newest first
+    row, style = reloader._pull_request_row(ledger, repo="willow-memory/willow-mcp", checkout=str(checkout))
+    assert style == "legacy" and row["id"] == "git_pull-1"
+
+
+def test_check_merge_accepts_legacy_row_when_confirmed_by_github(checkout, sealed_db):
+    """N2: an OLD-STYLE git_pull row (no changed/remote_sha -- the shape
+    the broker's OLD pull_executor writes for the FIRST pull landing this
+    merge, before the broker itself restarts onto this code) is accepted
+    as a request when its after equals HEAD AND GitHub reports it
+    merged+green -- the same confirmation the new-style path requires."""
+    config = _config(checkout, sealed_db)
+    receipt = _legacy_pull_receipt(checkout, after="cafef00d")
+    ledger = _FakeLedger()
+    ledger._rows["git_pull"] = [receipt]
+    api = _api(pr_response=_pr_ok(sha="cafef00d"), checks_response=_checks_ok())
+    out = reloader.check_merge(config, ledger=ledger, runner=_Git(), api=api, token_minter=_minter())
+    assert out["ok"] is True and out["act"] is True
+    assert out["receipt_id"] == "pull-legacy-1"
+
+
+def test_run_once_v2_restarts_once_for_a_confirmed_legacy_row(checkout, sealed_db):
+    config = _config(checkout, sealed_db)
+    receipt = _legacy_pull_receipt(checkout, after="cafef00d")
+    ledger = _FakeLedger()
+    ledger._rows["git_pull"] = [receipt]
+    api = _api(pr_response=_pr_ok(sha="cafef00d"), checks_response=_checks_ok())
+    git = _Git()
+    out = reloader.run_once_v2(config, ledger=ledger, runner=git, api=api, token_minter=_minter())
+    assert out["reloaded"] is True
+    assert len(git.restarts) == 1
+
+
+def test_run_once_v2_legacy_row_unconfirmed_gives_zero_restarts_and_blocks_env_trigger(
+        checkout, sealed_db, monkeypatch):
+    _stub_env_due(monkeypatch)
+    config = _config(checkout, sealed_db)
+    receipt = _legacy_pull_receipt(checkout, after="cafef00d")
+    ledger = _FakeLedger()
+    ledger._rows["git_pull"] = [receipt]
+    api = _api(pr_response=_pr_empty())  # not (yet) reported merged
+    git = _Git()
+    out = reloader.run_once_v2(config, ledger=ledger, runner=git, api=api, token_minter=_minter())
+    assert out["error"] == "EPARTIAL" and out["merge"]["error"] == "ENOTMERGED"
+    assert not git.restarts
+
+
+def test_check_merge_new_style_row_is_unaffected_by_legacy_support(checkout, sealed_db):
+    """A new-style row (has changed/remote_sha) still goes through its own
+    remote_sha==after check -- N2's legacy branch never applies to it."""
+    config = _config(checkout, sealed_db)
+    ledger = _FakeLedger(_pull_receipt(checkout, after="cafef00d", remote_sha="deadbeef"))
+    out = reloader.check_merge(config, ledger=ledger, runner=_Git())
+    assert out["error"] == "ENOTMERGED"
+
+
+# -- N3 (Loki F0C19708): pin the signed text next to the pinned pair id --------
+
+def test_ruling_sealed_hash_pin_is_unset_by_default():
+    """Never invented: building this from Kart cannot read the live
+    nestor.db, so RULING_TEXT_SHA256 stays None until the desk fills it in
+    from a broker read (see the constant's own comment in reloader.py)."""
+    assert reloader.RULING_TEXT_SHA256 is None
+
+
+def test_ruling_sealed_checks_pinned_text_hash_when_set(tmp_path, ring_with_sean, monkeypatch):
+    correct_hash = hashlib.sha256(
+        ns.seal_message(_RULING_SOURCE_NORM, _RULING_TARGET, "sean campbell")).hexdigest()
+    monkeypatch.setattr(reloader, "RULING_TEXT_SHA256", correct_hash)
+
+    good_dir = tmp_path / "good"
+    good_dir.mkdir()
+    good_db = _ruling_db(good_dir, seal_sig=_sign_ruling(ring_with_sean))
+    assert reloader._ruling_sealed(good_db) is True
+
+    other_target = "yes -- a DIFFERENT text, same pair id"
+    bad_dir = tmp_path / "bad"
+    bad_dir.mkdir()
+    bad_db = _ruling_db(bad_dir, seal_sig=_sign_ruling(ring_with_sean, target=other_target),
+                        target=other_target)
+    assert reloader._ruling_sealed(bad_db) is False
+
+
+# -- N6: the em dash in the no-keyring cause text -------------------------------
+
+def test_load_verify_ring_no_keyring_cause_uses_em_dash():
+    ring, err = reloader._load_verify_ring()
+    assert ring is None
+    assert err["state"] == "unreachable"
+    assert "—" in err["cause"]
+    assert "--" not in err["cause"]
+
+
+# -- N4: dedup against every prior refusal row, not only the last one ----------
+
+def test_run_once_v2_flapping_error_writes_only_two_rows_not_one_per_tick(checkout, sealed_db):
+    """N4 (Loki F0C19708): a result flapping between ECHECKS and EUNREACH
+    across many ticks must write at most ONE row per distinct
+    (receipt_id, error) pair -- not a fresh row every OTHER tick forever,
+    which is what dedup-against-only-the-last-row produced."""
+    config = _config(checkout, sealed_db)
+    receipt = _pull_receipt(checkout)
+    ledger = _FakeLedger(receipt)
+
+    sequence = [
+        _api(pr_response=_pr_ok(), checks_response={"ok": False, "status": 500, "reason": "boom"}),
+        _api(pr_response=_pr_ok(), checks_response=_checks_ok(
+            runs=[{"id": 1, "name": "t", "status": "completed", "conclusion": "failure",
+                   "output": {}, "app": {}}])),
+    ]
+    for i in range(6):
+        api = sequence[i % 2]
+        reloader.run_once_v2(config, ledger=ledger, runner=_Git(), api=api, token_minter=_minter())
+    rows = ledger._rows.get(reloader.MERGE_REFUSAL_EVENT, [])
+    assert len(rows) == 2
+    assert {r["content"]["error"] for r in rows} == {"EUNREACH", "ECHECKS"}

@@ -128,23 +128,35 @@ def inspect_for_pull(checkout: str | Path, *, remote: str = "origin",
 #: one string constant; both modules independently agree it is "unit_reload".
 _UNIT_RELOAD_EVENT = "unit_reload"
 
+#: The event type `reloader.py`'s merge-is-confirm path writes for ITS OWN
+#: restart (``reloader.MERGE_EVENT``) — duplicated here for the same reason
+#: ``_UNIT_RELOAD_EVENT`` is: no reloader<->pull_executor import coupling
+#: for one string constant. N5 (Loki F0C19708): a merge-path restart citing
+#: a receipt via ``pull_receipt_id`` must count as consumed here too, or
+#: this courtesy label points an operator's seal at a receipt a restart
+#: already acted on.
+_MERGE_RELOAD_EVENT = "broker_reload"
+
 
 def _unconsumed_pull_receipt_id_at(ledger, *, repo: str, checkout: str, after: str) -> Optional[str]:
     """Gap 797924DB V4: the newest ``git_pull`` receipt for ``repo``+
-    ``checkout`` whose ``after`` equals ``after`` that no ``unit_reload``
-    receipt has yet cited — the id an operator's seal should name. Purely a
-    courtesy label on a no-op pull's result (never a gate on the pull
-    itself): read-only, and any ledger hiccup or missing method on
-    ``ledger`` returns ``None`` rather than raising."""
+    ``checkout`` whose ``after`` equals ``after`` that no restart (either
+    the sealed-pair path's ``unit_reload``, or the merge-is-confirm path's
+    ``broker_reload`` — N5, Loki F0C19708) has yet cited — the id an
+    operator's seal should name. Purely a courtesy label on a no-op pull's
+    result (never a gate on the pull itself): read-only, and any ledger
+    hiccup or missing method on ``ledger`` returns ``None`` rather than
+    raising."""
     if ledger is None:
         return None
     try:
         candidates = ledger.all_events("git_pull", match={"repo": repo, "checkout": checkout, "after": after})
         reloads = ledger.all_events(_UNIT_RELOAD_EVENT, match={"repo": repo, "checkout": checkout})
+        merge_reloads = ledger.all_events(_MERGE_RELOAD_EVENT, match={"repo": repo, "checkout": checkout})
     except Exception:  # noqa: BLE001 — a label, not a fact this pull depends on
         return None
     consumed: set[str] = set()
-    for row in reloads:
+    for row in (*reloads, *merge_reloads):
         content = row.get("content") or {}
         rid = content.get("pull_receipt_id")
         if rid:
