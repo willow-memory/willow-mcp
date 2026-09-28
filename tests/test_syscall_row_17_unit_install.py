@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from willow_mcp import constitutional, envelope_authoring as ea
+from willow_mcp import constitutional
+from willow_mcp import envelope_authoring as ea
 
 _BUNDLE = (
     Path(__file__).resolve().parents[1]
@@ -50,15 +51,17 @@ def test_row_ids_are_dense_and_17_is_not_the_last_anymore():
     """Row 18 (manifest.grant, tests/test_manifest_grant.py) landed after this
     row, rows 20-23 (envelope.revoke, manifest.retire, manifest.create,
     federation.ratify — tests/test_trust_owner_verbs.py, pair 1bd6fd29) landed
-    after that, and row 24 (envelope.ratify — same file, same sealed pair,
-    gap d3f79320ccb5) landed after that — dense ids still hold everywhere
+    after that, row 24 (envelope.ratify — same file, same sealed pair,
+    gap d3f79320ccb5) landed after that, and row 25 (package.upgrade —
+    tests/test_syscall_row_25_package_upgrade.py, UNSEALED, gap
+    c1b4a8d006dc) landed after that — dense ids still hold everywhere
     except row 19, which is deliberately RESERVED for the sealed but
     not-yet-landed net.egress verb (pair c9ddd197; Loki audit BFCC5C79,
     finding F4 — the original draft used 19-22 and collided with it,
     renumbered before any envelope citing them was ever ratified). 17 is
     just no longer the tail."""
     ids = sorted(_rows())
-    assert ids == list(range(1, 19)) + list(range(20, 25))
+    assert ids == list(range(1, 19)) + list(range(20, 26))
     assert 19 not in ids
     assert 17 in ids
 
