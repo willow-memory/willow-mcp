@@ -104,6 +104,7 @@ def test_full_lifecycle(home):
         did,
         findings=[{"id": "g1", "text": "gap found", "severity": "high", "evidence": ["a.py:1"]}],
         narrative="Audited.",
+        session_id="sess-1",  # bite 1 (9BA76253): must match the accepting session
     )
     assert done["status"] == "complete"
 

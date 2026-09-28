@@ -5126,6 +5126,7 @@ def handoff_write_v4(
     checklist_resolved: bool = True,
     envelope_clean: bool = True,
     no_findings_reason: Optional[str] = None,
+    session_id: str = "",
 ) -> dict:
     """Close out a dispatch you accepted: writes handoff.json (the structured
     `findings` list) plus closeout.md (the `narrative`) into the packet and
@@ -5160,7 +5161,16 @@ def handoff_write_v4(
     verify_handoff runs (gap 34c8e60f4260; Loki 23CAD2B4 F3). An empty
     `findings` list is refused unless `no_findings_reason` explains why
     there is nothing to report (e.g. a genuine blocker); the reason is
-    recorded in the closeout."""
+    recorded in the closeout.
+
+    `session_id` (bite 1, dispatch 9BA76253): pass the session_id this
+    packet was accepted with (`dispatch_accept`'s return, or the one you
+    called `session_enter(dispatch_id=...)` with). When the packet's
+    accepted_session_id is recorded and does not match, this refuses
+    `ESESSION` and keeps your payload in a sidecar rather than letting a
+    re-entering session overwrite the accepting one's verdict. A packet
+    accepted before this field existed (no session_id recorded) skips the
+    check entirely — nothing there to compare against."""
     return handoff_stack.handoff_write_v4(
         app_id,
         dispatch_id,
@@ -5169,6 +5179,7 @@ def handoff_write_v4(
         checklist_resolved=checklist_resolved,
         envelope_clean=envelope_clean,
         no_findings_reason=no_findings_reason,
+        session_id=session_id,
     )
 
 

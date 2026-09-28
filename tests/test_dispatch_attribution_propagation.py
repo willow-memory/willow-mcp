@@ -187,23 +187,54 @@ def test_dispatch_accept_unattributed_packet_does_not_attribute(
 def test_session_enter_reentry_lifts_verifier(
     ring_with_rita, tmp_path, monkeypatch
 ):
-    """A specialist reconnecting to an already-accepted packet
-    (dispatch_accept ran earlier, cur='working') still has the
-    attribution lifted onto its session on re-entry."""
+    """A specialist reconnecting to an already-accepted packet under the
+    SAME accepting session (dispatch_accept ran earlier, cur='working';
+    the process restarted and lost its in-memory attribution cache, but
+    kept its session_id) still has the attribution lifted onto its
+    session on re-entry. Bite 1 (dispatch 9BA76253): re-entry under the
+    accepting session is the one shape session_enter still binds -- see
+    test_session_enter_reentry_with_different_session_is_held_not_bound
+    right below for the shape it now refuses."""
     out = _send()
     did = out["dispatch_id"]
-    # First accept — packet moves to working.
+    # First accept — packet moves to working, and records this as the
+    # ONE accepting session (accepted_session_id).
     dispatch.dispatch_accept(did, "hanuman", "s-hanu-first")
     human_session.clear_attribution_cache()  # simulate process restart
-    # Re-enter same packet under a different session.
+    # Re-enter the SAME packet under the SAME (accepting) session_id.
     _minimal_project(tmp_path, monkeypatch)
     dispatch.session_enter(
-        app_id="hanuman", session_id="s-hanu-reentry",
+        app_id="hanuman", session_id="s-hanu-first",
         project="", workspace="", dispatch_id=did,
     )
-    rec = dispatch.session_read("hanuman", "s-hanu-reentry")
+    rec = dispatch.session_read("hanuman", "s-hanu-first")
     assert rec.get("verifier") == "rita"
-    assert human_session.is_session_attributed("s-hanu-reentry")
+    assert human_session.is_session_attributed("s-hanu-first")
+
+
+def test_session_enter_reentry_with_different_session_is_held_not_bound(
+    ring_with_rita, tmp_path, monkeypatch
+):
+    """Bite 1 (dispatch 9BA76253, rework of 2E590F1B/262F89A1 F2): a SECOND
+    session entering an already-working packet is not the accepting
+    session (accepted_session_id was set to 's-hanu-first' by
+    dispatch_accept) -- session_enter must not silently bind it, or lift
+    attribution onto it. This is the shape the ratatosk listener's own
+    child process takes when it races the real specialist for the same
+    packet."""
+    out = _send()
+    did = out["dispatch_id"]
+    dispatch.dispatch_accept(did, "hanuman", "s-hanu-first")
+    _minimal_project(tmp_path, monkeypatch)
+    result = dispatch.session_enter(
+        app_id="hanuman", session_id="s-hanu-second",
+        project="", workspace="", dispatch_id=did,
+    )
+    assert result["held_by_other_session"] is True
+    assert result["accepted_session_id"] == "s-hanu-first"
+    rec = dispatch.session_read("hanuman", "s-hanu-second")
+    assert rec.get("error") == "not_found"
+    assert not human_session.is_session_attributed("s-hanu-second")
 
 
 def _minimal_project(tmp_path, monkeypatch):

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -168,8 +171,15 @@ def _utc_now() -> str:
 
 
 def _write_json(path: Path, data: dict) -> None:
+    """Atomic write (bite 1, dispatch 9BA76253, LOW-5): a plain truncate-then-
+    write left a reader able to observe a partially-written status.json or
+    meta.json mid-write. Write to a per-call temp file in the same directory,
+    then os.replace it into place -- atomic on POSIX, so a reader always sees
+    either the old content or the new, never a partial one."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _read_json(path: Path) -> dict | None:
@@ -360,7 +370,7 @@ _REQUIRED_META_FIELDS = ("dispatch_id", "from_app", "to_app")
 # symlinked packet dir or member file closes that disclosure path; it does
 # not (and cannot, same-uid) stop the packet from being forged in the first
 # place -- see _meta_is_well_formed's own docstring for that residual.
-PACKET_FILE_NAMES = ("meta.json", "assignment.md", "status.json", "handoff.json", "closeout.md")
+PACKET_FILE_NAMES = ("meta.json", "assignment.md", "status.json", "handoff.json", "closeout.md", "refused")
 
 
 def packet_symlink_refused(root: Path) -> bool:
@@ -370,6 +380,42 @@ def packet_symlink_refused(root: Path) -> bool:
     if root.is_symlink():
         return True
     return any((root / name).is_symlink() for name in PACKET_FILE_NAMES)
+
+
+@contextlib.contextmanager
+def packet_lock(root: Path):
+    """Cross-process exclusive claim on one packet directory (bite 1,
+    dispatch 9BA76253 rework of 2E590F1B/262F89A1 F1/F2): `fcntl.flock` on a
+    lockfile inside the packet dir. Blocks until acquired. Holds ACROSS
+    separate OS processes, not just threads inside one interpreter -- this
+    is load-bearing because the ratatosk listener runs its own willow-mcp
+    child process, a real second `python` racing the actual specialist for
+    the same packet, not a second thread in the same one.
+
+    Takes the resolved packet directory rather than a dispatch_id so each
+    caller resolves it through ITS OWN module-local `dispatch_dir` (this
+    module's, or handoff.py's) -- a test that patches one module's
+    `dispatch_dir` (a common fixture shape in this repo) then gets a lock
+    path consistent with the directory that module actually reads and
+    writes, instead of silently falling through to this module's real,
+    unpatched one.
+
+    Every caller that mutates a packet's accept/complete transition must
+    re-read the packet's status AFTER entering this context, never rely on
+    a read taken before it -- otherwise two callers can both observe
+    'working' before either acquires the lock and both believe they are the
+    first writer once they get it."""
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".handoff.lock"
+    fh = open(lock_path, "a+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 
 def _meta_is_well_formed(meta: dict) -> bool:
@@ -722,6 +768,19 @@ def dispatch_set_status(dispatch_id: str, status: str, **extra: Any) -> dict:
 def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict:
     """Specialist takes packet: pending → working.
 
+    Bite 1 (dispatch 9BA76253, rework of 2E590F1B/262F89A1 F2): the accept
+    that actually flips pending/cleared → working is the ONLY event that
+    records ``accepted_session_id`` on the packet's status -- under the
+    same cross-process ``packet_lock`` handoff_write_v4 re-reads status
+    under, so a claim here can't race a concurrent accept attempt from a
+    second process. ``handoff_write_v4`` later refuses a write whose
+    ``session_id`` doesn't match this recorded value (ESESSION) -- this is
+    what stops a re-entering session (e.g. the ratatosk listener's own
+    child process) from ever being treated as the accepting one. Always
+    written (even as ``""``) so a fresh accept on a recurring/cleared
+    packet overwrites whatever stale value a prior cycle left, rather than
+    leaving a previous session's id bound to a new acceptance.
+
     When the packet carries ``from_verifier`` (envelope-accrual PR9),
     that operator identity is bound onto the specialist's session record
     and added to the in-process attribution cache. That's what lets the
@@ -735,10 +794,16 @@ def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict
         return pkt
     if pkt["meta"].get("to_app", "").lower() != app_id.lower():
         return {"error": "wrong_recipient", "expected": pkt["meta"].get("to_app")}
-    cur = pkt.get("status", {}).get("status", "pending")
-    if cur not in ("pending", "cleared"):
-        return {"error": "invalid_transition", "from": cur, "to": "working"}
-    dispatch_set_status(dispatch_id, "working")
+    with packet_lock(dispatch_dir(dispatch_id)):
+        # Re-read status UNDER the lock -- a read taken before acquiring it
+        # can be stale by the time this caller wins the lock.
+        pkt = dispatch_read(dispatch_id)
+        if pkt.get("error"):
+            return pkt
+        cur = pkt.get("status", {}).get("status", "pending")
+        if cur not in ("pending", "cleared"):
+            return {"error": "invalid_transition", "from": cur, "to": "working"}
+        dispatch_set_status(dispatch_id, "working", accepted_session_id=session_id)
     if session_id:
         from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
         session_bind(
@@ -998,21 +1063,34 @@ def session_enter(
             "dispatch_id": did,
             "message": "packet was withdrawn by the orchestrator; it cannot be entered",
         }
+    held_by_other_session = False
     if cur == "pending":
         pkt = dispatch_accept(did, app_id, session_id)
     elif session_id:
         # Re-entry into an already-accepted packet (specialist reconnecting
-        # or continuing after a hop). Same envelope-accrual PR9 discipline
-        # as dispatch_accept: lift the packet's operator attribution onto
-        # the session and into the attribution cache. session_bind's
-        # verifier-preservation contract means an already-set verifier is
-        # not clobbered when the packet carries none; a specialist without
-        # a session record yet gets seeded here.
-        from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
-        session_bind(app_id, session_id, did, cur, verifier=from_verifier)
-        if from_verifier:
-            from . import human_session as _hs
-            _hs._remember_attributed(session_id)
+        # or continuing after a hop). Bite 1 (dispatch 9BA76253, rework of
+        # 2E590F1B/262F89A1 F2): a re-entry is only ever a continuation of
+        # the SAME accepting session -- not a chance for a second session
+        # (the ratatosk listener's own child process is the motivating
+        # case) to silently pick up attribution/binding for a packet it
+        # never actually accepted. `accepted_session_id` is recorded ONLY
+        # by dispatch_accept (see its docstring); when it is present and
+        # names a DIFFERENT session than this one, this call does not bind
+        # -- no session_bind, no attribution lift -- and the caller is told
+        # the packet is held by another session. An empty/absent
+        # `accepted_session_id` (a legacy packet accepted before this
+        # field existed, or one accepted with no session_id at all) has
+        # nothing recorded to protect, so re-entry there keeps the
+        # pre-existing permissive behavior.
+        accepted_session_id = str(pkt.get("status", {}).get("accepted_session_id") or "")
+        if accepted_session_id and accepted_session_id != session_id:
+            held_by_other_session = True
+        else:
+            from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
+            session_bind(app_id, session_id, did, cur, verifier=from_verifier)
+            if from_verifier:
+                from . import human_session as _hs
+                _hs._remember_attributed(session_id)
 
     closeout = closeout_from_meta(pkt.get("meta", {}))
     return {
@@ -1037,6 +1115,11 @@ def session_enter(
         "gaps_project": pkt.get("meta", {}).get("gaps_project", ""),
         "gaps_paths": pkt.get("meta", {}).get("gaps_paths", []),
         "status": pkt.get("status", {}).get("status"),
+        # Bite 1 (dispatch 9BA76253): surfaced so a re-entering caller can
+        # tell "you are not the accepting session" apart from an ordinary
+        # continuation -- see the elif branch above.
+        "held_by_other_session": held_by_other_session,
+        "accepted_session_id": pkt.get("status", {}).get("accepted_session_id", ""),
         **persona_context(app_id),
         **seed_context(app_id),
     }
