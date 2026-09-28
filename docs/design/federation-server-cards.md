@@ -7,7 +7,7 @@
 - Depends on: `federated-mcp-gating.md` (the gate, unchanged), `mcp_federation.py`
   (registry and identity), `trust_owner_verbs.py` (`federation.ratify`),
   `manifest_grant` `mcp:` groups (#646)
-- First users: codebase-memory-mcp, the served Nestor, CourtListener; then
+- First users: codebase-memory-mcp and the served Nestor; then
   whatever an operator or a future user wants to add
 
 ## 1. Why now
@@ -17,8 +17,9 @@ work one server costs. #646 made `mcp:<server_id>:<tool>` grantable; #648 put
 node9 in shadow beside the gates. Getting there took two PRs, two sealed pairs,
 two request/apply cycles, and a hand-copied server id.
 
-Three more servers are queued: codebase-memory-mcp, the served Nestor, and
-CourtListener. After them come servers this operator has not thought of yet,
+Three more integrations are queued: codebase-memory-mcp, the served Nestor,
+and CourtListener. The first two become federated servers. CourtListener goes
+through Jeles instead (§7.3). After them come servers this operator has not thought of yet,
 and servers other operators will add to their own boxes. At the node9 price,
 none of that happens. The gate is right. Getting a server through it should be
 routine.
@@ -232,7 +233,7 @@ extended from "unknown file" to "known server, reached around the gate." Its
 rows belong on Grove's served page as a Watch concern. That is a separate Grove
 change.
 
-## 7. The first three servers
+## 7. The first three integrations
 
 ### 7.1 codebase-memory-mcp
 
@@ -266,22 +267,37 @@ Nestor has two roles, and only one of them federates:
   served page. That is a Grove process path, not an agent path, and it is out
   of scope here.
 
-### 7.3 CourtListener
+### 7.3 CourtListener goes through Jeles, not federation
 
-- **Shape:** CourtListener (Free Law Project) is a remote REST API. Whichever
-  MCP server fronts it runs as a local stdio process that calls out, so **every
-  tool is `reach: net`**. Each call needs `mcp_federation`,
-  `consent.federation` and a live lease.
-- **Secrets:** the API token is passed by **name** in `env_keys` (for example
-  `COURTLISTENER_API_TOKEN`; the real name comes from the server chosen). The
-  value lives only in `$WILLOW_HOME/env`, never in a card, a pair or a ledger
-  row.
-- **Open question:** Jeles already owns institutional search, and
-  `orchestrator-routing.md` routes search-shaped egress through it. Should
-  CourtListener be its own federated server, or a Jeles source? A Jeles source
-  would inherit Jeles's lease split and its claim verification. A separate
-  server keeps legal lookups independent. This needs an operator ruling before
-  the card is written.
+**Ruling (operator, 2026-09-28):** CourtListener is a Jeles source. It does
+not get a federated server or a card of its own.
+
+- **Why:** Jeles already owns institutional search, and
+  `orchestrator-routing.md` routes search-shaped egress through it ("one organ,
+  guarded at spawn"). A separate server would be the second egress class for
+  the same job that the routing doc warns against. Going through Jeles also
+  inherits three things that already work:
+  - the lease split: its net-bearing `corpus_*` tools need a lease, its
+    loopback ones do not (Decision 3 addendum, #643);
+  - `confidence: "institutional"` on every hit;
+  - `corpus_verify_claim` for checking a claim against its source.
+- **It may already be there.** `skills/external-guard.md` lists CourtListener
+  among the collections behind `corpus_institutional_search`. The first step is
+  to confirm, in the Jeles repo, that it is registered in
+  `jeles.sources.SOURCES` and whether it is opt-in (outside the default
+  fan-out).
+- **Secrets:** the CourtListener API token, if the source needs one, lives in
+  Jeles's environment and is passed to the jeles-corpus entry by **name** in
+  `env_keys`. The value never appears in a pair, a card or a ledger row.
+- **If search is not enough:** fetching a specific opinion, walking citations
+  or following a docket is structured retrieval, not search. It would lose its
+  structure if flattened into search hits. If it is needed, add a few read-only
+  legal tools *to Jeles*, each listed as net-bearing in its lease
+  classification. It is still not a separate federated server.
+- **What this proposal owes it:** nothing directly. Once build step 2 moves
+  `reach` into the ratified jeles-corpus entry, any new Jeles legal tool gets
+  its lease class there, keyed by server, instead of in
+  `FEDERATION_LOOPBACK_STDIO_TOOLS`.
 
 ## 8. Build order
 
@@ -301,8 +317,8 @@ anything.
 5. **`federation.move`**, with the never-widen invariant tested at request time
    and at apply time.
 6. **Drift report.**
-7. **Pilots, in order:** codebase-memory-mcp, then the served Nestor, then
-   CourtListener once §7.3 is ruled. Rewiring the Grove `mcp.template.json`
+7. **Pilots, in order:** codebase-memory-mcp, then the served Nestor.
+   CourtListener rides Jeles (§7.3) and needs no pilot here. Rewiring the Grove `mcp.template.json`
    files to drop the direct entries is a follow-up PR in willows-grove.
 
 ## 9. Out of scope
@@ -322,11 +338,10 @@ anything.
 
 1. Where should draft cards live: `$WILLOW_HOME/federation/cards/`, or with the
    server's own source?
-2. CourtListener: its own server, or a Jeles source (§7.3)?
-3. May a non-operator seat *author* a card (propose only), for example a
+2. May a non-operator seat *author* a card (propose only), for example a
    specialist that found a server it wants? The seal and the apply stay with the
    trust owner either way.
-4. Should `move` also accept a narrower grant set in the same act, or must
+3. Should `move` also accept a narrower grant set in the same act, or must
    narrowing always be a separate revoke or grant?
 
 *ΔΣ=42*
