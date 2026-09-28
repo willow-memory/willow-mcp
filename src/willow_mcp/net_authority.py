@@ -86,6 +86,21 @@ EXPIRED_STATUS = "failed"
 #: that a request from a session nobody remembers does not sit for a week.
 HELD_MAX_AGE_S = 24 * 60 * 60
 
+#: A lease reason travels inside the sealed bytes and is what the operator
+#: reads before sealing (Loki 8EB4478D B3): unbounded, it is a 1MB paste an
+#: operator cannot review, and empty, it is nothing to review at all. 500
+#: chars is generous for "why does this app need standing egress" while
+#: still being something a human can actually read before sealing.
+MAX_REASON_LEN = 500
+
+#: read_sealed_pair's ``why`` value for a pair Nestor's own DecisionMemory
+#: has recorded as rejected (``reject_pair``/``memory.reject``). Gap
+#: 7ca0f5c6cd22: a rejected ask used to read exactly like "not sealed yet"
+#: and sat `waiting` until :data:`HELD_MAX_AGE_S` expired it — a no from the
+#: operator was indistinguishable from silence for up to a day. `drain`
+#: below treats this ``why`` as a `refused` outcome on sight.
+REJECTED_WHY = "status=rejected"
+
 #: A seal older than this is not honoured for a NEW mint: the operator sealed
 #: it for a row that has since been refused as stale, or the seal predates a
 #: key rotation the ring cannot express. Same bound as the held row.
@@ -280,9 +295,30 @@ def question_for_task(bound: dict) -> str:
             f"({bound['agent']}, submitted by {bound['submitted_by']}, scope {bound['scope']})?")
 
 
-def question_for_lease(bound: dict, nonce: str) -> str:
-    return (f"Grant {bound['app_id']} a standing egress lease for {bound['ttl']}s? "
-            f"[{nonce[:8]}]")
+def question_for_lease(bound: dict, nonce: str, requested_by: str = "",
+                       requested_by_verified: bool = False) -> str:
+    """The pair's source_text. When `requested_by` names a DIFFERENT seat
+    than the lease target (`bound['app_id']`) — one seat asking on
+    another's behalf — prefix the question with who is asking, so the
+    operator sees it before sealing rather than only in the SOIL record.
+    The prefix requires `requested_by_verified=True`: `requested_by` must
+    have passed `session_binder.verify_call` — signature, registration and
+    replay all checked — never a caller's bare assertion. An unverified or
+    absent `requested_by` never reaches this prefix, whatever name it
+    carries.
+
+    In practice, `server.lease_request` is this module's only caller, and
+    `session_binder.verify_call` requires the signed session's `agent_id`
+    to equal the `app_id` being verified — so a VERIFIED `requested_by`
+    coming from that path always equals the target, and this prefix never
+    actually fires through the server. It stays reachable for a caller of
+    `propose_lease` that supplies a genuinely different, independently
+    verified `requested_by` — none exists in this codebase today."""
+    grant = (f"Grant {bound['app_id']} a standing egress lease for "
+             f"{bound['ttl']}s? [{nonce[:8]}]")
+    if requested_by and requested_by_verified and requested_by != bound["app_id"]:
+        return f"{requested_by} asks: {grant}"
+    return grant
 
 
 # ── request: hold the row, propose the pair ───────────────────────────────────
@@ -380,41 +416,88 @@ def propose_lease(
     app_id: str,
     ttl_seconds: int,
     reason: str,
+    requested_by: Optional[str] = None,
+    requested_by_verified: bool = False,
     store=None,
     db_path: Optional[Path] = None,
     propose: Callable = None,
 ) -> dict:
     """The request half for a standing lease: one pair whose sealed text is
     the bound line ``(app_id, ttl, scope=lease)``, the rule, and the reason
-    — the reason inside the sealed bytes, same as a task's text."""
+    — the reason inside the sealed bytes, same as a task's text.
+
+    ``requested_by`` is the CALLING seat's identity, ACCEPTED HERE ONLY WHEN
+    ``requested_by_verified=True`` — never a caller's bare assertion. The
+    operator's seal over text that names the target is the only thing that
+    stops a wrong mint. The caller (`server.lease_request`) passes
+    `requested_by` ONLY when it came from a credential that passed
+    `session_binder.verify_call` in full (signature, registration,
+    replay/nonce all checked), and sets ``requested_by_verified``
+    accordingly; an unverified or absent value is dropped in favor of
+    ``app_id`` below, never carried through as an unverified name. Recorded
+    on the SOIL row as both ``requested_by`` and ``requested_by_verified``,
+    folded into the Nestor pair's ``origin``, and — only when verified AND
+    it differs from ``app_id`` — prefixed onto the sealed question itself
+    (:func:`question_for_lease`) so the operator sees who asked before
+    sealing. Falls back to ``app_id`` itself (never ``None``) whenever the
+    caller is unverified or unknown, or is itself the target — through
+    `server.lease_request`, `session_binder.verify_call` requires the
+    signed session's `agent_id` to equal `app_id`, so a VERIFIED
+    ``requested_by`` reaching this function is always identical to
+    ``app_id``; there is no live path today where the two differ AND
+    ``requested_by_verified`` is ``True``."""
     from .db import Store
     from . import lease as lease_mod
 
-    if not isinstance(ttl_seconds, int) or ttl_seconds <= 0 or ttl_seconds > lease_mod.MAX_TTL_SECONDS:
-        return {"error": f"lease_hold_denied: ttl_seconds must be within 1..{lease_mod.MAX_TTL_SECONDS}"}
+    # bool is an int subclass in Python (True/False pass isinstance(x, int)
+    # silently and would mint a 1-second or 0-second lease) — excluded
+    # explicitly. float/str are rejected by the isinstance check itself, not
+    # coerced (Loki 8EB4478D B3: ttl=1800.9 used to truncate, ttl='1800' used
+    # to be accepted as a digit string upstream).
+    if (not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool)
+            or ttl_seconds <= 0 or ttl_seconds > lease_mod.MAX_TTL_SECONDS):
+        return {"error": f"lease_hold_denied: ttl_seconds must be a real int within "
+                          f"1..{lease_mod.MAX_TTL_SECONDS}, got {ttl_seconds!r}"}
+    reason_text = reason or ""
+    if not reason_text.strip():
+        return {"error": "lease_hold_denied: reason must not be empty"}
+    if len(reason_text) > MAX_REASON_LEN:
+        return {"error": f"lease_hold_denied: reason must be at most {MAX_REASON_LEN} "
+                          f"characters, got {len(reason_text)}"}
+    # Defense in depth (Loki E48668A0 R1): an unverified `requested_by` — whatever
+    # name it carries — never reaches the SOIL record, the origin, or the sealed
+    # question as anything other than `app_id` itself. Only a caller that also
+    # sets `requested_by_verified=True` (server.lease_request does this ONLY
+    # after `session_binder.verify_call` passes in full) can name someone else.
+    verified = bool(requested_by_verified) and bool((requested_by or "").strip())
+    requester = (requested_by or "").strip() if verified else app_id
     nonce = mint_nonce()
     bound = {"app_id": app_id, "ttl": str(ttl_seconds), "scope": "lease"}
     try:
-        to_seal = sealed_lease_text(bound, reason or "")
+        to_seal = sealed_lease_text(bound, reason_text)
     except ValueError as exc:
         return {"error": f"lease_hold_denied: {exc}"}
     st = store if store is not None else Store()
     record_id = record_id_for_lease(app_id, nonce)
     st.put(seal_handler.GOVERNANCE_COLLECTION, {
-        "title": question_for_lease(bound, nonce),
+        "title": question_for_lease(bound, nonce, requested_by=requester,
+                                    requested_by_verified=verified),
         "ruling": to_seal,
         "rationale": "Seal only if the reason under the rule is one you accept for a "
                      "standing lease; the reason is inside the sealed bytes.",
         "kind": "net-lease-request",
         "app_id": app_id, "ttl": bound["ttl"], "nonce": nonce,
-        "status": "proposed", "proposed_by": app_id, "date": _now().date().isoformat(),
+        "status": "proposed", "proposed_by": app_id, "requested_by": requester,
+        "requested_by_verified": verified,
+        "date": _now().date().isoformat(),
         "under": "c8572a92",
     }, record_id=record_id)
     do_propose = propose
     if do_propose is None:
         from . import decision_bridge
         do_propose = decision_bridge.propose
-    proposed = do_propose(app_id, record_id, store=st, db_path=db_path)
+    proposed = do_propose(app_id, record_id, origin=f"willow:{requester}:{record_id}",
+                          store=st, db_path=db_path)
     if proposed.get("error"):
         return {"error": f"lease_hold_denied: {proposed['error']}", "record_id": record_id}
     return {"status": "proposed", "pair_id": proposed["pair_id"], "record_id": record_id,
@@ -636,6 +719,31 @@ def drain(
             counts["unreachable"] += 1
             rows_out.append(out)
             continue
+        if sealed["state"] == "empty" and sealed.get("why") == REJECTED_WHY:
+            # Gap 7ca0f5c6cd22: a rejected ask is a refusal now, not a
+            # standing offer that quietly times out. Fails the row
+            # immediately, named, and inked — same shape the age cap uses.
+            out.update(state="refused", field="rejected", failed_reason="rejected",
+                       reason="the operator rejected this pair in Nestor")
+            counts["refused"] += 1
+            _ink(ledger, out, EVENT_REFUSED, {"task_id": task_id, "pair_id": pair_id,
+                                              "reason": out["reason"], "field": "rejected"})
+            _expire(pg, cols, task_id)
+            # Item 3 gap (Loki 8EB4478D): the pg row's own status is the
+            # generic EXPIRED_STATUS, indistinguishable from an age-expired
+            # row once the tick returns. `out["failed_reason"]` above names
+            # it in THIS receipt; the governance record is what still says
+            # so on the NEXT read (age expiry leaves the governance record
+            # untouched at "proposed" too — this is deliberately narrower,
+            # a rejection is a definite operator answer an age timeout is
+            # not). Same move `drain_leases` already makes for a rejected
+            # lease record.
+            updated = seal_handler._strip_meta(gov)
+            updated["status"] = "rejected"
+            updated["failed_reason"] = "rejected"
+            st.update(seal_handler.GOVERNANCE_COLLECTION, record_id_for_task(task_id), updated)
+            rows_out.append(out)
+            continue
         if sealed["state"] == "empty":
             out.update(state="waiting", why=sealed.get("why"))
             counts["waiting"] += 1
@@ -738,7 +846,22 @@ def drain_leases(
     record still ``proposed`` whose pair is sealed goes to the signer, which
     writes the lease file (it owns the lease root on a hardened box) and
     reports ``minted``; the record flips to ``minted`` so it is never sent
-    twice."""
+    twice.
+
+    A lease record's ``status`` therefore only ever moves ``proposed`` ->
+    ``minted`` or ``proposed`` -> ``rejected`` (above) — it NEVER shows
+    ``sealed`` (Loki 02057439 non-blocking note; see
+    ``seal_handler._LEASE_REQUEST_KIND`` / the ``"lease_owned"`` outcome of
+    ``on_seal``, which deliberately leaves this record's status alone so
+    this function keeps sole ownership of the transition). The seal's own
+    details — the verifier and the minted expiry — are never written back
+    onto the SOIL record either, beyond ``lease_path``/``expires_at`` above;
+    they live where the mint actually happened: inside the lease FILE the
+    signer wrote (``lease.py``'s own shape, read by ``task_submit`` at
+    ``allow_net`` time), not in ``projects_willow_governance_decisions``.
+    If the pair is sealed but the signer refuses it, the record stays
+    ``proposed`` and is re-sent every tick until it either mints or is
+    rejected."""
     from .db import Store
 
     st = store if store is not None else Store()
@@ -759,6 +882,17 @@ def drain_leases(
             rows_out.append(out)
             continue
         sealed = read_sealed_pair(pair_id, nestor_db)
+        if sealed["state"] == "empty" and sealed.get("why") == REJECTED_WHY:
+            # Same fix as drain(): a rejected lease ask is a refusal now, not
+            # a standing offer — flip the record so it drops out of `pending`
+            # on the next tick instead of being re-checked forever.
+            updated = seal_handler._strip_meta(gov)
+            updated["status"] = "rejected"
+            st.update(seal_handler.GOVERNANCE_COLLECTION, rid, updated)
+            out.update(state="refused", field="rejected",
+                       reason="the operator rejected this lease request in Nestor")
+            rows_out.append(out)
+            continue
         if sealed["state"] != "populated":
             out.update(state="unreachable" if sealed["state"] == "unreachable" else "waiting",
                        why=sealed.get("why") or sealed.get("cause"))

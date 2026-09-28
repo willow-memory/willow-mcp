@@ -263,6 +263,16 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # depend on it (a retired row was already unusable).
         "envelope_retire_sweep",
     }),
+    # Gap 02E2E836 (Kart egress asks become envelope ratifications): the
+    # self-service half of net_authority.propose_lease — an app asking for
+    # its OWN standing egress lease, same standing as task_submit's own
+    # allow_net ask (a request the operator's seal in Nestor turns into
+    # authority; this group unlocks the ASK, never the grant). Also needs
+    # NET_PERMISSION (task_net), checked explicitly in the tool body, same
+    # two-key shape task_submit uses for allow_net.
+    "net_lease_request": frozenset({
+        "lease_request",
+    }),
     # Cryptographic identity binding (willow-gate seam, Phase 2). The security is
     # the HMAC signature, not this ACL; the group just lets a manifest opt an app
     # into calling check-in. Registration stays operator/CLI-only.
@@ -552,6 +562,11 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # shows spent — same standing as net_authority_drain, no new
         # authority, the gate does not depend on it.
         "envelope_retire_sweep",
+        # lease_request (gap 02E2E836): the self-service ASK for a standing
+        # egress lease, gated separately by task_net in the tool body —
+        # same shape task_submit's own allow_net check uses, so this rides
+        # full_access without silently carrying net access with it.
+        "lease_request",
         # gitsync_sweep / git_pull_execute (split off the shared
         # `envelope_apply` name by pair 163b9a70 — see "orchestrator" above
         # and server.py's git_pull_execute docstring).

@@ -512,11 +512,140 @@ def test_propose_lease_seals_the_reason_inside_the_text():
     store = _FakeStore()
     out = na.propose_lease(app_id="willow", ttl_seconds=1800, reason="Friday morning fun",
                            store=store,
-                           propose=lambda app, rid, store=None, db_path=None: {"pair_id": "pl"})
+                           propose=lambda app, rid, store=None, db_path=None, origin=None: {"pair_id": "pl"})
     assert out["status"] == "proposed"
     bound, reason = na.split_sealed_lease_text(out["seal_this"])
     assert bound == {"app_id": "willow", "ttl": "1800", "scope": "lease"}
     assert reason == "Friday morning fun"
+
+
+def test_propose_lease_records_the_requester_and_prefixes_the_question(monkeypatch):
+    """Loki 02057439 non-blocking note: the record and the Nestor pair's
+    origin carry the CALLING seat (`requested_by`) as well as the target
+    `app_id`, and the sealed question names who asked when they differ —
+    "loki asks: grant willow…" — so the operator sees it before sealing."""
+    store = _FakeStore()
+    seen_origin = {}
+
+    def _propose(app, rid, store=None, db_path=None, origin=None):
+        seen_origin["origin"] = origin
+        return {"pair_id": "pl"}
+
+    out = na.propose_lease(app_id="willow", ttl_seconds=1800, reason="on behalf of willow",
+                           requested_by="loki", requested_by_verified=True,
+                           store=store, propose=_propose)
+    assert out["status"] == "proposed"
+    gov = store.all(seal_handler.GOVERNANCE_COLLECTION)[0]
+    assert gov["app_id"] == "willow" and gov["requested_by"] == "loki"
+    assert gov["requested_by_verified"] is True
+    assert gov["title"].startswith("loki asks: Grant willow")
+    assert seen_origin["origin"] == f"willow:loki:{out['record_id']}"
+
+
+def test_propose_lease_does_not_prefix_an_unverified_requested_by(monkeypatch):
+    """Loki E48668A0 R1: a `requested_by` that was not proven by
+    `session_binder.verify_call` must never reach the sealed question's
+    "X asks:" prefix — the prefix is the exact thing the operator seals,
+    and a caller assertion has no business there."""
+    store = _FakeStore()
+
+    out = na.propose_lease(app_id="willow", ttl_seconds=1800, reason="claims to be loki",
+                           requested_by="loki", requested_by_verified=False,
+                           store=store,
+                           propose=lambda app, rid, store=None, db_path=None, origin=None: {"pair_id": "pl"})
+    assert out["status"] == "proposed"
+    gov = store.all(seal_handler.GOVERNANCE_COLLECTION)[0]
+    assert gov["requested_by_verified"] is False
+    assert not gov["title"].startswith("loki asks:")
+    assert gov["title"].startswith("Grant willow")
+
+
+def test_propose_lease_defaults_requested_by_to_app_id_when_the_caller_is_unknown():
+    """No `requested_by` given (no bound credential reached the call) —
+    falls back to `app_id`, and the question is NOT prefixed with an
+    asker, matching the plain single-operator shape unchanged by this
+    fix."""
+    store = _FakeStore()
+    na.propose_lease(app_id="willow", ttl_seconds=1800, reason="mine",
+                     store=store,
+                     propose=lambda app, rid, store=None, db_path=None, origin=None: {"pair_id": "pl"})
+    gov = store.all(seal_handler.GOVERNANCE_COLLECTION)[0]
+    assert gov["requested_by"] == "willow"
+    assert not gov["title"].startswith("willow asks:")
+    assert gov["title"].startswith("Grant willow")
+
+
+def test_question_for_lease_no_prefix_when_requester_equals_target():
+    """Loki C1FEAD98 M11 (survivor): the "X asks:" prefix must never appear
+    when `requested_by` equals the lease target, even though it is verified
+    — the prefix exists to flag ONE SEAT ASKING FOR ANOTHER's lease, and a
+    seat asking for its own is not that case, whatever the verified flag
+    says. (In practice this is the only shape `server.lease_request` can
+    ever produce, since `session_binder.verify_call` requires the signed
+    session's `agent_id` to equal `app_id` — see `propose_lease`'s
+    docstring.)"""
+    bound = {"app_id": "willow", "ttl": "1800", "scope": "lease"}
+    q = na.question_for_lease(bound, "deadbeef", requested_by="willow", requested_by_verified=True)
+    assert not q.startswith("willow asks:")
+    assert q.startswith("Grant willow")
+    # sanity: the prefix DOES fire when requester differs and is verified —
+    # so this test is checking the equals-target branch, not a broken prefix.
+    q2 = na.question_for_lease(bound, "deadbeef", requested_by="loki", requested_by_verified=True)
+    assert q2.startswith("loki asks: Grant willow")
+
+
+def test_propose_lease_rejects_a_ttl_at_and_above_the_ceiling(monkeypatch):
+    """L8 (Loki 8EB4478D): survived mutation was the TTL ceiling check
+    itself being removed from `propose_lease`."""
+    from willow_mcp import lease as lease_mod
+
+    store = _FakeStore()
+    at_ceiling = na.propose_lease(app_id="willow", ttl_seconds=lease_mod.MAX_TTL_SECONDS,
+                                  reason="right at the edge", store=store,
+                                  propose=lambda app, rid, store=None, db_path=None, origin=None: {"pair_id": "pl"})
+    assert at_ceiling["status"] == "proposed"
+
+    over = na.propose_lease(app_id="willow", ttl_seconds=lease_mod.MAX_TTL_SECONDS + 1,
+                            reason="one past the edge", store=store,
+                            propose=lambda app, rid, store=None, db_path=None, origin=None: pytest.fail(
+                                "must not propose over the ceiling"))
+    assert "error" in over and "lease_hold_denied" in over["error"]
+
+
+@pytest.mark.parametrize("bad_ttl", [True, False, 1800.9, "1800", None])
+def test_propose_lease_rejects_a_non_int_ttl(bad_ttl):
+    """B3 (Loki 8EB4478D): `bool` is an `int` subclass in Python and used to
+    pass the bare `isinstance(x, int)` check silently (True minted a
+    1-second lease); float/str used to be accepted too (a truncated or
+    digit-string TTL)."""
+    store = _FakeStore()
+    out = na.propose_lease(app_id="willow", ttl_seconds=bad_ttl, reason="x", store=store,
+                           propose=lambda app, rid, store=None, db_path=None, origin=None: pytest.fail(
+                               "must not propose with a non-int ttl"))
+    assert "error" in out and "lease_hold_denied" in out["error"]
+
+
+def test_propose_lease_rejects_an_empty_reason():
+    store = _FakeStore()
+    for bad_reason in ("", "   ", "\n\t"):
+        out = na.propose_lease(app_id="willow", ttl_seconds=1800, reason=bad_reason, store=store,
+                               propose=lambda app, rid, store=None, db_path=None, origin=None: pytest.fail(
+                                   "must not propose with an empty reason"))
+        assert "error" in out and "reason" in out["error"], out
+
+
+def test_propose_lease_rejects_a_reason_over_the_length_cap():
+    store = _FakeStore()
+    out = na.propose_lease(app_id="willow", ttl_seconds=1800, reason="x" * (na.MAX_REASON_LEN + 1),
+                           store=store,
+                           propose=lambda app, rid, store=None, db_path=None, origin=None: pytest.fail(
+                               "must not propose with an over-length reason"))
+    assert "error" in out and "reason" in out["error"]
+    # exactly at the cap still proposes
+    ok = na.propose_lease(app_id="willow", ttl_seconds=1800, reason="x" * na.MAX_REASON_LEN,
+                          store=store,
+                          propose=lambda app, rid, store=None, db_path=None, origin=None: {"pair_id": "pl2"})
+    assert ok["status"] == "proposed"
 
 
 # ── act: the tick ─────────────────────────────────────────────────────────────
@@ -609,6 +738,166 @@ def test_tick_expires_a_held_row_nobody_sealed(egress_keys, verifier, tmp_path, 
     r = na.drain(pg=pg2, cols=_COLS, store=store2, db_path=db, call=lambda req: {"state": "unreachable"},
                  now=datetime.now(timezone.utc) + timedelta(seconds=na.HELD_MAX_AGE_S - 60))
     assert r["rows"][0]["state"] == "waiting"
+
+
+def test_tick_refuses_a_rejected_row_at_once_not_after_a_day(tmp_path, monkeypatch):
+    """Gap 7ca0f5c6cd22: a pair the operator rejected in Nestor used to read
+    exactly like `status=draft` — `waiting` — and only failed once
+    HELD_MAX_AGE_S elapsed. It must fail on the very next tick instead."""
+    pg, store, db = _FakePg(), _FakeStore(), _nestor_db(tmp_path)
+    ledger = _Ledger()
+    out = _held(pg, store)
+    tid = out["task_id"]
+    _stamp(store, out["record_id"], "pair-rejected")
+    _put_pair(db, "pair-rejected", "q", out["seal_this"], status="rejected")
+
+    r = na.drain(pg=pg, cols=_COLS, ledger=ledger, store=store, db_path=db,
+                 call=lambda req: pytest.fail("signer must not be called for a rejected pair"))
+    row = r["rows"][0]
+    assert row["state"] == "refused" and row["field"] == "rejected", row
+    assert pg.tasks[tid]["status"] == na.EXPIRED_STATUS
+    assert ledger.rows[-1][1] == na.EVENT_REFUSED and ledger.rows[-1][2]["field"] == "rejected"
+    # gone on the next tick — expired rows are not held rows
+    r2 = na.drain(pg=pg, cols=_COLS, store=store, db_path=db,
+                  call=lambda req: pytest.fail("must not be called again"))
+    assert r2["state"] == "empty"
+
+
+def test_tick_names_a_rejected_task_row_distinctly_from_age_expiry(tmp_path):
+    """Item 3 gap (Loki 8EB4478D): before this fix, a rejected task row's pg
+    status (EXPIRED_STATUS) read identically to an age-expired row, and the
+    governance record stayed 'proposed' — the rejection was legible only in
+    the transient tick receipt and the FRANK ink, not on a later read. Now
+    the receipt carries a distinct `failed_reason` and the governance record
+    itself moves to 'rejected', same as the lease path already does."""
+    pg, store, db = _FakePg(), _FakeStore(), _nestor_db(tmp_path)
+    out = _held(pg, store)
+    _stamp(store, out["record_id"], "pair-rejected-2")
+    _put_pair(db, "pair-rejected-2", "q", out["seal_this"], status="rejected")
+
+    r = na.drain(pg=pg, cols=_COLS, store=store, db_path=db,
+                 call=lambda req: pytest.fail("signer must not be called for a rejected pair"))
+    row = r["rows"][0]
+    assert row["failed_reason"] == "rejected"
+    gov = store.get(seal_handler.GOVERNANCE_COLLECTION, out["record_id"])
+    assert gov["status"] == "rejected"
+    assert gov["failed_reason"] == "rejected"
+
+
+def test_tick_age_expiry_leaves_the_governance_record_at_proposed(tmp_path):
+    """The age cap is not a definite operator answer the way a rejection is
+    — an ask nobody ever looked at must not be reported the same way as one
+    the operator explicitly said no to."""
+    pg, store, db = _FakePg(), _FakeStore(), _nestor_db(tmp_path)
+    out = _held(pg, store)
+    _stamp(store, out["record_id"], "pair-age-1")
+    old = (na._now().timestamp() - (na.HELD_MAX_AGE_S + 60))
+    gov = store.get(seal_handler.GOVERNANCE_COLLECTION, out["record_id"])
+    from datetime import datetime, timezone
+    gov["held_at"] = datetime.fromtimestamp(old, tz=timezone.utc).isoformat()
+    store.update(seal_handler.GOVERNANCE_COLLECTION, out["record_id"], gov)
+
+    r = na.drain(pg=pg, cols=_COLS, store=store, db_path=db,
+                 call=lambda req: pytest.fail("signer must not be called for a stale row"))
+    row = r["rows"][0]
+    assert row["field"] == "age"
+    assert "failed_reason" not in row
+    gov_after = store.get(seal_handler.GOVERNANCE_COLLECTION, out["record_id"])
+    assert gov_after["status"] == "proposed"
+
+
+def test_seal_watcher_first_still_lets_drain_leases_mint_exactly_once(tmp_path):
+    """B1 (Loki 8EB4478D): `on_seal` used to flip ANY governance record
+    (kind-blind) carrying a sealed pair to status='sealed'; `drain_leases`
+    only ever reads status=='proposed', so a lease sealed before the next
+    tick was silently never minted, no matter how many ticks ran after. The
+    watcher is driven by the ledger tail and usually wins this race, so this
+    is the common case, not the edge case."""
+    store = _FakeStore()
+    db = _nestor_db(tmp_path)
+    out = na.propose_lease(app_id="willow", ttl_seconds=1800, reason="race test",
+                           store=store,
+                           propose=lambda app, rid, store=None, db_path=None, origin=None: {"pair_id": "pair-race"})
+    _stamp(store, out["record_id"], "pair-race")
+    _put_pair(db, "pair-race", "q", out["seal_this"], status="sealed", verifier="sean",
+              seal_sig="s" * 64)
+
+    # The watcher arrives first.
+    result = seal_handler.on_seal(
+        {"kind": "seal", "source_lang": "decision", "pair_id": "pair-race",
+         "verifier": "sean", "ts": "2026-09-27T00:00:00+00:00"},
+        store=store, db_path=db,
+    )
+    assert result == "lease_owned"
+    gov = store.get(seal_handler.GOVERNANCE_COLLECTION, out["record_id"])
+    assert gov["status"] == "proposed"  # untouched — drain_leases still owns this record
+
+    calls = []
+    r = na.drain_leases(store=store, db_path=db, call=lambda req: calls.append(req) or {
+        "state": "minted", "path": "/x/willow.json", "expires_at": "2099-01-01T00:00:00Z"})
+    assert r["rows"][0]["state"] == "minted"
+    assert len(calls) == 1
+    gov_after = store.get(seal_handler.GOVERNANCE_COLLECTION, out["record_id"])
+    assert gov_after["status"] == "minted"
+
+    # A double drain must not mint a second time.
+    r2 = na.drain_leases(store=store, db_path=db,
+                         call=lambda req: pytest.fail("must not be called again"))
+    assert r2["state"] == "empty"
+
+
+def test_drain_leases_first_then_seal_watcher_is_also_exactly_one_mint(tmp_path):
+    """Reverse order: the tick wins the race instead of the watcher. Still
+    exactly one mint, and the watcher arriving afterward is a clean no-op —
+    it still recognizes the record as lease-owned and leaves it alone."""
+    store = _FakeStore()
+    db = _nestor_db(tmp_path)
+    out = na.propose_lease(app_id="willow", ttl_seconds=1800, reason="race test 2",
+                           store=store,
+                           propose=lambda app, rid, store=None, db_path=None, origin=None: {"pair_id": "pair-race-2"})
+    _stamp(store, out["record_id"], "pair-race-2")
+    _put_pair(db, "pair-race-2", "q", out["seal_this"], status="sealed", verifier="sean",
+              seal_sig="s" * 64)
+
+    r = na.drain_leases(store=store, db_path=db,
+                        call=lambda req: {"state": "minted", "path": "/x/willow.json",
+                                          "expires_at": "2099-01-01T00:00:00Z"})
+    assert r["rows"][0]["state"] == "minted"
+
+    result = seal_handler.on_seal(
+        {"kind": "seal", "source_lang": "decision", "pair_id": "pair-race-2",
+         "verifier": "sean", "ts": "2026-09-27T00:00:00+00:00"},
+        store=store, db_path=db,
+    )
+    assert result == "lease_owned"
+    gov = store.get(seal_handler.GOVERNANCE_COLLECTION, out["record_id"])
+    assert gov["status"] == "minted"  # on_seal did not disturb the mint
+
+    r2 = na.drain_leases(store=store, db_path=db,
+                         call=lambda req: pytest.fail("must not be called again"))
+    assert r2["state"] == "empty"
+
+
+def test_drain_leases_refuses_a_rejected_request_and_it_drops_from_pending(tmp_path):
+    store = _FakeStore()
+    db = _nestor_db(tmp_path)
+    out = na.propose_lease(app_id="willow", ttl_seconds=1800, reason="no thanks", store=store,
+                           propose=lambda app, rid, store=None, db_path=None, origin=None: {"pair_id": "pl-rejected"})
+    _put_pair(db, "pl-rejected", "grant", out["seal_this"], status="rejected")
+    gov = store.get(seal_handler.GOVERNANCE_COLLECTION, out["record_id"])
+    gov["nestor_pair_id"] = "pl-rejected"
+    store.update(seal_handler.GOVERNANCE_COLLECTION, out["record_id"], gov)
+
+    r = na.drain_leases(store=store, db_path=db,
+                        call=lambda req: pytest.fail("signer must not be called"))
+    row = r["rows"][0]
+    assert row["state"] == "refused" and row["field"] == "rejected", row
+    updated = store.get(seal_handler.GOVERNANCE_COLLECTION, out["record_id"])
+    assert updated["status"] == "rejected"
+    # dropped from `pending` on the next drain — never re-checked
+    r2 = na.drain_leases(store=store, db_path=db,
+                         call=lambda req: pytest.fail("must not be called again"))
+    assert r2["state"] == "empty"
 
 
 def test_tick_three_state_on_the_signer_and_the_seal_store(egress_keys, verifier, tmp_path,
@@ -884,3 +1173,51 @@ def test_net_authority_drain_is_gated_classed_hooked_and_delegates(monkeypatch):
     seen.clear()
     assert fn("willow") == {"state": "empty"}
     assert seen == {"app_id": "willow", "pg": "PG"}
+
+
+def test_lease_request_is_gated_classed_hooked_and_delegates(monkeypatch):
+    """Gap 02E2E836: `net_authority.propose_lease`'s only caller was a test
+    until this desk verb wired it. Same five-way registration as
+    `net_authority_drain`, plus the task_net capability check task_submit's
+    own allow_net path uses — an app with the tool permission but not
+    task_net still gets net_denied, never a proposal."""
+    import importlib.util
+    from pathlib import Path as _P
+
+    from willow_mcp import advertise, gate, server, tier_policy
+
+    assert "lease_request" in gate.PERMISSION_GROUPS["net_lease_request"]
+    assert "lease_request" in gate.PERMISSION_GROUPS["full_access"]
+    assert tier_policy.TOOL_CLASS["lease_request"] == tier_policy.WRITE
+    assert "lease_request" not in advertise.DESK_CORE
+    repo = _P(__file__).resolve().parent.parent
+    for hook in ("hooks/pre_tool_use.py", "src/willow_mcp/bundle/hooks/pre_tool_use.py"):
+        spec = importlib.util.spec_from_file_location("hook_mod", repo / hook)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert "lease_request" in mod._SEAT_WRITE_TOOLS, hook
+        # Nit from Loki 8EB4478D Check 2: the regex already matched
+        # net_lease_request; the human-readable prose named every OTHER
+        # write-capable group but this one.
+        assert "net_lease_request" in mod._SEAT_ESCALATION_REASON, hook
+
+    fn = getattr(server.lease_request, "__wrapped__", server.lease_request)
+
+    monkeypatch.setattr(gate, "permitted", lambda app, perm: False)
+    denied = fn("kart", ttl_seconds=1800, reason="x")
+    assert denied["error"].startswith("net_denied") and "task_net" in denied["error"]
+
+    monkeypatch.setattr(gate, "permitted", lambda app, perm: True)
+    refused = fn("kart", ttl_seconds=1800, reason="x", scope="database")
+    assert refused["error"].startswith("lease_hold_denied") and "database" in refused["error"]
+
+    seen = {}
+    monkeypatch.setattr(na, "propose_lease", lambda **kw: seen.update(kw) or {"status": "proposed"})
+    assert fn("kart", ttl_seconds=1800, reason="Friday morning fun") == {"status": "proposed"}
+    # requested_by: no bound credential reached this call (no _CALL_CREDENTIAL
+    # set, __wrapped__ skips _gate entirely) — falls back to None here, which
+    # propose_lease itself defaults to app_id (Loki 02057439 non-blocking note).
+    # requested_by_verified is likewise False — there was nothing to verify
+    # (Loki E48668A0 R1).
+    assert seen == {"app_id": "kart", "ttl_seconds": 1800, "reason": "Friday morning fun",
+                    "requested_by": None, "requested_by_verified": False}

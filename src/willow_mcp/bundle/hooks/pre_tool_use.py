@@ -913,7 +913,7 @@ _SEAT_PRIV_RE = re.compile(
     r"envelope_apply|envelope_write|federation_call|fork_write|frank_write|friction_write|full_access|"
     r"gap_promote|gap_purge|gap_write|governance_propose|governance_sync|grove_all|grove_write|human_loop_write|integration_call|"
     r"knowledge_curate|knowledge_write|lineage_write|markdownai_directives|markdownai_write|"
-    r"nest_write|schema_admin|steward_sweep|steward_human_loop|steward_store_write|steward_gap_resolve|"
+    r"nest_write|net_lease_request|schema_admin|steward_sweep|steward_human_loop|steward_store_write|steward_gap_resolve|"
     r"steward_dispatch|store_all|store_write|task_db|task_queue|"
     r"tool_oracle_route|tool_oracle_seal)\b"
 )
@@ -956,6 +956,7 @@ _SEAT_WRITE_TOOLS = frozenset({
     "integration_call",
     "kb_ingest", "kb_journal", "kb_promote",
     "knowledge_flag", "knowledge_ingest", "knowledge_retract",
+    "lease_request",
     "lineage_link", "lineage_record",
     "mai_execute_directive", "mai_get_env", "mai_invalidate_cache", "mai_write_file",
     "nest_correct_classification",
@@ -976,7 +977,7 @@ _SEAT_ESCALATION_REASON = (
     "willow-mcp: this edits a manifest to add a WRITE-capable permission group "
     "(store_write / store_all / knowledge_write / knowledge_curate / lineage_write / schema_admin / "
     "nest_write / gap_write / gap_promote / gap_purge / friction_write / task_db / "
-    "task_queue / dispatch_write / human_loop_write / frank_write / envelope_apply / envelope_write / "
+    "task_queue / net_lease_request / dispatch_write / human_loop_write / frank_write / envelope_apply / envelope_write / "
     "fork_write / commitment_write / code_graph_write / agent_dispatch / grove_write / grove_all / "
     "integration_call / federation_call / markdownai_write / markdownai_directives / orchestrator / "
     "context / binding / tool_oracle_route / tool_oracle_seal / governance_propose / governance_sync / "

@@ -173,6 +173,7 @@ FRIENDLY_LABELS: dict[str, str] = {
     "web_read": "Search and fetch the open web (guarded)",
     "web_net": "Allow open-web search/fetch for this app",
     "task_net": "Request internet access (for tasks)",
+    "net_lease_request": "Ask for a standing internet-access lease for itself",
     "integration_net": "Request internet access (for outside services)",
     "federation_read": "See discovered and ratified MCP servers",
     "federation_call": "Call a tool on a ratified downstream MCP server",

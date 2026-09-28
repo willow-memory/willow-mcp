@@ -177,6 +177,37 @@ _binder = SessionBinder()
 _CALL_CREDENTIAL: "contextvars.ContextVar[Optional[dict]]" = contextvars.ContextVar(
     "willow_call_credential", default=None)
 
+# The result of the ONE `session_binder.verify_call` the pipeline already runs
+# per request — from `_enforce_binding_gate` (binding on/strict, registered app)
+# or `_observe_binding` (binding off) — cached here, so a tool body (e.g.
+# `lease_request`, Loki E48668A0 R1) can read the ALREADY-VERIFIED outcome
+# instead of calling `verify_call` a second time and spuriously replay-failing
+# on the nonce that first call already consumed. A tool called outside the
+# guarded pipeline (`.__wrapped__` in tests) sees no matching entry and falls
+# back to computing its own fresh `verify_call` — safe, since nothing has
+# consumed that nonce yet in that path.
+#
+# SCOPED TO ONE CALL (Loki C1FEAD98 B1): `_guarded`'s wrapper resets this to
+# `None` on entry and restores the prior value (via `.reset(token)`) in a
+# `finally`, the same binding primitive `request_context.active()` uses. The
+# cache must never outlive the call that filled it — before this fix nothing
+# reset it, so under `WILLOW_MCP_ENFORCE_BINDING=on` with an UNREGISTERED
+# target, `_enforce_binding_gate` steps aside without verifying and
+# `lease_request` could read back an entirely unrelated earlier call's
+# verified result, including one whose nonce this same call had already
+# spent (Loki 1Q853FJZ [C3 on same-ctx]).
+#
+# Keyed on (app_id, tool_name, session_id, call_nonce, sig) — the full inputs
+# `verify_call`'s result actually depends on. `id(_binder)` was dropped: it
+# is not a stable identity (5 fresh `SessionBinder()` instances gave 3
+# distinct ids in one process — Loki 1Q853FJZ [C6]) and is a compile-time
+# constant against the single production binder, so it verified nothing and
+# only added noise. Per-call scoping above is what makes a binder-swapped
+# test (a fresh `SessionBinder()` per test, then reverted) see a clean slate
+# — not binder identity in the key.
+_LAST_BIND_RESULT: "contextvars.ContextVar[Optional[tuple]]" = contextvars.ContextVar(
+    "willow_last_bind_result", default=None)
+
 # Tools exempt from the per-call credential requirement. `session_bind` is the
 # check-in itself — there is no session to sign against yet, and it authenticates
 # via its own header HMAC — so requiring a per-call signature would be a
@@ -194,7 +225,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 147 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 148 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -449,6 +480,9 @@ def _enforce_binding_gate(app_id: str, tool_name: str) -> Optional[dict]:
             f"out-of-band by the client's signing middleware. app_id alone cannot bind.")}
     v = _binder.verify_call(cred.get("session_id", ""), app_id, tool_name,
                             cred.get("call_nonce", ""), cred.get("sig", ""))
+    _LAST_BIND_RESULT.set(
+        (app_id, tool_name, cred.get("session_id", ""), cred.get("call_nonce", ""),
+         cred.get("sig", ""), v))
     if not v.get("bound"):
         return {"error": f"binding rejected for '{app_id}': {v.get('reason')}"}
     if not tier_policy.tier_permits(v["trust_level"], tool_name,
@@ -527,6 +561,9 @@ def _observe_binding(app_id: str, tool_name: str) -> None:
         if cred:
             r = _binder.verify_call(cred.get("session_id", ""), app_id, tool_name,
                                     cred.get("call_nonce", ""), cred.get("sig", ""))
+            _LAST_BIND_RESULT.set(
+                (app_id, tool_name, cred.get("session_id", ""), cred.get("call_nonce", ""),
+                 cred.get("sig", ""), r))
             _receipt_log.record(app_id, tool_name, "bind_observed",
                                 f"tier={r['tier']} sig=ok" if r.get("bound")
                                 else f"unbound: {r.get('reason')}")
@@ -1182,6 +1219,25 @@ def _guarded(tool_name: str, *, list_error: bool = False, paginated: bool = Fals
 
         @wraps(fn)
         def wrapper(*args, **kwargs):
+            # Scope `_LAST_BIND_RESULT` to exactly this call (Loki C1FEAD98
+            # B1): reset to `None` on entry, restore the prior value in
+            # `finally` via the token — the same primitive
+            # `request_context.active()` uses. Without this the cache
+            # outlived the call that filled it, so a later call (even one
+            # `_enforce_binding_gate` steps aside for, e.g. an unregistered
+            # `app_id` under `=on`) could read back an unrelated earlier
+            # call's verified result. `.reset(token)` rather than
+            # `.set(None)` in the `finally` because calls can nest (a tool
+            # invoking another guarded tool internally) and each frame must
+            # restore exactly what it overwrote, not stomp an outer frame's
+            # value.
+            token = _LAST_BIND_RESULT.set(None)
+            try:
+                return _call(*args, **kwargs)
+            finally:
+                _LAST_BIND_RESULT.reset(token)
+
+        def _call(*args, **kwargs):
             bound = sig.bind(*args, **kwargs)
             bound.apply_defaults()
             call_kwargs = dict(bound.arguments)
@@ -1848,6 +1904,127 @@ def net_authority_drain(app_id: str, max_rows: int = 0) -> dict:
     if max_rows and max_rows > 0:
         kwargs["max_rows"] = int(max_rows)
     return _na.tick(app_id=app_id, pg=get_pg(), **kwargs)
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("lease_request")
+def lease_request(app_id: str, ttl_seconds: int, reason: str, scope: str = "lease") -> dict:
+    """Ask for a standing egress lease for THIS app — the desk-verb front
+    door onto `net_authority.propose_lease` (gap 02E2E836; the drain half,
+    `net_authority_drain` / `drain_leases`, already mints; this was the
+    missing request half, whose only prior caller was a test). Wires the
+    same request/seal/mint shape `hold_and_propose` uses for a per-task ask
+    (decision c8572a92): this call only proposes — it writes a Nestor draft
+    pair whose SEALED TEXT is the bound line `(app_id, ttl, scope=lease)`, a
+    rule, and `reason`, and returns `{status: "proposed", pair_id,
+    record_id, seal_this}`. The operator seals the SAME text shown here in
+    the Nestor UI; the next `net_authority_drain` tick mints the lease file
+    and the app can call task_submit(allow_net=True) without a per-task
+    hold from then until the lease expires.
+
+    Requires the `task_net` capability (`gate.NET_PERMISSION`) in this app's
+    own manifest — the same key task_submit checks before honoring
+    allow_net. An app may ask for its own lease; there is no `for_app_id`
+    parameter, and holding this tool's group alone does not grant it —
+    `task_net` still gates the ask, same two-key shape task_submit's own
+    allow_net check uses. This is `@_guarded`, so in stdio it inherits the
+    same identity guarantee `whoami` documents: on a plain unenforced box
+    `app_id` is exactly what the caller passes (the ordinary single-operator
+    stdio trust model every write tool uses). Under binding enforcement,
+    `_gate` refuses the call before it reaches here ONLY under
+    `WILLOW_MCP_ENFORCE_BINDING=strict`, or under `=on` when `app_id` names a
+    REGISTERED agent — in either of those two cases the caller's own
+    per-call credential must prove it IS `app_id`, and a seat cannot ask for
+    another seat's lease by naming it (Loki 8EB4478D B2, 02057439 N1). Under
+    `=on` with an UNREGISTERED `app_id`, binding is a no-op by design (D3,
+    manifest-only auth) and the call is proposed with no credential
+    whatsoever — naming an unregistered seat is not refused. This box runs
+    with `WILLOW_MCP_ENFORCE_BINDING` unset (off) on every stdio broker — no
+    `.mcp.json`, env file, or systemd unit sets it — so today `app_id` is
+    exactly what the caller passes, full stop; none of the enforcement
+    behavior above is live here.
+
+    `ttl_seconds` must be a real `int` — `net_authority.propose_lease`
+    refuses a literal `bool` (an `int` subclass in Python) and any other
+    non-`int` value it actually receives. In practice, at the real MCP
+    boundary the SDK's own argument coercion converts `True`/`False`,
+    `"1800"`, and `1800.0` to a plain `int` BEFORE `propose_lease` — or this
+    wrapper — ever sees them (a non-integral float like `1800.9` raises a
+    tool-call error at that same boundary instead). So for a normal MCP
+    caller it is the SDK's coercion, not `propose_lease`'s bool/type check,
+    that decides what these forms become; the explicit `bool` exclusion in
+    `propose_lease` only matters for a caller that reaches it directly with
+    an actual `bool` object, bypassing the MCP boundary (Loki 8EB4478D B3,
+    02057439 N1). `reason` must be non-empty after stripping and at most
+    `net_authority.MAX_REASON_LEN` characters — also enforced in
+    `propose_lease`, since the reason is what the operator actually reads
+    before sealing.
+
+    `scope` defaults to `"lease"`, the only scope `net_authority.LEASE_
+    BOUND_FIELDS` currently defines; any other value is refused before a
+    draft is written.
+
+    The lease-request record and the Nestor pair's origin also carry
+    `requested_by` — but ONLY when the caller's per-call credential passes
+    the full `session_binder.verify_call` path (signature, registration and
+    replay/nonce all checked, the nonce consumed). A caller-supplied
+    `session_id` alone proves nothing (Loki E48668A0 R1: an unsigned or
+    mismatched credential naming another seat's live session used to be
+    trusted outright, writing that seat's name into the sealed question and
+    the Nestor origin — exactly the caller-asserted provenance
+    `net_authority`'s own rule forbids). When no credential is presented, or
+    `verify_call` refuses it for any reason (unbound, replayed, wrong
+    identity), the SOIL row records `requested_by=<app_id>` with
+    `requested_by_verified=False` — `net_authority.propose_lease` falls back
+    to `app_id` itself, never `None`, whenever the caller did not clear
+    verification — and the Nestor origin follows the same `app_id` fallback.
+    Because `session_binder.verify_call` requires the signed session's
+    `agent_id` to equal `app_id`, a VERIFIED `requested_by` reaching this
+    function always equals `app_id` — there is no live path through
+    `server.lease_request` where a verified requester names a different
+    seat. `net_authority.question_for_lease`'s "X asks:" prefix (reachable
+    only when `requested_by` differs from the target AND is verified) is
+    therefore unreachable from this server; it exists for `propose_lease`
+    callers other than this one."""
+    from . import gate, net_authority as _na
+
+    if not gate.permitted(app_id, gate.NET_PERMISSION):
+        return {"error": (
+            f"net_denied: a standing egress lease request requires the "
+            f"'{gate.NET_PERMISSION}' permission in this app's manifest "
+            f"($WILLOW_HOME/mcp_apps/{app_id or '<app_id>'}/manifest.json). "
+            "It is not granted by task_queue or full_access — add it explicitly.")}
+    if (scope or "").strip() != "lease":
+        return {"error": f"lease_hold_denied: unsupported scope {scope!r} — only 'lease' is defined"}
+    cred = _current_call_credential()
+    requested_by = None
+    requested_by_verified = False
+    if cred:
+        sid, nonce, sig = cred.get("session_id", ""), cred.get("call_nonce", ""), cred.get("sig", "")
+        cached = _LAST_BIND_RESULT.get()
+        # The guarded pipeline (`_enforce_binding_gate` under on/strict,
+        # `_observe_binding` under off) already ran `verify_call` once for THIS
+        # exact credential and consumed its nonce — reuse that result rather
+        # than calling `verify_call` again, which would spuriously read the
+        # now-spent nonce as a replay. A cache miss (e.g. `.__wrapped__` in
+        # tests, bypassing the pipeline entirely, or a same-call path
+        # `_enforce_binding_gate`/`_observe_binding` stepped aside for — an
+        # unregistered `app_id` under `=on`) means nothing has consumed this
+        # nonce yet IN THIS CALL, so a fresh call is correct and safe. The
+        # cache is scoped to exactly this call (`_guarded`'s wrapper resets it
+        # on entry and in `finally`), so a hit here can only be THIS call's
+        # own earlier verify — never a leftover from an earlier call.
+        if (cached is not None and cached[0] == app_id and cached[1] == "lease_request"
+                and cached[2] == sid and cached[3] == nonce and cached[4] == sig):
+            v = cached[5]
+        else:
+            v = _binder.verify_call(sid, app_id, "lease_request", nonce, sig)
+        if v.get("bound"):
+            requested_by = v["agent_id"]
+            requested_by_verified = True
+    return _na.propose_lease(app_id=app_id, ttl_seconds=ttl_seconds, reason=reason or "",
+                             requested_by=requested_by,
+                             requested_by_verified=requested_by_verified)
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
