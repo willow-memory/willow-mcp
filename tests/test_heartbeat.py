@@ -315,3 +315,79 @@ def test_derive_problems_worker_arg_is_optional():
     """Back-compat: existing callers pass four args."""
     from willow_mcp import server
     assert server._derive_problems({}, {}, {}, "stdio") == []
+
+
+# -- A Kart task carries only its submitter's identity (ruling D, pair b8b24c45) --
+
+
+def test_in_kart_sandbox_reads_the_marker_kart_env_sets(monkeypatch):
+    """kartikeya's kart_env() writes WILLOW_IN_KART unconditionally into every
+    sandboxed task's environment (kartikeya/sandbox.py ~line 939) -- the
+    signal Kart actually sets, not KART_TASK_ID, which kartikeya never
+    emits."""
+    monkeypatch.delenv("WILLOW_IN_KART", raising=False)
+    assert hb.in_kart_sandbox() is False
+    monkeypatch.setenv("WILLOW_IN_KART", "1")
+    assert hb.in_kart_sandbox() is True
+    monkeypatch.setenv("WILLOW_IN_KART", "0")
+    assert hb.in_kart_sandbox() is False
+
+
+def test_heartbeat_refuses_to_write_inside_a_kart_sandbox(hb_root, monkeypatch):
+    """A sandboxed task can reach $WILLOW_HOME/worker_heartbeat (it is bound
+    read-write) but is never the worker loop itself -- any write from
+    inside one is a forgery, not telemetry."""
+    monkeypatch.setenv("WILLOW_IN_KART", "1")
+    beat = hb.WorkerHeartbeat(interval=5.0)
+    beat()  # must not raise, must not write
+    assert not beat.path.exists()
+    assert hb.read_workers()["alive"] == 0
+
+
+def test_heartbeat_writes_normally_outside_a_sandbox(hb_root, monkeypatch):
+    monkeypatch.delenv("WILLOW_IN_KART", raising=False)
+    beat = hb.WorkerHeartbeat(interval=5.0)
+    beat()
+    assert beat.path.exists()
+
+
+def test_foreign_pid_namespace_record_is_dead_even_when_alive_and_fresh(
+    hb_root, monkeypatch
+):
+    """The fleet_health pids seen 2026-09-27 (3, 4, 6, 9, 12, 20, 35, 128):
+    low numbers typical of a bwrap sandbox's own nested pid counting. A
+    record whose pid namespace differs from ours is dead regardless of
+    _pid_alive/starttime -- force _pid_alive True so the namespace check,
+    not a coincidentally-dead real pid 4 on this host, is what is under
+    test."""
+    monkeypatch.setattr(hb, "_pid_in_foreign_namespace", lambda pid: pid == 4)
+    monkeypatch.setattr(hb, "_pid_alive", lambda pid: True)
+    _write(hb_root, "kart-fast-forged.json", pid=4)
+    out = hb.read_workers()
+    assert out["workers"][0]["state"] == "dead"
+    assert out["alive"] == 0
+
+
+def test_own_pid_namespace_record_still_classifies_normally(hb_root, monkeypatch):
+    monkeypatch.setattr(hb, "_pid_in_foreign_namespace", lambda pid: False)
+    _write(hb_root, "kart-fast-own.json")
+    assert hb.read_workers()["workers"][0]["state"] == "alive"
+
+
+def test_reap_drops_a_forged_foreign_namespace_record(hb_root, monkeypatch):
+    monkeypatch.setattr(hb, "_pid_in_foreign_namespace", lambda pid: pid == 4)
+    monkeypatch.setattr(hb, "_pid_alive", lambda pid: True)
+    _write(hb_root, "kart-fast-forged.json", pid=4)
+    assert hb.reap() == 1
+    assert list(hb_root.glob("*.json")) == []
+
+
+def test_pid_namespace_lookup_degrades_gracefully(monkeypatch):
+    """No /proc/<pid>/ns/pid (permission denied, non-Linux, gone process) ->
+    None, not a raise -- and the foreign-namespace check then fails open."""
+    def _boom(*_a, **_k):
+        raise OSError("nope")
+
+    monkeypatch.setattr(hb.os, "readlink", _boom)
+    assert hb._pid_namespace(1) is None
+    assert hb._pid_in_foreign_namespace(1) is False
