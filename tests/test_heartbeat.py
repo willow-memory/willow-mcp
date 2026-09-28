@@ -322,14 +322,31 @@ def test_derive_problems_worker_arg_is_optional():
 
 def test_in_kart_sandbox_reads_the_marker_kart_env_sets(monkeypatch):
     """kartikeya's kart_env() writes WILLOW_IN_KART unconditionally into every
-    sandboxed task's environment (kartikeya/sandbox.py ~line 939) -- the
-    signal Kart actually sets, not KART_TASK_ID, which kartikeya never
-    emits."""
+    sandboxed task's environment (kartikeya/sandbox.py:949, an unconditional
+    "1", no allow_net branch) -- the signal Kart actually sets, not
+    KART_TASK_ID, which kartikeya never emits."""
     monkeypatch.delenv("WILLOW_IN_KART", raising=False)
     assert hb.in_kart_sandbox() is False
     monkeypatch.setenv("WILLOW_IN_KART", "1")
     assert hb.in_kart_sandbox() is True
+
+
+def test_in_kart_sandbox_treats_any_non_empty_value_as_in_kart(monkeypatch):
+    """Loki 0E7F0C89 W4: this helper used to read "0" as not-in-Kart and
+    "false" as in-Kart -- backwards from what either string should mean,
+    and weaker than the any-non-empty-value idiom every other in-Kart check
+    in the fleet already uses (_in_kart in manifest_grant_executor.py,
+    pgp.py, egress_authorization.py, server.py). "0" and "false" must now
+    both read as in-Kart, matching that idiom; only unset/empty is not."""
     monkeypatch.setenv("WILLOW_IN_KART", "0")
+    assert hb.in_kart_sandbox() is True
+    monkeypatch.setenv("WILLOW_IN_KART", "false")
+    assert hb.in_kart_sandbox() is True
+    monkeypatch.setenv("WILLOW_IN_KART", "1")
+    assert hb.in_kart_sandbox() is True
+    monkeypatch.delenv("WILLOW_IN_KART", raising=False)
+    assert hb.in_kart_sandbox() is False
+    monkeypatch.setenv("WILLOW_IN_KART", "")
     assert hb.in_kart_sandbox() is False
 
 
@@ -391,3 +408,28 @@ def test_pid_namespace_lookup_degrades_gracefully(monkeypatch):
     monkeypatch.setattr(hb.os, "readlink", _boom)
     assert hb._pid_namespace(1) is None
     assert hb._pid_in_foreign_namespace(1) is False
+
+
+def test_pid_in_foreign_namespace_compares_real_differing_links(monkeypatch):
+    """Loki 0E7F0C89 W3 BLOCKER: mutation E (`return own != own`, a permanent
+    no-op) survived 41/41 because every existing namespace test monkeypatches
+    _pid_in_foreign_namespace itself wholesale, and the degrade test only
+    covers the None case. This exercises the comparison directly: fake
+    readlink returns a genuinely different ns link for `own` vs `other`, so
+    only a real `own != other` comparison can pass -- `own != own` cannot."""
+    own_pid = os.getpid()
+    other_pid = own_pid + 1
+
+    def _fake_readlink(path, *_a, **_k):
+        if path == f"/proc/{own_pid}/ns/pid":
+            return "pid:[4026531836]"
+        if path == f"/proc/{other_pid}/ns/pid":
+            return "pid:[4026532000]"
+        raise OSError("no such pid")
+
+    monkeypatch.setattr(hb.os, "getpid", lambda: own_pid)
+    monkeypatch.setattr(hb.os, "readlink", _fake_readlink)
+    assert hb._pid_namespace(own_pid) == "pid:[4026531836]"
+    assert hb._pid_namespace(other_pid) == "pid:[4026532000]"
+    assert hb._pid_in_foreign_namespace(other_pid) is True
+    assert hb._pid_in_foreign_namespace(own_pid) is False

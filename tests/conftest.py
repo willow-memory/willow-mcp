@@ -30,6 +30,15 @@ os.environ["WILLOW_MCP_APPS_ROOT"] = os.path.join(_tmp, "mcp_apps")
 # put that file under a separate uid, 52 tests fail with PermissionError; on a
 # box where it has not, the suite silently rewrites the operator's manifest.
 os.environ["WILLOW_MCP_EGRESS_CONFIG_DIR"] = os.path.join(_tmp, "egress")
+# Loki 0E7F0C89 W1: heartbeat.heartbeat_root() prefers WILLOW_WORKER_HEARTBEAT_ROOT
+# over $WILLOW_HOME, so pinning WILLOW_HOME above does not isolate it. A worker
+# unit's systemd env sets this to the LIVE heartbeat dir, and when a suite run
+# inherits it (a Kart task run from this desk does), test_server.py's
+# fleet_health tests write real phantom kart-fast-<pid>.json files with
+# tick_ok=False straight into the operator's live directory -- proven 2026-09-27
+# (kart-fast-1/2/3/4/6.json). Force it to a throwaway tmp dir the same way as
+# every other path above -- do NOT setdefault, for the identical reason.
+os.environ["WILLOW_WORKER_HEARTBEAT_ROOT"] = os.path.join(_tmp, "worker_heartbeat")
 # `paths.trusted_read` refuses a governance input that is group- or
 # other-writable. pytest's tmp files take the runner's umask, so under a 002
 # umask (a Kart sandbox, some CI images) every fixture pre-approved.json and

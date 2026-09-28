@@ -34,12 +34,16 @@ logger = logging.getLogger("willow_mcp.heartbeat")
 
 # The in-sandbox signal Kart actually sets: kartikeya's kart_env() writes this
 # unconditionally into every sandboxed task's environment (kartikeya/sandbox.py
-# ~line 939, "WILLOW_IN_KART": "1" if allow_net else ... -- the literal key is
-# always present, only its value shape varies), not KART_TASK_ID, which
-# kartikeya never sets. Reused by the private `_in_kart()` check in
-# manifest_grant_executor.py; exported here (public, not underscored) so
-# other in-sandbox refusals -- packet 7E6C2D84 -- can share one check instead
-# of re-deriving the env var name.
+# line 949, "WILLOW_IN_KART": "1", with no conditional on allow_net -- the
+# literal key is always present and always "1" from kart_env itself; a
+# different value only ever reaches a process here if something else in the
+# chain set it), not KART_TASK_ID, which kartikeya never sets. NOT reused by
+# the private `_in_kart()` check in manifest_grant_executor.py, pgp.py, or
+# egress_authorization.py -- each of those re-derives the same env var name
+# with its own any-non-empty-value truthiness test (Loki 0E7F0C89 W4).
+# Exported here (public, not underscored) so other in-sandbox refusals --
+# packet 7E6C2D84 -- can share one check instead of re-deriving the env var
+# name, but that sharing means this helper's semantics must match theirs.
 _KART_SANDBOX_ENV_VAR = "WILLOW_IN_KART"
 
 
@@ -52,8 +56,17 @@ def in_kart_sandbox() -> bool:
     sandbox, so any in-sandbox write is definitionally a forgery, not
     telemetry. Callers that need to refuse an in-sandbox act use this
     instead of re-checking the env var directly.
+
+    Any non-empty value counts as in-Kart -- "0" and "false" included --
+    matching the idiom every other in-Kart check in the fleet already uses
+    (`_in_kart` in manifest_grant_executor.py:281-285, pgp.py:397,
+    egress_authorization.py:179, the server.py sites). Loki 0E7F0C89 W4:
+    this helper used to read "0"/"false" as NOT in-Kart, which is weaker
+    than the idiom it was meant to unify, and packet 7E6C2D84 is told to
+    reuse this helper -- so its own weaker reading would have quietly
+    downgraded those callers' refusals were it not fixed here.
     """
-    return os.environ.get(_KART_SANDBOX_ENV_VAR, "").strip() not in ("", "0")
+    return bool(os.environ.get(_KART_SANDBOX_ENV_VAR, "").strip())
 
 # A worker rewrites its file every loop tick: `interval` seconds when idle, ~0.5s
 # when busy. Three missed idle ticks (floor 30s) is a real absence, not a slow
@@ -214,18 +227,28 @@ def _pid_namespace(pid: int) -> str | None:
 
 
 def _pid_in_foreign_namespace(pid: int) -> bool:
-    """True when `pid`, read from here, is not in our own pid namespace.
+    """True when `pid`, CURRENTLY, resolves to a process in a different pid
+    namespace than ours.
 
     read_workers()/reap() always run on the host, outside any Kart sandbox
     -- so a live worker's own heartbeat is always written by (and later
     read as) a process in the reader's own pid namespace. A record whose
-    pid resolves to a DIFFERENT namespace names either a process running
-    inside a bwrap sandbox right now, or is otherwise not us -- either way
-    it is not the worker that (claims to have) written this file, and the
-    fleet_health pids seen 2026-09-27 (3, 4, 6, 9, 12, 20, 35, 128 -- low
-    numbers typical of a sandbox's own nested pid counting) are exactly
-    this shape. Fails open (False) when either namespace cannot be read,
-    so the existing liveness/starttime checks still apply.
+    pid CURRENTLY resolves to a DIFFERENT namespace names a process running
+    inside a bwrap sandbox right now that happens to occupy that pid number
+    -- a coincidence path, not the general phantom-heartbeat case.
+
+    Corrected (Loki 0E7F0C89 W2): the fleet_health phantom pids seen
+    2026-09-27 (3, 4, 6, 9, 12, 20, 35, 128) are NOT caught by this check.
+    They are host kernel threads living in the HOST's own pid namespace
+    (`/proc/<pid>/ns/pid` for a kthread is single-level, same as ours), so
+    this function correctly returns False for them. What actually retires
+    those phantoms is the pre-existing starttime check in `_classify`
+    (gap c400089095c7): a kthread's starttime is near-zero, which never
+    matches the real worker's recorded starttime. This function only
+    catches the narrower case where the recorded pid number is, right now,
+    genuinely held by a process inside a nested (sandboxed) pid namespace.
+    Fails open (False) when either namespace cannot be read, so the
+    existing liveness/starttime checks still apply.
     """
     own = _pid_namespace(os.getpid())
     other = _pid_namespace(pid)
