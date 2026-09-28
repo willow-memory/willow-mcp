@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* lease_request desk verb; requested_by only from a verified, per-call-scoped credential ([d7dfc86](https://github.com/willow-memory/willow-mcp/commit/d7dfc866f9b51ca41d696f4f5cfbcae9b30d8efd))
 * lease_request desk verb; requested_by only from a verified, per-call-scoped credential ([d0a6802](https://github.com/willow-memory/willow-mcp/commit/d0a680248bf9bac2b8ecc2a435003a45c7e328d2))
 
 ## [2.85.0](https://github.com/willow-memory/willow-mcp/compare/v2.84.1...v2.85.0) (2026-09-28)
