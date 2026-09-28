@@ -31,6 +31,24 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.89.0](https://github.com/willow-memory/willow-mcp/compare/v2.88.0...v2.89.0) (2026-09-28)
+
+
+### Added
+
+* **reloader:** the operator's merge into master is the restart confirm ([3e3e4b9](https://github.com/willow-memory/willow-mcp/commit/3e3e4b9bab1200c319cd7fa3604241dd0687af72))
+* **constitutional:** sealed-amendment path for syscall-table row modifications ([e09146c](https://github.com/willow-memory/willow-mcp/commit/e09146c3242439e1f1afa421a16695c33d77ab04))
+
+
+### Fixed
+
+* **reloader:** pin ruling text hash, fix L1 dedup, resolve F4 (Loki PASS 0D8EA229) ([386a6de](https://github.com/willow-memory/willow-mcp/commit/386a6de7002adf6dbedf19aa838bbca529c8af2d))
+* **constitutional:** tighten the amend-line parser, adopt Loki's isolation tests, fail-closed Store(), fix docstrings ([0912c8f](https://github.com/willow-memory/willow-mcp/commit/0912c8f34f9d1b8417c60ef0952630a8324cd311))
+* **reloader:** rework merge-is-confirm takeover path after Loki REVISE F0C19708 ([650e76d](https://github.com/willow-memory/willow-mcp/commit/650e76d90d9fbd22beafd63b2aced145b3d9b1af))
+* **reloader:** name the held who-may-merge gap with a TODO(ruling) ([ed8df5c](https://github.com/willow-memory/willow-mcp/commit/ed8df5cb3547fd809bbcd1c4a608c618f8e43791))
+* **reloader:** rework merge-is-confirm after Loki FAIL 40F02AAD ([f84eb96](https://github.com/willow-memory/willow-mcp/commit/f84eb96975deb9966a2331239f1f57e12332fb60))
+* **constitutional:** bind the sealed-amendment authority to the sealed text ([85da8fb](https://github.com/willow-memory/willow-mcp/commit/85da8fb1b1d88289576adac453c984585f193b65))
+
 ## [2.88.0](https://github.com/willow-memory/willow-mcp/compare/v2.87.0...v2.88.0) (2026-09-28)
 
 
