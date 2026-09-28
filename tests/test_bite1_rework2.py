@@ -258,8 +258,18 @@ def test_handoff_lock_is_in_packet_file_names(home):
 
 
 def test_withdraw_race_against_accept_never_torn(home):
+    """N5B (Loki ADC80409) rework: the old version of this test only
+    checked the FINAL status landed in {working, withdrawn} -- it never
+    checked the two callers' own return values agreed with that final
+    status, so a torn outcome (e.g. the packet ends up "withdrawn" while
+    a session record still shows it bound "working" to a packet nobody
+    told was gone) would have passed silently. Both withdraw and accept
+    now decide under packet_lock (dispatch.py), so the race resolves to
+    exactly one of two internally consistent end states -- assert which
+    one, and that it is consistent, not just that the status string is
+    one of two values."""
     did = _send(runner="seat")
-    outcomes = []
+    outcomes = {}
     lock = threading.Lock()
     barrier = threading.Barrier(2)
 
@@ -267,13 +277,13 @@ def test_withdraw_race_against_accept_never_torn(home):
         barrier.wait()
         r = ds.dispatch_accept(did, "loki", "s-accept")
         with lock:
-            outcomes.append(("accept", r))
+            outcomes["accept"] = r
 
     def do_withdraw():
         barrier.wait()
         r = ds.dispatch_withdraw(did, "no longer needed", by_app="willow")
         with lock:
-            outcomes.append(("withdraw", r))
+            outcomes["withdraw"] = r
 
     t1 = threading.Thread(target=do_accept)
     t2 = threading.Thread(target=do_withdraw)
@@ -283,12 +293,25 @@ def test_withdraw_race_against_accept_never_torn(home):
     t2.join(timeout=10)
 
     final = ds.dispatch_read(did)["status"]["status"]
-    assert final in ("working", "withdrawn")
-    for kind, r in outcomes:
-        if kind == "accept" and r.get("error"):
-            assert r["error"] in ("invalid_transition",)
-        if kind == "withdraw" and r.get("error"):
-            assert r["error"] in ("already", "invalid_transition")
+    accept_r, withdraw_r = outcomes["accept"], outcomes["withdraw"]
+    bound = ds._sessions_bound_to("loki", did)
+
+    if final == "working":
+        # accept won the lock first: withdraw must have seen the bound
+        # session and refused EBUSY -- a working packet bound to a
+        # session is never withdrawn.
+        assert not accept_r.get("error"), accept_r
+        assert withdraw_r.get("error") == "EBUSY", withdraw_r
+        assert any(r.get("session_id") == "s-accept" for r in bound), bound
+    elif final == "withdrawn":
+        # withdraw won the lock first: accept must have seen the packet
+        # already withdrawn and refused invalid_transition -- no session
+        # is left bound to a withdrawn packet.
+        assert not withdraw_r.get("error"), withdraw_r
+        assert accept_r.get("error") == "invalid_transition", accept_r
+        assert not bound, bound
+    else:
+        pytest.fail(f"torn/unexpected final status: {final}")
 
 
 def test_verify_handoff_and_agent_clear_still_work_after_locking_change(home):

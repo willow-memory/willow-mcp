@@ -381,7 +381,7 @@ _REQUIRED_META_FIELDS = ("dispatch_id", "from_app", "to_app")
 # symlinked packet dir or member file closes that disclosure path; it does
 # not (and cannot, same-uid) stop the packet from being forged in the first
 # place -- see _meta_is_well_formed's own docstring for that residual.
-PACKET_FILE_NAMES = ("meta.json", "assignment.md", "status.json", "handoff.json", "closeout.md", "refused", ".handoff.lock")
+PACKET_FILE_NAMES = ("meta.json", "assignment.md", "status.json", "handoff.json", "closeout.md", "refused", ".handoff.lock", "history")
 
 
 def packet_symlink_refused(root: Path) -> bool:
@@ -800,8 +800,14 @@ def _archive_prior_handoff(dispatch_id: str) -> None:
     if not handoff_path.exists():
         return
     ts = _utc_now().replace(":", "").replace("-", "")
-    hist_dir = root / "history" / ts
-    hist_dir.mkdir(parents=True, exist_ok=True)
+    # F3B (Loki ADC80409): _utc_now() has one-second granularity; exist_ok
+    # plus os.replace let three re-accepts in the same wall-clock second
+    # overwrite each other's archive. A random token makes the directory
+    # name unique regardless of timing, same discipline as the sidecar
+    # filenames in _write_refused_sidecar.
+    token = uuid.uuid4().hex[:8]
+    hist_dir = root / "history" / f"{ts}-{token}"
+    hist_dir.mkdir(parents=True, exist_ok=False)
     import os as _os
     _os.replace(handoff_path, hist_dir / "handoff.json")
     closeout_path = root / "closeout.md"
@@ -1179,6 +1185,29 @@ def session_enter(
         else:
             pkt = accept_result
     elif session_id:
+        # N1B (Loki ADC80409): the runner check dispatch_accept enforces on
+        # a FRESH accept (below, cur == "pending") was never enforced on
+        # RE-ENTRY into an already-working packet -- a listener could
+        # dispatch_accept a seat packet with an empty session_id (the
+        # tool's own default), then re-enter here with runner="ratatosk"
+        # and pick up the full assignment, held_by_other_session=False,
+        # reachable by a late/redelivered/backlogged WAKE. Same refusal
+        # shape as dispatch_accept's: no bind, no status change.
+        pkt_runner = (pkt["meta"].get("runner") or "seat").strip().lower()
+        caller_runner = (runner or "seat").strip().lower()
+        if pkt_runner != caller_runner:
+            return {
+                "entry_mode": "dispatch",
+                "error": "ERUNNER",
+                "dispatch_id": did,
+                "expected": pkt_runner,
+                "got": caller_runner,
+                "message": (
+                    f"packet {did!r} is runner={pkt_runner!r}; caller "
+                    f"passed runner={caller_runner!r} -- refused, no bind, "
+                    f"no status change"
+                ),
+            }
         # Re-entry into an already-accepted packet (specialist reconnecting
         # or continuing after a hop). Bite 1 (dispatch 9BA76253, rework of
         # 2E590F1B/262F89A1 F2): a re-entry is only ever a continuation of
@@ -1331,14 +1360,24 @@ def agent_clear(target_app: str, dispatch_id: str, session_id: str = "") -> dict
     pkt = dispatch_read(dispatch_id)
     if pkt.get("error"):
         return pkt
-    st = pkt.get("status", {}).get("status")
-    if st not in ("complete", "verified"):
-        return {"error": "not_ready_for_clear", "status": st}
-    dispatch_set_status(
-        dispatch_id,
-        "cleared",
-        cleared_at=_utc_now(),
-    )
+    root = dispatch_dir(dispatch_id)
+    # N5C (Loki ADC80409): same stale-read-before-lock hazard as withdraw
+    # (N5B) -- re-read status under packet_lock so a concurrent write
+    # (e.g. the packet going to "failed") can't be clobbered by a clear
+    # decided against a status read before this caller won the lock.
+    with packet_lock(root):
+        pkt = dispatch_read(dispatch_id)
+        if pkt.get("error"):
+            return pkt
+        st = pkt.get("status", {}).get("status")
+        if st not in ("complete", "verified"):
+            return {"error": "not_ready_for_clear", "status": st}
+        dispatch_set_status(
+            dispatch_id,
+            "cleared",
+            cleared_at=_utc_now(),
+            already_locked=True,
+        )
     if session_id:
         session_bind(target_app, session_id, "", "idle")
     return {"dispatch_id": dispatch_id, "target_app": target_app, "status": "cleared"}
@@ -1401,52 +1440,64 @@ def dispatch_withdraw(
     if pkt.get("error"):
         return pkt
     did = pkt["meta"].get("dispatch_id") or dispatch_id.upper()
-    cur = pkt.get("status", {}).get("status", "pending")
-    if cur == "withdrawn":
-        return {"error": "already", "dispatch_id": did, "status": cur}
-    forced_over: list[str] = []
-    if cur == "working":
-        bound = _sessions_bound_to(pkt["meta"].get("to_app", ""), did)
-        if bound:
-            session_ids = [str(r.get("session_id")) for r in bound]
-            if force and is_orchestrator_app(by_app):
-                forced_over = session_ids
-            else:
-                to_app = pkt["meta"].get("to_app")
-                return {
-                    "error": "EBUSY",
-                    "dispatch_id": did,
-                    "status": cur,
-                    "sessions": session_ids,
-                    "reconcile": [
-                        {"tool": "session_reconcile", "app_id": to_app, "session_id": s}
-                        for s in session_ids
-                    ],
-                    "message": (
-                        f"{to_app} session(s) {', '.join(session_ids)} still bound "
-                        "to this packet as working; liveness beyond the session "
-                        "record cannot be known here. Wait for the handoff, "
-                        f"reconcile the session(s) (session_reconcile(app_id={to_app!r}, "
-                        "session_id=<id>, ...)), or — orchestrator only, for a seat "
-                        "that is gone — withdraw with force=True; the forced-over "
-                        "sessions are recorded on the packet and in FRANK."
-                    ),
-                }
-    elif cur != "pending":
-        return {"error": "invalid_transition", "from": cur, "to": "withdrawn",
-                "dispatch_id": did}
-    extra: dict[str, Any] = {}
-    if forced_over:
-        extra["forced_over_sessions"] = forced_over
-    dispatch_set_status(
-        did, "withdrawn",
-        withdrawn_at=_utc_now(),
-        withdrawn_by=by_app,
-        withdraw_reason=reason.strip(),
-        **extra,
-    )
-    out = {"dispatch_id": did, "previous": cur, "status": "withdrawn",
-           "to_app": pkt["meta"].get("to_app"), "reason": reason.strip()}
-    if forced_over:
-        out["forced_over_sessions"] = forced_over
-    return out
+    root = dispatch_dir(did)
+    # N5B (Loki ADC80409): the decision (read status, check EBUSY) used to
+    # be made BEFORE acquiring packet_lock -- a concurrent dispatch_accept
+    # or handoff_write_v4 could land between this read and the write below,
+    # so withdraw's own "pending"/EBUSY read went stale and it overwrote a
+    # packet that had since become working and session-bound. Re-read
+    # under the lock, same discipline dispatch_accept/handoff_write_v4 use.
+    with packet_lock(root):
+        pkt = dispatch_read(did)
+        if pkt.get("error"):
+            return pkt
+        cur = pkt.get("status", {}).get("status", "pending")
+        if cur == "withdrawn":
+            return {"error": "already", "dispatch_id": did, "status": cur}
+        forced_over: list[str] = []
+        if cur == "working":
+            bound = _sessions_bound_to(pkt["meta"].get("to_app", ""), did)
+            if bound:
+                session_ids = [str(r.get("session_id")) for r in bound]
+                if force and is_orchestrator_app(by_app):
+                    forced_over = session_ids
+                else:
+                    to_app = pkt["meta"].get("to_app")
+                    return {
+                        "error": "EBUSY",
+                        "dispatch_id": did,
+                        "status": cur,
+                        "sessions": session_ids,
+                        "reconcile": [
+                            {"tool": "session_reconcile", "app_id": to_app, "session_id": s}
+                            for s in session_ids
+                        ],
+                        "message": (
+                            f"{to_app} session(s) {', '.join(session_ids)} still bound "
+                            "to this packet as working; liveness beyond the session "
+                            "record cannot be known here. Wait for the handoff, "
+                            f"reconcile the session(s) (session_reconcile(app_id={to_app!r}, "
+                            "session_id=<id>, ...)), or — orchestrator only, for a seat "
+                            "that is gone — withdraw with force=True; the forced-over "
+                            "sessions are recorded on the packet and in FRANK."
+                        ),
+                    }
+        elif cur != "pending":
+            return {"error": "invalid_transition", "from": cur, "to": "withdrawn",
+                    "dispatch_id": did}
+        extra: dict[str, Any] = {}
+        if forced_over:
+            extra["forced_over_sessions"] = forced_over
+        dispatch_set_status(
+            did, "withdrawn",
+            withdrawn_at=_utc_now(),
+            withdrawn_by=by_app,
+            withdraw_reason=reason.strip(),
+            already_locked=True,
+            **extra,
+        )
+        out = {"dispatch_id": did, "previous": cur, "status": "withdrawn",
+               "to_app": pkt["meta"].get("to_app"), "reason": reason.strip()}
+        if forced_over:
+            out["forced_over_sessions"] = forced_over
+        return out

@@ -1132,30 +1132,66 @@ def _current_orchestrator_session() -> str:
         return _orchestrator_session_id
 
 
-# ── Current specialist session, per app_id (N2, dispatch 1AD03A64) ──────────
-# The in-process analogue of `_set_orchestrator_session` above, for a
-# specialist app_id. Same in-process/single-connection assumption -- one
-# willow-mcp process serves one specialist app_id at a time (stdio: one
-# process per seat; serve: one bound identity per connection) -- so "the
-# session bound at session_enter for THIS connection" is exactly the last
-# one recorded here for this app_id. handoff_write_v4 reads this back when
-# a caller omits session_id (Loki 10A39E21 N2: the skill doc's own example
-# omitted it, and no seat doc told callers to pass it).
+# ── Current specialist session, per (app_id, dispatch_id) (D1, Loki ADC80409) ─
+# Rework of N2 (dispatch 1AD03A64): that comment claimed "one willow-mcp
+# process serves one specialist app_id at a time (stdio: one process per
+# seat; serve: one bound identity per connection)" -- FALSE. A Claude Code
+# desk's subagents (parallel Hanumans/Lokis) share their parent's single
+# stdio willow-mcp child, and the shared `serve` process (:8768) is one
+# process for every remote connection -- this dict is not keyed per
+# connection at all, it is a plain process global. A single app-id-keyed
+# slot let one session's held (refused) entry into packet P1 silently
+# rebind what an UNRELATED session's omitted `handoff_write_v4` call for
+# packet P2 resolved to (Loki ADC80409 S1/S2/S3): a bare "last write wins"
+# guess is unsafe wherever two sessions of one app_id can be live in the
+# same process, which is always, not "single-operator" as N2 assumed.
+#
+# Fix: refuse to guess instead of guessing wrong. Scoped per (app_id,
+# dispatch_id) -- not per app_id alone -- so two sessions of the same
+# app_id working two different packets never contaminate each other's
+# resolution (S1). Every session_enter call for a dispatch is recorded as
+# a distinct entrant, HELD ones included (S3: a held/refused entrant still
+# counts) -- an omitted session_id at handoff_write_v4 resolves ONLY when
+# exactly one distinct session has ever entered that (app_id, dispatch_id)
+# pair in this process; the moment a second, different session has ever
+# touched it (even just to be told "held"), the ambiguity is permanent for
+# that dispatch and every future omitted call is refused ESESSION rather
+# than guessed (S2: this is what stops a held entrant's own later omitted
+# close from being silently attributed to the session that actually
+# accepted the packet). The accepting session always keeps its own
+# explicit-session_id escape hatch -- passing the id it was given by
+# session_enter/dispatch_accept never depends on this resolver at all.
 
 _specialist_session_lock = threading.Lock()
 _specialist_sessions: dict[str, str] = {}
+_specialist_entrants: dict[str, set] = {}
 
 
-def _set_specialist_session(app_id: str, session_id: str) -> None:
+def _specialist_key(app_id: str, dispatch_id: str = "") -> str:
+    return f"{(app_id or '').strip().lower()}\x00{(dispatch_id or '').strip().upper()}"
+
+
+def _set_specialist_session(app_id: str, session_id: str, dispatch_id: str = "") -> None:
+    """Record `session_id` as having entered (app_id, dispatch_id) -- every
+    call, held or not (D1: held entries must count towards ambiguity, see
+    the module comment above)."""
     if not app_id or not session_id:
         return
+    key = _specialist_key(app_id, dispatch_id)
     with _specialist_session_lock:
-        _specialist_sessions[app_id.strip().lower()] = session_id
+        _specialist_entrants.setdefault(key, set()).add(session_id)
+        _specialist_sessions[key] = session_id
 
 
-def _current_specialist_session(app_id: str) -> str:
+def _current_specialist_session(app_id: str, dispatch_id: str = "") -> str:
+    """Resolve an omitted session_id for (app_id, dispatch_id) -- "" (refuse
+    to guess) unless exactly one distinct session has ever entered it."""
+    key = _specialist_key(app_id, dispatch_id)
     with _specialist_session_lock:
-        return _specialist_sessions.get((app_id or "").strip().lower(), "")
+        entrants = _specialist_entrants.get(key) or set()
+        if len(entrants) != 1:
+            return ""
+        return _specialist_sessions.get(key, "")
 
 
 # ── Rate limiter (Phase 4b) ──────────────────────────────────────────────────
@@ -5073,6 +5109,14 @@ def dispatch_read(app_id: str, dispatch_id: str) -> dict:
         return grant
     if grant.get("via"):
         pkt = {**pkt, **grant}
+    # N3 (Loki ADC80409): accepted_session_id is a bearer value the
+    # handoff_write_v4 ESESSION check compares against -- withhold it here
+    # from anyone but the packet's own to_app (the only party that could
+    # legitimately hold it). The orchestrator, a citation-grant reader, or
+    # any other party reads the packet without it.
+    to_app = (pkt.get("meta", {}).get("to_app") or "").strip().lower()
+    if (app_id or "").strip().lower() != to_app and pkt.get("status", {}).get("accepted_session_id"):
+        pkt = {**pkt, "status": {k: v for k, v in pkt["status"].items() if k != "accepted_session_id"}}
     return pkt
 
 
@@ -5208,7 +5252,7 @@ def handoff_write_v4(
     # N2 (dispatch 1AD03A64): an omitted session_id is resolved from this
     # connection's own session_enter binding before the ESESSION check
     # ever sees it -- see `_current_specialist_session`.
-    resolved_session_id = session_id or _current_specialist_session(app_id)
+    resolved_session_id = session_id or _current_specialist_session(app_id, dispatch_id)
     return handoff_stack.handoff_write_v4(
         app_id,
         dispatch_id,
@@ -5421,7 +5465,7 @@ def session_enter(
         # N2 (dispatch 1AD03A64): record this connection's session so a
         # seat that omits `session_id` on handoff_write_v4 can still be
         # resolved from context.
-        _set_specialist_session(app_id, session_id)
+        _set_specialist_session(app_id, session_id, dispatch_id)
 
     from . import gate
 
