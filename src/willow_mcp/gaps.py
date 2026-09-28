@@ -21,9 +21,12 @@ so "promoted" always means "an actual knowledge atom exists for this."
 
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from .db import Store, decode_cursor, encode_cursor
@@ -356,3 +359,426 @@ def mark_promoted(gap_id: str, knowledge_id: str) -> None:
     record["status"] = "promoted"
     record["promoted_to"] = knowledge_id
     _store.update(_COLLECTION, gap_id, record)
+
+
+# ── gap_touching (B1 of docs/design/gaps-in-soil.md, §4.2) ────────────────────
+#
+# Read-time only: no edge store, no migration. Every open/resolved gap is
+# scanned at call time with the same regexes the design's linker (B2) will
+# later persist as `names_file`/`names_symbol` edges. Three tiers, in order:
+#   1. exact  — a path from `paths` appears verbatim in the gap's own text
+#      (or the text names a file under a directory prefix, when a `paths`
+#      entry ends in "/").
+#   2. symbol — an identifier in the gap's text resolves to EXACTLY ONE
+#      symbol in the per-project code_graph DB, and that symbol's file is
+#      one of `paths`.
+#   3. project+stem (weaker, capped at 5) — the gap's topic pins `project`,
+#      and a token of one of the `paths`' basenames (split on "/ . - _")
+#      is among the gap's own tokenizer output. This is the only tier that
+#      finds 07aa99036f09 (topic `ratatosk/listener-home-pin-tests-and-
+#      crown-mcp-guard`, no file path in its text at all).
+
+#: Path-looking substrings inside gap text: the same shape the design's
+#: `names_file` linker will use (§2) — a repo-relative path (one or more
+#: "/"-separated segments) or a bare `name.ext` (zero segments), unified
+#: into one pattern. Loki A4836541 L1c: each segment is length-bounded
+#: ({1,80}) and the whole thing is \b-anchored, so a long unbroken
+#: `[\w.-]`-run backtracks at most O(80) per starting offset instead of
+#: O(run-length) — re.finditer's per-position restart stays linear in the
+#: text length rather than quadratic.
+_PATH_EXTS = r"py|js|ts|md|json|sh|toml|ya?ml|sql|service|template"
+_PATH_SEG = r"[\w.-]{1,80}"
+_PATH_RE = re.compile(
+    rf"\b{_PATH_SEG}(?:/{_PATH_SEG}){{0,10}}\.(?:{_PATH_EXTS})(?::\d+)?\b"
+)
+
+#: Identifier-looking substrings: backticked names, `name()` calls,
+#: snake_case (>=4 chars), or CamelCase with at least two humps — the same
+#: shape the design's `names_symbol` linker will use (§2). Length-bounded
+#: per group for the same backtracking reason as `_PATH_RE`.
+_IDENT_RE = re.compile(
+    r"`([A-Za-z_][A-Za-z0-9_.]{3,40})`"
+    r"|\b([A-Za-z_][A-Za-z0-9_]{3,40})\(\)"
+    r"|\b([a-z][a-z0-9]{0,40}_[a-z0-9_]{2,40})\b"
+    r"|\b([A-Z][a-z0-9]{1,40}(?:[A-Z][a-z0-9]{1,40}){1,10})\b"
+)
+
+#: §4 bounds (gap 1477ebb2bc35's row cap, applied here too): at most 25 rows.
+MAX_TOUCHING_ROWS = 25
+
+#: Tier 3 is the weak one — capped tighter than the page itself (§4.2).
+MAX_TOUCHING_TIER3_ROWS = 5
+
+#: The 16 KB serialized-page ceiling §4 requires alongside the row cap — a
+#: row cap alone under-bounds a page of large `question` text (same reasoning
+#: as MAX_LIST_LIMIT_FULL above).
+MAX_TOUCHING_BYTES = 16 * 1024
+
+#: Loki A4836541 B2: tier 2's hard budget. Both bounds are checked before
+#: EVERY unique-identifier lookup (not per row — see `_resolve_tier2_matches`),
+#: so the worst case is bounded regardless of backlog size or graph size.
+#: 500 indexed lookups is generous headroom over any real backlog observed
+#: (B9F28JGJ's 20k-symbol graph needed 1185 lookups to time out at ~50ms
+#: each under the OLD unindexed LOWER() scan; indexed lookups cost close to
+#: 0 by comparison) while still being a real, enforced ceiling.
+MAX_TIER2_LOOKUPS = 500
+MAX_TIER2_SECONDS = 2.0
+
+
+def _gap_text(row: dict[str, Any]) -> str:
+    return f"{row.get('topic', '')} {row.get('question', '')}"
+
+
+def _extract_paths(text: str) -> list[str]:
+    out = []
+    for m in _PATH_RE.finditer(text or ""):
+        out.append(re.sub(r":\d+$", "", m.group(0)))
+    return out
+
+
+def paths_in_text(text: str) -> list[str]:
+    """Public wrapper over `_extract_paths` for callers outside this module
+    (`dispatch_send`, `session_enter`) that need to turn an assignment's
+    free text into the `paths` `touching()` takes — same regex, so a path
+    dispatch_send finds is exactly what a later `touching()` call on it
+    would find too. Order-preserving, de-duplicated."""
+    seen: list[str] = []
+    for p in _extract_paths(text):
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+def _extract_identifiers(text: str) -> list[str]:
+    out = []
+    for m in _IDENT_RE.finditer(text or ""):
+        ident = next((g for g in m.groups() if g), None)
+        if ident:
+            out.append(ident)
+    return out
+
+
+def _basename_stems(paths: list[str]) -> set[str]:
+    stems: set[str] = set()
+    for p in paths:
+        base = p.rstrip("/").rsplit("/", 1)[-1]
+        for tok in re.split(r"[./\-_]", base):
+            if tok:
+                stems.add(tok.lower())
+    return stems
+
+
+def _project_root(project: str) -> Optional[Path]:
+    """The registered checkout root for `project`, or None — never raises.
+    Loki A4836541 M2: used ONLY to verify a flat-DB tier-2 match actually
+    lives in the caller's own project before it is trusted; a per-project
+    DB needs no such check (it is already scoped)."""
+    if not project:
+        return None
+    try:
+        from . import mcp_projects
+
+        reg = mcp_projects.load_registry()
+        entry = (reg.get("projects") or {}).get(project)
+        if not entry:
+            return None
+        return mcp_projects.project_paths(project, entry)["root"]
+    except Exception:
+        return None
+
+
+def _code_graph_db_for(project: str) -> tuple[Optional[Path], str]:
+    """Resolve the per-project code_graph DB path (design §0.2: the graph
+    schema has no repo column, so the deterministic path is one DB per
+    project). Today's code_graph_index only ever writes the flat
+    `$WILLOW_HOME/code_graph/graph.db` (server.py's `_code_graph_db`), so a
+    per-project `$WILLOW_HOME/code_graph/<project>/graph.db` is checked
+    first (forward-compatible with B2's linker, which will need to start
+    writing one DB per project) and the flat path is the fallback.
+
+    Returns `(path, source)` where `source` is `"per_project"`, `"flat"`,
+    or `"none"` — the caller (Loki A4836541 M2) uses `source` to decide
+    whether a match needs cross-repo verification: a flat-DB match is
+    unscoped and must be checked against the caller's own project
+    checkout before it is trusted; a per-project DB is already scoped and
+    needs no such check."""
+    from . import paths as _paths
+
+    home = _paths.willow_home()
+    if project:
+        per_project = home / "code_graph" / project / "graph.db"
+        if per_project.is_file():
+            return per_project, "per_project"
+    flat = home / "code_graph" / "graph.db"
+    if flat.is_file():
+        return flat, "flat"
+    return None, "none"
+
+
+def _ordered_unique_identifiers(live: list[dict[str, Any]]) -> list[str]:
+    """Loki 28B97C69 M4: a deterministic identifier order, independent of
+    PYTHONHASHSEED. The live backlog carries more unique identifiers than
+    the tier-2 budget, so WHICH ones get resolved (and therefore which
+    gaps get labelled) must not depend on Python's per-process string-hash
+    salt — the same input has to yield the same output every run. Rows are
+    sorted by `last_asked_at` descending (most recently asked first, ties
+    broken by id for a total order) rather than relying on `_store.all`'s
+    own row order; identifiers are then taken in each row's own extraction
+    order, first-seen-wins, using a list + a `seen` set rather than a bare
+    `set()` for the return value itself."""
+    ordered_rows = sorted(
+        live,
+        key=lambda r: (str(r.get("last_asked_at") or ""), str(r.get("_id") or "")),
+        reverse=True,
+    )
+    seen: set[str] = set()
+    result: list[str] = []
+    for row in ordered_rows:
+        for ident in _extract_identifiers(_gap_text(row)):
+            if ident not in seen:
+                seen.add(ident)
+                result.append(ident)
+    return result
+
+
+def _defines_symbol(file_path: Path, name: str) -> bool:
+    """Loki 28B97C69 Q4/fold-in: a weak stand-in for "the file's content
+    hash matches" (the flat code_graph DB stores neither a project/root
+    column nor a content hash to compare against — see `_code_graph_db_for`
+    ). Re-reads the file AS FOUND IN THE CALLER'S OWN CHECKOUT and checks
+    that it actually defines `name` (a `def`/`class` at that name) rather
+    than trusting the flat DB's stale (file_path, name) pairing blindly.
+    This is exactly what catches Q4's willow-bot `_guarded_home` row
+    resolving against willow-mcp's own `tests/conftest.py`, which never
+    defines it: the file exists (M2's first check passes) but does not
+    define the symbol (this check fails), so the match is dropped.
+    Never raises — an unreadable file is "cannot determine", so it drops
+    the match rather than trusting it."""
+    try:
+        text = file_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    pattern = re.compile(rf"\b(?:def|class)\s+{re.escape(name)}\b")
+    return bool(pattern.search(text))
+
+
+def _resolve_tier2_matches(
+    db_path: Path, identifiers: list[str], project: str, db_source: str,
+) -> tuple[dict[str, list[str]], str]:
+    """Loki A4836541 B2: ONE connection for the whole call, ONE indexed
+    lookup per UNIQUE identifier across the entire backlog (never per row —
+    the old code ran rows × identifiers_per_row fresh-connection LOWER()
+    full scans, which is how a 20k-symbol graph exceeded 60s). `name = ?`
+    (no `LOWER()`) so `idx_symbols_name` is used. Bounded by both a lookup
+    count and a wall-clock budget, checked before every lookup, so the
+    worst case is bounded regardless of the backlog or the graph's size.
+
+    M2 (tightened per Loki 28B97C69 Q4): a flat-DB match is trusted only
+    if the symbol's defining file exists in the caller's own project
+    checkout (`_project_root`) AND that file actually defines the symbol
+    there (`_defines_symbol`, a stand-in for a content-hash match the
+    schema has no column to check directly) — a flat DB carries no repo
+    column, so mere path existence let a symbol from one repo (e.g.
+    willow-bot's `_guarded_home` in its own `tests/conftest.py`) get
+    labelled tier 2 for a different repo's file of the same relative path
+    that never defines it. If either signal cannot be determined (no
+    project root, unreadable file), the match is dropped, never trusted.
+
+    Returns `(identifier -> [file_path, ...], health)`, health one of
+    `"indexed"` (every identifier resolved within budget), `"unreachable"`
+    (the DB raised on open or on a query), or `"budget_exhausted"`
+    (stopped early; the returned map is a genuine partial result, not a
+    failure — every identifier resolved before the budget ran out is
+    trustworthy)."""
+    import time
+
+    matches: dict[str, list[str]] = {}
+    root = _project_root(project) if db_source == "flat" else None
+    start = time.monotonic()
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error:
+        return {}, "unreachable"
+    try:
+        count = 0
+        for ident in identifiers:
+            if count >= MAX_TIER2_LOOKUPS or (time.monotonic() - start) > MAX_TIER2_SECONDS:
+                return matches, "budget_exhausted"
+            count += 1
+            try:
+                rows = conn.execute(
+                    "SELECT DISTINCT file_path FROM symbols WHERE name = ?",
+                    (ident,),
+                ).fetchall()
+            except sqlite3.Error:
+                return matches, "unreachable"
+            files = [r[0] for r in rows]
+            if db_source == "flat" and files:
+                files = [
+                    f for f in files
+                    if root is not None
+                    and (root / f).is_file()
+                    and _defines_symbol(root / f, ident)
+                ]
+            matches[ident] = files
+    finally:
+        conn.close()
+    return matches, "indexed"
+
+
+def touching(
+    paths: Optional[list[str]],
+    project: str = "",
+    limit: int = MAX_TOUCHING_ROWS,
+) -> dict[str, Any]:
+    """§4.2: open/resolved gaps whose text touches any of `paths` — a
+    dispatch's or a diff's file list — in three labelled tiers (see the
+    module comment above `_PATH_RE`). `promoted` gaps are never returned
+    (their knowledge atom is the closure, not another surfacing).
+
+    Three-state on every call (INVARIANTS §1): `state` is one of
+    `"populated"`, `"empty"`, or `"unreachable"`. A `Store.all` failure is
+    reported as `unreachable` with its `reason` and an empty `items` — it
+    is NEVER folded into the same shape an honestly-empty backlog returns,
+    which is the exact bug this design calls out in `boot_context._gap_lines`
+    (left for B7, see docs/design/gaps-in-soil.md §7).
+
+    `tier2_health` reports the CODE GRAPH's own state separately (Loki
+    A4836541 M1) rather than folding a missing/unreachable/exhausted graph
+    into the same "empty" a truly-empty backlog returns: `"not_attempted"`
+    (the store read itself failed, or there was nothing to scan),
+    `"unindexed"` (no code_graph DB found for `project`), `"indexed"`
+    (queried, within budget), `"unreachable"` (the DB raised), or
+    `"budget_exhausted"` (see `_resolve_tier2_matches`).
+
+    Bounded (§4): at most `MAX_TOUCHING_ROWS` (25) rows, tier 3 additionally
+    capped at `MAX_TOUCHING_TIER3_ROWS` (5) — `total` is counted BEFORE
+    that cap, so it still reflects every real match — and the serialized
+    page never exceeds `MAX_TOUCHING_BYTES` (16 KB). `truncated` is True
+    when the row cap, the byte ceiling, OR the tier-3 cap itself cut real
+    rows (Loki 28B97C69 NITS(a): a caller with few real tier-3 matches
+    still needs to know the cap dropped some, even when the page never
+    gets close to the row/byte bounds). There is no `cursor` parameter, so
+    a truncated page has no way to ask for the next one — `next_cursor`
+    was dropped rather than shipped as a promise this verb cannot keep.
+
+    Only a QUALIFIED path (containing "/") is eligible for tier 1's exact
+    match (Loki A4836541 M3): a bare `paths` entry like `tick.py` is
+    ambiguous across every repo that has one, so it contributes only to
+    tier 3's basename-stem set, never to "exact". Symmetrically, gap text
+    naming a bare filename for a qualified input path is caught the same
+    way, through tier 3 — not missed, and not mislabelled "exact" either.
+
+    Read-time only (B1): no edge store, no migration, no model anywhere in
+    the path — regex, a code_graph SQLite read, and set intersection.
+    """
+    try:
+        rows = _store.all(_COLLECTION)
+    except Exception as exc:
+        return {
+            "state": "unreachable",
+            "reason": f"{type(exc).__name__}: {exc}",
+            "items": [],
+            "truncated": False,
+            "total": 0,
+            "tier2_health": "not_attempted",
+        }
+
+    clean_paths = [p.strip() for p in (paths or []) if (p or "").strip()]
+    live = [r for r in rows if r.get("status") in ("open", "resolved")]
+
+    if not clean_paths or not live:
+        return {
+            "state": "empty", "items": [], "truncated": False, "total": 0,
+            "tier2_health": "not_attempted",
+        }
+
+    limit = max(1, min(int(limit or MAX_TOUCHING_ROWS), MAX_TOUCHING_ROWS))
+
+    # M3: only a qualified ("has a '/'") path is eligible for tier 1. A bare
+    # basename still feeds tier 3's stem set (via _basename_stems, below,
+    # which runs over every clean path regardless).
+    exact_paths = {p for p in clean_paths if "/" in p and not p.endswith("/")}
+    dir_prefixes = [p for p in clean_paths if p.endswith("/")]
+    basename_tokens = _basename_stems(clean_paths)
+
+    db_path, db_source = _code_graph_db_for(project)
+    tier2_matches: dict[str, list[str]] = {}
+    tier2_health = "unindexed"
+    if db_path is not None:
+        # M4: deterministic order (not a bare `set()`'s hash-randomized
+        # iteration) so which identifiers make it inside the tier-2 budget
+        # -- and therefore which gaps get labelled -- is stable run to run.
+        ordered_idents = _ordered_unique_identifiers(live)
+        if ordered_idents:
+            tier2_matches, tier2_health = _resolve_tier2_matches(
+                db_path, ordered_idents, project, db_source,
+            )
+        else:
+            tier2_health = "indexed"
+
+    tier1: list[tuple[dict, str]] = []
+    tier2: list[tuple[dict, str]] = []
+    tier3: list[tuple[dict, str]] = []
+
+    for row in live:
+        text = _gap_text(row)
+
+        why = None
+        for fp in _extract_paths(text):
+            if fp in exact_paths or any(fp.startswith(pfx) for pfx in dir_prefixes):
+                why = f"exact:{fp}"
+                break
+        if why:
+            tier1.append((row, why))
+            continue
+
+        if tier2_matches:
+            symbol_why = None
+            for ident in _extract_identifiers(text):
+                files = tier2_matches.get(ident) or []
+                if len(files) == 1 and files[0] in clean_paths:
+                    symbol_why = f"symbol:{ident}"
+                    break
+            if symbol_why:
+                tier2.append((row, symbol_why))
+                continue
+
+        if project:
+            topic = str(row.get("topic") or "")
+            topic_head = topic.split("/", 1)[0]
+            if topic_head == project:
+                hit = sorted(set(_tokens(text)) & basename_tokens)
+                if hit:
+                    tier3.append((row, f"project+stem:{hit[0]}"))
+
+    total = len(tier1) + len(tier2) + len(tier3)  # before the tier-3 cap (L1a)
+    # NITS(a): the tier-3 cap itself is a truncation even when the row/byte
+    # loop below never has to cut anything -- a caller with a small `paths`
+    # list and >5 real tier-3 matches must not see truncated=False.
+    truncated = len(tier3) > MAX_TOUCHING_TIER3_ROWS
+    tier3 = tier3[:MAX_TOUCHING_TIER3_ROWS]
+    ordered = tier1 + tier2 + tier3
+
+    items: list[dict[str, Any]] = []
+    total_bytes = 0
+    for row, why in ordered:
+        if len(items) >= limit:
+            truncated = True
+            break
+        brief = _brief_view(row)
+        brief["why"] = why
+        row_bytes = len(json.dumps(brief, separators=(",", ":")).encode("utf-8"))
+        if items and total_bytes + row_bytes > MAX_TOUCHING_BYTES:
+            truncated = True
+            break
+        items.append(brief)
+        total_bytes += row_bytes
+
+    return {
+        "state": "populated" if items else "empty",
+        "items": items,
+        "truncated": truncated,
+        "total": total,
+        "tier2_health": tier2_health,
+    }

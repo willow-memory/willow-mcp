@@ -223,6 +223,8 @@ def dispatch_send(
     dispatch_id: str = "",
     from_verifier: str = "",
     from_session: str = "",
+    gaps_project: str = "",
+    gaps_paths: Optional[list[str]] = None,
 ) -> dict:
     """Create dispatch/{id}/ with meta, assignment, and status pending.
 
@@ -235,7 +237,15 @@ def dispatch_send(
     dropped as unattributed. Both empty (legacy call site, unattributed
     orchestrator, or specialist-to-specialist chain) keeps the pre-PR9
     behavior: no attribution rides the packet, the specialist's own gate
-    misses stay silent."""
+    misses stay silent.
+
+    ``gaps_project`` and ``gaps_paths`` (Loki 28B97C69 H1b) record the
+    project and paths server.dispatch_send's own gaps_touching computation
+    used AT SEND TIME. They ride the signed packet so session_enter can
+    recompute the recipient's gaps_touching block from what the packet
+    itself names, never from the specialist's own entering workspace --
+    a packet about `ratatosk` entered from `willows-grove` must not lose
+    its tier-3 match just because the specialist opened a different repo."""
     if not (assignment_md or "").strip():
         return {"error": "assignment_required"}
     if (from_app or "").strip().lower() == (to_app or "").strip().lower():
@@ -290,6 +300,11 @@ def dispatch_send(
         # forge an operator attribution.
         "from_verifier": (from_verifier or "").strip(),
         "from_session": (from_session or "").strip(),
+        # Loki 28B97C69 H1b: the send-time project/paths for gaps_touching,
+        # so session_enter reads the packet's own project rather than the
+        # specialist's entering workspace.
+        "gaps_project": (gaps_project or "").strip(),
+        "gaps_paths": list(gaps_paths or []),
     }
     # B-52/#241: sign every field above (HMAC-SHA256, runtime-held key --
     # dispatch_signing.py) so dispatch_read/dispatch_list can tell a packet
@@ -1013,6 +1028,14 @@ def session_enter(
         "closeout": closeout,
         "closeout_tools": [closeout["tool"]],
         "project": project_info,
+        # Loki 28B97C69 H1b: the packet's OWN gaps project/paths, recorded
+        # at send time -- server.session_enter reads these (falling back
+        # to the entering workspace's project / a fresh extraction from
+        # `assignment` for a packet sent before this shipped) rather than
+        # the specialist's entering workspace, which may be a different
+        # repo entirely from the one the assignment is about.
+        "gaps_project": pkt.get("meta", {}).get("gaps_project", ""),
+        "gaps_paths": pkt.get("meta", {}).get("gaps_paths", []),
         "status": pkt.get("status", {}).get("status"),
         **persona_context(app_id),
         **seed_context(app_id),

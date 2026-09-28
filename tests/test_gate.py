@@ -198,14 +198,19 @@ def test_collection_permitted_empty_scope_denies_all(apps_root):
 
 # ── gap backlog permission groups ────────────────────────────────────────────
 
-def test_gap_read_expands_to_gap_list_and_gap_get_only(apps_root):
+def test_gap_read_expands_to_gap_list_gap_get_and_gap_touching_only(apps_root):
     """Gap 1477ebb2bc35: gap_get is the id-lookup door the backlog was
     missing (store_get refuses `gaps` -- outside every seat's store_scope --
     and gap_list has no id lookup), added to the SAME read group as
-    gap_list rather than a new one."""
+    gap_list rather than a new one. gap_touching (docs/design/gaps-in-soil.md
+    B1) rides the same group for the same reason -- and Loki A4836541 B1
+    depends on this exact membership: a seat without gap_read must not
+    receive gap text through the dispatch_send/session_enter auto-attach
+    either."""
     _write_manifest(apps_root, "gap_reader", ["gap_read"])
     assert gate.permitted("gap_reader", "gap_list") is True
     assert gate.permitted("gap_reader", "gap_get") is True
+    assert gate.permitted("gap_reader", "gap_touching") is True
     assert gate.permitted("gap_reader", "gap_log") is False
     assert gate.permitted("gap_reader", "gap_promote") is False
 

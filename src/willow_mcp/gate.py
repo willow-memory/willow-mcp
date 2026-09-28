@@ -187,8 +187,11 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     # store_scope) and gap_list has no id lookup — rides the SAME read
     # group as gap_list rather than a new one; a specialist that can list
     # the backlog should be able to look up one entry from it by id.
+    # gap_touching (docs/design/gaps-in-soil.md B1, dispatch AC4E4457): a
+    # read-time view over the same backlog, same reasoning — no write
+    # surface, rides the read group.
     "gap_read": frozenset({
-        "gap_list", "gap_get",
+        "gap_list", "gap_get", "gap_touching",
     }),
     "gap_write": frozenset({
         "gap_log", "gap_resolve", "gap_delete",
@@ -587,7 +590,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # Self-audit
         "receipts_tail",
         # Gap backlog
-        "gap_log", "gap_list", "gap_get", "gap_resolve", "gap_delete",
+        "gap_log", "gap_list", "gap_get", "gap_touching", "gap_resolve", "gap_delete",
         "gap_purge_topic", "gap_promote", "gap_retopic",
         # Lineage / provenance ("story of this willow")
         "lineage_why", "lineage_list", "lineage_record", "lineage_link",
