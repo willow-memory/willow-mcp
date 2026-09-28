@@ -49,6 +49,27 @@ GOVERNANCE_COLLECTION = "projects_willow_governance_decisions"
 #: display/audit, not a verification artifact.
 _SIG_PREFIX_LEN = 16
 
+#: A governance record of this kind is owned end-to-end by
+#: ``net_authority.drain_leases``: that function reads the seal itself
+#: (``read_sealed_pair``) to decide sealedness and never consults this
+#: record's ``status`` field to find candidates — it filters on
+#: ``status == "proposed"`` directly. If this handler flipped a
+#: net-lease-request to ``status=sealed`` on the watcher's own schedule (as
+#: it does for every other governance kind), a lease sealed before the next
+#: drain tick would drop out of ``drain_leases``'s ``proposed`` filter and be
+#: silently never minted — the seal watcher and the drain tick would be
+#: racing over one field, and the watcher usually wins because it is driven
+#: by the ledger tail, not a poll interval (gap: net-lease-request minted by
+#: seal watcher race, Loki 8EB4478D B1). The narrower fix is here, not in
+#: drain_leases: nothing else in this codebase reads a net-lease-request
+#: record's ``status`` as ``sealed`` (unlike ``net-authorization-request``,
+#: whose ``drain`` also never checks it, but changing drain_leases as well
+#: would touch a working, differently-shaped consumer for no reason). So
+#: this handler leaves the record's status untouched for this one kind, and
+#: drain_leases keeps sole ownership of when a lease request stops being
+#: ``proposed``.
+_LEASE_REQUEST_KIND = "net-lease-request"
+
 
 def _nestor_db_path() -> Path:
     """Where Nestor's own SQLite ledger lives — ``nestor.db`` next to the
@@ -165,6 +186,10 @@ def on_seal(record: dict, *, store: Optional[Store] = None,
       "already"   — the matching record is already status=sealed — clean
                     idempotent no-op
       "upgraded"  — the matching record was upgraded to status=sealed
+      "lease_owned" — the matching record is a net-lease-request; its
+                    status is left untouched because net_authority's own
+                    drain_leases reads the seal directly and owns this
+                    record's status transitions (Loki 8EB4478D B1)
       "error"     — the store itself is broken; logged, never raised
 
     Never raises on a well-formed or malformed input record. The only path
@@ -210,6 +235,13 @@ def _on_seal(record: dict, *, store: Optional[Store], db_path: Optional[Path]) -
         return "unmatched"
 
     record_id, gov = match
+    if gov.get("kind") == _LEASE_REQUEST_KIND:
+        logger.info(
+            "seal_handler: pair_id=%s belongs to a net-lease-request "
+            "(governance record %s) — leaving status=%r for net_authority's "
+            "drain_leases to own", pair_id, record_id, gov.get("status"),
+        )
+        return "lease_owned"
     if gov.get("status") == "sealed":
         logger.info(
             "seal_handler: pair_id=%s already sealed on governance record "

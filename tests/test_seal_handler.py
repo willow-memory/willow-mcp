@@ -155,6 +155,23 @@ def test_nestor_db_missing_row_still_upgrades(store, tmp_path):
     assert "nestor_seal_sig_prefix" not in gov
 
 
+def test_net_lease_request_kind_is_left_for_drain_leases_to_own(store, tmp_path):
+    """B1 (Loki 8EB4478D): flipping a net-lease-request record's status to
+    'sealed' here would drop it out of `net_authority.drain_leases`'s own
+    `status == 'proposed'` filter, and nothing else ever reads this kind's
+    status as 'sealed' — `drain_leases` reads the seal itself."""
+    rid, _ = store.put(seal_handler.GOVERNANCE_COLLECTION,
+                       _gov_record(kind="net-lease-request"))
+    db_path = tmp_path / "nestor.db"
+    _make_nestor_db(db_path, pair_id="pair-001", seal_sig="f" * 64)
+
+    result = seal_handler.on_seal(_seal_record(), store=store, db_path=db_path)
+
+    assert result == "lease_owned"
+    gov = store.get(seal_handler.GOVERNANCE_COLLECTION, rid)
+    assert gov["status"] == "proposed"
+
+
 def test_broken_store_returns_error_not_raise(tmp_path):
     class ExplodingStore:
         def all(self, collection):

@@ -257,6 +257,94 @@ def test_expired_lease_still_blocks_when_manifest_carries_task_net(home, monkeyp
     assert found["scope"] == "egress"
 
 
+def test_fix_text_offers_lease_request_only_to_a_seat_holding_task_net(home, monkeypatch):
+    """Loki 8EB4478D Check 4 / L9: `lease_request` is gated on `task_net`
+    (`gate.NET_PERMISSION`), the same key `task_submit`'s `allow_net` path
+    checks — not on any of the broader egress kinds
+    `federation_tool_egress.seat_uses_net_egress` counts (web/integration/
+    federation). A seat holding only `integration_net` or a federated tool
+    permission cannot call `lease_request` and must not be told to."""
+    import willow_mcp.lease as lease
+
+    apps = home / "mcp_apps" / "utety"
+    apps.mkdir(parents=True)
+    (apps / "manifest.json").write_text(json.dumps({
+        "permissions": ["integration_net"],
+    }))
+    monkeypatch.setattr(lease, "read_lease", lambda a: {
+        "status": "expired", "expires_at": "2020-01-01T00:00:00+00:00",
+    })
+    found = blockers._check_lease("utety")
+    assert found is not None
+    assert "lease_request(" not in found["fix"]
+    assert "grant-net utety" in found["fix"]
+
+
+def test_fix_text_names_lease_request_when_the_seat_holds_task_net(home, monkeypatch):
+    """Both keys are required — task_net AND the lease_request tool
+    permission (net_lease_request) — same two-key shape task_submit's own
+    allow_net check uses."""
+    import willow_mcp.lease as lease
+
+    apps = home / "mcp_apps" / "hasnet"
+    apps.mkdir(parents=True)
+    (apps / "manifest.json").write_text(json.dumps({
+        "permissions": ["task_net", "net_lease_request"],
+    }))
+    monkeypatch.setattr(lease, "read_lease", lambda a: {
+        "status": "expired", "expires_at": "2020-01-01T00:00:00+00:00",
+    })
+    found = blockers._check_lease("hasnet")
+    assert found is not None
+    assert "lease_request(app_id='hasnet'" in found["fix"]
+
+
+def test_fix_text_does_not_name_lease_request_when_the_seat_lacks_the_tool_permission(home, monkeypatch):
+    """L10 (Loki 02057439 item 5): a seat holding ONLY task_net (no
+    net_lease_request / full_access / literal lease_request) would be
+    gate-denied at "not permitted for 'lease_request'" if pointed at the
+    verb — the fix text must not name it as if it would just work."""
+    import willow_mcp.lease as lease
+
+    apps = home / "mcp_apps" / "hasnet"
+    apps.mkdir(parents=True)
+    (apps / "manifest.json").write_text(json.dumps({
+        "permissions": ["task_net"],
+    }))
+    monkeypatch.setattr(lease, "read_lease", lambda a: {
+        "status": "expired", "expires_at": "2020-01-01T00:00:00+00:00",
+    })
+    found = blockers._check_lease("hasnet")
+    assert found is not None
+    assert "lease_request(" not in found["fix"]
+    assert "lease_request" in found["fix"]  # names the missing permission, not the call
+    assert "grant-net hasnet" in found["fix"]
+
+
+def test_fix_text_names_both_missing_keys_when_the_seat_holds_neither(home, monkeypatch):
+    """Loki E48668A0 item-5 residual: a seat lacking BOTH task_net and the
+    lease_request tool permission (utety and vishwakarma's actual shape)
+    must be told about both keys up front, not just task_net — following
+    advice that named only task_net would still gate-deny at "not
+    permitted for 'lease_request'"."""
+    import willow_mcp.lease as lease
+
+    apps = home / "mcp_apps" / "vishwakarma"
+    apps.mkdir(parents=True)
+    (apps / "manifest.json").write_text(json.dumps({
+        "permissions": ["integration_net"],
+    }))
+    monkeypatch.setattr(lease, "read_lease", lambda a: {
+        "status": "expired", "expires_at": "2020-01-01T00:00:00+00:00",
+    })
+    found = blockers._check_lease("vishwakarma")
+    assert found is not None
+    assert "lease_request(" not in found["fix"]
+    assert "holds neither" in found["fix"]
+    assert "task_net" in found["fix"] and "net_lease_request" in found["fix"]
+    assert "grant-net vishwakarma" in found["fix"]
+
+
 def test_an_unreadable_lease_blocks_with_a_chmod_fix_not_a_regrant(home, monkeypatch):
     """Gap d90246688413: the fix for a lease this process cannot read is a
     mode change. Telling the operator to re-issue reproduces the same file."""

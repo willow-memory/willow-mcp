@@ -1187,6 +1187,7 @@ _WRITE_CAPABLE_GROUPS = {
     "grove_all", "grove_write",
     "human_loop_write", "integration_call", "knowledge_curate", "knowledge_write",
     "lineage_write", "markdownai_directives", "markdownai_write", "nest_write",
+    "net_lease_request",
     "orchestrator",
     "schema_admin", "store_all", "store_write", "task_queue",
     "tool_oracle_route", "tool_oracle_seal",

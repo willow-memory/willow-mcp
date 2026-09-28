@@ -108,6 +108,10 @@ TOOL_CLASS: dict[str, str] = {
     # register and appends a FRANK envelope_revoked row — a write, mints no
     # new authority (decision 83faa340).
     "envelope_retire_sweep": WRITE,
+    # lease_request writes a Nestor draft pair proposing a standing egress
+    # lease — a write, never a seal, same class as decision_propose (gap
+    # 02E2E836).
+    "lease_request": WRITE,
     "context_save": WRITE, "context_expire": WRITE,
     "frank_append": WRITE,
     # nest_scan writes a local SQLite Nest DB; nest_promote writes structure-only

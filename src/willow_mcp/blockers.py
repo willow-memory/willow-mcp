@@ -178,8 +178,58 @@ def _check_lease(app_id: str) -> dict | None:
                f"grant, not a secret). Do NOT re-issue: a fresh grant-net from "
                f"the same shell writes the same unreadable file")
     else:
-        fix = (f"willow-mcp grant-net {app_id} --ttl 30m --reason \"...\" — operator "
-               f"only; a task also needs willow-mcp sign-net-task")
+        from . import gate
+
+        # lease_request needs TWO keys, same two-key shape task_submit's own
+        # allow_net check uses: the tool permission itself (granted by the
+        # `net_lease_request` group, `full_access`, or the literal
+        # "lease_request" name) AND gate.NET_PERMISSION (task_net), checked
+        # explicitly in the tool body. Neither is any of the egress kinds
+        # federation_tool_egress.seat_uses_net_egress actually counts (web/
+        # integration/federation too). Pointing every net-egress seat at
+        # lease_request used to send utety (integration_net) and
+        # vishwakarma (mcp_federation) — neither holding task_net — to a
+        # verb that refuses them with net_denied (Loki 8EB4478D, Check 4 /
+        # L9). Checking task_net alone still had the same failure mode for a
+        # seat that holds task_net but not the lease_request tool
+        # permission itself — gate-denied at "not permitted for
+        # 'lease_request'" (Loki 02057439 item 5 / L10) — so both are
+        # required before this fix text names the verb.
+        has_net = gate.permitted(app_id, gate.NET_PERMISSION)
+        has_tool = gate.permitted(app_id, "lease_request")
+        if has_net and has_tool:
+            fix = (f"lease_request(app_id={app_id!r}, ttl_seconds=1800, reason=\"...\") from "
+                   f"{app_id}'s own seat — the operator seals the proposed pair in the Nestor "
+                   f"UI and the next net_authority_drain tick mints the lease file; "
+                   f"willow-mcp grant-net at a TTY still works but is no longer the only door. "
+                   f"A Kart task also needs its own held-and-sealed ask (task_submit's own "
+                   f"allow_net path) or willow-mcp sign-net-task")
+        elif has_net and not has_tool:
+            fix = (f"{app_id!r} holds '{gate.NET_PERMISSION}' but not the 'lease_request' tool "
+                   f"permission itself (granted by the 'net_lease_request' group or "
+                   f"'full_access') — calling lease_request would gate-deny with "
+                   f"\"not permitted for 'lease_request'\" — ask the operator to run "
+                   f"willow-mcp grant-net {app_id} --ttl 30m from a TTY, or to add "
+                   f"'net_lease_request' to this app's manifest so it can ask for its own lease")
+        elif not has_tool:
+            # Neither key held (Loki E48668A0 item-5 residual): naming only
+            # task_net used to leave a seat lacking BOTH still gate-denied
+            # after following the advice, at "not permitted for
+            # 'lease_request'" — say what both keys are up front.
+            fix = (f"{app_id!r} holds neither '{gate.NET_PERMISSION}' nor the "
+                   f"'lease_request' tool permission (granted by 'net_lease_request' "
+                   f"or 'full_access') — calling lease_request needs BOTH, the same "
+                   f"two-key shape task_submit's own allow_net path uses — ask the "
+                   f"operator to run willow-mcp grant-net {app_id} --ttl 30m from a "
+                   f"TTY, or to add both '{gate.NET_PERMISSION}' and "
+                   f"'net_lease_request' to this app's manifest so it can ask for "
+                   f"its own lease")
+        else:
+            fix = (f"{app_id!r} does not hold '{gate.NET_PERMISSION}', so it cannot call "
+                   f"lease_request itself (the same key task_submit's allow_net path "
+                   f"requires) — ask the operator to run willow-mcp grant-net "
+                   f"{app_id} --ttl 30m from a TTY, or to add '{gate.NET_PERMISSION}' to "
+                   f"this app's manifest so it can ask for its own lease")
     return _item(
         "no_egress_lease",
         f"no active egress lease for {app_id!r} — {detail}",
