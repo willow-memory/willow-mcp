@@ -332,3 +332,87 @@ def test_agent_clear_race_against_failure_is_never_silently_cleared(home):
         assert final == "failed"
     else:
         assert final in ("cleared", "failed")
+
+
+# -- M12 (Loki 10A39E21 p16, rerun): write's own re-read under the lock
+
+
+def test_p16_write_rereads_status_under_lock_after_concurrent_withdraw(home):
+    """M12: handoff_write_v4 must re-read status AFTER acquiring
+    packet_lock, not trust a read taken before it. A withdraw landing
+    while this writer waits on the lock must be seen -- the writer is
+    refused invalid_transition, not allowed to write over a withdrawn
+    packet."""
+    import fcntl
+    did = ds.dispatch_send("willow", "loki", "# Task\n", summary="t")["dispatch_id"]
+    ds.dispatch_accept(did, "loki", "")
+    root = ds.dispatch_dir(did)
+    fd = os.open(str(root / ".handoff.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("r", ho.handoff_write_v4("loki", did, **GOOD)))
+    t.start()
+    import time
+    time.sleep(0.5)
+    ds._dispatch_set_status_locked(did, root, "withdrawn", {})
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+    t.join(10)
+    assert out["r"].get("error") == "invalid_transition", out["r"]
+    assert not (root / "handoff.json").exists()
+
+
+# -- M27 (F6): no partial/torn handoff.json is ever observable
+
+
+def test_f6_no_partial_read_of_handoff_json(home):
+    p = ds.dispatch_send("willow", "loki", "# Task\n", summary="t")["dispatch_id"]
+    ds.dispatch_accept(p, "loki", "s")
+    path = ds.dispatch_dir(p) / "handoff.json"
+    stop = threading.Event()
+    stats = {"reads": 0, "bad": 0}
+
+    def reader():
+        while not stop.is_set():
+            try:
+                b = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            stats["reads"] += 1
+            try:
+                json.loads(b)
+            except ValueError:
+                stats["bad"] += 1
+
+    t = threading.Thread(target=reader)
+    t.start()
+    big = dict(GOOD, narrative="Audit: 12 passed. " + "x" * 500_000)
+    ho.handoff_write_v4("loki", p, session_id="s", **big)
+    import time
+    time.sleep(0.2)
+    stop.set()
+    t.join(10)
+    left = [x.name for x in path.parent.iterdir() if x.name.endswith(".tmp")]
+    assert stats["bad"] == 0, stats
+    assert not left, left
+
+
+# -- N5 base: dispatch_set_status blocks on the lock (not just N5B/N5C's callers)
+
+
+def test_n5_set_status_blocks_on_lock(home):
+    import fcntl
+    p = ds.dispatch_send("willow", "loki", "# Task\n", summary="t")["dispatch_id"]
+    root = ds.dispatch_dir(p)
+    root.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(root / ".handoff.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    t = threading.Thread(target=lambda: ds.dispatch_set_status(p, "withdrawn"))
+    t.start()
+    import time
+    time.sleep(0.4)
+    mid = ds.dispatch_read(p)["status"]["status"]
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+    t.join(10)
+    assert mid == "pending", mid
