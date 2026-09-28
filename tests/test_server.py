@@ -1722,6 +1722,39 @@ def test_fleet_health_stranded_when_the_only_live_worker_fails_every_claim(
     assert result["stranded"] is True
 
 
+def test_fleet_health_heartbeat_tests_never_write_outside_tmp(app_id, monkeypatch, tmp_path):
+    """Regression for Loki 0E7F0C89 W1: test_fleet_health_not_stranded_when_a_
+    worker_is_alive and test_fleet_health_stranded_when_the_only_live_worker_
+    fails_every_claim (above) each pin only WILLOW_HOME to tmp_path and then
+    call WorkerHeartbeat().beat() for real. heartbeat_root() prefers
+    WILLOW_WORKER_HEARTBEAT_ROOT over WILLOW_HOME, so when that var leaks in
+    from a live worker unit's environment (proven 2026-09-27: this exact
+    pattern wrote kart-fast-1/2/3/4/6.json with tick_ok=False into the
+    operator's real worker_heartbeat directory), pinning WILLOW_HOME alone
+    does not isolate the write. conftest.py now forces
+    WILLOW_WORKER_HEARTBEAT_ROOT to a session tmp dir at import, before either
+    test's own WILLOW_HOME monkeypatch runs. This pins that the resolved root
+    -- and the real file WorkerHeartbeat writes -- is confined under the
+    system tempdir, never under a real operator $WILLOW_HOME/worker_heartbeat,
+    regardless of what a test itself sets WILLOW_HOME to."""
+    import tempfile
+    from pathlib import Path
+
+    from willow_mcp.heartbeat import WorkerHeartbeat, heartbeat_root
+
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    root = heartbeat_root()
+    tmp_root = Path(tempfile.gettempdir()).resolve()
+    assert tmp_root in root.resolve().parents or root.resolve() == tmp_root, (
+        f"heartbeat_root() resolved to {root} -- outside the system tempdir "
+        f"{tmp_root}; a live WILLOW_WORKER_HEARTBEAT_ROOT would leak through"
+    )
+
+    beat = WorkerHeartbeat(interval=5.0)
+    beat()
+    assert tmp_root in beat.path.resolve().parents
+
+
 def test_fleet_health_reports_per_lane_stranding(app_id, monkeypatch, tmp_path):
     # With a mapped lane column and pending work, fleet_health issues the per-lane
     # pending query and reports stranded_lanes for any lane with no alive worker
