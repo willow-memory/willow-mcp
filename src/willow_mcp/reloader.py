@@ -562,6 +562,382 @@ def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = No
             "request_state": request_state}
 
 
+# -- the merge confirm: the operator's merge into master, not a per-restart
+# Nestor seal (gap 55fc7c9681e9; replaces sealed ruling e961aff8) ---------
+#
+# Governing decision: SOIL record RULING_RECORD_ID in
+# projects_willow_governance_decisions, proposed to Nestor. Until that
+# record's own status is "sealed", check_merge() always refuses ENORULING
+# and the sealed-pair path above (check()/run_once()) stays the ONLY live
+# restart path for the pull trigger -- run_once_v2() enforces that gating
+# by construction: it calls run_once() unchanged while unsealed, and only
+# switches to check_merge()/the merge act once the record is sealed.
+
+#: The governance record whose status this module reads to decide whether
+#: the merge-is-confirm path may act at all. Its own seal (via seal_handler
+#: on the ratatosk seal-watch) is what flips run_once_v2() over.
+RULING_RECORD_ID = "reloader-merge-is-confirm-2026-09-28"
+
+#: FRANK event types for the merge-is-confirm path -- distinct from
+#: unit_reload_executor.EVENT ("unit_reload", the sealed-pair path's own
+#: ink) so the two mechanisms' receipts are never ambiguous about which
+#: confirm authorized a restart.
+MERGE_EVENT = "broker_reload"
+MERGE_REFUSAL_EVENT = "broker_reload_refusal"
+
+_API = "https://api.github.com"
+
+#: Conclusions that mean a check-run genuinely failed.
+_MERGE_FAILING_CONCLUSIONS = frozenset({"failure", "cancelled", "timed_out",
+                                        "action_required", "startup_failure"})
+
+#: check_merge() errnos that mean "a real pending change exists but is not
+#: yet confirmed" -- the merge-path sibling of _is_open_trigger's ENOSEAL/
+#: EDRIFT/EUNREACH set. run_once_v2() refuses EPARTIAL (never silently
+#: drops the merge trigger) when this is true but act is not.
+_MERGE_OPEN_ERRORS = frozenset({"ECHECKS", "EUNREACH"})
+
+
+def _ruling_sealed(store=None) -> bool:
+    """Whether RULING_RECORD_ID is sealed. Fails CLOSED: a missing store, a
+    missing record, or any read error is "not sealed" -- the brief's own
+    instruction ("if it is not yet sealed, build anyway... keep the old
+    seal path as the ONLY live path"). Never raises."""
+    try:
+        from . import seal_handler
+        from .db import Store
+
+        st = store if store is not None else Store()
+        rec = st.get(seal_handler.GOVERNANCE_COLLECTION, RULING_RECORD_ID)
+    except Exception:
+        return False
+    return bool(rec) and rec.get("status") == "sealed"
+
+
+def _default_merge_api(method: str, url: str, *, bearer: str, body: Optional[dict] = None) -> dict:
+    from . import github_app_credentials as gac
+
+    return gac._api(method, url, bearer=bearer, body=body)
+
+
+def _classify_merge_http_failure(resp: dict) -> tuple[str, str]:
+    status = resp.get("status") or 0
+    reason = str(resp.get("reason") or "")
+    if status == 404:
+        return "not_found", reason
+    if status:
+        return f"http_{status}", reason
+    return "unavailable", reason
+
+
+def _pr_for_commit(repo: str, sha: str, *, api, bearer: str) -> dict:
+    """The merged PR whose base branch is master and whose merge_commit_sha
+    is exactly ``sha`` -- found via GitHub's own commit->PRs read
+    (``GET /repos/{repo}/commits/{sha}/pulls``), the mirror image of the
+    head-sha->PR resolution :func:`pr_checks.read_pr_checks` already does
+    the other way. ``{"state": "populated", "number"}``,
+    ``{"state": "empty"}`` (no such PR -- not merged, wrong base, or this
+    sha is not itself the merge/squash commit), or ``{"state":
+    "unreachable", "reason", "detail"}`` on an HTTP miss."""
+    resp = api("GET", f"{_API}/repos/{repo}/commits/{sha}/pulls", bearer=bearer)
+    if not resp.get("ok"):
+        cause, reason = _classify_merge_http_failure(resp)
+        return {"state": "unreachable", "reason": cause, "detail": reason}
+    items = resp.get("body")
+    items = items if isinstance(items, list) else []
+    for pr in items:
+        if pr.get("merged_at") and (pr.get("base") or {}).get("ref") == "master" \
+                and pr.get("merge_commit_sha") == sha:
+            return {"state": "populated", "number": pr.get("number")}
+    return {"state": "empty"}
+
+
+def _checks_all_green(repo: str, sha: str, *, api, bearer: str) -> dict:
+    """Every check-run on ``sha`` is conclusive (``status == "completed"``)
+    and none is failure/cancelled/timed_out/action_required/
+    startup_failure. Reuses :func:`pr_checks._fetch_check_runs` -- the same
+    GitHub read path ``pr_checks_read`` uses -- rather than a second,
+    independent implementation of check-run pagination."""
+    from . import pr_checks
+
+    runs, failed = pr_checks._fetch_check_runs(api, repo=repo, sha=sha, bearer=bearer)
+    if failed is not None:
+        cause, reason = _classify_merge_http_failure(failed)
+        return {"state": "unreachable", "reason": cause, "detail": reason}
+    if not runs:
+        return {"state": "empty", "runs": []}
+    if any(r.get("status") != "completed" for r in runs):
+        return {"state": "pending", "runs": runs}
+    bad = [r for r in runs if r.get("conclusion") in _MERGE_FAILING_CONCLUSIONS]
+    if bad:
+        return {"state": "failing", "runs": runs, "bad": bad}
+    return {"state": "green", "runs": runs}
+
+
+def _is_consumed_merge(ledger, receipt_id: str, *, repo: str, checkout: str) -> bool:
+    """A MERGE_EVENT receipt already cites ``receipt_id`` -- the merge
+    path's own "never twice" guard, tracked against its OWN event type
+    (never unit_reload_executor.EVENT, which the sealed-pair path owns) so
+    the two mechanisms' idempotence never entangle."""
+    if not receipt_id:
+        return False
+    for row in ledger.all_events(MERGE_EVENT, match={"repo": repo, "checkout": checkout}):
+        if (row.get("content") or {}).get("pull_receipt_id") == receipt_id:
+            return True
+    return False
+
+
+def check_merge(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None,
+                store=None, api=None, token_minter: Optional[Callable] = None) -> dict:
+    """Decide whether the operator's own merge into master is a live
+    confirm to restart onto (gap 55fc7c9681e9). Never restarts anything.
+
+    Gated: refuses ``ENORULING`` outright while RULING_RECORD_ID is
+    unsealed -- see :func:`_ruling_sealed`. Once sealed, restarts only when
+    ALL of:
+
+    * the checkout is on branch ``master``  (``ENOTMASTER``);
+    * an unconsumed ``git_pull`` receipt with ``changed: true`` exists for
+      this repo+checkout (``ENORECEIPT``), newer than the unit's own
+      ``ActiveEnterTimestamp`` (``EALREADY``) and not already cited by a
+      prior merge-path restart (``EALREADY``);
+    * that receipt's ``after`` sha equals its own ``remote_sha`` -- a
+      clean fast-forward onto origin/master's HEAD, not a merge commit
+      pull_executor itself constructed some other way (``ENOTMERGED``);
+    * the checkout's CURRENT HEAD still equals that sha -- the tree has
+      not moved again since the pull (``EDRIFT``);
+    * that sha is the merge/squash commit of a PR that GitHub reports
+      merged into ``master`` (``ENOTMERGED``, via :func:`_pr_for_commit`);
+    * every check-run on that sha is conclusive and none failed
+      (``ECHECKS``, via :func:`_checks_all_green`).
+
+    GitHub unreachable at either read is ``EUNREACH`` -- never a restart,
+    logged as its own state (INVARIANTS Section 1), never collapsed into
+    "not merged" or "checks failing".
+    """
+    unit = (config.unit or "").strip()
+    if not urx.is_broker_unit(unit):
+        return _refuse("EINVAL", f"{unit!r} is not the broker's unit -- reload it "
+                                 f"through unit_reload_execute under a unit.reload envelope")
+    if config.checkout is None:
+        return _refuse("EINVAL", f"no broker checkout: set {_ENV_CHECKOUT} or run from an editable install")
+    path = Path(config.checkout).expanduser()
+    if not (path / ".git").exists():
+        return _refuse("EINVAL", f"{path} is not a git checkout (no .git)")
+    if ledger is None:
+        return _refuse("EAMBIG", "no governance ledger: a restart that cannot be matched to a "
+                                 "pull receipt or cited is not performed")
+
+    if not _ruling_sealed(store):
+        return _refuse("ENORULING",
+                       f"governance record {RULING_RECORD_ID!r} is not sealed yet -- the "
+                       f"sealed-pair path (decision e961aff8) stays the only live restart path "
+                       f"for the pull trigger until it is")
+
+    branch = urx._git(path, "rev-parse", "--abbrev-ref", "HEAD", runner=runner)
+    if branch.returncode != 0:
+        return _refuse("EINVAL", f"could not read the current branch of {path}")
+    current_branch = (branch.stdout or "").strip()
+    if current_branch != "master":
+        return _refuse("ENOTMASTER", f"{path} is on branch {current_branch!r}, not master -- the "
+                                     f"merge-is-confirm path only ever follows master")
+
+    receipt = ledger.latest_event(
+        urx.PULL_EVENT, match={"repo": config.repo, "checkout": str(path), "changed": True})
+    if receipt is None:
+        return _refuse("ENORECEIPT", f"no git_pull receipt with changed=true for "
+                                     f"repo={config.repo!r} checkout={str(path)!r}")
+    receipt_id = receipt.get("id")
+    if not receipt_id:
+        return _refuse("EAMBIG", "the pull receipt carries no row id; a restart cannot cite it")
+    content = receipt["content"]
+
+    state = urx.show_unit(unit, runner=runner)
+    if not state.get("ok"):
+        return _refuse("EUNREACH", f"unit state unreachable: {state.get('cause')}",
+                       cause=state.get("cause"), receipt_id=receipt_id)
+
+    active_enter = urx._parse_systemd_timestamp(state.get("ActiveEnterTimestamp"))
+    receipt_at = urx._as_utc(receipt.get("created_at"))
+    if active_enter is not None and receipt_at is not None and active_enter >= receipt_at:
+        return _refuse("EALREADY",
+                       f"{unit} has been active since {state.get('ActiveEnterTimestamp')!r}, "
+                       f"which is no older than pull receipt {receipt_id} -- already on that code",
+                       receipt_id=receipt_id, receipt=content)
+
+    if _is_consumed_merge(ledger, receipt_id, repo=config.repo, checkout=str(path)):
+        return _refuse("EALREADY", f"pull receipt {receipt_id} was already consumed by a prior "
+                                   f"merge-confirm restart", receipt_id=receipt_id)
+
+    head = urx._git(path, "rev-parse", "HEAD", runner=runner)
+    if head.returncode != 0:
+        return _refuse("EINVAL", f"could not read HEAD of {path}")
+    current_head = (head.stdout or "").strip()
+    after = content.get("after")
+    remote_sha = content.get("remote_sha")
+    if not after or after != remote_sha:
+        return _refuse("ENOTMERGED",
+                       f"pull receipt {receipt_id}'s after-sha {after!r} does not equal its own "
+                       f"remote_sha {remote_sha!r} -- not a clean landing of origin/master HEAD",
+                       receipt_id=receipt_id, receipt=content)
+    if current_head != after:
+        return _refuse("EDRIFT",
+                       f"{path} HEAD is {current_head!r} but pull receipt {receipt_id}'s "
+                       f"after-sha is {after!r} -- the tree moved again since the pull",
+                       receipt_id=receipt_id, receipt=content)
+
+    from . import github_app_credentials as gac
+    from . import pr_checks
+
+    call = api or _default_merge_api
+    mint = token_minter or gac.mint_installation_token
+    auth = mint(config.repo)
+    if not (auth.get("ok") and auth.get("mode") == "app"):
+        return _refuse("EUNREACH",
+                       f"could not mint a willows-bot installation token: {auth.get('reason')}",
+                       receipt_id=receipt_id)
+    bearer = auth["token"]
+    if not pr_checks.checks_perm_present(auth.get("permissions")):
+        return _refuse("EUNREACH", "willows-bot App token lacks the checks permission",
+                       receipt_id=receipt_id)
+
+    pr = _pr_for_commit(config.repo, current_head, api=call, bearer=bearer)
+    if pr["state"] == "unreachable":
+        return _refuse("EUNREACH",
+                       f"could not resolve the merged PR for {current_head}: {pr.get('detail')}",
+                       receipt_id=receipt_id)
+    if pr["state"] == "empty":
+        return _refuse("ENOTMERGED",
+                       f"{current_head} is not the merge/squash commit of a PR GitHub reports "
+                       f"merged into master", receipt_id=receipt_id)
+
+    checks = _checks_all_green(config.repo, current_head, api=call, bearer=bearer)
+    if checks["state"] == "unreachable":
+        return _refuse("EUNREACH",
+                       f"could not read check-runs for {current_head}: {checks.get('detail')}",
+                       receipt_id=receipt_id, pr_number=pr["number"])
+    if checks["state"] in ("empty", "pending"):
+        return _refuse("ECHECKS", f"check-runs for {current_head} are not all conclusive yet",
+                       receipt_id=receipt_id, pr_number=pr["number"])
+    if checks["state"] == "failing":
+        return _refuse("ECHECKS",
+                       f"check-runs for {current_head} include a failing run: "
+                       f"{[r.get('name') for r in checks['bad']]}",
+                       receipt_id=receipt_id, pr_number=pr["number"])
+
+    return {"ok": True, "act": True, "unit": unit, "repo": config.repo, "checkout": str(path),
+            "receipt_id": receipt_id, "receipt": content, "head": current_head,
+            "pr_number": pr["number"], "check_summary": {"runs": len(checks["runs"])},
+            "state_before": state}
+
+
+def run_once_v2(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None,
+                store=None, api=None, token_minter: Optional[Callable] = None,
+                project: str = "willow-mcp") -> dict:
+    """The dispatcher :func:`main` now calls for ``tick``/``check``.
+
+    While RULING_RECORD_ID is unsealed this IS :func:`run_once` unchanged
+    -- the sealed-pair path (decision ``e961aff8``) stays the ONLY live
+    restart path for the pull trigger, exactly as the brief requires.
+    Once sealed, the pull trigger switches to :func:`check_merge` and the
+    sealed-pair path (``check()``) is gated off here rather than deleted
+    -- its module, its tests, and any receipt a PRIOR tick already
+    consumed the old way stay meaningful, and reverting the seal needs no
+    code change to fall back to it. The env trigger (:func:`check_env`,
+    decision ``1bd6fd29``) is unaffected either way and keeps firing on
+    its own schedule -- one restart per tick, at most, for whichever
+    trigger(s) are due, the same rule :func:`run_once` already enforces
+    between its own two triggers.
+
+    Every refusal writes its OWN FRANK ``broker_reload_refusal`` receipt
+    naming the reason code ("Receipts, not seals" -- step 3 of the
+    brief): nothing in this path asks Nestor for a per-restart confirm,
+    so the ledger carries the trail on its own.
+    """
+    if not _ruling_sealed(store):
+        return run_once(config, ledger=ledger, runner=runner, project=project)
+
+    merge_verdict = check_merge(config, ledger=ledger, runner=runner, store=store, api=api,
+                               token_minter=token_minter)
+    env_verdict = check_env(config, ledger=ledger, runner=runner)
+    due_merge = bool(merge_verdict.get("act"))
+    due_env = bool(env_verdict.get("act"))
+    open_merge = due_merge or merge_verdict.get("error") in _MERGE_OPEN_ERRORS
+    open_env = _is_open_trigger(env_verdict)
+
+    def _write_refusal(verdict: dict) -> Optional[str]:
+        if ledger is None:
+            return None
+        try:
+            return ledger.append(project, MERGE_REFUSAL_EVENT, {
+                "actor": ACTOR, "unit": config.unit, "repo": config.repo,
+                "checkout": str(config.checkout) if config.checkout else None,
+                "error": verdict.get("error"), "reason": verdict.get("reason"),
+                "receipt_id": verdict.get("receipt_id"),
+            })
+        except Exception:
+            return None
+
+    if not (due_merge or due_env):
+        out = dict(merge_verdict)
+        out["reloaded"] = False
+        out["env"] = env_verdict
+        out["refusal_receipt_id"] = _write_refusal(merge_verdict)
+        return out
+
+    if (open_merge and not due_merge) or (open_env and not due_env):
+        out = {"ok": False, "act": False, "reloaded": False, "error": "EPARTIAL",
+               "reason": "not every open trigger is confirmed -- refusing to restart onto a "
+                         "partially-confirmed state; both triggers are named below",
+               "merge": merge_verdict, "env": env_verdict}
+        out["refusal_receipt_id"] = _write_refusal(merge_verdict)
+        return out
+
+    unit = merge_verdict["unit"] if due_merge else env_verdict["unit"]
+    try:
+        restarted = urx._run(["systemctl", "--user", "restart", unit], runner=runner,
+                             timeout=_SYSTEMCTL_TIMEOUT_S)
+    except FileNotFoundError:
+        return {"ok": False, "act": True, "reloaded": False, "error": "EUNREACH",
+                "reason": "systemctl_missing", "unit": unit, "merge": merge_verdict, "env": env_verdict}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "act": True, "reloaded": False, "error": "ETIMEDOUT",
+                "reason": f"systemctl restart exceeded {_SYSTEMCTL_TIMEOUT_S}s",
+                "unit": unit, "merge": merge_verdict, "env": env_verdict}
+    if restarted.returncode != 0:
+        tail = (restarted.stderr or restarted.stdout or "").strip()[-300:]
+        return {"ok": False, "act": True, "reloaded": False, "error": "ERESTART",
+                "reason": tail or f"systemctl restart exited {restarted.returncode}",
+                "unit": unit, "merge": merge_verdict, "env": env_verdict}
+
+    triggers = []
+    out = {"ok": True, "act": True, "reloaded": True, "unit": unit,
+           "merge": merge_verdict, "env": env_verdict,
+           "state_after": urx.show_unit(unit, runner=runner)}
+    if due_merge:
+        triggers.append("merge")
+        try:
+            out["reload_receipt_id"] = ledger.append(project, MERGE_EVENT, {
+                "actor": ACTOR, "unit": unit, "repo": merge_verdict["repo"],
+                "checkout": merge_verdict["checkout"], "pull_receipt_id": merge_verdict["receipt_id"],
+                "head": merge_verdict["head"], "pr_number": merge_verdict["pr_number"],
+                "check_summary": merge_verdict["check_summary"], "decision": RULING_RECORD_ID,
+            })
+        except Exception as exc:  # noqa: BLE001 -- the restart happened; the receipt failing is reported, not hidden
+            out["receipt_error"] = f"{type(exc).__name__}: {exc}"
+    if due_env:
+        triggers.append("env_changed")
+        try:
+            out["env_receipt_id"] = ledger.append(project, urx.EVENT, {
+                "actor": ACTOR, "unit": unit, "env_path": env_verdict["env_path"],
+                "env_receipt_id": env_verdict["receipt_id"], "decision": "1bd6fd29",
+            })
+        except Exception as exc:  # noqa: BLE001 -- the restart happened; the receipt failing is reported, not hidden
+            out["env_receipt_error"] = f"{type(exc).__name__}: {exc}"
+    out["triggers"] = triggers
+    return out
+
+
 #: A safety valve against a pathological ledger, not a curated window.
 #: Rework (Loki 797924DB V1): this used to cap the CANDIDATE scan at the
 #: newest 20 rows at HEAD — on the ledger the fix exists to rescue, the
@@ -1168,8 +1544,10 @@ def main(argv: Optional[list] = None) -> int:
         if args.command == "check":
             out = dict(check(config, ledger=ledger))
             out["env"] = check_env(config, ledger=ledger)
+            out["merge"] = check_merge(config, ledger=ledger)
+            out["ruling_sealed"] = _ruling_sealed()
         else:
-            out = run_once(config, ledger=ledger)
+            out = run_once_v2(config, ledger=ledger)
         print(json.dumps(out, default=str, indent=2))
         # Due-and-failed is the only exit that should wake anyone.
         return 1 if (out.get("act") and not out.get("reloaded")) else 0
