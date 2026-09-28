@@ -88,6 +88,8 @@ from .unit_reload_executor import (
     _git,
     _run,
     is_broker_unit,
+    liveness_refusal_after_action,
+    sample_restart_loop,
     show_unit,
 )
 
@@ -576,6 +578,7 @@ def execute_unit_install(
     ledger=None,
     store=None,
     runner: Optional[Callable] = None,
+    sleeper: Optional[Callable[[float], None]] = None,
     github_root: Optional[Path] = None,
     destination: Optional[Path] = None,
     values: Optional[dict[str, str]] = None,
@@ -584,9 +587,10 @@ def execute_unit_install(
     that governs ``app_id`` — or refuse, cite the refusal, and file the ask.
 
     ``ledger`` is a :class:`GovernanceLedger`; ``runner`` replaces
-    ``subprocess.run`` for ``systemctl`` and ``git``; ``github_root`` /
-    ``destination`` / ``values`` are test seams for the clone root, the
-    systemd user directory, and the render values.
+    ``subprocess.run`` for ``systemctl`` and ``git``; ``sleeper`` replaces
+    ``time.sleep`` in :func:`unit_reload_executor.sample_restart_loop` for
+    tests; ``github_root`` / ``destination`` / ``values`` are test seams for
+    the clone root, the systemd user directory, and the render values.
     """
     from .envelopes import EnvelopeAuthority, governing_envelopes
 
@@ -887,7 +891,11 @@ def execute_unit_install(
                 keep_written=False,
             )
 
-    # Enable succeeded — now cite (meters max_count) and ink the success receipt.
+    # Enable succeeded — now cite (meters max_count) and ink the success
+    # receipt. Liveness (below, via `liveness_refusal_after_action`) is
+    # judged AFTER this citation, by design: the unit already has to be
+    # written and enabled to sample it. A genuine EDEAD/EFAILED/EUNREACH
+    # refusal past this point still spends the grant this call cites.
     cited = EnvelopeAuthority(ledger).authorize_and_cite(
         matches[0], actor=app_id, verb=VERB, call_args=call_args,
         project=project, session=session,
@@ -900,7 +908,70 @@ def execute_unit_install(
             pending={"citation_id": cited.get("citation_id"), "enabled_without_cite": True},
         )
 
-    state_after = show_unit(unit, runner=runner)
+    # Gap d30c923424a0: a single post-enable sample reads a restart-looping
+    # unit (2026-09-21: nestor-ui.service) as merely `active` and the desk
+    # resolved a gap on that "ok". Two samples, spaced to give a
+    # fast-restarting unit room to loop again, tell the difference.
+    loop_sample = sample_restart_loop(unit, runner=runner, sleeper=sleeper)
+    state_after = loop_sample["second"]
+    # Loki 0DFFEFA6 B2: when a timer sibling was enabled, ITS liveness (not
+    # the timer-activated, almost-always-`Type=oneshot` SERVICE's) is what
+    # "the install came up" means — a fresh sample taken after the same
+    # enable, judged by `liveness_refusal_after_action` below.
+    timer_state = show_unit(timer_name, runner=runner) if timer_name else None
+
+    if loop_sample["restart_loop"]:
+        from . import unit_status as _unit_status
+        journal = _unit_status.journal_tail(unit, 20, runner=runner)
+        out = {
+            "ok": False, "installed": True, "error": "ELOOP",
+            "reason": (
+                f"{unit} was installed and enabled but is restart-looping "
+                f"(NRestarts/ActiveEnterTimestamp changed or SubState="
+                f"auto-restart across a {loop_sample['wait_s']}s sample) — "
+                f"not reporting ok on a unit that is not stable"
+            ),
+            "unit": unit, "source": source, "repo": repo, "path": rel,
+            "head": head_sha, "written": written,
+            "envelope_id": matches[0], "citation_id": cited.get("citation_id"),
+            "state_before": state_before, "state_first": loop_sample["first"],
+            "state_after": state_after, "journal": journal,
+        }
+        try:
+            out["receipt_id"] = ledger.append(project, f"{EVENT}_restart_loop", {
+                "actor": app_id, "unit": unit, "source": source, "repo": repo,
+                "path": rel, "head": head_sha, "session": session,
+                "citation_id": cited.get("citation_id"),
+                "state_first": loop_sample["first"], "state_second": state_after,
+            })
+        except Exception as exc:  # noqa: BLE001 — the loop was detected; the receipt failing is reported, not hidden
+            out["receipt_error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    dead = liveness_refusal_after_action(loop_sample, timer_state=timer_state)
+    if dead is not None:
+        from . import unit_status as _unit_status
+        journal = _unit_status.journal_tail(unit, 20, runner=runner)
+        out = {
+            "ok": False, "installed": True, "error": dead["errno"],
+            "reason": dead["reason"],
+            "unit": unit, "source": source, "repo": repo, "path": rel,
+            "head": head_sha, "written": written,
+            "envelope_id": matches[0], "citation_id": cited.get("citation_id"),
+            "state_before": state_before, "state_first": loop_sample["first"],
+            "state_after": state_after, "journal": journal,
+        }
+        try:
+            out["receipt_id"] = ledger.append(project, f"{EVENT}_dead", {
+                "actor": app_id, "unit": unit, "source": source, "repo": repo,
+                "path": rel, "head": head_sha, "session": session,
+                "citation_id": cited.get("citation_id"), "errno": dead["errno"],
+                "state_first": loop_sample["first"], "state_second": state_after,
+            })
+        except Exception as exc:  # noqa: BLE001 — the refusal happened; the receipt failing is reported, not hidden
+            out["receipt_error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
     pruned: list[str] = []
     unrecognised: list[str] = []
     for target, _ in targets:

@@ -188,7 +188,10 @@ class _Fake:
     def __init__(self, *, tracked=True, dirty="", head="abc123", remote_ok=True,
                  show_rc_before=1, bus_down=False, enable_rc=0, reload_rc=0,
                  on_remote="  origin/master\n", mode="100644",
-                 timer_tracked=True, timer_dirty="", enable_stderr=""):
+                 timer_tracked=True, timer_dirty="", enable_stderr="",
+                 post_enable_samples=None, raise_on_post_enable_show=None,
+                 journal_output=None, timer_show_unit="", timer_sample=None,
+                 oneshot=False):
         self.tracked = tracked
         self.dirty = dirty
         self.head = head
@@ -202,8 +205,37 @@ class _Fake:
         self.timer_tracked = timer_tracked
         self.timer_dirty = timer_dirty
         self.enable_stderr = enable_stderr
+        # execute_unit_install now takes TWO show samples after a successful
+        # enable (sample_restart_loop, B2BF4DB9); each entry here is a dict
+        # of property overrides consumed one per post-enable show call, in
+        # order. Missing entries fall back to the plain post-enable text.
+        self.post_enable_samples = list(post_enable_samples or [])
+        # 0-based index into the post-enable show calls (sample_restart_loop
+        # always makes exactly two) at which to raise instead of answering —
+        # "the SECOND sample itself is unreachable" (Loki 6ACB1F10 F2).
+        self.raise_on_post_enable_show = raise_on_post_enable_show
+        # ELOOP/EDEAD attaches a real journal tail (unit_status.journal_tail)
+        # — a test seam so a mutant that empties or drops it can be caught by
+        # asserting on ACTUAL content, not merely the key's presence.
+        self.journal_output = journal_output or ("2026-09-27T10:00:00 loop tail\n", 0, "")
+        # Realistic timer/oneshot sampling (Loki 0DFFEFA6 B2): when set, a
+        # post-enable `show` of THIS unit name answers with a TIMER-shaped
+        # sample (ActiveState/SubState only — no ExecMainStatus/Type/Result,
+        # exactly what real systemd reports for a `.timer`) instead of
+        # falling through to the generic service text below. Kept OUT of the
+        # `post_enable_samples`/`_post_enable_show_count` sequence entirely:
+        # `sample_restart_loop` never queries the timer, only
+        # `execute_unit_install`'s separate `show_unit(timer_name)` call does.
+        self.timer_show_unit = timer_show_unit
+        self.timer_sample = timer_sample or {}
+        # A realistic `Type=oneshot` service completes a run and goes
+        # `inactive`/`Result=success` on its own — the shape every bundled
+        # timer-activated pair (and a directly-reloaded oneshot) actually
+        # takes, as opposed to the long-running-service default below.
+        self.oneshot = oneshot
         self.calls: list[list[str]] = []
         self._enabled = False
+        self._post_enable_show_count = 0
 
     def __call__(self, argv, **kw):
         self.calls.append(argv)
@@ -213,11 +245,53 @@ class _Fake:
                 if self.bus_down:
                     return subprocess.CompletedProcess(argv, 1, "", "Failed to connect to bus: no")
                 if self._enabled:
-                    return subprocess.CompletedProcess(
-                        argv, 0,
-                        "ActiveState=active\nActiveEnterTimestamp=Mon 2026-09-21 03:00:00 UTC\n"
-                        "ActiveEnterTimestampMonotonic=1\nMainPID=42\n"
-                        "ExecMainStartTimestamp=Mon 2026-09-21 03:00:00 UTC\n", "")
+                    unit_arg = argv[-1]
+                    # The TIMER's own liveness (Loki 0DFFEFA6 B2) — a
+                    # separate, un-counted `show_unit(timer_name)` call
+                    # `execute_unit_install` makes AFTER `sample_restart_loop`
+                    # has already used up the two counted service samples
+                    # below. Real systemd reports a `.timer` with only
+                    # ActiveState/SubState — no ExecMainStatus/Type/Result.
+                    if self.timer_show_unit and unit_arg == self.timer_show_unit:
+                        lines = [
+                            f"ActiveState={self.timer_sample.get('ActiveState', 'active')}",
+                            f"SubState={self.timer_sample.get('SubState', 'waiting')}",
+                        ]
+                        return subprocess.CompletedProcess(argv, 0, "\n".join(lines) + "\n", "")
+                    if self.raise_on_post_enable_show == self._post_enable_show_count:
+                        self._post_enable_show_count += 1
+                        raise subprocess.TimeoutExpired(argv, 10)
+                    idx = self._post_enable_show_count
+                    self._post_enable_show_count += 1
+                    extra = self.post_enable_samples[idx] if idx < len(self.post_enable_samples) else {}
+                    # A realistic `Type=oneshot` service default: it ran once
+                    # and went `inactive` on its own — success, not death.
+                    # Explicit `post_enable_samples` overrides (used by the
+                    # ELOOP/EDEAD tests) still win either way.
+                    defaults = (
+                        {"ActiveState": "inactive", "Type": "oneshot", "Result": "success",
+                         "ExecMainStatus": "0"}
+                        if self.oneshot else {"ActiveState": "active"}
+                    )
+                    active_enter = extra.get("ActiveEnterTimestamp", "Mon 2026-09-21 03:00:00 UTC")
+                    lines = [
+                        f"ActiveState={extra.get('ActiveState', defaults['ActiveState'])}",
+                        f"ActiveEnterTimestamp={active_enter}",
+                        "ActiveEnterTimestampMonotonic=1",
+                        f"MainPID={extra.get('MainPID', 42)}",
+                        f"ExecMainStartTimestamp={active_enter}",
+                    ]
+                    if self.oneshot:
+                        lines.append(f"Type={extra.get('Type', defaults['Type'])}")
+                        lines.append(f"Result={extra.get('Result', defaults['Result'])}")
+                        lines.append(f"ExecMainStatus={extra.get('ExecMainStatus', defaults['ExecMainStatus'])}")
+                    if "NRestarts" in extra:
+                        lines.append(f"NRestarts={extra['NRestarts']}")
+                    if "SubState" in extra:
+                        lines.append(f"SubState={extra['SubState']}")
+                    if "RestartUSec" in extra:
+                        lines.append(f"RestartUSec={extra['RestartUSec']}")
+                    return subprocess.CompletedProcess(argv, 0, "\n".join(lines) + "\n", "")
                 return subprocess.CompletedProcess(
                     argv, self.show_rc_before, "", "Unit nestor-ui.service could not be found.")
             if sub == "daemon-reload":
@@ -246,6 +320,10 @@ class _Fake:
             if rest[:2] == ["status", "--porcelain"]:
                 return subprocess.CompletedProcess(argv, 0, self.timer_dirty if is_timer else self.dirty, "")
             raise AssertionError(f"unexpected git call {rest}")
+        if argv[0] == "journalctl":
+            # Only reached on an ELOOP/EDEAD refusal (unit_status.journal_tail).
+            stdout, rc, err = self.journal_output
+            return subprocess.CompletedProcess(argv, rc, stdout, err)
         raise AssertionError(f"unexpected call {argv}")
 
     @property
@@ -259,9 +337,12 @@ class _NeverRun:
 
 
 def _install(pg, runner, github_root, dest, **kw):
+    # sleeper defaults to a no-op: sample_restart_loop's wait must never be a
+    # real sleep under test (B2BF4DB9). Override with a recording fake to
+    # assert on the wait itself.
     args = dict(app_id="willow", unit=UNIT, source=SRC, project="willow-mcp",
                 ledger=_ledger(pg), runner=runner, github_root=github_root,
-                destination=dest, values=VALUES)
+                destination=dest, values=VALUES, sleeper=lambda s: None)
     args.update(kw)
     return uix.execute_unit_install(args.pop("app_id"), **args)
 
@@ -294,6 +375,104 @@ def test_granted_install_writes_enables_and_receipts(home, tmp_path, monkeypatch
     assert out["receipt_id"] == receipts[0]["id"]
 
 
+# ── restart loop (gap d30c923424a0): two samples, not one ───────────────────
+
+def test_restart_loop_from_climbing_nrestarts_refuses_eloop_after_install(
+        home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    fake = _Fake(post_enable_samples=[{"NRestarts": "1"}, {"NRestarts": "2"}])
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] is False
+    assert out["error"] == "ELOOP"
+    assert out["installed"] is True  # the files really were written and enabled
+    assert out["state_first"]["NRestarts"] == "1"
+    assert out["state_after"]["NRestarts"] == "2"
+    # L8: the ELOOP journal must carry the REAL tail, not an emptied stand-in.
+    assert out["journal"]["state"] == "populated"
+    assert out["journal"]["lines"] == ["2026-09-27T10:00:00 loop tail"]
+    # L6: the ELOOP refusal still writes a FRANK receipt.
+    assert out["receipt_id"]
+    restart_loop_receipts = [r for r in pg.rows if r["event_type"] == f"{uix.EVENT}_restart_loop"]
+    assert len(restart_loop_receipts) == 1
+    assert restart_loop_receipts[0]["id"] == out["receipt_id"]
+    # the file is genuinely on disk -- ELOOP is a report, not a rollback
+    assert (dest / UNIT).is_file()
+
+
+def test_restart_loop_from_auto_restart_substate_refuses_eloop_after_install(
+        home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    fake = _Fake(post_enable_samples=[
+        {"SubState": "auto-restart"}, {"SubState": "auto-restart"},
+    ])
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] is False
+    assert out["error"] == "ELOOP"
+
+
+def test_stable_unit_after_install_reports_ok(home, tmp_path, monkeypatch, github_root, dest):
+    """Two identical post-enable samples (the common case) still report ok."""
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    fake = _Fake(post_enable_samples=[{}, {}])
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] and out["installed"] and "error" not in out
+
+
+def test_crashed_after_install_with_restart_no_refuses_edead(
+        home, tmp_path, monkeypatch, github_root, dest):
+    """Restart=no: no auto-restart substate, NRestarts never climbs,
+    ActiveEnterTimestamp never moves again -- the OLD code's restart-loop
+    check saw none of its three signals and reported ok=True with a `failed`
+    state_after. EDEAD is a distinct errno from ELOOP."""
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    fake = _Fake(post_enable_samples=[
+        {"ActiveState": "active"}, {"ActiveState": "failed"},
+    ])
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] is False
+    assert out["error"] == "EDEAD"
+    assert out["installed"] is True
+    assert out["state_after"]["ActiveState"] == "failed"
+    # N8-N11 (Loki 0DFFEFA6): the EDEAD receipt and its journal must carry
+    # REAL content, not merely be present under the key.
+    assert out["journal"]["state"] == "populated"
+    assert out["journal"]["lines"] == ["2026-09-27T10:00:00 loop tail"]
+    assert out["receipt_id"]
+    edead_receipts = [r for r in pg.rows if r["event_type"] == f"{uix.EVENT}_dead"]
+    assert len(edead_receipts) == 1 and edead_receipts[0]["id"] == out["receipt_id"]
+    assert edead_receipts[0]["content"]["errno"] == "EDEAD"
+
+
+def test_inactive_dead_both_samples_after_install_refuses_edead(
+        home, tmp_path, monkeypatch, github_root, dest):
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    fake = _Fake(post_enable_samples=[
+        {"ActiveState": "inactive"}, {"ActiveState": "inactive"},
+    ])
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] is False and out["error"] == "EDEAD"
+    assert out["journal"]["state"] == "populated"
+    assert out["journal"]["lines"] == ["2026-09-27T10:00:00 loop tail"]
+    assert out["receipt_id"]
+
+
+def test_second_post_enable_sample_unreachable_refuses_eunreach_not_ok(
+        home, tmp_path, monkeypatch, github_root, dest):
+    """An unreachable second sample must never collapse into ok=True."""
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    fake = _Fake(raise_on_post_enable_show=1)
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] is False
+    assert out["error"] == "EUNREACH"
+    assert out["state_after"]["ok"] is False
+
+
 def test_timer_sibling_is_written_and_the_timer_is_what_gets_enabled(
         home, tmp_path, monkeypatch, github_root, dest):
     _charter(tmp_path, monkeypatch)
@@ -307,6 +486,113 @@ def test_timer_sibling_is_written_and_the_timer_is_what_gets_enabled(
     assert "Unit=nestor-ui.service" in (dest / "nestor-ui.timer").read_text()
     assert fake.enables == [["systemctl", "--user", "enable", "--now", "nestor-ui.timer"]]
     assert sorted(Path(p).name for p in out["written"]) == ["nestor-ui.service", "nestor-ui.timer"]
+
+
+def test_timer_activated_oneshot_install_reports_ok_when_the_run_is_clean(
+        home, tmp_path, monkeypatch, github_root, dest):
+    """Loki 0DFFEFA6 B2: the SERVICE a timer activates is `Type=oneshot` — it
+    runs once and goes `inactive` between ticks. Judging the SERVICE's own
+    post-enable sample (the old behaviour) reads a CORRECT install as EDEAD
+    on every bundled timer pair; the TIMER's own liveness (active/waiting)
+    is what "came up" means once a timer sibling was installed — PROVIDED
+    the oneshot's own first run, inside the sample window, actually
+    succeeded (Loki 58BC828C: a timer being healthy says nothing about
+    whether the run it triggered failed; see the EFAILED test below for
+    that case)."""
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(TIMER)
+    pg = _FakeGovernancePg()
+    fake = _Fake(oneshot=True, timer_show_unit=TIMER_UNIT,
+                 timer_sample={"ActiveState": "active", "SubState": "waiting"},
+                 post_enable_samples=[
+                     {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"},
+                     {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"},
+                 ])
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] and out["installed"], out
+    assert "error" not in out
+    assert out["state_after"]["ActiveState"] == "inactive"  # the SERVICE, oneshot-finished
+    assert _receipts(pg) and _receipts(pg)[0]["content"]["head"] == "abc123"
+
+
+def test_timer_activated_oneshot_failed_first_run_refuses_efailed(
+        home, tmp_path, monkeypatch, github_root, dest):
+    """Loki 58BC828C (Failed first run, INFO): the TIMER can be healthy while
+    the oneshot SERVICE it activates FAILED its very first run inside the
+    sample window (`OnBootSec` can have long elapsed on a running box, so the
+    timer fires at once). Manifest-grant's first apply refusing
+    `efingerprint_absent` must not read as a successful install — this is
+    the mutant `test_timer_activated_oneshot_install_reports_ok_when_the_run_is_clean`
+    used to hide before EFAILED existed: a mutant that ignores `timer_state`
+    and judges the service instead is caught by the DEAD-timer test above,
+    and a mutant that ignores the service's own failure once the timer is up
+    is caught here."""
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(TIMER)
+    pg = _FakeGovernancePg()
+    fake = _Fake(oneshot=True, timer_show_unit=TIMER_UNIT,
+                 timer_sample={"ActiveState": "active", "SubState": "waiting"},
+                 post_enable_samples=[
+                     {"ActiveState": "inactive", "Result": "exit-code", "ExecMainStatus": "1"},
+                     {"ActiveState": "inactive", "Result": "exit-code", "ExecMainStatus": "1"},
+                 ])
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] is False
+    assert out["error"] == "EFAILED"
+    assert out["installed"] is True  # the unit really was written and enabled
+    assert out["state_after"]["ActiveState"] == "inactive"
+    assert out["journal"]["state"] == "populated"
+    assert out["journal"]["lines"] == ["2026-09-27T10:00:00 loop tail"]
+    assert out["receipt_id"]
+    efailed_receipts = [r for r in pg.rows if r["event_type"] == f"{uix.EVENT}_dead"]
+    assert len(efailed_receipts) == 1 and efailed_receipts[0]["id"] == out["receipt_id"]
+    assert efailed_receipts[0]["content"]["errno"] == "EFAILED"
+
+
+def test_timer_activated_oneshot_install_refuses_edead_when_the_timer_is_dead(
+        home, tmp_path, monkeypatch, github_root, dest):
+    """The inverse: the TIMER itself failed to come up, even though the
+    oneshot SERVICE looks exactly like a normal "ran once and exited"
+    completion — EDEAD must follow the timer, not the service."""
+    _charter(tmp_path, monkeypatch)
+    (github_root / "willow-memory" / "willow-mcp" / "deploy" / "nestor-ui.timer.template").write_text(TIMER)
+    pg = _FakeGovernancePg()
+    fake = _Fake(oneshot=True, timer_show_unit=TIMER_UNIT,
+                 timer_sample={"ActiveState": "inactive", "SubState": "dead"})
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] is False and out["error"] == "EDEAD"
+    assert out["installed"] is True
+    assert "journal" in out and out["journal"]["state"] == "populated"
+    assert out["journal"]["lines"] == ["2026-09-27T10:00:00 loop tail"]
+    assert out["receipt_id"]
+
+
+def test_direct_oneshot_install_with_no_timer_accepts_a_clean_run(
+        home, tmp_path, monkeypatch, github_root, dest):
+    """No timer sibling at all: a directly-installed `Type=oneshot` unit
+    that ran once and exited 0 is accepted ("the same logic, inferred" —
+    Loki 0DFFEFA6 B2), not reported EDEAD merely for going `inactive`."""
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    fake = _Fake(oneshot=True)
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] and out["installed"], out
+    assert out["state_after"]["ActiveState"] == "inactive"
+    assert out["state_after"]["Result"] == "success"
+
+
+def test_direct_oneshot_install_with_a_failed_run_refuses_edead(
+        home, tmp_path, monkeypatch, github_root, dest):
+    """A oneshot that ran and FAILED (`Result` not `success`, non-zero
+    `ExecMainStatus`) is still EDEAD — the oneshot allowance is narrow."""
+    _charter(tmp_path, monkeypatch)
+    pg = _FakeGovernancePg()
+    fake = _Fake(oneshot=True, post_enable_samples=[
+        {"ActiveState": "inactive", "Result": "exit-code", "ExecMainStatus": "1"},
+        {"ActiveState": "inactive", "Result": "exit-code", "ExecMainStatus": "1"},
+    ])
+    out = _install(pg, fake, github_root, dest)
+    assert out["ok"] is False and out["error"] == "EDEAD"
 
 
 def test_replace_records_the_previous_digest(home, tmp_path, monkeypatch, github_root, dest):
