@@ -593,19 +593,24 @@ RULING_PAIR_ID = "f13f15d9-5b31-4b20-bffa-7fd5157d9c9b"
 #: decision copied under the SAME id would also pass. Exploiting that
 #: already needs nestor.db write access, and the same writer can already
 #: clear superseded_by, so this is defence in depth, not the primary gate.
-#: Left UNSET (None) here: building this from Kart cannot read the live
-#: nestor.db (the sandbox mounts the worktree, not the live
-#: WILLOW_HOME/nestor.db, and no task_db/task_net capability was granted
-#: for this build), so the hash below is never invented. When None, the
-#: check in _ruling_sealed() is skipped entirely -- every OTHER gate still
-#: applies; only this one defence-in-depth layer is absent. The desk fills
-#: this in from a broker read of the live pair, via the SAME function the
-#: gate uses:
-#:   sealed = net_authority.read_sealed_pair(RULING_PAIR_ID, nestor_db)
+#: Pinned (Loki PASS 0D8EA229): Kart cannot read the live nestor.db (the
+#: sandbox mounts the worktree, not the live WILLOW_HOME/nestor.db, and no
+#: task_db/task_net capability was granted for this build), so the value
+#: below was read from the broker, never invented in Kart. Exact recipe --
+#: the SAME function the gate itself calls, via the read-only Nestor MCP
+#: (nestor_provenance, never a direct nestor.db read, which Kart cannot
+#: reach):
+#:   sealed = nestor_provenance(pair_id=RULING_PAIR_ID)  # signature_valid=true
 #:   hashlib.sha256(net_signer.seal_message(
 #:       sealed["source_norm"], sealed["target_text"], sealed["verifier"]
 #:   )).hexdigest()
-RULING_TEXT_SHA256: Optional[str] = None
+#: When None, the check in _ruling_sealed() is skipped entirely -- every
+#: OTHER gate still applies; only this one defence-in-depth layer is
+#: absent. A WRONG pin fails SAFE (falls back to run_once() below) but is
+#: never SILENT about it -- run_once_v2() writes a named ERULINGTEXT
+#: refusal row (see _ruling_sealed_detail) rather than looking identical
+#: to "the pair simply isn't sealed at all".
+RULING_TEXT_SHA256: Optional[str] = "239d333eb89e1a23a0508a96a9b4041bfd4fdf35d8f493ffe518f3421fcb3976"
 
 #: FRANK event types for the merge-is-confirm path -- distinct from
 #: unit_reload_executor.EVENT ("unit_reload", the sealed-pair path's own
@@ -639,6 +644,39 @@ _MERGE_TOKEN_PERMISSIONS = {"checks": "read", "pull_requests": "read", "metadata
 _MERGE_OPEN_ERRORS = frozenset({"ECHECKS", "EUNREACH", "ENOTMERGED", "EDRIFT", "ENOTMASTER"})
 
 
+def _ruling_sealed_detail(nestor_db: Path) -> tuple[bool, Optional[str]]:
+    """As :func:`_ruling_sealed`, but also names WHY when the pin itself is
+    the reason for "not sealed" -- ``(False, "text_hash_mismatch")`` is the
+    ONE case :func:`run_once_v2` treats as loud (a named ``ERULINGTEXT``
+    refusal row) rather than silent (indistinguishable from "the pair
+    simply isn't sealed at all"). Every other "not sealed" path returns
+    ``(False, None)``. N3 (Loki PASS 0D8EA229)."""
+    from . import net_authority
+    from . import net_signer
+
+    sealed = net_authority.read_sealed_pair(RULING_PAIR_ID, nestor_db)
+    if sealed.get("state") != "populated":
+        return False, None
+    if sealed.get("source_lang") != "decision":
+        return False, None
+
+    ring, _ring_err = _load_verify_ring()
+    if ring is None:
+        return False, None
+    ok, _reason, _field = net_signer.verify_seal(sealed, ring, max_age_s=None)
+    if not ok:
+        return False, None
+
+    if RULING_TEXT_SHA256 is not None:
+        import hashlib
+
+        signed_text = net_signer.seal_message(
+            sealed["source_norm"], sealed["target_text"], sealed["verifier"])
+        if hashlib.sha256(signed_text).hexdigest() != RULING_TEXT_SHA256:
+            return False, "text_hash_mismatch"
+    return True, None
+
+
 def _ruling_sealed(nestor_db: Path) -> bool:
     """Whether the PINNED pair RULING_PAIR_ID is a sealed, non-superseded,
     source_lang='decision' pair in nestor.db AND its seal_sig verifies
@@ -665,31 +703,14 @@ def _ruling_sealed(nestor_db: Path) -> bool:
     assertion, not a signed one: seal_message() covers only
     source_norm/target_text/verifier, so source_lang is checked here, in
     code, against whatever the row holds. N3 adds the optional signed-text
-    hash pin -- see RULING_TEXT_SHA256 above for why it may be None."""
-    from . import net_authority
-    from . import net_signer
+    hash pin -- see RULING_TEXT_SHA256 above for why it may be None.
 
-    sealed = net_authority.read_sealed_pair(RULING_PAIR_ID, nestor_db)
-    if sealed.get("state") != "populated":
-        return False
-    if sealed.get("source_lang") != "decision":
-        return False
-
-    ring, _ring_err = _load_verify_ring()
-    if ring is None:
-        return False
-    ok, _reason, _field = net_signer.verify_seal(sealed, ring, max_age_s=None)
-    if not ok:
-        return False
-
-    if RULING_TEXT_SHA256 is not None:
-        import hashlib
-
-        signed_text = net_signer.seal_message(
-            sealed["source_norm"], sealed["target_text"], sealed["verifier"])
-        if hashlib.sha256(signed_text).hexdigest() != RULING_TEXT_SHA256:
-            return False
-    return True
+    Rework 3 (Loki PASS 0D8EA229): delegates to _ruling_sealed_detail(),
+    which also names a text-hash mismatch specifically so run_once_v2()
+    can write a loud refusal row for that one case instead of falling
+    back silently."""
+    sealed, _reason = _ruling_sealed_detail(nestor_db)
+    return sealed
 
 
 def _default_merge_api(method: str, url: str, *, bearer: str, body: Optional[dict] = None) -> dict:
@@ -723,15 +744,13 @@ def _pr_for_commit(repo: str, sha: str, *, api, bearer: str) -> dict:
         return {"state": "unreachable", "reason": cause, "detail": reason}
     items = resp.get("body")
     items = items if isinstance(items, list) else []
-    # TODO(ruling): Loki 40F02AAD finding 4, held for the operator -- ANY
-    # PR merged into master naming this sha counts, including
-    # release-please's own release PR (merged_by willow-ci[bot]) and
-    # dependabot automerge. That matches the letter of the sealed ruling
-    # ("a PR merged into master") but not its premise ("the merge is a
-    # ratified human act"), since those bot merges are exempt from
-    # Ratified-by. Left as-is pending an operator decision: allowlist
-    # merged_by (needs GET /pulls/{n}; the list endpoint has no
-    # merged_by), or name the bot release pair explicitly in the ruling.
+    # F4 (resolved -- the operator, ruling f13f15d9, "a PR merged into
+    # master"): ANY PR merged into master naming this sha counts,
+    # including release-please's own release PR (merged_by
+    # willow-ci[bot]) and dependabot automerge. This is deliberate, not
+    # an oversight -- the ruling is stated by the merge fact alone, never
+    # by who or what performed it, so no merged_by/user.type allowlist is
+    # applied here.
     for pr in items:
         if pr.get("merged_at") and (pr.get("base") or {}).get("ref") == "master" \
                 and pr.get("merge_commit_sha") == sha:
@@ -1005,17 +1024,6 @@ def run_once_v2(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = 
     brief): nothing in this path asks Nestor for a per-restart confirm,
     so the ledger carries the trail on its own.
     """
-    if not _ruling_sealed(config.nestor_db):
-        return run_once(config, ledger=ledger, runner=runner, project=project)
-
-    merge_verdict = check_merge(config, ledger=ledger, runner=runner, api=api,
-                               token_minter=token_minter)
-    env_verdict = check_env(config, ledger=ledger, runner=runner)
-    due_merge = bool(merge_verdict.get("act"))
-    due_env = bool(env_verdict.get("act"))
-    open_merge = due_merge or merge_verdict.get("error") in _MERGE_OPEN_ERRORS
-    open_env = _is_open_trigger(env_verdict)
-
     def _refused_pairs_on_file() -> set:
         # N4 (Loki F0C19708): dedup against every (receipt_id, error) pair
         # already on the ledger for this repo/checkout, not only against
@@ -1039,15 +1047,21 @@ def run_once_v2(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = 
         return seen
 
     def _write_refusal(*, error: Optional[str], reason: Optional[str],
-                       receipt_id: Optional[str] = None, **extra) -> Optional[str]:
+                       receipt_id: Optional[str] = None, dedup: bool = True,
+                       **extra) -> Optional[str]:
         if ledger is None:
             return None
         # F4/F5/N4 (Loki 40F02AAD, F0C19708): the SAME (receipt, error)
         # pair as ANY prior refusal row for this repo/checkout writes
         # NOTHING -- a 60s timer would otherwise put ~1440 permanent rows a
         # day on a ledger that can only be annulled, never rewritten, for a
-        # state this same pair has already reported once.
-        if (receipt_id, error) in _refused_pairs_on_file():
+        # state this same pair has already reported once. L1 (Loki PASS
+        # 0D8EA229): the three REAL restart-attempt failure paths
+        # (systemctl_missing/ETIMEDOUT/ERESTART) pass dedup=False -- each
+        # is a distinct side-effecting attempt against the live unit, not
+        # an idle re-poll of the same unconfirmed state, so N4's
+        # ledger-spam guard must never collapse them into one row.
+        if dedup and (receipt_id, error) in _refused_pairs_on_file():
             return None
         try:
             return ledger.append(project, MERGE_REFUSAL_EVENT, {
@@ -1057,6 +1071,30 @@ def run_once_v2(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = 
             })
         except Exception:
             return None
+
+    sealed, ruling_reason = _ruling_sealed_detail(config.nestor_db)
+    if not sealed:
+        if ruling_reason == "text_hash_mismatch":
+            # N3 (Loki PASS 0D8EA229): a wrong RULING_TEXT_SHA256 pin fails
+            # SAFE (falls back to run_once() below, never acting on an
+            # unverified text) but must never fail SILENTLY -- this names
+            # the mismatch on the ledger rather than looking identical to
+            # "the pair simply isn't sealed at all".
+            _write_refusal(
+                error="ERULINGTEXT",
+                reason=f"the pinned pair {RULING_PAIR_ID}'s signed text does not hash to "
+                       f"RULING_TEXT_SHA256 -- falling back to the sealed-pair path rather "
+                       f"than acting on an unverified ruling text",
+                receipt_id=None)
+        return run_once(config, ledger=ledger, runner=runner, project=project)
+
+    merge_verdict = check_merge(config, ledger=ledger, runner=runner, api=api,
+                               token_minter=token_minter)
+    env_verdict = check_env(config, ledger=ledger, runner=runner)
+    due_merge = bool(merge_verdict.get("act"))
+    due_env = bool(env_verdict.get("act"))
+    open_merge = due_merge or merge_verdict.get("error") in _MERGE_OPEN_ERRORS
+    open_env = _is_open_trigger(env_verdict)
 
     if not (due_merge or due_env):
         out = dict(merge_verdict)
@@ -1093,14 +1131,14 @@ def run_once_v2(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = 
         # F7 (Loki 40F02AAD): a failed restart writes a refusal receipt
         # carrying the reason code -- it used to write no ink at all.
         out["refusal_receipt_id"] = _write_refusal(
-            error=out["error"], reason=out["reason"], receipt_id=restart_receipt_id)
+            error=out["error"], reason=out["reason"], receipt_id=restart_receipt_id, dedup=False)
         return out
     except subprocess.TimeoutExpired:
         out = {"ok": False, "act": True, "reloaded": False, "error": "ETIMEDOUT",
                "reason": f"systemctl restart exceeded {_SYSTEMCTL_TIMEOUT_S}s",
                "unit": unit, "merge": merge_verdict, "env": env_verdict}
         out["refusal_receipt_id"] = _write_refusal(
-            error=out["error"], reason=out["reason"], receipt_id=restart_receipt_id)
+            error=out["error"], reason=out["reason"], receipt_id=restart_receipt_id, dedup=False)
         return out
     if restarted.returncode != 0:
         tail = (restarted.stderr or restarted.stdout or "").strip()[-300:]
@@ -1108,7 +1146,7 @@ def run_once_v2(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = 
                "reason": tail or f"systemctl restart exited {restarted.returncode}",
                "unit": unit, "merge": merge_verdict, "env": env_verdict}
         out["refusal_receipt_id"] = _write_refusal(
-            error=out["error"], reason=out["reason"], receipt_id=restart_receipt_id)
+            error=out["error"], reason=out["reason"], receipt_id=restart_receipt_id, dedup=False)
         return out
 
     triggers = []

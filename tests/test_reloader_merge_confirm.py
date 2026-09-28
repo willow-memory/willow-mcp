@@ -43,10 +43,20 @@ from willow_mcp import reloader
 
 _SC = "systemctl"
 
+#: Snapshot of the module's REAL pinned hash (N3, Loki PASS 0D8EA229),
+#: taken at import time -- before the autouse fixture below neutralizes
+#: it for the rest of this suite's synthetic fixture text.
+_LIVE_RULING_TEXT_SHA256 = reloader.RULING_TEXT_SHA256
+
 
 @pytest.fixture(autouse=True)
 def _merge_willow_home(tmp_path, monkeypatch):
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path / "willow_home_default"))
+    # This suite's own _RULING_SOURCE_NORM/_RULING_TARGET fixture text is
+    # synthetic and does NOT hash to the real, live RULING_TEXT_SHA256 --
+    # reset to None (the "pin skipped" default) for every test EXCEPT the
+    # ones that explicitly monkeypatch their own pin to exercise it.
+    monkeypatch.setattr(reloader, "RULING_TEXT_SHA256", None)
 
 
 # -- fakes --------------------------------------------------------------------
@@ -466,6 +476,33 @@ def test_pr_for_commit_empty_when_not_merged():
     assert out["state"] == "empty"
 
 
+# -- F4 (resolved -- the operator, ruling f13f15d9, "a PR merged into master") --
+
+def test_pr_for_commit_populated_for_a_bot_authored_merged_pr():
+    """F4: 'all merges should count' -- a PR merged into master by a Bot
+    account (release-please's own release PR, dependabot automerge) counts
+    exactly like a human-authored one. No merged_by/user.type allowlist is
+    applied."""
+    api = _api(pr_response={"ok": True, "body": [
+        {"number": 7, "merged_at": "2026-09-28T10:00:00Z", "base": {"ref": "master"},
+         "merge_commit_sha": "cafef00d", "merged_by": {"login": "willow-ci[bot]"},
+         "user": {"login": "willow-ci[bot]", "type": "Bot"}}]})
+    out = reloader._pr_for_commit("willow-memory/willow-mcp", "cafef00d", api=api, bearer="t")
+    assert out == {"state": "populated", "number": 7}
+
+
+def test_check_merge_accepts_a_bot_authored_merged_pr(checkout, sealed_db):
+    config = _config(checkout, sealed_db)
+    ledger = _FakeLedger(_pull_receipt(checkout))
+    pr_response = {"ok": True, "body": [
+        {"number": 7, "merged_at": "2026-09-28T10:00:00Z", "base": {"ref": "master"},
+         "merge_commit_sha": "cafef00d", "merged_by": {"login": "willow-ci[bot]"},
+         "user": {"login": "willow-ci[bot]", "type": "Bot"}}]}
+    api = _api(pr_response=pr_response, checks_response=_checks_ok())
+    out = reloader.check_merge(config, ledger=ledger, runner=_Git(), api=api, token_minter=_minter())
+    assert out["ok"] is True and out["act"] is True and out["pr_number"] == 7
+
+
 # -- ECHECKS (allowlist, F8) -----------------------------------------------------
 
 def test_check_merge_refuses_echecks_when_a_run_is_not_conclusive(checkout, sealed_db):
@@ -859,11 +896,15 @@ def test_check_merge_new_style_row_is_unaffected_by_legacy_support(checkout, sea
 
 # -- N3 (Loki F0C19708): pin the signed text next to the pinned pair id --------
 
-def test_ruling_sealed_hash_pin_is_unset_by_default():
-    """Never invented: building this from Kart cannot read the live
-    nestor.db, so RULING_TEXT_SHA256 stays None until the desk fills it in
-    from a broker read (see the constant's own comment in reloader.py)."""
-    assert reloader.RULING_TEXT_SHA256 is None
+def test_ruling_sealed_hash_pin_is_filled_in_from_the_live_pair():
+    """Filled in (Loki PASS 0D8EA229) from a broker read of the live pair
+    -- never invented in Kart (see the constant's own comment in
+    reloader.py) -- with the exact hash Loki computed against pair
+    f13f15d9-5b31-4b20-bffa-7fd5157d9c9b's signed text. Checked against
+    the import-time snapshot, since the autouse fixture above resets the
+    live module attribute to None for the rest of this suite."""
+    assert _LIVE_RULING_TEXT_SHA256 == (
+        "239d333eb89e1a23a0508a96a9b4041bfd4fdf35d8f493ffe518f3421fcb3976")
 
 
 def test_ruling_sealed_checks_pinned_text_hash_when_set(tmp_path, ring_with_sean, monkeypatch):
@@ -884,9 +925,42 @@ def test_ruling_sealed_checks_pinned_text_hash_when_set(tmp_path, ring_with_sean
     assert reloader._ruling_sealed(bad_db) is False
 
 
+def test_run_once_v2_wrong_pin_falls_back_and_writes_named_refusal(
+        checkout, tmp_path, ring_with_sean, monkeypatch):
+    """N3 (Loki PASS 0D8EA229): a WRONG RULING_TEXT_SHA256 pin must fail
+    SAFE -- run_once_v2() falls back to the old run_once() path exactly as
+    it does while wholly unsealed -- but never SILENTLY: it names the
+    mismatch in a dedicated ERULINGTEXT refusal row rather than looking
+    identical to "the pair simply isn't sealed at all"."""
+    wrong_hash = "0" * 64
+    monkeypatch.setattr(reloader, "RULING_TEXT_SHA256", wrong_hash)
+    db = _ruling_db(tmp_path, seal_sig=_sign_ruling(ring_with_sean))
+    config = _config(checkout, db)
+    ledger = _FakeLedger()
+
+    out = reloader.run_once_v2(config, ledger=ledger, runner=_Git())
+    fallback = reloader.run_once(config, ledger=_FakeLedger(), runner=_Git())
+    assert out.get("ok") == fallback.get("ok")
+    assert out.get("error") == fallback.get("error")
+
+    rows = ledger._rows.get(reloader.MERGE_REFUSAL_EVENT, [])
+    assert len(rows) == 1
+    assert rows[0]["content"]["error"] == "ERULINGTEXT"
+    assert reloader.RULING_PAIR_ID in rows[0]["content"]["reason"]
+
+    # A second tick with the same wrong pin writes no SECOND row -- N4's
+    # dedup applies to this refusal type too.
+    reloader.run_once_v2(config, ledger=ledger, runner=_Git())
+    assert len(ledger._rows.get(reloader.MERGE_REFUSAL_EVENT, [])) == 1
+
+
 # -- N6: the em dash in the no-keyring cause text -------------------------------
 
-def test_load_verify_ring_no_keyring_cause_uses_em_dash():
+def test_load_verify_ring_no_keyring_cause_uses_em_dash(monkeypatch):
+    # Minor (Loki PASS 0D8EA229 INFO): isolate WILLOW_KEYRING explicitly --
+    # this test wants "no keyring configured" specifically, not whatever
+    # happened to be (un)set in the ambient environment.
+    monkeypatch.delenv("WILLOW_KEYRING", raising=False)
     ring, err = reloader._load_verify_ring()
     assert ring is None
     assert err["state"] == "unreachable"
@@ -917,3 +991,32 @@ def test_run_once_v2_flapping_error_writes_only_two_rows_not_one_per_tick(checko
     rows = ledger._rows.get(reloader.MERGE_REFUSAL_EVENT, [])
     assert len(rows) == 2
     assert {r["content"]["error"] for r in rows} == {"EUNREACH", "ECHECKS"}
+
+
+# -- L1 (Loki PASS 0D8EA229): real failed-restart attempts each recorded -------
+
+def test_run_once_v2_three_real_restart_failures_on_one_receipt_all_recorded(checkout, sealed_db):
+    """L1: N4's history-wide dedup must never swallow REAL, side-effecting
+    restart-attempt failures (systemctl_missing/ETIMEDOUT/ERESTART) even
+    when they repeat the SAME (receipt_id, error) pair on the SAME
+    receipt -- each attempt against the live unit is its own event, not
+    an idle re-poll of unconfirmed state. Chosen fix: those three write
+    paths pass dedup=False to _write_refusal rather than gaining a
+    separate attempt counter."""
+    config = _config(checkout, sealed_db)
+    receipt = _pull_receipt(checkout)
+    ledger = _FakeLedger(receipt)
+    api = _api(pr_response=_pr_ok(), checks_response=_checks_ok())
+
+    for _ in range(3):
+        # A FRESH fake each tick: _Git flips its own "restarted" flag on
+        # ANY restart call regardless of returncode, which would otherwise
+        # make the SECOND tick see an active-since-receipt unit and refuse
+        # EALREADY instead of retrying the real, still-broken restart.
+        git = _Git(restart_rc=1)
+        out = reloader.run_once_v2(config, ledger=ledger, runner=git, api=api, token_minter=_minter())
+        assert out["error"] == "ERESTART"
+
+    rows = ledger._rows.get(reloader.MERGE_REFUSAL_EVENT, [])
+    assert len(rows) == 3
+    assert all(r["content"]["error"] == "ERESTART" for r in rows)
