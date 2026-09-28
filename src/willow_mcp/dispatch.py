@@ -801,6 +801,12 @@ def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict
         if pkt.get("error"):
             return pkt
         cur = pkt.get("status", {}).get("status", "pending")
+        # TODO(ruling): re-accepting a CLEARED packet (a recurring dispatch)
+        # re-enters this same branch and lets a second handoff overwrite the
+        # prior verified one with no sidecar -- Loki 262F89A1 F3. Whether a
+        # cleared packet's prior handoff should be archived or the re-accept
+        # itself refused is an open operator ruling; out of scope for bite 1
+        # (dispatch 9BA76253). Left as-is on purpose.
         if cur not in ("pending", "cleared"):
             return {"error": "invalid_transition", "from": cur, "to": "working"}
         dispatch_set_status(dispatch_id, "working", accepted_session_id=session_id)
