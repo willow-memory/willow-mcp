@@ -126,7 +126,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     }),
     "fleet_read": frozenset({
         "fleet_status", "fleet_health", "frank_read", "frank_verify",
-        "bot_status", "pr_checks_read",
+        "bot_status", "pr_checks_read", "unit_status",
     }),
     # Grove — the fleet's shared messaging room (legacy fleet monolith's sap/grove_tools.py
     # successor; see willow_mcp/grove_tools.py). Read/write mirror the
@@ -538,7 +538,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # Fleet (read-only)
         "fleet_status", "fleet_health",
         "frank_read", "frank_verify",
-        "bot_status", "pr_checks_read",
+        "bot_status", "pr_checks_read", "unit_status",
         # Seal watch tick — mirrors a human's seal, mints nothing (unlike
         # decision_propose, which stays off this line): the steward and the
         # desk tick it beside fleet_health without a manifest re-sign.

@@ -194,7 +194,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 146 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 147 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -6085,6 +6085,36 @@ def bot_status(app_id: str) -> dict:
         return _bot_status.read_status()
     except Exception as exc:
         return {"state": "unreachable", "reason": f"bot_status_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_READ)
+@_guarded("unit_status")
+def unit_status(app_id: str, unit: str = "", journal_lines: int = 20) -> dict:
+    """The desk can see whether a `systemctl --user` unit is actually
+    running, not just enabled (gap `158600e03598`): tonight an urgent item
+    was closed on a `default.target.wants` symlink with nothing able to show
+    the unit's live state. `unit` empty enumerates every loaded
+    `willow-*`/`ratatosk-*` unit plus enabled-but-not-loaded unit files, so a
+    unit that has never started still shows up; a named unit must match one
+    of those two prefixes or the call is refused `EINVAL` — this is not a
+    general systemd reader. Reuses `unit_reload_executor.show_unit` for
+    `ActiveState`/`SubState`/`MainPID`/`NRestarts`/`ActiveEnterTimestamp`/
+    `UnitFileState`/`ExecMainStatus`, and reports `restarting: true` when
+    `NRestarts` > 0 within the last 60s or `SubState` is `auto-restart` — the
+    "active is not bound" guard, in code, so a crash-looping unit never reads
+    as healthy from one sample. Each unit carries a bounded, redacted
+    `journalctl --user` tail (`journal_lines`, capped at 200). Three-state at
+    the top level (INVARIANTS §1): `populated` / `empty` (no matching units)
+    / `unreachable` (`cause`: `no_user_bus`, `systemctl_missing`, `timeout` —
+    never collapsed into `empty`); the journal tail carries its own
+    three-state per unit. Read-only: no writes, no envelope, no FRANK
+    citation."""
+    from . import unit_status as _unit_status
+
+    try:
+        return _unit_status.read_unit_status(unit=unit, journal_lines=journal_lines)
+    except Exception as exc:
+        return {"state": "unreachable", "reason": f"unit_status_failed: {exc}"}
 
 
 @mcp.tool(annotations=_ANNO_READ)
