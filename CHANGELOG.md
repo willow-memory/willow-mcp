@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.86.0](https://github.com/willow-memory/willow-mcp/compare/v2.85.0...v2.86.0) (2026-09-28)
+
+
+### Added
+
+* lease_request desk verb; requested_by only from a verified, per-call-scoped credential ([d0a6802](https://github.com/willow-memory/willow-mcp/commit/d0a680248bf9bac2b8ecc2a435003a45c7e328d2))
+
 ## [2.85.0](https://github.com/willow-memory/willow-mcp/compare/v2.84.1...v2.85.0) (2026-09-28)
 
 
