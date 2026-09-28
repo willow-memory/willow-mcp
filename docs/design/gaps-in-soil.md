@@ -380,30 +380,27 @@ a mutation proof: break the code in a scratch copy and paste the red result.
    answered yes.
 
 @phase 8-open-questions
-## 8. Open questions for the operator
+## 8. Open questions for the operator — ANSWERED
 
-1. **Read door.** Should `gaps` and `gap_edges` be readable through
-   `store_get`/`store_list`/`store_search`/`store_search_all` by every
-   `gap_read` holder? That would be a read-only exception in
-   `gate.collection_permitted`. Or should they stay behind the gap verbs? Adding
-   them to a `store_scope` is **not** an option: scope also governs
-   `store_put`/`store_update`/`store_delete` (`server.py:1413-1415`,
-   `1464-1468`, `1495-1498`), which would let any seat rewrite or tombstone a
-   gap outside the gap verbs.
-2. **Who confirms `recurs`.** Should `gap_recurs_decide` be open to any
-   `gap_promote` holder, models included (every decision recorded with
-   `decided_by`, and the operator can revoke)? Or should it be operator-seat
-   only?
-3. **Thresholds.** Accept the provisional S2–S4 values (J 0.20/0.20/0.40) and
-   S5 ≥ 0.92, with proposals on `gap_log` held until the backfill histogram has
-   been read?
-4. **Demand.** Should a confirmed `recurs` stay out of `asked_count`, so that
-   it remains the literal ask counter and ranking uses cluster size? Or should
-   it fold into the canonical row's `asked_count`?
-5. **Re-ask after close.** `gap_log` on a `resolved` id keeps it `resolved`
-   (`gaps.py:83`). With `closed_by` edges in place, a re-ask after the closing
-   commit is evidence of a false close. Should it reopen the gap (status →
-   `open`, keeping the `closed_by` edge marked `reasked_after`)?
+Answered by governance record `019e388e`. The operator's own words: "I agree
+with your 5 for B1."
+
+1. **Read door.** ANSWERED: `gaps` and `gap_edges` are readable through a
+   dedicated read-only door, not through `store_scope` — `store_scope` also
+   governs `store_put`/`store_update`/`store_delete`
+   (`server.py:1413-1415`, `1464-1468`, `1495-1498`), which would let any
+   seat rewrite or tombstone a gap outside the gap verbs.
+2. **Who confirms `recurs`.** ANSWERED: `gap_recurs_decide` may be called by
+   any seat holding `gap_promote`, models included, with `decided_by`
+   recorded. A model only confirms or rejects a machine-proposed edge; it
+   never proposes one itself.
+3. **Thresholds.** ANSWERED: the S2–S4/S5 thresholds are provisional.
+   Recurrence proposals on `gap_log` wait until the operator has read the
+   backfill's overlap (J) histogram.
+4. **Demand.** ANSWERED: rank by confirmed-recurrence cluster size;
+   `asked_count` stays the literal count of re-asks — a confirmed `recurs`
+   does not fold into it.
+5. **Re-ask after close.** ANSWERED: re-logging a resolved gap reopens it.
 
 @phase constraints
 ## Constraints
