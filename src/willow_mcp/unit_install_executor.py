@@ -100,6 +100,14 @@ EVENT = "unit_install"
 _ASKABLE = frozenset({"ENOENT", "EAMBIG", "EEXPIRED", "EDQUOT", "ENOGRANTS"})
 
 _UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]*\.(service|timer|socket|path|target)$")
+#: A `.d/` drop-in beside an already-installed unit: `<parent>.d/<name>.conf`
+#: (assignment 16BAEFD8, build item 3). `_UNIT_RE` refuses this shape by
+#: design (see the module docstring); this is the narrow, separate admission
+#: -- group 1 is the parent unit judged alongside it, group 3 the file name.
+_DROPIN_RE = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9_.@:-]*\.(service|timer|socket|path|target))\.d/"
+    r"([A-Za-z0-9][A-Za-z0-9_.-]*\.conf)$"
+)
 _DECLARED_RE = re.compile(r"^\s*#\s*unit:\s*(\S+)\s*$", re.MULTILINE)
 _PLACEHOLDER_RE = re.compile(r"@([A-Z][A-Z0-9_]*)@")
 
@@ -566,6 +574,272 @@ def timer_activates(timer_rendered: str, timer_name: str) -> str:
     return enable_effects(timer_rendered, timer_name)["activates"]
 
 
+def render_dropin_values(parent: str, dropin_name: str, *,
+                          runner: Optional[Callable] = None) -> dict[str, str]:
+    """Values for a `.d/` drop-in template. ``keyring.conf`` resolves
+    ``WILLOW_KEYRING`` the SAME way the reloader's own rendered unit does --
+    :func:`reloader.resolve_keyring_path` (the net-signer unit's own
+    environment first, :func:`net_signer.default_ring_path` as the named
+    fallback) -- never a second, independent guess, and never this
+    process's own possibly-unset ``WILLOW_KEYRING`` (which
+    :func:`render_values` would silently omit rather than resolve).
+
+    Refuses (``ValueError``, the same ETEMPLATE-shaped refusal
+    :func:`reloader.render_units` already gives for its own unit) when the
+    resolved path is not an existing file -- a drop-in rendered against a
+    ring that is not actually staged can never verify a real seal.
+
+    Any OTHER drop-in name falls back to :func:`render_values` unchanged --
+    this is the one override the assignment named, not a general keyring
+    substitution for every future drop-in."""
+    values = render_values(parent)
+    if dropin_name == "keyring.conf":
+        from . import reloader as _reloader
+
+        keyring_path, keyring_source = _reloader.resolve_keyring_path(runner=runner)
+        if not keyring_path.is_file():
+            raise ValueError(
+                f"WILLOW_KEYRING would render to {keyring_path} (resolved via "
+                f"{keyring_source}), which is not a file -- refusing to render a "
+                f"drop-in whose seal confirm can never succeed; stage the public "
+                f"ring first (`willow-mcp-net-signer export-ring` or `install`) "
+                f"or re-render from where {_reloader._NET_SIGNER_UNIT} is actually installed"
+            )
+        values["WILLOW_KEYRING"] = str(keyring_path)
+    return values
+
+
+#: For a drop-in that targets the broker's own unit (willow-mcp-serve.service
+#: itself -- assignment 16BAEFD8's whole point): the ONLY content ever
+#: admitted is `[Service] Environment=`. Nothing else -- not `ExecStart`, not
+#: `User`, no `[Unit]`/`[Install]` section -- because those DO let a drop-in
+#: change what the broker runs as, exactly what the whole-unit EPERM above
+#: exists to prevent. This is the content-level guard that makes admitting a
+#: drop-in against the broker safe rather than reopening that hole.
+_DROPIN_BROKER_ALLOWED_KEYS = frozenset({"Environment"})
+
+
+def _dropin_broker_content_violation(rendered: str) -> str:
+    """"" when ``rendered`` is Environment=-only in [Service]; otherwise the
+    refusal reason naming what else it touches."""
+    section = ""
+    for raw in _logical_lines(rendered):
+        line = raw.strip()
+        m = _SECTION_RE.match(line)
+        if m:
+            section = m.group("name").strip()
+            continue
+        if not line or line.startswith(("#", ";")) or "=" not in line:
+            continue
+        if section != "Service":
+            return (f"a drop-in against the broker's own unit may only touch "
+                    f"[Service] Environment=, not [{section}]")
+        key = line.split("=", 1)[0].strip()
+        if key not in _DROPIN_BROKER_ALLOWED_KEYS:
+            return (f"a drop-in against the broker's own unit may only set "
+                    f"Environment=, not {key}=")
+    return ""
+
+
+def _execute_dropin_install(
+    app_id: str, *, unit: str, parent: str, dropin_name: str, source: str,
+    repo: str, rel: str, envelope_id: str, project: str, session: str, task_id: str,
+    ledger, store, runner: Optional[Callable], github_root: Optional[Path],
+    destination: Optional[Path],
+) -> dict:
+    """Write (or replace) one `.d/` drop-in beside an already-installed unit,
+    under the SAME ``unit.install`` verb as a whole-unit install -- the
+    bounds judge ``units=[parent, unit]`` (assignment 16BAEFD8, build item
+    3): the parent unit named as what the drop-in modifies, and the
+    drop-in's own ``<parent>.d/<name>.conf`` path named as the file written.
+
+    Unlike a whole unit, a drop-in is never ``enable``d or started here --
+    fitting an ``Environment=`` line onto an ALREADY-managed unit is a
+    content change the unit's own reload/restart path (the reloader's env
+    trigger, ruling 1bd6fd29) picks up, not a new activation. A
+    ``daemon-reload`` alone (never ``enable --now``) makes the drop-in
+    visible to the unit's NEXT restart."""
+    from .envelopes import EnvelopeAuthority, governing_envelopes
+
+    if ledger is None:
+        return _refuse(
+            "EAMBIG",
+            "no governance ledger: an install that cannot be cited is not performed",
+        )
+
+    clone_info = _resolve_clone(repo, root=github_root, runner=runner)
+    if not clone_info.get("ok"):
+        return clone_info
+    clone, head_sha = clone_info["clone"], clone_info["head"]
+    src = _read_tracked(clone, repo, rel, runner=runner)
+    if not src.get("ok"):
+        return src
+    declared = declared_unit_name(src["text"], src["path"])
+    if declared != unit:
+        return _refuse(
+            "ENAME", f"template {rel!r} declares {declared!r}, not {unit!r}",
+            declared=declared,
+        )
+    try:
+        vals = render_dropin_values(parent, dropin_name, runner=runner)
+        rendered = render_template(src["text"], unit, values=vals)
+    except ValueError as exc:
+        return _refuse("ETEMPLATE", str(exc))
+
+    named = broker_units_named(rendered)
+    if named:
+        return _refuse(
+            "EPERM",
+            f"the rendered drop-in names the broker's own unit -- never grantable, "
+            f"regardless of bounds: {'; '.join(named)}",
+            named=named,
+        )
+    if is_broker_unit(parent):
+        violation = _dropin_broker_content_violation(rendered)
+        if violation:
+            return _refuse("EPERM", violation)
+
+    judged: list[str] = [parent, unit]
+    call_args = {"units": judged, "sources": [source]}
+    try:
+        rows = governing_envelopes(VERB, app_id)
+    except (OSError, ValueError) as exc:
+        return _refuse("EAMBIG", f"envelope registry unreadable: {exc}")
+    matches = [row["id"] for row in rows]
+    if envelope_id:
+        if envelope_id not in matches:
+            result = _refuse(
+                "ENOENT", f"envelope {envelope_id!r} does not govern {VERB} "
+                          f"for {app_id!r}", envelope_ids=matches,
+            )
+            result["ask"] = _file_ask(app_id, units=judged, source=source, errno="ENOENT",
+                                      reason=result["reason"], fields=None,
+                                      task_id=task_id, store=store)
+            return result
+        matches = [envelope_id]
+    if not matches:
+        result = _refuse("ENOENT", f"no active {VERB} envelope governs {app_id!r}")
+        result["ask"] = _file_ask(app_id, units=judged, source=source, errno="ENOENT",
+                                  reason=result["reason"], fields=None,
+                                  task_id=task_id, store=store)
+        return result
+    if len(matches) > 1:
+        return _refuse(
+            "EAMBIG", f"multiple active {VERB} envelopes govern {app_id!r} -- "
+                      f"pass envelope_id to name which one to cite",
+            envelope_ids=matches,
+        )
+
+    result = EnvelopeAuthority(ledger).check(
+        matches[0], actor=app_id, verb=VERB, call_args=call_args,
+    )
+    if not result.get("ok"):
+        cited = EnvelopeAuthority(ledger).authorize_and_cite(
+            matches[0], actor=app_id, verb=VERB, call_args=call_args,
+            project=project, session=session,
+        )
+        errno = result.get("errno", "EAMBIG")
+        reason = result.get("reason", "")
+        fields = result.get("fields")
+        outside = _outside_bounds(rows, matches[0], judged=judged, source=source)
+        if fields and outside:
+            reason = f"{reason}: {'; '.join(outside)}"
+        out = _refuse(errno, reason, envelope_id=matches[0],
+                      citation_id=cited.get("citation_id"), fields=fields)
+        if errno in _ASKABLE:
+            out["ask"] = _file_ask(app_id, units=judged, source=source, errno=errno,
+                                   reason=out["reason"], fields=fields,
+                                   task_id=task_id, store=store)
+        return out
+
+    root = Path(destination) if destination is not None else unit_dir()
+    dropin_dir = root / f"{parent}.d"
+    dropin_dir.mkdir(parents=True, exist_ok=True)
+    target = dropin_dir / dropin_name
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    replaced = target.is_file()
+    previous_digest = _digest(target.read_text(encoding="utf-8")) if replaced else ""
+    backup: Optional[tuple[Path, Path]] = None
+    if target.is_file():
+        keep = _fresh_backup_path(target, stamp)
+        os.replace(target, keep)
+        backup = (target, keep)
+    tmp = target.with_name(target.name + ".new")
+    tmp.write_text(rendered, encoding="utf-8")
+    os.replace(tmp, target)
+    written = [str(target)]
+
+    def _fail(errno: str, reason: str) -> dict:
+        restored: list[str] = []
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        if backup:
+            try:
+                os.replace(backup[1], backup[0])
+                restored.append(str(backup[0]))
+            except OSError as exc:  # noqa: PERF203 -- report, never hide
+                restored.append(f"{backup[0]}: restore failed: {exc}")
+        out = {"ok": False, "installed": False, "error": errno, "reason": reason,
+               "written": written, "restored": restored, "previous_digest": previous_digest,
+               "envelope_id": matches[0], "citation_id": None}
+        try:
+            out["receipt_id"] = ledger.append(project, f"{EVENT}_dropin_failed", {
+                "actor": app_id, "unit": unit, "parent": parent, "source": source,
+                "repo": repo, "path": rel, "head": head_sha, "errno": errno,
+                "reason": reason, "written": written, "restored": restored,
+                "session": session, "citation_id": None,
+            })
+        except Exception as exc:  # noqa: BLE001 -- the failure happened; report, never hide
+            out["receipt_error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    try:
+        proc = _run(["systemctl", "--user", "daemon-reload"], runner=runner,
+                    timeout=_SYSTEMCTL_TIMEOUT_S)
+    except FileNotFoundError:
+        return _fail("EUNREACH", "systemctl_missing")
+    except subprocess.TimeoutExpired:
+        return _fail("ETIMEDOUT", f"daemon-reload exceeded {_SYSTEMCTL_TIMEOUT_S}s")
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-300:]
+        return _fail("EINSTALL", tail or f"daemon-reload exited {proc.returncode}")
+
+    cited = EnvelopeAuthority(ledger).authorize_and_cite(
+        matches[0], actor=app_id, verb=VERB, call_args=call_args,
+        project=project, session=session,
+    )
+    if not cited.get("ok"):
+        return _fail(cited.get("errno", "EAMBIG"),
+                     cited.get("reason", "citation refused after write"))
+
+    pruned, unrecognised = _prune_backups(target)
+    receipt_out = {
+        "ok": True, "installed": True, "unit": unit, "parent_unit": parent,
+        "dropin": True, "source": source, "repo": repo, "path": rel, "head": head_sha,
+        "remote_refs": clone_info["remote_refs"], "template_digest": _digest(src["text"]),
+        "rendered_digest": _digest(rendered), "replaced": replaced,
+        "previous_digest": previous_digest,
+        "previous_kept": [str(backup[1])] if backup else [], "pruned": pruned,
+        "unrecognised_backups": unrecognised, "judged_units": judged, "written": written,
+        "envelope_id": matches[0], "citation_id": cited.get("citation_id"),
+    }
+    try:
+        receipt_out["receipt_id"] = ledger.append(project, f"{EVENT}_dropin", {
+            "actor": app_id, "unit": unit, "parent_unit": parent, "source": source,
+            "repo": repo, "path": rel, "head": head_sha,
+            "template_digest": receipt_out["template_digest"],
+            "rendered_digest": receipt_out["rendered_digest"], "replaced": replaced,
+            "previous_digest": previous_digest, "previous_kept": receipt_out["previous_kept"],
+            "pruned": pruned, "unrecognised_backups": unrecognised, "judged_units": judged,
+            "written": written, "session": session, "citation_id": cited.get("citation_id"),
+        })
+    except Exception as exc:  # noqa: BLE001 -- the write happened; report, never hide
+        receipt_out["receipt_error"] = f"{type(exc).__name__}: {exc}"
+    return receipt_out
+
+
 def execute_unit_install(
     app_id: str,
     *,
@@ -596,11 +870,24 @@ def execute_unit_install(
 
     unit = (unit or "").strip()
     source = (source or "").strip()
-    if not unit or not _UNIT_RE.match(unit):
+    dropin_match = _DROPIN_RE.match(unit)
+    if not unit or not (_UNIT_RE.match(unit) or dropin_match):
         return _refuse("EINVAL", "an install names a unit like `name.service` (or .timer/.socket/.path/.target)")
     repo, rel = parse_source(source)
     if not repo:
         return _refuse("EINVAL", "source must be `org/name@relative/path` inside that repo")
+    if dropin_match:
+        # A drop-in against the broker's OWN unit is admitted here -- that is
+        # exactly what assignment 16BAEFD8 needs (WILLOW_KEYRING on
+        # willow-mcp-serve.service itself) -- but only content this narrow;
+        # _execute_dropin_install's own content-level guard is what keeps
+        # this from reopening the hole the whole-unit EPERM below closes.
+        return _execute_dropin_install(
+            app_id, unit=unit, parent=dropin_match.group(1), dropin_name=dropin_match.group(3),
+            source=source, repo=repo, rel=rel, envelope_id=envelope_id, project=project,
+            session=session, task_id=task_id, ledger=ledger, store=store, runner=runner,
+            github_root=github_root, destination=destination,
+        )
     if is_broker_unit(unit):
         return _refuse(
             "EPERM",

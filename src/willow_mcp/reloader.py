@@ -1622,6 +1622,13 @@ def _resolve_keyring_path(*, runner: Optional[Callable] = None) -> tuple[Path, s
     return net_signer.default_ring_path(), "default"
 
 
+#: Public alias -- the serve keyring drop-in (unit_install_executor,
+#: assignment 16BAEFD8) resolves WILLOW_KEYRING the SAME way this module's
+#: own rendered unit does, by calling this function rather than keeping a
+#: second, independent copy of the net-signer-unit-environment read.
+resolve_keyring_path = _resolve_keyring_path
+
+
 def render_units(config: ReloaderConfig, *, python: Optional[Path] = None,
                  interval: str = DEFAULT_INTERVAL, runner: Optional[Callable] = None) -> dict[str, str]:
     """The .service and .timer bodies, rendered together so the timer's

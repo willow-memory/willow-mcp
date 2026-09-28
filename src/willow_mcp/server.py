@@ -7878,7 +7878,7 @@ def _diag_env_stale() -> dict:
     return out
 
 
-def _diag_syscall_amendments() -> dict:
+def _diag_syscall_amendments(keyring: dict | None = None) -> dict:
     """The read-only verb gap 82022def338f asks for (build item 4): every
     syscall-table row the live table and the bundle both carry but disagree
     on, structurally -- the exact record shape a sealed
@@ -7886,10 +7886,13 @@ def _diag_syscall_amendments() -> dict:
     :func:`constitutional.sync_syscall_table_from_bundle`'s amendment path.
 
     Pure preview: reads both tables, computes nothing else, writes nothing.
-    Informational only (never enters `problems`) -- a changed row sitting
-    unamended is this table's ordinary resting state between a ratified
-    change landing in git and an operator sealing the amendment; it is not
-    a defect diagnostic_summary should degrade over.
+    Ordinarily informational (never moves the verdict) -- a changed row
+    sitting unamended is this table's ordinary resting state between a
+    ratified change landing in git and an operator sealing the amendment.
+
+    BUT (assignment 16BAEFD8, build item 5): a non-empty ``rows`` with no
+    working keyring means these amendments cannot be VERIFIED at all --
+    that combination is a ``problem``, named with its fix, never `ok`.
     """
     from . import constitutional as _constitutional
     try:
@@ -7898,7 +7901,14 @@ def _diag_syscall_amendments() -> dict:
         return {"status": "could_not_run", "error": str(e)[:160]}
     if not out.get("ok"):
         return {"status": "could_not_run", "error": out.get("reason")}
-    return {"status": "ok", "rows": out.get("rows") or []}
+    rows = out.get("rows") or []
+    result = {"status": "ok", "rows": rows}
+    if rows and (not keyring or keyring.get("status") != "ok"):
+        result["status"] = "problem"
+        result["fix"] = ("configure WILLOW_KEYRING (see the `keyring` diagnostic) so these "
+                         "pending syscall-table row amendments can be sealed and verified -- "
+                         "a row that cannot be verified must never read as merely unamended")
+    return result
 
 
 def _diag_keyring() -> dict:
@@ -7981,6 +7991,110 @@ def _diag_keyring() -> dict:
     return check
 
 
+def _diag_keyring_drift() -> dict:
+    """Loki 318AC272 / amendment 785E55E3: serve, the reloader and the
+    net-signer all verify against the PUBLIC ring
+    (:func:`reloader.resolve_keyring_path`); the source of truth is this
+    process's own ``WILLOW_KEYRING`` (config/verifiers.json). Nothing keeps
+    them in sync automatically -- only a manual `export-ring` plus install
+    updates the public copy, and `keys add`/rotate/revoke never re-export.
+    A revoked or compromised key can therefore stay trusted by serve with
+    nothing to show it, until this check.
+
+    Compares verifier NAMES, ed25519 public-key sha256 fingerprints (16 hex
+    chars -- never the key itself), and the revoked/compromised flags.
+    Reports (but does not count against equivalence) any HMAC or
+    ``legacy_key`` entry in the source ring -- the export drops both by
+    construction (:func:`net_signer.export_public_ring`), so their absence
+    from the public ring is expected, not drift.
+
+    ``unreachable`` is its own state (no ``WILLOW_KEYRING`` configured here,
+    or the public ring resolves to no file) -- never folded into ``drift``:
+    an unset per-verifier identity on a stdio install is this check's
+    ordinary resting state, not a defect (B-18)."""
+    import hashlib
+    from . import keyring as _keyring
+    from . import net_signer as _net_signer
+    from . import reloader as _reloader
+
+    source_path = os.environ.get("WILLOW_KEYRING", "").strip()
+    if not source_path:
+        return {"status": "unreachable", "detail": "no WILLOW_KEYRING configured for this process"}
+    try:
+        source_ring = _keyring.load(source_path)
+    except Exception as e:  # noqa: BLE001 -- a diagnostic read never raises
+        return {"status": "unreachable", "detail": f"source ring unreadable: {str(e)[:160]}"}
+
+    try:
+        public_path, public_source = _reloader.resolve_keyring_path()
+    except Exception as e:  # noqa: BLE001
+        return {"status": "unreachable", "detail": f"could not resolve the public ring: {str(e)[:160]}"}
+    if not public_path.is_file():
+        return {"status": "unreachable",
+                "detail": f"public ring at {public_path} (resolved via {public_source}) is not a file",
+                "public_path": str(public_path), "public_source": public_source}
+    try:
+        public_ring = _net_signer.load_public_ring(public_path)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "unreachable", "detail": f"public ring unreadable: {str(e)[:160]}",
+                "public_path": str(public_path)}
+
+    def fp(key_bytes: bytes) -> str:
+        return hashlib.sha256(key_bytes).hexdigest()[:16]
+
+    source_ed25519: dict[str, dict] = {}
+    source_hmac_or_legacy: list[str] = []
+    for entry in source_ring.entries():
+        if entry.kind == "ed25519":
+            source_ed25519[entry.name] = {
+                "fingerprint": fp(entry.key),
+                "revoked": bool(entry.revoked_at),
+                "compromised": bool(entry.compromised),
+            }
+        else:
+            source_hmac_or_legacy.append(entry.name)
+    if getattr(source_ring, "legacy_key", None):
+        source_hmac_or_legacy.append("legacy_key")
+
+    public_entries = {
+        name: {
+            "fingerprint": fp(v["key"]),
+            "revoked": bool(v.get("revoked_at")),
+            "compromised": bool(v.get("compromised")),
+        }
+        for name, v in public_ring.items()
+    }
+
+    drift_names: list[str] = []
+    for name, s in source_ed25519.items():
+        pub = public_entries.get(name)
+        if pub is None:
+            drift_names.append(name)
+            continue
+        if (s["fingerprint"], s["revoked"], s["compromised"]) != (
+                pub["fingerprint"], pub["revoked"], pub["compromised"]):
+            drift_names.append(name)
+    for name in public_entries:
+        if name not in source_ed25519:
+            drift_names.append(name)
+    drift_names = sorted(set(drift_names))
+
+    verdict = "drift" if drift_names else "equivalent"
+    out = {
+        "status": verdict,
+        "public_path": str(public_path), "public_source": public_source,
+        "source_names": sorted(source_ed25519),
+        "public_names": sorted(public_entries),
+        "hmac_or_legacy_in_source": sorted(source_hmac_or_legacy),
+        "drift_names": drift_names,
+    }
+    if verdict == "drift":
+        out["fix"] = ("re-export and install the public ring: `willow-mcp-net-signer "
+                      "export-ring` from an operator terminal, then reinstall it at "
+                      f"{public_path}")
+    return out
+
+
 def _diag_trust_root_boot_problems(app_id: str) -> list[dict]:
     """Boot-time subset of diagnostic_summary's trust-root problems (hook spec #3,
     gap 37d44bfa1f4c): keyring, manifest, and self-writable-grant faults, computed
@@ -8046,6 +8160,17 @@ _VERDICT_SEVERITY_SUBCHECKS: dict[str, dict[str, str]] = {
     # the resolver itself still returns a value, so this is a warning to the
     # operator, not an outage.
     "split_brain": {"warn": "warn"},
+    # A pending syscall-table amendment that cannot be verified (no working
+    # keyring) must never read `ok` — gap 82022def338f / assignment 16BAEFD8
+    # build item 5: the row sits unverifiable, not merely unamended.
+    "syscall_amendments": {"problem": "error"},
+    # Loki 318AC272 / amendment 785E55E3: the public ring (what serve, the
+    # reloader and the net-signer verify against) can drift from the source
+    # ring with nothing to show it. Degrades (never errors outright) — the
+    # resolver still returns a value and existing seals keep verifying
+    # against whichever ring is actually staged; this is a "go re-export"
+    # nudge, not an active break.
+    "keyring_drift": {"drift": "warn"},
 }
 
 # Deliberately exempt from the verdict (informational, B-18): a dry roster or a
@@ -8057,7 +8182,7 @@ _VERDICT_SEVERITY_SUBCHECKS: dict[str, dict[str, str]] = {
 # resting state, decision 1bd6fd29/e961aff8) — this just makes it visible here
 # instead of only in the journal a desk would otherwise have to go read.
 _VERDICT_INFORMATIONAL_SUBCHECKS = frozenset(
-    {"build_leases", "env", "security_signals", "env_stale", "syscall_amendments"})
+    {"build_leases", "env", "security_signals", "env_stale"})
 
 
 def _diag_security_signals(app_id: str) -> dict:
@@ -8085,6 +8210,17 @@ _SUBCHECK_PROBLEM_TEXT: dict[str, dict[str, str]] = {
     "identity_bindings": {
         "detail": "the identity-bindings directory could not be read",
         "fix": "check the _identity_bindings directory under WILLOW_MCP_APPS_ROOT is readable",
+    },
+    "syscall_amendments": {
+        "detail": ("a syscall-table row amendment is pending but no working keyring is "
+                    "configured to verify a seal for it"),
+        "fix": "configure WILLOW_KEYRING (see the `keyring` diagnostic) so pending amendments can be sealed",
+    },
+    "keyring_drift": {
+        "detail": ("the public keyring (what serve/reloader/net-signer verify against) has "
+                    "drifted from the source ring"),
+        "fix": ("re-export and install the public ring: `willow-mcp-net-signer export-ring` "
+                "from an operator terminal, then reinstall it"),
     },
     "split_brain": {
         "detail": "a trust-critical artifact has two or more divergent resolvable copies",
@@ -8655,12 +8791,13 @@ def diagnostic_summary(app_id: str = "") -> dict:
     uid_separation = _diag_uid_separation(eff)
     store_db_perms = _diag_store_db_perms(eff)
     keyring = _diag_keyring()
+    keyring_drift = _diag_keyring_drift()
     envelope_registry = _diag_envelope_registry()
     split_brain_check = _diag_split_brain()
     env = _diag_env()
     security_signals_check = _diag_security_signals(eff)
     env_stale = _diag_env_stale()
-    syscall_amendments = _diag_syscall_amendments()
+    syscall_amendments = _diag_syscall_amendments(keyring)
 
     checks = {"store": store, "postgres": postgres, "rings": rings,
               "schema": schema, "manifest": manifest, "identity_bindings": bindings,
@@ -8668,6 +8805,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
               "build_leases": build_leases,
               "severance": severance, "uid_separation": uid_separation,
               "store_db_perms": store_db_perms, "keyring": keyring,
+              "keyring_drift": keyring_drift,
               "envelope_registry": envelope_registry, "split_brain": split_brain_check,
               "security_signals": security_signals_check, "env": env,
               "env_stale": env_stale, "syscall_amendments": syscall_amendments}
@@ -8682,6 +8820,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
         "rings": rings, "schema": schema, "identity_bindings": bindings,
         "uid_separation": uid_separation, "store_db_perms": store_db_perms,
         "keyring": keyring, "split_brain": split_brain_check,
+        "syscall_amendments": syscall_amendments, "keyring_drift": keyring_drift,
     }
     problems = _derive_problems(store, postgres, manifest, mode, worker, consent,
                                 net_lease, severance, envelope_registry,
