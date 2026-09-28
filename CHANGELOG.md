@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.84.1](https://github.com/willow-memory/willow-mcp/compare/v2.84.0...v2.84.1) (2026-09-28)
+
+
+### Fixed
+
+* an egress lease is a scope, not an entry blocker ([89cd018](https://github.com/willow-memory/willow-mcp/commit/89cd018a0b500c283f1485dcc96cc1fcfbc8fb5c))
+
 ## [2.84.0](https://github.com/willow-memory/willow-mcp/compare/v2.83.0...v2.84.0) (2026-09-27)
 
 
