@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.88.0](https://github.com/willow-memory/willow-mcp/compare/v2.87.0...v2.88.0) (2026-09-28)
+
+
+### Added
+
+* package_upgrade_execute, a brokered install of a tagged fleet release built in Kart and verified against a private source (syscall row 25) ([7f79fd1](https://github.com/willow-memory/willow-mcp/commit/7f79fd156b66eca1edbb1aa06ec4653afde3b0e5))
+
+
+### Fixed
+
+* **tests:** reset the in-process rate limiter between tests ([ee926b6](https://github.com/willow-memory/willow-mcp/commit/ee926b69ab80b677126e112a9f24e60bd5950220))
+
 ## [2.87.0](https://github.com/willow-memory/willow-mcp/compare/v2.86.1...v2.87.0) (2026-09-28)
 
 
