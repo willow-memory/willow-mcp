@@ -54,10 +54,20 @@ def federated_call_requires_net_lease(server_id: str, tool: str) -> bool:
 
 
 def seat_uses_net_egress(app_id: str) -> bool:
-    """Whether an inactive lease should surface as a boot blocker for this seat."""
+    """Whether an inactive lease should surface as a boot blocker for this seat.
+
+    An unreadable manifest (absent, unparseable, or unsigned) is NOT read as
+    net-bearing: "the gate could not read this manifest" is a different fact
+    than "this seat needs the internet", and conflating them reported a dead
+    egress lease as the blocker on seats that had no net permission at all
+    (or no manifest willow-mcp could parse in the first place). That case is
+    its own blocker (`blockers._check_manifest_readable`, id
+    `manifest_unreadable`, scope `entry`) — this function only classifies
+    seats whose permissions it could actually read.
+    """
     manifest = gate._load_manifest(app_id)
     if manifest is None:
-        return True
+        return False
     perms: list = manifest.get("permissions") or []
     if not perms:
         return True
