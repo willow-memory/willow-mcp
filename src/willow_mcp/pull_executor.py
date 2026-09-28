@@ -313,7 +313,7 @@ def execute_pull(
             rec = ledger.append(project, EVENT, {
                 "actor": app_id, "repo": repo, "branch": branch, "remote": remote,
                 "before": before, "after": after, "pruned": pruned, "session": session,
-                "checkout": str(path),
+                "checkout": str(path), "remote_sha": remote_sha, "changed": receipt["changed"],
             })
             receipt["receipt_id"] = rec
         except Exception as exc:  # noqa: BLE001 — the pull happened; the receipt failing is reported, not hidden
