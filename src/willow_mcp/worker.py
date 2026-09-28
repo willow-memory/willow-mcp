@@ -162,7 +162,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lane", default=None, choices=["fast", "batch"],
                         help="worker lane (default: WILLOW_WORKER_LANE or KART_WORKER_LANE or fast)")
     parser.add_argument("--slots", type=int, default=None,
-                        help="fast-lane concurrency (default: KART_FAST_WORKERS or 3)")
+                        help="worker concurrency for the selected lane (default: "
+                             "KART_FAST_WORKERS or 3 for fast, KART_BATCH_WORKERS or 1 for batch)")
     parser.add_argument("--interval", type=float, default=5.0,
                         help="idle poll interval in seconds")
     parser.add_argument("--once", action="store_true",
