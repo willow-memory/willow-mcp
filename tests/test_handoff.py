@@ -7,6 +7,8 @@ functions via filesystem fixtures with mocked dispatch dependencies.
 from __future__ import annotations
 
 import json
+
+import pytest
 from unittest.mock import patch
 
 from willow_mcp.handoff import (
@@ -153,7 +155,7 @@ def test_handoff_write_v4_success(tmp_path):
     pkt = {
         "meta": {"to_app": "hanuman", "reply_to": "willow", "role": "builder",
                  "summary": "Build task"},
-        "status": {"status": "active"},
+        "status": {"status": "working"},
     }
     with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
          patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root), \
@@ -622,7 +624,7 @@ def _write(tmp_path, dispatch_id="d-refuse", **kwargs):
     dispatch_root.mkdir(parents=True, exist_ok=True)
     pkt = {
         "meta": {"to_app": "hanuman", "reply_to": "willow", "role": "builder"},
-        "status": {"status": "active"},
+        "status": {"status": "working"},
     }
     with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
          patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root), \
@@ -784,3 +786,202 @@ def test_write_accepts_checklist_resolved_with_narrative_count_and_no_finding_ev
         narrative="Ran the suite: 17/17 tests passing.",
     )
     assert result["status"] == "complete"
+
+
+# ── bite 1: handoffs are written once (dispatch 2E590F1B, plan 6AE6ACE1) ────
+#
+# State table: pending -> handoff refused (ESTATE); working -> handoff ok
+# (test_handoff_write_v4_success, above); complete -> handoff refused
+# (ECLOSED), with a sidecar written and the original handoff.json left
+# byte-for-byte unchanged; two refusals write two sidecars, never colliding.
+
+
+def test_handoff_write_v4_refuses_pending_with_estate(tmp_path):
+    dispatch_id = "d-pending"
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    dispatch_root.mkdir(parents=True)
+    pkt = {"meta": {"to_app": "hanuman", "reply_to": "willow"},
+           "status": {"status": "pending"}}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root):
+        result = handoff_write_v4("hanuman", dispatch_id, narrative="x", findings=[],
+                                  no_findings_reason="test fixture: ESTATE guard")
+    assert result["error"] == "ESTATE"
+    assert result["status"] == "pending"
+    assert not (dispatch_root / "handoff.json").exists()
+
+
+def test_handoff_write_v4_refuses_cleared_with_estate(tmp_path):
+    """`cleared` is re-acceptable (dispatch_accept: pending/cleared ->
+    working), so a handoff against it is "not accepted yet" (ESTATE), not
+    "already closed" (ECLOSED)."""
+    dispatch_id = "d-cleared"
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    dispatch_root.mkdir(parents=True)
+    pkt = {"meta": {"to_app": "hanuman", "reply_to": "willow"},
+           "status": {"status": "cleared"}}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root):
+        result = handoff_write_v4("hanuman", dispatch_id, narrative="x", findings=[],
+                                  no_findings_reason="test fixture: cleared is not closed")
+    assert result["error"] == "ESTATE"
+    assert result["status"] == "cleared"
+
+
+def test_handoff_write_v4_refuses_complete_with_eclosed_and_writes_sidecar(tmp_path):
+    dispatch_id = "d-complete"
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    dispatch_root.mkdir(parents=True)
+    original = {"format": "handoff_v1", "app_id": "hanuman", "findings": [],
+                "narrative": "original", "written_at": "2026-09-28T00:00:00Z"}
+    handoff_path = dispatch_root / "handoff.json"
+    handoff_path.write_text(json.dumps(original, indent=2) + "\n", encoding="utf-8")
+    original_bytes = handoff_path.read_bytes()
+
+    pkt = {"meta": {"to_app": "hanuman", "reply_to": "willow"},
+           "status": {"status": "complete"}}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root):
+        result = handoff_write_v4("hanuman", dispatch_id, narrative="second write",
+                                  findings=[], no_findings_reason="test fixture: ECLOSED")
+    assert result["error"] == "ECLOSED"
+    assert result["status"] == "complete"
+    assert handoff_path.read_bytes() == original_bytes, "original handoff must stay byte-for-byte unchanged"
+
+    sidecars = list((dispatch_root / "refused").glob("*.json"))
+    assert len(sidecars) == 1
+    body = json.loads(sidecars[0].read_text())
+    assert body["writer_app"] == "hanuman"
+    assert body["reason"] == result["message"]
+    assert body["payload"]["narrative"] == "second write"
+
+
+@pytest.mark.parametrize("closed_status", ["complete", "verified", "failed"])
+def test_handoff_write_v4_refuses_every_closed_status(tmp_path, closed_status):
+    dispatch_id = f"d-{closed_status}"
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    dispatch_root.mkdir(parents=True)
+    pkt = {"meta": {"to_app": "hanuman", "reply_to": "willow"},
+           "status": {"status": closed_status}}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root):
+        result = handoff_write_v4("hanuman", dispatch_id, narrative="x", findings=[],
+                                  no_findings_reason="test fixture: every closed status")
+    assert result["error"] == "ECLOSED"
+    assert result["status"] == closed_status
+
+
+def test_handoff_write_v4_two_refusals_write_two_sidecars(tmp_path):
+    dispatch_id = "d-complete-2"
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    dispatch_root.mkdir(parents=True)
+    (dispatch_root / "handoff.json").write_text(
+        json.dumps({"format": "handoff_v1", "findings": [], "narrative": "orig"}),
+        encoding="utf-8",
+    )
+    pkt = {"meta": {"to_app": "hanuman", "reply_to": "willow"},
+           "status": {"status": "complete"}}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root):
+        r1 = handoff_write_v4("hanuman", dispatch_id, narrative="attempt 1", findings=[],
+                              no_findings_reason="test fixture: two sidecars")
+        r2 = handoff_write_v4("hanuman", dispatch_id, narrative="attempt 2", findings=[],
+                              no_findings_reason="test fixture: two sidecars")
+    assert r1["error"] == "ECLOSED"
+    assert r2["error"] == "ECLOSED"
+    sidecars = list((dispatch_root / "refused").glob("*.json"))
+    assert len(sidecars) == 2
+    assert r1["sidecar"] != r2["sidecar"]
+
+
+def test_handoff_write_v4_concurrent_writers_never_collide_on_a_sidecar(tmp_path):
+    """Two (five, for a stronger proof) writers race a closed packet: every
+    refusal lands, and no two sidecar filenames collide -- an in-process
+    concurrency check, not a true multi-process race, but cheap and it
+    exercises the same filename-uniqueness path a real race would hit."""
+    import threading as _threading
+
+    dispatch_id = "d-race"
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    dispatch_root.mkdir(parents=True)
+    (dispatch_root / "handoff.json").write_text(
+        json.dumps({"format": "handoff_v1", "findings": [], "narrative": "orig"}),
+        encoding="utf-8",
+    )
+    pkt = {"meta": {"to_app": "hanuman", "reply_to": "willow"},
+           "status": {"status": "complete"}}
+    results = []
+    lock = _threading.Lock()
+
+    def _write(n):
+        r = handoff_write_v4(
+            "hanuman", dispatch_id, narrative=f"race {n}", findings=[],
+            no_findings_reason="test fixture: concurrent writers",
+        )
+        with lock:
+            results.append(r)
+
+    # unittest.mock.patch's enter/exit is not safe to run concurrently from
+    # multiple threads against the SAME module attribute -- each thread's
+    # __exit__ restores whatever IT saved on __enter__, so two overlapping
+    # `with patch(...)` blocks race and can leave willow_mcp.handoff.
+    # dispatch_read permanently monkeypatched to a stale Mock after this
+    # test returns (measured: it broke every later real, unmocked
+    # handoff_write_v4 call in the same pytest process). Patch ONCE, outside
+    # the threads, for the whole test -- there is nothing per-thread about
+    # the stub itself, only the concurrent WRITE below needs to race.
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root):
+        threads = [_threading.Thread(target=_write, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    assert len(results) == 5
+    assert all(r["error"] == "ECLOSED" for r in results)
+    sidecar_paths = {r["sidecar"] for r in results}
+    assert len(sidecar_paths) == 5, "two writers collided on the same sidecar filename"
+    on_disk = list((dispatch_root / "refused").glob("*.json"))
+    assert len(on_disk) == 5
+
+
+def test_verify_handoff_exposes_sidecar_count(tmp_path):
+    dispatch_id = "d-verify-sidecar"
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    dispatch_root.mkdir(parents=True)
+    (dispatch_root / "refused").mkdir()
+    (dispatch_root / "refused" / "a.json").write_text("{}", encoding="utf-8")
+    (dispatch_root / "refused" / "b.json").write_text("{}", encoding="utf-8")
+
+    pkt = {"meta": {}, "status": {"status": "complete"}}
+    handoff_data = {
+        "checklist_resolved": True, "envelope_clean": True, "findings": [],
+        "narrative": "42 passed, 0 failed.",
+    }
+    hr = {"dispatch_id": dispatch_id, "handoff": handoff_data, "closeout_md": ""}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.handoff_read", return_value=hr), \
+         patch("willow_mcp.handoff.dispatch_set_status"), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root):
+        result = verify_handoff(dispatch_id)
+    assert result["sidecar_count"] == 2
+    assert result["verified"] is True
+
+
+def test_verify_handoff_sidecar_count_zero_when_no_race(tmp_path):
+    dispatch_id = "d-verify-clean"
+    dispatch_root = tmp_path / "dispatch" / dispatch_id
+    dispatch_root.mkdir(parents=True)
+    pkt = {"meta": {}, "status": {"status": "complete"}}
+    handoff_data = {
+        "checklist_resolved": True, "envelope_clean": True, "findings": [],
+        "narrative": "1 passed.",
+    }
+    hr = {"dispatch_id": dispatch_id, "handoff": handoff_data, "closeout_md": ""}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.handoff_read", return_value=hr), \
+         patch("willow_mcp.handoff.dispatch_set_status"), \
+         patch("willow_mcp.handoff.dispatch_dir", return_value=dispatch_root):
+        result = verify_handoff(dispatch_id)
+    assert result["sidecar_count"] == 0

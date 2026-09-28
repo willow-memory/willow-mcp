@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -44,6 +46,112 @@ def _lint_refusal_reason(lint_refusals: list) -> str:
     )
 
 
+#: Bite 1 of next-bites-2026-09-28 (dispatch 2E590F1B, plan 6AE6ACE1): a
+#: handoff only ever lands on a packet the specialist actually holds
+#: (`working`), and a packet that already closed one handoff refuses a
+#: second -- these are the states past which a write is refused rather
+#: than silently overwriting whatever verdict already landed there (the
+#: ratatosk-Gemini-vs-Loki race, gaps f9dff345ece7/71ce64eae9fd/
+#: 0147276f1097). `withdrawn` stays a separate, pre-existing refusal
+#: (invalid_transition, above) -- terminal for a different reason (the
+#: orchestrator retired the packet) with its own error shape callers
+#: already depend on. `cleared` is deliberately NOT closed here:
+#: dispatch_accept accepts a `cleared` packet again (pending/cleared ->
+#: working) for a recurring dispatch, so a handoff attempt against a
+#: `cleared` packet just hasn't been accepted yet (ESTATE), not "already
+#: closed" (ECLOSED).
+_CLOSED_STATUSES: frozenset = frozenset({"complete", "verified", "failed"})
+
+
+def _refused_sidecar_dir(dispatch_id: str) -> Path:
+    return dispatch_dir(dispatch_id) / "refused"
+
+
+def _sidecar_count(dispatch_id: str) -> int:
+    """How many refused-handoff sidecars sit next to this packet -- the
+    signal `verify_handoff` surfaces so the desk can see a race happened,
+    without reading or judging their content itself. Never raises: a
+    dispatch_id `dispatch_dir` itself refuses (malformed, e.g. from a test
+    fixture that never went through dispatch_send) reads as "no sidecars
+    to report" rather than blowing up a verify call that has nothing to do
+    with the sidecar feature."""
+    try:
+        d = _refused_sidecar_dir(dispatch_id)
+        if not d.is_dir():
+            return 0
+        return sum(1 for p in d.iterdir() if p.is_file() and not p.name.startswith("."))
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_refused_sidecar(dispatch_id: str, writer_app: str, payload: dict,
+                           reason: str, *, session_id: str = "") -> str:
+    """Write one refused-handoff sidecar next to the packet, atomically and
+    without ever colliding with another sidecar -- two writers racing a
+    closed (or not-yet-accepted) packet must both land, not clobber each
+    other, and the original handoff.json this function never touches stays
+    byte-for-byte as it was. Filename carries a UTC timestamp, the writer's
+    app_id, and a random token -- the token is what actually keeps two
+    refusals in the same wall-clock second from colliding, the timestamp
+    alone would not. Writes to a per-call temp file in the same directory
+    and `os.replace`s it into place -- atomic on POSIX, so a reader
+    (`_sidecar_count`) never sees a partial file mid-write."""
+    sidecar_dir = _refused_sidecar_dir(dispatch_id)
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    ts = _utc_now()
+    token = uuid.uuid4().hex[:8]
+    safe_app = re.sub(r"[^A-Za-z0-9_.-]", "_", writer_app or "unknown")
+    fname = f"{ts.replace(':', '')}-{safe_app}-{token}.json"
+    body = {
+        "writer_app": writer_app,
+        "session_id": session_id or "",
+        "dispatch_id": dispatch_id,
+        "reason": reason,
+        "written_at": ts,
+        "payload": payload,
+    }
+    tmp = sidecar_dir / f".{fname}.{os.getpid()}.{token}.tmp"
+    tmp.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+    target = sidecar_dir / fname
+    os.replace(tmp, target)
+    return str(target)
+
+
+_receipt_log_lock = threading.Lock()
+_receipt_log_singleton = None
+
+
+def _handoff_receipt_log():
+    """Lazy, module-private `ReceiptLog` -- constructed on first real use,
+    never at import time (the same `_LazySingleton` discipline server.py
+    documents at gap 035d287206e1: a receipt log construction is a real
+    side effect, `mkdir` + `sqlite3.connect`, that must not run for every
+    process that merely imports this module, including one running under a
+    uid that cannot write $WILLOW_HOME at all)."""
+    global _receipt_log_singleton
+    if _receipt_log_singleton is None:
+        with _receipt_log_lock:
+            if _receipt_log_singleton is None:
+                from .receipts import ReceiptLog
+                _receipt_log_singleton = ReceiptLog()
+    return _receipt_log_singleton
+
+
+def _record_handoff_refusal_receipt(app_id: str, dispatch_id: str, errno: str,
+                                     reason: str) -> None:
+    """A refusal is `receipts_tail`-visible (bite 1's own requirement) --
+    but strictly secondary to the refusal itself: a receipt log that can't
+    be opened (read-only $WILLOW_HOME, disk full) must never turn an honest
+    refusal into an unhandled exception."""
+    try:
+        _handoff_receipt_log().record(
+            app_id, "handoff_write_v4", f"refused_{errno.lower()}",
+            f"dispatch_id={dispatch_id} reason={reason}",
+        )
+    except Exception:  # noqa: BLE001 -- the refusal already happened; logging it failing is not itself a failure
+        pass
+
+
 def handoff_write_v4(
     app_id: str,
     dispatch_id: str,
@@ -78,6 +186,40 @@ def handoff_write_v4(
                 "dispatch_id": dispatch_id}
 
     findings_list = list(findings or [])
+
+    # Bite 1 (dispatch 2E590F1B, plan 6AE6ACE1, gap 70069fbb7f1b): ECLOSED
+    # is checked before ESTATE -- a closed packet is never merely "not yet
+    # working", it already has a verdict on it.
+    if cur in _CLOSED_STATUSES:
+        reason = (
+            f"packet {dispatch_id!r} is already {cur!r} -- a handoff was "
+            f"already written and this packet is closed; the original "
+            f"handoff stays unchanged, this write is kept in a sidecar"
+        )
+        payload = {
+            "app_id": app_id, "dispatch_id": dispatch_id,
+            "findings": findings_list, "narrative": narrative,
+            "checklist_resolved": checklist_resolved,
+            "envelope_clean": envelope_clean,
+            "no_findings_reason": no_findings_reason,
+        }
+        sidecar_path = _write_refused_sidecar(dispatch_id, app_id, payload, reason)
+        _record_handoff_refusal_receipt(app_id, dispatch_id, "ECLOSED", reason)
+        return {
+            "error": "ECLOSED", "message": reason, "status": cur,
+            "dispatch_id": dispatch_id, "sidecar": sidecar_path,
+        }
+
+    if cur != "working":
+        reason = (
+            f"packet {dispatch_id!r} is {cur!r}, not 'working' -- the "
+            f"accepting seat must call dispatch_accept before writing a "
+            f"handoff"
+        )
+        _record_handoff_refusal_receipt(app_id, dispatch_id, "ESTATE", reason)
+        return {"error": "ESTATE", "message": reason, "status": cur,
+                "dispatch_id": dispatch_id}
+
     refusal = hv.write_refusal(
         extra_kwargs=_unknown_fields,
         findings=findings_list,
@@ -416,6 +558,11 @@ def verify_handoff(dispatch_id: str) -> dict:
         "checklist_resolved": handoff.get("checklist_resolved"),
         "envelope_clean": handoff.get("envelope_clean"),
         "findings_count": len(findings),
+        # Bite 1 (dispatch 2E590F1B): a sidecar count the desk can see
+        # without opening the refused/ directory itself -- verify_handoff
+        # still reads only the ORIGINAL handoff for its verdict; sidecars
+        # never change `verified`, they are exposed so a race is visible.
+        "sidecar_count": _sidecar_count(dispatch_id),
         "status": "verified" if verified else "complete",
     }
     if reasons:
