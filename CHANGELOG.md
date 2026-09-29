@@ -31,6 +31,19 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.90.1](https://github.com/willow-memory/willow-mcp/compare/v2.90.0...v2.90.1) (2026-09-29)
+
+
+### Added
+
+* **serve:** keyring drop-in for the served broker, plus a ring-drift check ([5acdf99](https://github.com/willow-memory/willow-mcp/commit/5acdf99c145bf63fd310e5e0590bbcfdfa7b1b24))
+
+
+### Fixed
+
+* **serve:** keyring diagnostic truth, exception guard, fd-bound ring load ([5c6db74](https://github.com/willow-memory/willow-mcp/commit/5c6db7484a9e4761d4334d641a11aef8e56126db))
+* **serve:** resolve the keyring from the net-signer unit, drop the drop-in install path ([7cc4eba](https://github.com/willow-memory/willow-mcp/commit/7cc4ebabd8151c5308af20877bd55630601f0df8))
+
 ## [2.90.0](https://github.com/willow-memory/willow-mcp/compare/v2.89.0...v2.90.0) (2026-09-29)
 
 
