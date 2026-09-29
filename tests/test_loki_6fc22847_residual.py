@@ -110,33 +110,56 @@ def test_r_empty_sid_enter(home):
     e = _enter(home, "", p, runner="ratatosk")
     print("RES empty-sid enter err", e.get("error"), "held", e.get("held_by_other_session"), "alen", len(e.get("assignment") or ""), "acc", repr(e.get("accepted_session_id")))
     assert e.get("error") == "EINVAL"
+    assert not e.get("assignment")
+    assert "accepted_session_id" not in e
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "G2b (Loki 74DA52ED): dispatch_accept's empty/whitespace session_id "
+    "was found to be load-bearing across dozens of real callers -- "
+    "tests/test_dispatch_withdraw.py::test_withdraw_working_with_no_live_"
+    "session_succeeds documents accept-with-no-session as an intended "
+    "lifecycle shape, and tests/test_dispatch_stack.py, "
+    "tests/test_at_m2_dispatch_lifecycle.py, tests/test_bite1_rework3.py "
+    "and tests/test_loki_6fc22847_probe.py all call dispatch_accept with "
+    "no session_id as their normal, low-ceremony accept path. An EINVAL "
+    "guard on dispatch_accept broke all of them. The hole stays open; "
+    "this pins the gap as a strict xfail rather than silently accepting "
+    "it as correct."
+))
 def test_r_empty_accept_then_x(home):
     """Packet accepted with session_id='' (dispatch_accept tool default):
     nothing was recorded at accept time to check a later caller against, so
     the pre-existing permissive behavior holds (same shape as
     test_no_session_check_when_packet_was_accepted_without_one in
     test_handoff_write_once_concurrency.py) -- X's omitted-session write
-    succeeds, it is not refused ESESSION."""
+    succeeds, it is NOT refused ESESSION even though it should be. This
+    test asserts the refusal G2b calls for; it stays red (xfail) until the
+    hole is actually closed without breaking the real callers named above."""
     _man(home)
     p = _send()
     ds.dispatch_accept(p, "loki", "")
     x = _enter(home, "sess-X", p)
     r = _close(p, **XSTUB)
     print("RES empty-accept X enter held", x.get("held_by_other_session"), "X-omit", r.get("error"), r.get("status"))
-    assert r.get("status") == "complete"
+    assert r.get("error") == "ESESSION"
 
 
 def test_r_resume_without_dispatch_id(home):
     """A re-enters with no dispatch_id (resume via its session file) in a
     fresh process -- the resume itself works (dispatch_id and entry_mode
-    resolve correctly from the session record), but the in-process
-    specialist-entrant context that the server's own omitted-session
-    resolver reads was reset by _clear_ctx() along with it, so a
-    SUBSEQUENT omitted close cannot be resolved unambiguously either --
-    ESESSION, not a silent success. Pre-existing behavior, unrelated to
-    G1/G2/G3."""
+    resolve correctly from the session record), but
+    server._set_specialist_session records THIS resume's entrant under
+    the LITERAL dispatch_id ARGUMENT ("", not the resolved dispatch_id --
+    see server._specialist_key/_set_specialist_session, which key on the
+    caller's own dispatch_id parameter, not on result["dispatch_id"]).
+    _clear_ctx() before it only simulates a fresh process by wiping the
+    in-memory entrant/session caches entirely; it is not itself what
+    keys the resume's entry to the wrong slot. So the resolver, keyed on
+    the REAL dispatch_id at close time, finds no entrant recorded for it
+    at all, and a SUBSEQUENT omitted close cannot be resolved
+    unambiguously -- ESESSION, not a silent success. Pre-existing
+    behavior, unrelated to G1/G2/G3."""
     _man(home)
     p = _send()
     _enter(home, "sess-A", p)
