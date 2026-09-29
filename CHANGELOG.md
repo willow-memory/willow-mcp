@@ -36,14 +36,17 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **dispatch:** write-once handoffs bound to the accepting session; listener opt-in; archive on re-accept ([58b1ecf](https://github.com/willow-memory/willow-mcp/commit/58b1ecf62f6726fd02ae1c1db4cb9888b6f263bc))
+* **handoff:** cross-process claim under lock, bind handoff to the accepting session ([fdc2014](https://github.com/willow-memory/willow-mcp/commit/fdc2014b61db2c4a768fa39d831dbed4bbdbd131))
+* **handoff:** refuse a handoff on a packet that is not working, and refuse a second write on a closed one ([c397e09](https://github.com/willow-memory/willow-mcp/commit/c397e0928827dfb8f2fe27906744680fe94a321d))
 
 
 ### Fixed
 
-* **dispatch:** adopt p16/F6/N5-base mutation-killers (Loki ADC80409 rework 3) ([70a2953](https://github.com/willow-memory/willow-mcp/commit/70a2953f7925c2dca38e56570c3589320be4de70))
 * **dispatch:** never expose accepted_session_id, refuse empty session_id, bind under lock ([9dc836c](https://github.com/willow-memory/willow-mcp/commit/9dc836cf69da8685a925d6680876449d1242869f))
+* **dispatch:** adopt p16/F6/N5-base mutation-killers (Loki ADC80409 rework 3) ([70a2953](https://github.com/willow-memory/willow-mcp/commit/70a2953f7925c2dca38e56570c3589320be4de70))
 * **dispatch:** refuse to guess session resolution, close deploy-order and lock gaps (Loki ADC80409 rework 3) ([a925ddc](https://github.com/willow-memory/willow-mcp/commit/a925ddc526339fdab11fb89163cb7dd59d072238))
+* **dispatch:** listener opt-in, context-resolved session, write-once rework 2 ([b3d93f2](https://github.com/willow-memory/willow-mcp/commit/b3d93f2f6b5be374927dffcb85f7f8c11ab3102d))
+* **dispatch:** mark the cleared-reaccept overwrite gap as TODO(ruling) ([bcee349](https://github.com/willow-memory/willow-mcp/commit/bcee34961772485ee9d4aba4c3b1d522b2db17c5))
 
 ## [2.89.0](https://github.com/willow-memory/willow-mcp/compare/v2.88.0...v2.89.0) (2026-09-28)
 
