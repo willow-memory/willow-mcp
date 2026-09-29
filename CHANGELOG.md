@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.91.0](https://github.com/willow-memory/willow-mcp/compare/v2.90.4...v2.91.0) (2026-09-29)
+
+
+### Added
+
+* **unit-install:** install worker lane units; refuse any reinstall that weakens a unit ([a3f59a7](https://github.com/willow-memory/willow-mcp/commit/a3f59a747a6a76d2c8204bb369156e8ec8c15c27))
+
 ## [2.90.4](https://github.com/willow-memory/willow-mcp/compare/v2.90.3...v2.90.4) (2026-09-29)
 
 
