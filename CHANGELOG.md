@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **diagnostic:** report credential prefixes from the Kart workers' env ([1949cf8](https://github.com/willow-memory/willow-mcp/commit/1949cf8a159cfbbe91b8c2001b149c99277ecb88))
 * **diagnostic:** report credential prefixes from the Kart workers' env ([a20c57b](https://github.com/willow-memory/willow-mcp/commit/a20c57b03f32ad845ddc1f76e79f7532cb193a8d))
 
 ## [2.90.1](https://github.com/willow-memory/willow-mcp/compare/v2.90.0...v2.90.1) (2026-09-29)
