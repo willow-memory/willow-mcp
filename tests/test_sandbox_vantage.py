@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
+from willow_mcp import env_fingerprint
 from willow_mcp import home_init as hi
 from willow_mcp import server
 from willow_mcp import trust_root_setup as trs
@@ -50,6 +53,98 @@ def test_credential_prefixes_populated_names_prefixes_not_values(monkeypatch):
 
 def test_diag_net_lease_carries_the_populated_map(home, monkeypatch):
     hi.ensure_home_layout()
+    monkeypatch.setattr(env_fingerprint.subprocess, "run", _no_systemctl)
     out = server._diag_net_lease("")
     assert "credential_prefixes_populated" in out
     assert isinstance(out["credential_prefixes_populated"], dict)
+    assert "credential_prefixes_this_process" in out
+    assert isinstance(out["credential_prefixes_source"], list)
+
+
+# ── the vantage is the Kart worker, not this process (2026-09-29) ──────────────
+#
+# The desk's stdio process inherits the shell that launched the client. That
+# shell held only GROQ_, so every session read "only Groq", whatever the
+# worker units (which are what a task inherits) actually load.
+
+_PREFIXES = ("GROQ_", "HF_", "GEMINI_", "ANTHROPIC_")
+
+
+def _no_systemctl(*_a, **_k):
+    raise OSError("no systemctl in this test")
+
+
+class _Proc:
+    def __init__(self, stdout: str, returncode: int = 0):
+        self.stdout, self.returncode = stdout, returncode
+
+
+def _runner(by_unit: dict):
+    def run(cmd, **_k):
+        return _Proc(by_unit.get(cmd[3], ""))
+    return run
+
+
+def _pin_prefixes(monkeypatch):
+    sandbox = pytest.importorskip("kartikeya.sandbox")
+    monkeypatch.setattr(sandbox, "load_sandbox_config", lambda _p: {"credential_env_prefixes": list(_PREFIXES)})
+
+
+def _env_file(tmp_path, name: str, lines: list[str]):
+    p = tmp_path / name
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def test_worker_env_decides_populated_not_this_process(tmp_path, monkeypatch):
+    _pin_prefixes(monkeypatch)
+    for k in [k for k in os.environ if k.startswith(_PREFIXES)]:
+        monkeypatch.delenv(k)
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_shell_only_value")
+    env = _env_file(tmp_path, "env", ["GROQ_API_KEY=gsk_box_value", "HF_API_KEY=hf_box_value_must_not_appear"])
+    show = f"EnvironmentFiles={env} (ignore_errors=no)\nEnvironment=\n"
+    out = server._diag_credential_prefixes(runner=_runner(dict.fromkeys(env_fingerprint.WORKER_UNITS, show)))
+    assert out["credential_prefixes_populated"]["HF_"] is True
+    assert out["credential_prefixes_populated"]["GEMINI_"] is False
+    assert out["credential_prefixes_this_process"]["HF_"] is False
+    assert out["credential_prefixes_this_process"]["GROQ_"] is True
+    assert "hf_box_value_must_not_appear" not in repr(out)
+    assert "gsk_" not in repr(out)
+
+
+def test_environment_lines_and_files_are_unioned(tmp_path, monkeypatch):
+    _pin_prefixes(monkeypatch)
+    env = _env_file(tmp_path, "env", ["GROQ_API_KEY=x"])
+    show = f"EnvironmentFiles=-{env} (ignore_errors=yes)\nEnvironment=GEMINI_API_KEY=y WILLOW_HOME=/h\n"
+    out = server._diag_credential_prefixes(runner=_runner(dict.fromkeys(env_fingerprint.WORKER_UNITS, show)))
+    assert out["credential_prefixes_populated"]["GROQ_"] is True
+    assert out["credential_prefixes_populated"]["GEMINI_"] is True
+
+
+def test_a_prefix_one_lane_lacks_is_not_populated(tmp_path, monkeypatch):
+    _pin_prefixes(monkeypatch)
+    fast = _env_file(tmp_path, "fast.env", ["GROQ_API_KEY=x", "GEMINI_API_KEY=y"])
+    batch = _env_file(tmp_path, "batch.env", ["GROQ_API_KEY=x"])
+    fast_unit, batch_unit = env_fingerprint.WORKER_UNITS
+    out = server._diag_credential_prefixes(runner=_runner({
+        fast_unit: f"EnvironmentFiles={fast} (ignore_errors=no)\n",
+        batch_unit: f"EnvironmentFiles={batch} (ignore_errors=no)\n",
+    }))
+    assert out["credential_prefixes_populated"]["GROQ_"] is True
+    assert out["credential_prefixes_populated"]["GEMINI_"] is False
+
+
+def test_unreadable_worker_env_is_an_error_never_this_process(tmp_path, monkeypatch):
+    _pin_prefixes(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_shell_only_value")
+    show = f"EnvironmentFiles={tmp_path / 'missing.env'} (ignore_errors=no)\n"
+    out = server._diag_credential_prefixes(runner=_runner(dict.fromkeys(env_fingerprint.WORKER_UNITS, show)))
+    assert set(out["credential_prefixes_populated"]) == {"_error"}
+    assert all(s["state"] == "unreachable" for s in out["credential_prefixes_source"])
+
+
+def test_no_systemctl_falls_back_to_box_env_and_says_so(home, monkeypatch):
+    hi.ensure_home_layout()
+    names = env_fingerprint.env_names_for_unit(env_fingerprint.WORKER_UNITS[0], runner=_no_systemctl)
+    assert names["source"] == "fallback"
+    assert names["files"] == [str(env_fingerprint.default_env_path())]

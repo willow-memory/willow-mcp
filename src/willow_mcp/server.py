@@ -7584,7 +7584,12 @@ def _diag_net_lease(app_id: str) -> dict:
         # at the API for a credential that was never loaded. This names the
         # populated ones — never the values — so "you hold a lease for a key
         # you do not have" is legible before a task runs.
-        "credential_prefixes_populated": _credential_prefixes_populated(),
+        #
+        # Read from the Kart worker units' env, because that is what a task
+        # inherits. It used to read this process's os.environ: on the desk
+        # that is the shell that launched the client, which reported "only
+        # GROQ_" no matter what the workers load (2026-09-29).
+        **_diag_credential_prefixes(),
         # A sub-check that lists the keys this process could forge and then calls
         # itself "ok" is asserting a membrane it just measured a hole in. The
         # verdict still turns on _derive_problems (a lone `warn` here would make
@@ -7594,17 +7599,50 @@ def _diag_net_lease(app_id: str) -> dict:
     }
 
 
-def _credential_prefixes_populated() -> dict:
+def _credential_prefixes_populated(names=None) -> dict:
     """Which of the sandbox's credential env prefixes have at least one
-    variable set in this process — names only, never values. Reads the same
-    kart-sandbox.json the worker resolves; degrades to an empty map when
-    kartikeya or the config is unavailable, and says so."""
+    variable set — names only, never values. ``names`` is the pool to test
+    (default: this process's os.environ). Reads the same kart-sandbox.json
+    the worker resolves; degrades to an empty map when kartikeya or the
+    config is unavailable, and says so."""
     try:
         from kartikeya.sandbox import load_sandbox_config
         prefixes = tuple(load_sandbox_config(None).get("credential_env_prefixes") or ())
     except Exception as e:  # kartikeya missing or config unreadable — not a diag failure
         return {"_error": f"unreadable: {str(e)[:80]}"}
-    return {p: any(k.startswith(p) for k in os.environ) for p in prefixes}
+    pool = os.environ if names is None else names
+    return {p: any(k.startswith(p) for k in pool) for p in prefixes}
+
+
+def _diag_credential_prefixes(runner=None) -> dict:
+    """Credential prefixes as the Kart workers hold them, plus this
+    process's own view under a name that says so.
+
+    ``credential_prefixes_populated`` is True for a prefix only when every
+    reachable worker unit loads a variable under it, because a task can land
+    on either lane. If no worker unit is reachable, it is an ``_error`` map,
+    never a guess from this process. ``credential_prefixes_this_process`` is
+    the old reading (this process's env) and is kept only for comparison.
+    """
+    from . import env_fingerprint
+    units = [env_fingerprint.env_names_for_unit(u, runner=runner) for u in env_fingerprint.WORKER_UNITS]
+    reachable = [u for u in units if u.get("state") != "unreachable"]
+    if reachable:
+        maps = [_credential_prefixes_populated(u["names"]) for u in reachable]
+        if "_error" in maps[0]:
+            worker_map = maps[0]
+        else:
+            worker_map = {p: all(m.get(p) for m in maps) for p in maps[0]}
+    else:
+        worker_map = {"_error": "unreachable: no worker unit env could be read"}
+    return {
+        "credential_prefixes_populated": worker_map,
+        "credential_prefixes_source": [
+            {k: u[k] for k in ("unit", "source", "files", "state", "reason") if k in u}
+            for u in units
+        ],
+        "credential_prefixes_this_process": _credential_prefixes_populated(),
+    }
 
 
 def _diag_build_leases() -> dict:
