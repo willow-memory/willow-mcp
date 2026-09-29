@@ -37,12 +37,16 @@ def test_clean_install_renders_standalone_worker_units(config, lane):
     # The seam that the 2026-07-20 units were missing. Rendered units carried no
     # KART_SANDBOX_CONFIG and no EnvironmentFile, so kartikeya silently used its
     # vendored policy and both lanes failed every task for 28 hours.
-    assert "KART_SANDBOX_CONFIG=" in unit
-    # ...as a literal Environment=, never an EnvironmentFile= directive: that
-    # file is read at exec time, so editing it cannot reach a running worker.
-    assert not any(
-        line.startswith("EnvironmentFile=") for line in unit.splitlines()
-    )
+    assert f'Environment="KART_SANDBOX_CONFIG={config.sandbox_config}"' in unit
+    # ...as a literal Environment=, never through an EnvironmentFile: that file
+    # is read at exec time, so editing it cannot reach a running worker. The one
+    # EnvironmentFile a worker carries is the optional inference-only env.kart
+    # (Nestor pair b1e88cda), never the full $WILLOW_HOME/env, which holds the Nestor
+    # seal key.
+    env_files = [
+        line for line in unit.splitlines() if line.startswith("EnvironmentFile=")
+    ]
+    assert env_files == [f"EnvironmentFile=-{config.willow_home}/env.kart"]
     assert "willow-2.0" not in unit
     assert "@" not in unit
 
