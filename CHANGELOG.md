@@ -36,7 +36,7 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **handoff:** lint CI pin follows the dispatch project; syscall sync via trust-owner apply ([876a3ee](https://github.com/willow-memory/willow-mcp/commit/876a3ee8d67cd53df8044ecfb998836ecfc5193b))
+* **handoff:** lint CI pin follows dispatch project, not desk workspace ([bd2c1b2](https://github.com/willow-memory/willow-mcp/commit/bd2c1b2dd86803f02706b5d0424f95ac4e27de71))
 
 ## [2.90.2](https://github.com/willow-memory/willow-mcp/compare/v2.90.1...v2.90.2) (2026-09-29)
 
