@@ -7982,6 +7982,29 @@ def _diag_env_stale() -> dict:
     return out
 
 
+def _diag_syscall_amendments() -> dict:
+    """The read-only verb gap 82022def338f asks for (build item 4): every
+    syscall-table row the live table and the bundle both carry but disagree
+    on, structurally -- the exact record shape a sealed
+    ``syscall_row_amend`` governance decision must name to unblock
+    :func:`constitutional.sync_syscall_table_from_bundle`'s amendment path.
+
+    Pure preview: reads both tables, computes nothing else, writes nothing.
+    Informational only (never enters `problems`) -- a changed row sitting
+    unamended is this table's ordinary resting state between a ratified
+    change landing in git and an operator sealing the amendment; it is not
+    a defect diagnostic_summary should degrade over.
+    """
+    from . import constitutional as _constitutional
+    try:
+        out = _constitutional.diff_changed_rows()
+    except Exception as e:  # noqa: BLE001 -- a diagnostic read never raises
+        return {"status": "could_not_run", "error": str(e)[:160]}
+    if not out.get("ok"):
+        return {"status": "could_not_run", "error": out.get("reason")}
+    return {"status": "ok", "rows": out.get("rows") or []}
+
+
 def _diag_keyring() -> dict:
     """Per-verifier keyring (WILLOW_KEYRING) reachability — gap 37d44bfa1f4c.
 
@@ -8137,7 +8160,8 @@ _VERDICT_SEVERITY_SUBCHECKS: dict[str, dict[str, str]] = {
 # up a rotated key is not broken (the reloader's ENOSEAL wait is the intended
 # resting state, decision 1bd6fd29/e961aff8) — this just makes it visible here
 # instead of only in the journal a desk would otherwise have to go read.
-_VERDICT_INFORMATIONAL_SUBCHECKS = frozenset({"build_leases", "env", "security_signals", "env_stale"})
+_VERDICT_INFORMATIONAL_SUBCHECKS = frozenset(
+    {"build_leases", "env", "security_signals", "env_stale", "syscall_amendments"})
 
 
 def _diag_security_signals(app_id: str) -> dict:
@@ -8740,6 +8764,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
     env = _diag_env()
     security_signals_check = _diag_security_signals(eff)
     env_stale = _diag_env_stale()
+    syscall_amendments = _diag_syscall_amendments()
 
     checks = {"store": store, "postgres": postgres, "rings": rings,
               "schema": schema, "manifest": manifest, "identity_bindings": bindings,
@@ -8749,7 +8774,7 @@ def diagnostic_summary(app_id: str = "") -> dict:
               "store_db_perms": store_db_perms, "keyring": keyring,
               "envelope_registry": envelope_registry, "split_brain": split_brain_check,
               "security_signals": security_signals_check, "env": env,
-              "env_stale": env_stale}
+              "env_stale": env_stale, "syscall_amendments": syscall_amendments}
     # Construction-time completeness guard: every computed sub-check must be
     # wired into the verdict (or explicitly exempt) — gap 37d44bfa1f4c.
     _assert_verdict_considers(checks)

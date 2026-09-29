@@ -500,3 +500,20 @@ def test_the_pull_tools_are_gated_on_their_own_names():
     catalogue = server._gate_tool_catalogue()
     assert catalogue["git_pull_execute"] == "git_pull_execute"
     assert catalogue["gitsync_sweep"] == "gitsync_sweep"
+
+
+
+def test_no_op_pull_skips_a_receipt_already_consumed_by_a_merge_path_restart(checkout):
+    """N5 (Loki F0C19708): the merge-is-confirm path's OWN restart event
+    (reloader.MERGE_EVENT == "broker_reload") must also mark a receipt
+    consumed here -- not only the sealed-pair path's unit_reload -- or a
+    no-op pull after a merge-path restart points an operator's seal at a
+    receipt that restart already acted on."""
+    git = _FakeGit(local_sha="bbb222", remote_sha="bbb222", ahead=0, behind=0, current="master")
+    ledger = _Ledger()
+    ledger.append("forge-play", "git_pull", {"repo": "forge-play/Forge", "checkout": str(checkout),
+                                             "before": "aaa111", "after": "bbb222"})
+    ledger.append("forge-play", "broker_reload", {"repo": "forge-play/Forge", "checkout": str(checkout),
+                                                  "pull_receipt_id": "rec-1"})
+    out = _pull(checkout, git, ledger)
+    assert out["confirm_receipt_id"] is None
