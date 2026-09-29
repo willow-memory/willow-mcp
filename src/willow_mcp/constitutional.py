@@ -492,6 +492,216 @@ def _confirm_amendment(rec: dict, *, live_row: dict, bundle_row: dict,
     return True, ""
 
 
+def bundle_table_digest(doc: dict) -> str:
+    """Stable digest of the bundle table's verb rows — what the trust-owner
+    apply half re-checks against the live package copy before writing."""
+    verbs = doc.get("verbs") or []
+    return hashlib.sha256(_canonical_json(verbs).encode("utf-8")).hexdigest()
+
+
+def live_syscall_table_writable(live_path: Path) -> bool:
+    """Whether this process may create ``live_path``'s ``.tmp`` sibling and
+    replace the live table — false when ``constitutional/`` is trust-owner
+    owned (gap ``7b1fee1f2861``)."""
+    parent = live_path.parent
+    if not parent.is_dir():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+    tmp = live_path.with_name(live_path.name + ".writability-probe")
+    try:
+        tmp.write_text("", encoding="utf-8")
+        tmp.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def evaluate_syscall_table_sync(
+    *,
+    live_path: Optional[Path] = None,
+    bundle_path: Optional[Path] = None,
+    store: Optional[Store] = None,
+    nestor_db_path: Optional[Path] = None,
+) -> dict:
+    """Verify-only half of :func:`sync_syscall_table_from_bundle` — computes
+    whether the bundle may be applied, what would be added/amended, and the
+    bundle digest, without writing the live table or FRANK ink."""
+    live_path = live_path or paths.syscall_table_path()
+    bundle_path = bundle_path or _default_bundle_path()
+
+    if not live_path.exists():
+        return {
+            "ok": True, "needs_apply": False, "added": [],
+            "reason": "no live table yet — home_init seeds it from the "
+                      "bundle on first install",
+        }
+    if not bundle_path.exists():
+        return {"ok": False, "refused": True, "needs_apply": False,
+                "reason": f"bundle table missing: {bundle_path}"}
+
+    try:
+        live = _load_live(live_path)
+    except (OSError, PermissionError, ValueError) as exc:
+        return {"ok": False, "refused": True, "needs_apply": False,
+                "reason": f"live_table_untrusted: could not read live table {live_path}: {exc}"}
+
+    try:
+        bundle = _load_bundle(bundle_path)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "refused": True, "needs_apply": False,
+                "reason": f"could not read bundle table: {exc}",
+                "live_rows": _rows_by_id(live)}
+
+    live_rows = _rows_by_id(live)
+    bundle_rows = _rows_by_id(bundle)
+
+    missing = sorted(set(live_rows) - set(bundle_rows))
+    if missing:
+        return {
+            "ok": False, "refused": True, "needs_apply": False,
+            "reason": (f"bundle is missing live row id(s) {missing} — not a "
+                       f"strict superset, refusing to touch the live table"),
+            "live_rows": live_rows, "bundle_rows": bundle_rows,
+        }
+
+    changed = sorted(
+        vid for vid in live_rows
+        if _structural(live_rows[vid]) != _structural(bundle_rows[vid])
+    )
+
+    amended: list[dict] = []
+    if changed:
+        try:
+            st = store if store is not None else Store()
+            candidates = _find_amendment_candidates(st)
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "ok": False, "refused": True, "needs_apply": False,
+                "reason": (f"could not read governance decisions to check "
+                           f"amendment(s) for row(s) {changed}: "
+                           f"{type(exc).__name__}: {exc}"),
+                "live_rows": live_rows, "bundle_rows": bundle_rows,
+            }
+
+        unauthorized: list[str] = []
+        for vid in changed:
+            live_row, bundle_row = live_rows[vid], bundle_rows[vid]
+            verb = live_row.get("verb")
+            row_reasons: list[str] = []
+            confirmed_pair_id = None
+            for rec in candidates:
+                try:
+                    ok, why = _confirm_amendment(
+                        rec, live_row=live_row, bundle_row=bundle_row,
+                        nestor_db_path=nestor_db_path)
+                except Exception as exc:  # noqa: BLE001
+                    ok, why = False, (
+                        f"row {vid} ({verb}): error checking governance "
+                        f"decision {rec.get('_id')!r}: {type(exc).__name__}: {exc}")
+                if ok:
+                    confirmed_pair_id = rec.get("nestor_pair_id")
+                    break
+                row_reasons.append(why)
+            if confirmed_pair_id is None:
+                if row_reasons:
+                    unauthorized.append("; ".join(row_reasons))
+                else:
+                    unauthorized.append(
+                        f"row {vid} ({verb}): no sealed "
+                        f"{AMENDMENT_KIND} governance decision found")
+                continue
+            amended.append({
+                "id": vid, "verb": verb,
+                "from_sha256": _row_hash(live_row), "to_sha256": _row_hash(bundle_row),
+                "pair_id": confirmed_pair_id,
+            })
+
+        if unauthorized:
+            return {
+                "ok": False, "refused": True, "needs_apply": False,
+                "reason": (f"bundle row(s) {changed} differ from the live table's "
+                           f"existing content — a modification is not a merge, and "
+                           f"not every changed row has a sealed amendment: "
+                           + "; ".join(unauthorized)),
+                "live_rows": live_rows, "bundle_rows": bundle_rows,
+            }
+
+    added = sorted(set(bundle_rows) - set(live_rows))
+    if not added and not amended:
+        return {"ok": True, "needs_apply": False, "added": [],
+                "reason": "live table already matches the bundle"}
+
+    verb_names: list[str] = []
+    seals: dict[int, str] = {}
+    for vid in added:
+        row = bundle_rows[vid]
+        verb_names.append(row.get("verb", f"id-{vid}"))
+        seal_id = _extract_seal_id(row.get("note", ""))
+        if seal_id:
+            seals[vid] = seal_id
+
+    return {
+        "ok": True, "needs_apply": True, "added": added, "amended": amended,
+        "verbs": verb_names, "seals": seals,
+        "bundle_digest": bundle_table_digest(bundle),
+        "bundle_path": str(bundle_path),
+        "live_path": str(live_path),
+        "bundle_doc": bundle,
+    }
+
+
+def apply_evaluated_syscall_sync(
+    plan: dict,
+    *,
+    live_path: Optional[Path] = None,
+    ledger=None,
+    project: str = "fleet",
+    actor: str = "willow-mcp",
+) -> dict:
+    """Trust-owner write half — applies a plan from
+    :func:`evaluate_syscall_table_sync` and inks FRANK."""
+    if not plan.get("ok") or not plan.get("needs_apply"):
+        return {"ok": False, "refused": True,
+                "reason": "plan does not authorize an apply"}
+    live_path = live_path or Path(plan.get("live_path") or paths.syscall_table_path())
+    bundle = plan.get("bundle_doc")
+    if bundle is None:
+        bundle_path = Path(plan.get("bundle_path") or _default_bundle_path())
+        bundle = _load_bundle(bundle_path)
+
+    _atomic_write(live_path, bundle)
+
+    added = plan.get("added") or []
+    amended = plan.get("amended") or []
+    verb_names = plan.get("verbs") or []
+    seals = plan.get("seals") or {}
+
+    result: dict = {
+        "ok": True, "added": added, "verbs": verb_names, "seals": seals,
+        "path": str(live_path), "bundle_digest": plan.get("bundle_digest"),
+    }
+    if amended:
+        result["amended"] = amended
+
+    if ledger is not None:
+        try:
+            content = {
+                "actor": actor, "added": added, "verbs": verb_names,
+                "seals": seals, "path": str(live_path),
+                "bundle_digest": plan.get("bundle_digest"),
+            }
+            if amended:
+                content["amended"] = amended
+            record_id = ledger.append(project, "constitutional_sync", content)
+            result["receipt_id"] = record_id
+        except Exception as exc:  # noqa: BLE001
+            result["receipt_error"] = f"{type(exc).__name__}: {exc}"
+
+    return result
+
+
 def _atomic_write(path: Path, doc: dict) -> None:
     """Same discipline as ``envelope_authoring._atomic_write`` (gap
     ``6b4b7737c535``): write to a temp file beside the target, strip
@@ -566,181 +776,98 @@ def sync_syscall_table_from_bundle(
     reason (unreadable, untrusted, malformed) IS reported as a refusal:
     it is the same fail-closed posture ``envelopes._load`` takes on every
     other governance input.
+
+    When the live table directory is not writable by this process (gap
+    ``7b1fee1f2861``), verification still runs but the write is refused
+    here with ``deferred`` set — :func:`sync_syscall_table_at_boot` queues
+    a ``syscall.sync`` request for the trust-owner apply unit instead.
     """
     live_path = live_path or paths.syscall_table_path()
     bundle_path = bundle_path or _default_bundle_path()
 
-    if not live_path.exists():
-        return {
-            "ok": True, "added": [],
-            "reason": "no live table yet — home_init seeds it from the "
-                      "bundle on first install",
-        }
-    if not bundle_path.exists():
-        reason = f"bundle table missing: {bundle_path}"
-        result = {"ok": False, "refused": True, "reason": reason}
-        receipt = _ink_refusal(ledger, project, actor, reason=reason,
-                                live_path=live_path, bundle_path=bundle_path)
-        if receipt:
-            result.update(receipt)
-        return result
-
-    try:
-        live = _load_live(live_path)
-    except (OSError, PermissionError, ValueError) as exc:
-        reason = f"live_table_untrusted: could not read live table {live_path}: {exc}"
-        result = {"ok": False, "refused": True, "reason": reason}
-        receipt = _ink_refusal(ledger, project, actor, reason=reason,
-                                live_path=live_path, bundle_path=bundle_path)
-        if receipt:
-            result.update(receipt)
-        return result
-
-    try:
-        bundle = _load_bundle(bundle_path)
-    except (OSError, ValueError) as exc:
-        reason = f"could not read bundle table: {exc}"
-        result = {"ok": False, "refused": True, "reason": reason}
-        receipt = _ink_refusal(ledger, project, actor, reason=reason,
-                                live_path=live_path, bundle_path=bundle_path,
-                                live_rows=_rows_by_id(live))
-        if receipt:
-            result.update(receipt)
-        return result
-
-    live_rows = _rows_by_id(live)
-    bundle_rows = _rows_by_id(bundle)
-
-    missing = sorted(set(live_rows) - set(bundle_rows))
-    if missing:
-        reason = (f"bundle is missing live row id(s) {missing} — not a "
-                  f"strict superset, refusing to touch the live table")
-        result = {"ok": False, "refused": True, "reason": reason}
-        receipt = _ink_refusal(ledger, project, actor, reason=reason,
-                                live_path=live_path, bundle_path=bundle_path,
-                                live_rows=live_rows, bundle_rows=bundle_rows)
-        if receipt:
-            result.update(receipt)
-        return result
-
-    changed = sorted(
-        vid for vid in live_rows
-        if _structural(live_rows[vid]) != _structural(bundle_rows[vid])
+    plan = evaluate_syscall_table_sync(
+        live_path=live_path, bundle_path=bundle_path,
+        store=store, nestor_db_path=nestor_db_path,
     )
 
-    # A changed row is still refused by default — UNLESS a sealed
-    # AMENDMENT_KIND governance decision names exactly this row's id/verb
-    # and the exact from/to structural hash (gap 82022def338f, ruling A).
-    # Every changed row must clear this or the whole sync still refuses;
-    # this is additive to the modification refusal, never a replacement
-    # for it — an unsealed modification, or a row with no matching
-    # decision at all, is refused exactly as before.
-    amended: list[dict] = []
-    if changed:
-        try:
-            st = store if store is not None else Store()
-            candidates = _find_amendment_candidates(st)
-        except Exception as exc:  # noqa: BLE001 — a broken governance-decision
-            # read must fail the sync CLOSED, same as any other refusal path
-            # here: the live table stays untouched and the reason is inked
-            # (Loki 573273BD F5 — an exception used to escape this function
-            # entirely instead of becoming a named refusal).
-            reason = (f"could not read governance decisions to check "
-                      f"amendment(s) for row(s) {changed}: "
-                      f"{type(exc).__name__}: {exc}")
-            result = {"ok": False, "refused": True, "reason": reason}
-            receipt = _ink_refusal(ledger, project, actor, reason=reason,
-                                    live_path=live_path, bundle_path=bundle_path,
-                                    live_rows=live_rows, bundle_rows=bundle_rows)
-            if receipt:
-                result.update(receipt)
-            return result
+    if not plan.get("ok"):
+        result = {k: v for k, v in plan.items() if k != "live_rows" and k != "bundle_rows"}
+        result.setdefault("refused", True)
+        receipt = _ink_refusal(
+            ledger, project, actor, reason=plan.get("reason", ""),
+            live_path=live_path, bundle_path=bundle_path,
+            live_rows=plan.get("live_rows"), bundle_rows=plan.get("bundle_rows"),
+        )
+        if receipt:
+            result.update(receipt)
+        return result
 
-        unauthorized: list[str] = []
-        for vid in changed:
-            live_row, bundle_row = live_rows[vid], bundle_rows[vid]
-            verb = live_row.get("verb")
-            row_reasons: list[str] = []
-            confirmed_pair_id = None
-            # Every candidate of AMENDMENT_KIND is checked — accept on the
-            # first that verifies. A stale or planted record earlier in the
-            # list must not shadow a valid one later (Loki 573273BD F4).
-            for rec in candidates:
-                try:
-                    ok, why = _confirm_amendment(
-                        rec, live_row=live_row, bundle_row=bundle_row,
-                        nestor_db_path=nestor_db_path)
-                except Exception as exc:  # noqa: BLE001 — one bad candidate
-                    # record must not crash the sync, or block a later valid
-                    # one; it is simply not an authorization (Loki 573273BD
-                    # F5, the old AttributeError-at-:308 crash).
-                    ok, why = False, (
-                        f"row {vid} ({verb}): error checking governance "
-                        f"decision {rec.get('_id')!r}: {type(exc).__name__}: {exc}")
-                if ok:
-                    confirmed_pair_id = rec.get("nestor_pair_id")
-                    break
-                row_reasons.append(why)
-            if confirmed_pair_id is None:
-                if row_reasons:
-                    unauthorized.append("; ".join(row_reasons))
-                else:
-                    unauthorized.append(
-                        f"row {vid} ({verb}): no sealed "
-                        f"{AMENDMENT_KIND} governance decision found")
-                continue
-            amended.append({
-                "id": vid, "verb": verb,
-                "from_sha256": _row_hash(live_row), "to_sha256": _row_hash(bundle_row),
-                "pair_id": confirmed_pair_id,
-            })
+    if not plan.get("needs_apply"):
+        return {k: v for k, v in plan.items()
+                if k not in ("needs_apply", "bundle_doc", "live_rows", "bundle_rows")}
 
-        if unauthorized:
-            reason = (f"bundle row(s) {changed} differ from the live table's "
-                      f"existing content — a modification is not a merge, and "
-                      f"not every changed row has a sealed amendment: "
-                      + "; ".join(unauthorized))
-            result = {"ok": False, "refused": True, "reason": reason}
-            receipt = _ink_refusal(ledger, project, actor, reason=reason,
-                                    live_path=live_path, bundle_path=bundle_path,
-                                    live_rows=live_rows, bundle_rows=bundle_rows)
-            if receipt:
-                result.update(receipt)
-            return result
+    if not live_syscall_table_writable(live_path):
+        out = {k: v for k, v in plan.items()
+               if k not in ("needs_apply", "bundle_doc", "live_rows", "bundle_rows")}
+        out["deferred"] = True
+        out["reason"] = (
+            f"live syscall table at {live_path} is not writable by uid "
+            f"{os.geteuid()} — queue syscall.sync for the trust-owner apply half"
+        )
+        return out
 
-    added = sorted(set(bundle_rows) - set(live_rows))
-    if not added and not amended:
-        return {"ok": True, "added": [], "reason": "live table already matches the bundle"}
+    applied = apply_evaluated_syscall_sync(
+        plan, live_path=live_path, ledger=ledger, project=project, actor=actor,
+    )
+    return applied
 
-    _atomic_write(live_path, bundle)
 
-    verb_names: list[str] = []
-    seals: dict[int, str] = {}
-    for vid in added:
-        row = bundle_rows[vid]
-        verb_names.append(row.get("verb", f"id-{vid}"))
-        seal_id = _extract_seal_id(row.get("note", ""))
-        if seal_id:
-            seals[vid] = seal_id
+def sync_syscall_table_at_boot(
+    *,
+    ledger=None,
+    project: str = "fleet",
+    actor: str = "willow-mcp",
+    grants_root: Optional[Path] = None,
+    store: Optional[Store] = None,
+    nestor_db_path: Optional[Path] = None,
+) -> dict:
+    """Boot-time sync: verify, apply locally when writable, else queue
+    ``syscall.sync`` for :func:`manifest_grant_executor.manifest_grant_apply`."""
+    from . import trust_owner_verbs as _tov
 
-    result: dict = {
-        "ok": True, "added": added, "verbs": verb_names, "seals": seals,
-        "path": str(live_path),
-    }
-    if amended:
-        result["amended"] = amended
+    live_path = paths.syscall_table_path()
+    bundle_path = _default_bundle_path()
+    plan = evaluate_syscall_table_sync(
+        live_path=live_path, bundle_path=bundle_path,
+        store=store, nestor_db_path=nestor_db_path,
+    )
 
-    if ledger is not None:
-        try:
-            content = {
-                "actor": actor, "added": added, "verbs": verb_names,
-                "seals": seals, "path": str(live_path),
-            }
-            if amended:
-                content["amended"] = amended
-            record_id = ledger.append(project, "constitutional_sync", content)
-            result["receipt_id"] = record_id
-        except Exception as exc:  # noqa: BLE001 — the sync happened; the receipt failing is reported, not hidden
-            result["receipt_error"] = f"{type(exc).__name__}: {exc}"
+    if not plan.get("ok"):
+        result = {k: v for k, v in plan.items() if k != "live_rows" and k != "bundle_rows"}
+        result.setdefault("refused", True)
+        receipt = _ink_refusal(
+            ledger, project, actor, reason=plan.get("reason", ""),
+            live_path=live_path, bundle_path=bundle_path,
+            live_rows=plan.get("live_rows"), bundle_rows=plan.get("bundle_rows"),
+        )
+        if receipt:
+            result.update(receipt)
+        return result
 
-    return result
+    if not plan.get("needs_apply"):
+        return {k: v for k, v in plan.items()
+                if k not in ("needs_apply", "bundle_doc", "live_rows", "bundle_rows")}
+
+    if live_syscall_table_writable(live_path):
+        return apply_evaluated_syscall_sync(
+            plan, live_path=live_path, ledger=ledger, project=project, actor=actor,
+        )
+
+    queued = _tov.queue_syscall_sync_request(
+        plan, actor=actor, project=project, grants_root=grants_root,
+    )
+    out = {k: v for k, v in plan.items()
+           if k not in ("needs_apply", "bundle_doc", "live_rows", "bundle_rows")}
+    out["deferred"] = True
+    out["queued"] = queued
+    return out

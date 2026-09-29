@@ -390,7 +390,9 @@ def handoff_write_v4(
                     "error": "EINVAL",
                     "message": _NO_COMPLETION_EVIDENCE_REASON,
                 }
-            lint_verdicts = _judge_lint_claims(draft, findings_list)
+            lint_verdicts = _judge_lint_claims(
+                draft, findings_list, pkt.get("meta"),
+            )
             lint_refusals = [v for v in lint_verdicts if v["verdict"] == "refuse"]
             if lint_refusals:
                 return {
@@ -711,7 +713,7 @@ def verify_handoff(dispatch_id: str) -> dict:
         )
     if checklist and not _has_completion_evidence(handoff):
         reasons.append(_NO_COMPLETION_EVIDENCE_REASON)
-    lint_verdicts = _judge_lint_claims(handoff, findings)
+    lint_verdicts = _judge_lint_claims(handoff, findings, pkt.get("meta"))
     lint_refusals = [v for v in lint_verdicts if v["verdict"] == "refuse"]
     lint_advisories = [v for v in lint_verdicts if v["verdict"] == "advisory"]
     if checklist and lint_refusals:
@@ -755,10 +757,12 @@ def verify_handoff(dispatch_id: str) -> dict:
 # measured with, and that version must be the one the repo's CI pins —
 # ratatosk #48 (2026-09-21) went red because 0.15.0 was clean where the
 # pinned 0.16.7 was not. The repo root, per finding: the finding's own
-# `repo_root` / `workspace` when it names one (a builder working two repos
-# names the one each claim is about), else the handoff's, else the broker's
-# WILLOW_PROJECT_ROOT. No root at all → the pin is `unreachable` and the
-# verdict is advisory — never a refusal on a repo the verifier could not read.
+# `repo_root` / `workspace`, then the dispatch packet's `gaps_project`
+# checkout, then a repo named by evidence paths, then an explicit handoff
+# `repo_root` — not the handoff's session `workspace` and not the desk's
+# WILLOW_PROJECT_ROOT until those are exhausted (gap 0b5a2aa26001). No root
+# at all → the pin is `unreachable` and the verdict is advisory — never a
+# refusal on a repo the verifier could not read.
 _NO_ROOT_PIN = {
     "state": "unreachable",
     "reason": "no repo root: neither the finding nor the handoff names repo_root/workspace and WILLOW_PROJECT_ROOT is unset",
@@ -767,16 +771,23 @@ _NO_ROOT_PIN = {
 }
 
 
-def _lint_pin_root(finding: dict, handoff: dict) -> str:
-    for scope in (finding, handoff):
-        for key in ("repo_root", "workspace"):
-            val = scope.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-    return os.environ.get("WILLOW_PROJECT_ROOT", "").strip()
+def _lint_pin_root(
+    finding: dict,
+    handoff: dict,
+    dispatch_meta: dict | None = None,
+) -> str:
+    from . import ci_lint_pin
+
+    return ci_lint_pin.lint_repo_root(
+        finding, handoff, dispatch_meta=dispatch_meta,
+    )
 
 
-def _judge_lint_claims(handoff: dict, findings: list) -> list[dict]:
+def _judge_lint_claims(
+    handoff: dict,
+    findings: list,
+    dispatch_meta: dict | None = None,
+) -> list[dict]:
     from . import ci_lint_pin
 
     pins: dict[str, dict] = {}
@@ -784,7 +795,7 @@ def _judge_lint_claims(handoff: dict, findings: list) -> list[dict]:
     for i, f in enumerate(findings):
         if not isinstance(f, dict):
             continue
-        root = _lint_pin_root(f, handoff)
+        root = _lint_pin_root(f, handoff, dispatch_meta)
         if root not in pins:
             pins[root] = ci_lint_pin.ci_lint_pin(root) if root else dict(_NO_ROOT_PIN)
         for v in ci_lint_pin.judge_findings([f], pins[root]):

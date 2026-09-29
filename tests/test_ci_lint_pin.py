@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from willow_mcp import ci_lint_pin as clp
+from willow_mcp import handoff as handoff_mod
 from willow_mcp.handoff import verify_handoff
 
 
@@ -108,8 +109,14 @@ def test_adversarial_set():
 # ── resolver ───────────────────────────────────────────────────────────────
 
 
-def _repo(tmp_path: Path, workflow: str | None = None, pyproject: str | None = None) -> Path:
-    root = tmp_path / "repo"
+def _repo(
+    tmp_path: Path,
+    workflow: str | None = None,
+    pyproject: str | None = None,
+    *,
+    subdir: str = "repo",
+) -> Path:
+    root = tmp_path / subdir
     root.mkdir()
     if workflow is not None:
         wf = root / ".github" / "workflows"
@@ -494,3 +501,78 @@ def test_verify_does_not_judge_lint_when_checklist_is_unresolved(tmp_path, monke
     result = _verify(data)
     assert result["reason"] == "checklist not resolved"
     assert result["lint_claims"][0]["verdict"] == "refuse"
+
+
+# ── lint repo root (gap 0b5a2aa26001) ───────────────────────────────────────
+
+
+def test_lint_repo_root_prefers_dispatch_project_over_desk_workspace(tmp_path, monkeypatch):
+    """Desk on willows-grove, dispatch gaps_project willow-mcp: CI pin follows
+    the packet's project, not WILLOW_PROJECT_ROOT alone."""
+    grove = _repo(tmp_path, workflow="  - run: pip install ruff==0.15.0\n", subdir="grove")
+    mcp = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n", subdir="mcp")
+    monkeypatch.setenv("WILLOW_PROJECT_ROOT", str(grove))
+    monkeypatch.setattr(
+        clp,
+        "project_checkout_path",
+        lambda pid: str(mcp) if pid == "willow-mcp" else "",
+    )
+    finding = {"evidence": ["ruff 0.16.7 check: All checks passed!"]}
+    assert clp.lint_repo_root(finding, {}, dispatch_meta={"gaps_project": "willow-mcp"}) == str(mcp)
+    assert clp.lint_repo_root(finding, {}, dispatch_meta={}) == str(grove)
+
+
+def test_lint_repo_root_from_evidence_path_before_session_root(tmp_path, monkeypatch):
+    grove = _repo(tmp_path, workflow="  - run: pip install ruff==0.15.0\n", subdir="grove")
+    mcp = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n", subdir="mcp")
+    target = mcp / "src" / "willow_mcp" / "handoff.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("# stub\n", encoding="utf-8")
+    monkeypatch.setenv("WILLOW_PROJECT_ROOT", str(grove))
+    finding = {"evidence": [f"measured on {target}: ruff 0.16.7 clean"]}
+    assert clp.lint_repo_root(finding, {}, dispatch_meta={}) == str(mcp)
+
+
+def test_handoff_lint_judgement_uses_dispatch_project_not_desk_pin(tmp_path, monkeypatch):
+    """Mutation guard: without gaps_project on the packet, the same lint claim
+    is refused against the desk's WILLOW_PROJECT_ROOT pin."""
+    grove = _repo(tmp_path, workflow="  - run: pip install ruff==0.15.0\n", subdir="grove")
+    mcp = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n", subdir="mcp")
+    monkeypatch.setenv("WILLOW_PROJECT_ROOT", str(grove))
+    monkeypatch.setattr(
+        clp,
+        "project_checkout_path",
+        lambda pid: str(mcp) if pid == "willow-mcp" else "",
+    )
+    finding = {
+        "text": "fixed lint pin resolution",
+        "evidence": ["360 passed", "ruff 0.16.7 check: All checks passed!"],
+    }
+    handoff = {"narrative": "", "findings": [finding]}
+    meta = {"gaps_project": "willow-mcp"}
+    ok = handoff_mod._judge_lint_claims(handoff, [finding], meta)
+    assert ok[0]["verdict"] == "accept"
+    assert ok[0]["repo_root"] == str(mcp)
+    wrong = handoff_mod._judge_lint_claims(handoff, [finding], None)
+    assert wrong[0]["verdict"] == "refuse"
+    assert wrong[0]["repo_root"] == str(grove)
+
+
+def test_verify_handoff_passes_dispatch_meta_to_lint_pin(tmp_path, monkeypatch):
+    grove = _repo(tmp_path, workflow="  - run: pip install ruff==0.15.0\n", subdir="grove")
+    mcp = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n", subdir="mcp")
+    monkeypatch.setenv("WILLOW_PROJECT_ROOT", str(grove))
+    monkeypatch.setattr(
+        clp,
+        "project_checkout_path",
+        lambda pid: str(mcp) if pid == "willow-mcp" else "",
+    )
+    data = _handoff("ruff 0.16.7 check: All checks passed!")
+    pkt = {"meta": {"gaps_project": "willow-mcp"}, "status": {"status": "complete"}}
+    hr = {"dispatch_id": "d1", "handoff": data, "closeout_md": ""}
+    with patch("willow_mcp.handoff.dispatch_read", return_value=pkt), \
+         patch("willow_mcp.handoff.handoff_read", return_value=hr), \
+         patch("willow_mcp.handoff.dispatch_set_status"):
+        result = verify_handoff("d1")
+    assert result["verified"] is True
+    assert result["lint_claims"][0]["repo_root"] == str(mcp)
