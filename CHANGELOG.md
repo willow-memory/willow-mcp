@@ -31,6 +31,20 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.90.0](https://github.com/willow-memory/willow-mcp/compare/v2.89.0...v2.90.0) (2026-09-29)
+
+
+### Added
+
+* **dispatch:** write-once handoffs bound to the accepting session; listener opt-in; archive on re-accept ([58b1ecf](https://github.com/willow-memory/willow-mcp/commit/58b1ecf62f6726fd02ae1c1db4cb9888b6f263bc))
+
+
+### Fixed
+
+* **dispatch:** adopt p16/F6/N5-base mutation-killers (Loki ADC80409 rework 3) ([70a2953](https://github.com/willow-memory/willow-mcp/commit/70a2953f7925c2dca38e56570c3589320be4de70))
+* **dispatch:** never expose accepted_session_id, refuse empty session_id, bind under lock ([9dc836c](https://github.com/willow-memory/willow-mcp/commit/9dc836cf69da8685a925d6680876449d1242869f))
+* **dispatch:** refuse to guess session resolution, close deploy-order and lock gaps (Loki ADC80409 rework 3) ([a925ddc](https://github.com/willow-memory/willow-mcp/commit/a925ddc526339fdab11fb89163cb7dd59d072238))
+
 ## [2.89.0](https://github.com/willow-memory/willow-mcp/compare/v2.88.0...v2.89.0) (2026-09-28)
 
 
