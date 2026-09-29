@@ -21,6 +21,14 @@ Environment="WILLOW_WORKER_HEARTBEAT_ROOT=@HEARTBEAT_ROOT@"
 # Without KART_SANDBOX_CONFIG, kartikeya resolves its vendored product-neutral
 # default and every task fails `bwrap: Creating new namespace failed`.
 Environment="KART_SANDBOX_CONFIG=@KART_SANDBOX_CONFIG@"
+# Inference-provider keys for allow_net tasks, and nothing else (Nestor pair
+# b1e88cda, amends f07789d1). env.kart is the operator-maintained subset of
+# $WILLOW_HOME/env. The full env is never loaded here: it also holds
+# NESTOR_SEAL_KEY, and a seal key must not sit in the process that launches
+# agent tasks. The leading '-' lets a box with no env.kart start with no
+# provider keys. This file is read at exec, so a key change takes a worker
+# restart; the seams above stay literal Environment= lines for that reason.
+EnvironmentFile=-@WILLOW_HOME@/env.kart
 ExecStart=@PYTHON@ -m willow_mcp.worker --lane @LANE@ --app-id @APP_ID@ --require-postgres
 Restart=on-failure
 RestartSec=2
