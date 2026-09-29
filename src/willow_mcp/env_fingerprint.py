@@ -291,6 +291,66 @@ def resolve_env_source(unit: str, *, runner: Optional[Callable] = None) -> dict:
     return {"source": "fallback", "path": default_env_path()}
 
 
+#: The Kart worker units. A task's allow_net credential pass-through reads
+#: THEIR process env — never the desk's stdio process, which inherits
+#: whatever shell launched the client. Mirrors
+#: package_upgrade_executor's worker_units without importing it.
+WORKER_UNITS = ("willow-mcp-worker-fast.service", "willow-mcp-worker-batch.service")
+
+
+def env_names_for_unit(unit: str, *, runner: Optional[Callable] = None) -> dict:
+    """The variable NAMES a unit loads — never a value, never a digest.
+
+    Unlike :func:`resolve_env_source`, which picks one source to
+    fingerprint, this unions every source systemd reports for the unit:
+    each ``EnvironmentFiles=`` entry and every ``Environment=`` pair, since
+    a credential can sit in either. When systemctl cannot answer, or the
+    unit reports neither, it falls back to ``$WILLOW_HOME/env`` and labels
+    the result ``source: fallback``.
+
+    Three-state: ``populated`` (names found), ``empty`` (sources read, no
+    names), ``unreachable`` (a file could not be read — ``reason`` says
+    which). Never raises.
+    """
+    run = runner or subprocess.run
+    files: list[Path] = []
+    names: set[str] = set()
+    source = "fallback"
+    try:
+        proc = run(
+            ["systemctl", "--user", "show", unit, "--property=EnvironmentFiles,Environment"],
+            capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT_S, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        for line in (proc.stdout or "").splitlines():
+            key, _, value = line.partition("=")
+            value = value.strip()
+            if key == "EnvironmentFiles" and value:
+                # "/path/env (ignore_errors=no)"; a leading "-" marks optional.
+                first = value.split()[0].lstrip("-")
+                if first:
+                    files.append(Path(first))
+            elif key == "Environment" and value:
+                names |= {n for n, _ in _parse_environment_pairs(value)}
+        if files or names:
+            source = "unit"
+    if source == "fallback":
+        files = [default_env_path()]
+    out: dict = {"unit": unit, "source": source, "files": [str(p) for p in files]}
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as e:
+            out.update(state="unreachable", reason=f"{path}: {type(e).__name__}", names=[])
+            return out
+        names |= {n for n, _ in _parse_env_lines(text)}
+    out["names"] = sorted(names)
+    out["state"] = "populated" if names else "empty"
+    return out
+
+
 def fingerprint_source(src: dict) -> dict:
     """The ``{state, keys, digest}`` fingerprint of a
     :func:`resolve_env_source` result, plus ``env_source``/``env_ref`` so a
