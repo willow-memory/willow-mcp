@@ -46,6 +46,7 @@ def _builder_packet(done: bool = True) -> str:
         ho.handoff_write_v4(
             "hanuman", did, narrative="Built.",
             findings=[{"id": "f1", "text": "x", "severity": "low", "evidence": ["a.py:1"]}],
+            session_id="s-build",  # bite 1 (9BA76253): must match the accepting session
         )
     return did
 
@@ -222,6 +223,7 @@ def test_citing_packet_complete_still_grants(seats):
     ho.handoff_write_v4(
         "loki", audit, narrative="Audited.", findings=[],
         no_findings_reason="test fixture: citation-read access test",
+        session_id="s-audit-loki",  # bite 1 (9BA76253): matches _audit_packet's accept
     )
     assert server.dispatch_read("loki", builder)["via"] == audit
 

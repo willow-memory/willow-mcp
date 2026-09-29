@@ -230,6 +230,7 @@ def test_attestation_survives_handoff_write_v4(home, pgp_env, monkeypatch):
     result = hf.handoff_write_v4(
         "willow", dispatch_id, narrative="closing out the dispatch: 1 passed",
         no_findings_reason="test fixture: attestation test",
+        session_id="sess-v4",  # bite 1 (9BA76253): must match the accepting session
     )
     assert "error" not in result, result
     assert result["status"] == "complete"
@@ -416,6 +417,7 @@ def test_dispatch_closeout_gate_e2e_ordinary_error_not_attestation(home, pgp_env
     closed = server.handoff_write_v4(
         "willow", dispatch_id, narrative="closing out via the guarded tool: 1 passed",
         no_findings_reason="test fixture: attestation e2e test",
+        session_id="sess-v4-e2e",  # bite 1 (9BA76253): must match the accepting session
     )
     assert "error" not in closed, closed
     assert closed["status"] == "complete"

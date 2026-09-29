@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -168,8 +171,15 @@ def _utc_now() -> str:
 
 
 def _write_json(path: Path, data: dict) -> None:
+    """Atomic write (bite 1, dispatch 9BA76253, LOW-5): a plain truncate-then-
+    write left a reader able to observe a partially-written status.json or
+    meta.json mid-write. Write to a per-call temp file in the same directory,
+    then os.replace it into place -- atomic on POSIX, so a reader always sees
+    either the old content or the new, never a partial one."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _read_json(path: Path) -> dict | None:
@@ -225,6 +235,7 @@ def dispatch_send(
     from_session: str = "",
     gaps_project: str = "",
     gaps_paths: Optional[list[str]] = None,
+    runner: str = "seat",
 ) -> dict:
     """Create dispatch/{id}/ with meta, assignment, and status pending.
 
@@ -265,6 +276,15 @@ def dispatch_send(
         return {"error": "dispatch_exists", "dispatch_id": did}
 
     role = (role or to_app).lower()
+    # N1 (dispatch 1AD03A64): listener opt-in. "seat" (default) or
+    # "ratatosk" -- the only two runners this fleet has today. Stored on
+    # the signed meta so dispatch_accept/session_enter can refuse a
+    # mismatched acceptor (ERUNNER) without trusting the caller's own
+    # claim about what it is.
+    runner_norm = (runner or "seat").strip().lower()
+    if runner_norm not in ("seat", "ratatosk"):
+        return {"error": "EINVAL",
+                "message": f"runner must be 'seat' or 'ratatosk', got {runner!r}"}
     rel_assignment = f"dispatch/{did}/assignment.md"
     assignment_text = assignment_md.strip() + "\n"
     meta = {
@@ -305,6 +325,7 @@ def dispatch_send(
         # specialist's entering workspace.
         "gaps_project": (gaps_project or "").strip(),
         "gaps_paths": list(gaps_paths or []),
+        "runner": runner_norm,
     }
     # B-52/#241: sign every field above (HMAC-SHA256, runtime-held key --
     # dispatch_signing.py) so dispatch_read/dispatch_list can tell a packet
@@ -360,7 +381,7 @@ _REQUIRED_META_FIELDS = ("dispatch_id", "from_app", "to_app")
 # symlinked packet dir or member file closes that disclosure path; it does
 # not (and cannot, same-uid) stop the packet from being forged in the first
 # place -- see _meta_is_well_formed's own docstring for that residual.
-PACKET_FILE_NAMES = ("meta.json", "assignment.md", "status.json", "handoff.json", "closeout.md")
+PACKET_FILE_NAMES = ("meta.json", "assignment.md", "status.json", "handoff.json", "closeout.md", "refused", ".handoff.lock", "history")
 
 
 def packet_symlink_refused(root: Path) -> bool:
@@ -370,6 +391,47 @@ def packet_symlink_refused(root: Path) -> bool:
     if root.is_symlink():
         return True
     return any((root / name).is_symlink() for name in PACKET_FILE_NAMES)
+
+
+@contextlib.contextmanager
+def packet_lock(root: Path):
+    """Cross-process exclusive claim on one packet directory (bite 1,
+    dispatch 9BA76253 rework of 2E590F1B/262F89A1 F1/F2): `fcntl.flock` on a
+    lockfile inside the packet dir. Blocks until acquired. Holds ACROSS
+    separate OS processes, not just threads inside one interpreter -- this
+    is load-bearing because the ratatosk listener runs its own willow-mcp
+    child process, a real second `python` racing the actual specialist for
+    the same packet, not a second thread in the same one.
+
+    Takes the resolved packet directory rather than a dispatch_id so each
+    caller resolves it through ITS OWN module-local `dispatch_dir` (this
+    module's, or handoff.py's) -- a test that patches one module's
+    `dispatch_dir` (a common fixture shape in this repo) then gets a lock
+    path consistent with the directory that module actually reads and
+    writes, instead of silently falling through to this module's real,
+    unpatched one.
+
+    Every caller that mutates a packet's accept/complete transition must
+    re-read the packet's status AFTER entering this context, never rely on
+    a read taken before it -- otherwise two callers can both observe
+    'working' before either acquires the lock and both believe they are the
+    first writer once they get it."""
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".handoff.lock"
+    # N7 (dispatch 1AD03A64): O_NOFOLLOW so a symlink planted at .handoff.lock
+    # (dispatch/ is operator-writable) cannot redirect this open to a file
+    # outside the packet dir -- same disclosure shape PACKET_FILE_NAMES exists
+    # to close for the other packet files, now closed for the lockfile too.
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fh = os.fdopen(fd, "r+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 
 def _meta_is_well_formed(meta: dict) -> bool:
@@ -680,7 +742,9 @@ def dispatch_list(
     }
 
 
-def dispatch_set_status(dispatch_id: str, status: str, **extra: Any) -> dict:
+def dispatch_set_status(
+    dispatch_id: str, status: str, *, already_locked: bool = False, **extra: Any,
+) -> dict:
     if status not in VALID_STATUSES:
         return {"error": "invalid_status", "status": status}
     root = dispatch_dir(dispatch_id)
@@ -691,6 +755,21 @@ def dispatch_set_status(dispatch_id: str, status: str, **extra: Any) -> dict:
     # relying on call-order elsewhere never changing.
     if packet_symlink_refused(root):
         return {"error": "symlinked_packet", "dispatch_id": dispatch_id}
+    # N5 (dispatch 1AD03A64, Loki 10A39E21 N5): dispatch_withdraw/
+    # agent_clear/verify_handoff used to read-modify-write status.json
+    # OUTSIDE packet_lock -- a concurrent accept or close could lose an
+    # update against them. `already_locked=True` is passed ONLY by callers
+    # that already hold packet_lock for this same dispatch_id
+    # (dispatch_accept, handoff_write_v4) -- taking it again here, even in
+    # the same process, would deadlock (flock is per open-file-description,
+    # not per-process). Every other caller gets the lock taken right here.
+    if already_locked:
+        return _dispatch_set_status_locked(dispatch_id, root, status, extra)
+    with packet_lock(root):
+        return _dispatch_set_status_locked(dispatch_id, root, status, extra)
+
+
+def _dispatch_set_status_locked(dispatch_id: str, root: Path, status: str, extra: dict) -> dict:
     path = root / "status.json"
     data = _read_json(path)
     if data is None:
@@ -705,22 +784,52 @@ def dispatch_set_status(dispatch_id: str, status: str, **extra: Any) -> dict:
     meta = _read_json(meta_path)
     if meta:
         meta["status"] = status
-        # B-52/#241: this is a legitimate mutation of meta.json (only reached
-        # through dispatch_accept/handoff_write_v4/agent_clear -- never a raw
-        # write), so re-sign rather than let a lifecycle transition
-        # self-invalidate the packet's own signature. Any OTHER edit to
-        # meta.json -- one that didn't go through this function -- still
-        # invalidates it, which is exactly the tamper evidence this exists
-        # to catch. A legacy packet with no prior signature is signed for
-        # the first time here, same as dispatch_send would have.
         meta["signature"] = dispatch_signing.sign_meta(meta)
         _write_json(meta_path, meta)
     _pg_mirror_status(dispatch_id, status)  # best-effort fleet mirror
     return {"dispatch_id": dispatch_id, "status": status}
 
 
-def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict:
+def _archive_prior_handoff(dispatch_id: str) -> None:
+    """F3 (dispatch 1AD03A64): move a cleared packet's prior handoff.json
+    and closeout.md to history/<utc-ts>/ before a re-accept starts a fresh
+    cycle. Caller must already hold packet_lock. A missing handoff.json
+    (never actually completed, or already archived) is a silent no-op."""
+    root = dispatch_dir(dispatch_id)
+    handoff_path = root / "handoff.json"
+    if not handoff_path.exists():
+        return
+    ts = _utc_now().replace(":", "").replace("-", "")
+    # F3B (Loki ADC80409): _utc_now() has one-second granularity; exist_ok
+    # plus os.replace let three re-accepts in the same wall-clock second
+    # overwrite each other's archive. A random token makes the directory
+    # name unique regardless of timing, same discipline as the sidecar
+    # filenames in _write_refused_sidecar.
+    token = uuid.uuid4().hex[:8]
+    hist_dir = root / "history" / f"{ts}-{token}"
+    hist_dir.mkdir(parents=True, exist_ok=False)
+    import os as _os
+    _os.replace(handoff_path, hist_dir / "handoff.json")
+    closeout_path = root / "closeout.md"
+    if closeout_path.exists():
+        _os.replace(closeout_path, hist_dir / "closeout.md")
+
+
+def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "", runner: str = "seat") -> dict:
     """Specialist takes packet: pending → working.
+
+    Bite 1 (dispatch 9BA76253, rework of 2E590F1B/262F89A1 F2): the accept
+    that actually flips pending/cleared → working is the ONLY event that
+    records ``accepted_session_id`` on the packet's status -- under the
+    same cross-process ``packet_lock`` handoff_write_v4 re-reads status
+    under, so a claim here can't race a concurrent accept attempt from a
+    second process. ``handoff_write_v4`` later refuses a write whose
+    ``session_id`` doesn't match this recorded value (ESESSION) -- this is
+    what stops a re-entering session (e.g. the ratatosk listener's own
+    child process) from ever being treated as the accepting one. Always
+    written (even as ``""``) so a fresh accept on a recurring/cleared
+    packet overwrites whatever stale value a prior cycle left, rather than
+    leaving a previous session's id bound to a new acceptance.
 
     When the packet carries ``from_verifier`` (envelope-accrual PR9),
     that operator identity is bound onto the specialist's session record
@@ -735,24 +844,70 @@ def dispatch_accept(dispatch_id: str, app_id: str, session_id: str = "") -> dict
         return pkt
     if pkt["meta"].get("to_app", "").lower() != app_id.lower():
         return {"error": "wrong_recipient", "expected": pkt["meta"].get("to_app")}
-    cur = pkt.get("status", {}).get("status", "pending")
-    if cur not in ("pending", "cleared"):
-        return {"error": "invalid_transition", "from": cur, "to": "working"}
-    dispatch_set_status(dispatch_id, "working")
-    if session_id:
-        from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
-        session_bind(
-            app_id, session_id, dispatch_id, "working",
-            verifier=from_verifier,
+    # N1 (dispatch 1AD03A64): listener opt-in. A packet's runner is fixed at
+    # dispatch_send time; a caller whose own runner doesn't match is refused
+    # here, before the lock -- no bind, no status change, so a listener
+    # racing a real seat for a seat-only packet can never win the accept.
+    pkt_runner = (pkt["meta"].get("runner") or "seat").strip().lower()
+    caller_runner = (runner or "seat").strip().lower()
+    if pkt_runner != caller_runner:
+        return {
+            "error": "ERUNNER",
+            "dispatch_id": dispatch_id,
+            "expected": pkt_runner,
+            "got": caller_runner,
+            "message": (
+                f"packet {dispatch_id!r} is runner={pkt_runner!r}; caller "
+                f"passed runner={caller_runner!r} -- refused, no bind, no "
+                f"status change"
+            ),
+        }
+    with packet_lock(dispatch_dir(dispatch_id)):
+        # Re-read status UNDER the lock -- a read taken before acquiring it
+        # can be stale by the time this caller wins the lock.
+        pkt = dispatch_read(dispatch_id)
+        if pkt.get("error"):
+            return pkt
+        cur = pkt.get("status", {}).get("status", "pending")
+        # F3 (dispatch 1AD03A64), operator ruling recorded as SOIL
+        # listener-opt-in-and-reaccept-archive-2026-09-28 ("Archive the old
+        # one"): re-accepting a CLEARED packet (a recurring dispatch) is
+        # allowed, but its prior handoff.json/closeout.md are archived
+        # under history/ FIRST, atomically, under this same lock -- so the
+        # new run always writes fresh and _create_handoff_exclusive never
+        # loses a race against a stale verdict left by the previous cycle.
+        if cur not in ("pending", "cleared"):
+            return {"error": "invalid_transition", "from": cur, "to": "working"}
+        if cur == "cleared":
+            _archive_prior_handoff(dispatch_id)
+        dispatch_set_status(
+            dispatch_id, "working", accepted_session_id=session_id,
+            already_locked=True,
         )
-        if from_verifier:
-            # Adds this specialist session to the attribution cache so its
-            # own gate misses (via _auto_propose_on_gate_miss) succeed
-            # rather than short-circuiting on is_session_attributed=False.
-            # Lazy import: human_session pulls keyring, and dispatch.py
-            # is imported early enough that a top-level import loops.
-            from . import human_session as _hs
-            _hs._remember_attributed(session_id)
+        # G3 (Loki 6FC22847): session_bind used to run AFTER this lock was
+        # released -- a withdraw winning the very next acquisition of this
+        # same lock in that window saw status "working" with
+        # accepted_session_id already recorded but no session record yet
+        # on disk, so _sessions_bound_to (which reads session files, not
+        # status.json) found nothing bound. Binding here, still under the
+        # same lock as the status write, closes that window: by the time
+        # any other caller can acquire this lock, both the packet's
+        # accepted_session_id and the session record agree.
+        if session_id:
+            from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
+            session_bind(
+                app_id, session_id, dispatch_id, "working",
+                verifier=from_verifier,
+            )
+            if from_verifier:
+                # Adds this specialist session to the attribution cache so
+                # its own gate misses (via _auto_propose_on_gate_miss)
+                # succeed rather than short-circuiting on
+                # is_session_attributed=False. Lazy import: human_session
+                # pulls keyring, and dispatch.py is imported early enough
+                # that a top-level import loops.
+                from . import human_session as _hs
+                _hs._remember_attributed(session_id)
     return dispatch_read(dispatch_id)
 
 
@@ -863,6 +1018,7 @@ def session_enter(
     verifier: str = "",
     attested_at: str = "",
     seal_sig: str = "",
+    runner: str = "seat",
 ) -> dict:
     """Resolve session entry mode: human prompt vs dispatch id path.
 
@@ -998,24 +1154,100 @@ def session_enter(
             "dispatch_id": did,
             "message": "packet was withdrawn by the orchestrator; it cannot be entered",
         }
+
+    # G2 (Loki 6FC22847): an empty/missing session_id used to reach the
+    # re-entry branch below (`elif session_id:` was simply skipped) and
+    # fall all the way through to the result -- full assignment,
+    # held_by_other_session left False, and the bearer accepted_session_id
+    # handed back -- without EITHER the runner check or the
+    # held-by-another-session check ever running. Refuse before any of
+    # that: a dispatch entry always names the session entering it.
+    if not (session_id or "").strip():
+        return {
+            "entry_mode": "dispatch",
+            "error": "EINVAL",
+            "dispatch_id": did,
+            "message": "session_id is required to enter a dispatch packet",
+        }
+
+    # N1B / G2 (Loki 6FC22847): the runner check now runs before ANY status
+    # branch -- it used to sit only inside the re-entry branch (reachable
+    # solely when session_id was truthy), so a runner mismatch on a fresh
+    # accept relied entirely on dispatch_accept's own later, redundant
+    # check. Checking here first makes it uniform for the pending-accept
+    # and re-entry paths alike; it can run unconditionally now that
+    # session_id is guaranteed non-empty above.
+    pkt_runner = (pkt["meta"].get("runner") or "seat").strip().lower()
+    caller_runner = (runner or "seat").strip().lower()
+    if pkt_runner != caller_runner:
+        return {
+            "entry_mode": "dispatch",
+            "error": "ERUNNER",
+            "dispatch_id": did,
+            "expected": pkt_runner,
+            "got": caller_runner,
+            "message": (
+                f"packet {did!r} is runner={pkt_runner!r}; caller "
+                f"passed runner={caller_runner!r} -- refused, no bind, "
+                f"no status change"
+            ),
+        }
+
+    held_by_other_session = False
     if cur == "pending":
-        pkt = dispatch_accept(did, app_id, session_id)
-    elif session_id:
-        # Re-entry into an already-accepted packet (specialist reconnecting
-        # or continuing after a hop). Same envelope-accrual PR9 discipline
-        # as dispatch_accept: lift the packet's operator attribution onto
-        # the session and into the attribution cache. session_bind's
-        # verifier-preservation contract means an already-set verifier is
-        # not clobbered when the packet carries none; a specialist without
-        # a session record yet gets seeded here.
-        from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
-        session_bind(app_id, session_id, did, cur, verifier=from_verifier)
-        if from_verifier:
-            from . import human_session as _hs
-            _hs._remember_attributed(session_id)
+        accept_result = dispatch_accept(did, app_id, session_id, runner=runner)
+        if accept_result.get("error"):
+            # The runner check just above already excludes ERUNNER here --
+            # any error reaching this point is the N4 (Loki 10A39E21 N4)
+            # concurrent-accept race: re-read rather than let `pkt` become
+            # the bare error dict and fall through below as a
+            # success-shaped, empty entry.
+            pkt = dispatch_read(did)
+            if pkt.get("error"):
+                return {"entry_mode": "dispatch", "error": pkt["error"], "dispatch_id": did}
+            cur = pkt.get("status", {}).get("status", "pending")
+            accepted_session_id = str(pkt.get("status", {}).get("accepted_session_id") or "")
+            if accepted_session_id and accepted_session_id != session_id:
+                held_by_other_session = True
+            elif accepted_session_id != session_id:
+                # Lost the race and it isn't even bound to us -- surface
+                # the real error rather than pretending success.
+                return {
+                    "entry_mode": "dispatch",
+                    "error": accept_result["error"],
+                    "dispatch_id": did,
+                    "status": cur,
+                }
+        else:
+            pkt = accept_result
+    else:
+        # Re-entry into an already-accepted (or since-cleared) packet.
+        # session_id is guaranteed non-empty above. Bite 1 (dispatch
+        # 9BA76253, rework of 2E590F1B/262F89A1 F2): a re-entry is only
+        # ever a continuation of the SAME accepting session -- not a
+        # chance for a second session (the ratatosk listener's own child
+        # process is the motivating case) to silently pick up
+        # attribution/binding for a packet it never actually accepted.
+        # `accepted_session_id` is recorded ONLY by dispatch_accept (see
+        # its docstring); when it is present and names a DIFFERENT session
+        # than this one, this call does not bind -- no session_bind, no
+        # attribution lift -- and the caller is told the packet is held by
+        # another session. An empty/absent `accepted_session_id` (a legacy
+        # packet accepted before this field existed, or one accepted with
+        # no session_id at all) has nothing recorded to protect, so
+        # re-entry there keeps the pre-existing permissive behavior.
+        accepted_session_id = str(pkt.get("status", {}).get("accepted_session_id") or "")
+        if accepted_session_id and accepted_session_id != session_id:
+            held_by_other_session = True
+        else:
+            from_verifier = str(pkt["meta"].get("from_verifier") or "").strip()
+            session_bind(app_id, session_id, did, cur, verifier=from_verifier)
+            if from_verifier:
+                from . import human_session as _hs
+                _hs._remember_attributed(session_id)
 
     closeout = closeout_from_meta(pkt.get("meta", {}))
-    return {
+    result = {
         "entry_mode": "dispatch",
         "app_id": app_id,
         "session_id": session_id,
@@ -1037,9 +1269,20 @@ def session_enter(
         "gaps_project": pkt.get("meta", {}).get("gaps_project", ""),
         "gaps_paths": pkt.get("meta", {}).get("gaps_paths", []),
         "status": pkt.get("status", {}).get("status"),
+        # Bite 1 (dispatch 9BA76253): surfaced so a re-entering caller can
+        # tell "you are not the accepting session" apart from an ordinary
+        # continuation -- see the else branch above.
+        "held_by_other_session": held_by_other_session,
         **persona_context(app_id),
         **seed_context(app_id),
     }
+    # G1 (Loki 6FC22847): accepted_session_id is a bearer value -- never
+    # return it from session_enter to anyone, including the holder. The
+    # holder already knows its own session_id; there is no legitimate
+    # reader of this field here (dispatch_read/dispatch_list withhold it
+    # too -- see server.py's dispatch_read wrapper and dispatch_list's row
+    # shape above).
+    return result
 
 
 def session_handoff_write(
@@ -1131,14 +1374,24 @@ def agent_clear(target_app: str, dispatch_id: str, session_id: str = "") -> dict
     pkt = dispatch_read(dispatch_id)
     if pkt.get("error"):
         return pkt
-    st = pkt.get("status", {}).get("status")
-    if st not in ("complete", "verified"):
-        return {"error": "not_ready_for_clear", "status": st}
-    dispatch_set_status(
-        dispatch_id,
-        "cleared",
-        cleared_at=_utc_now(),
-    )
+    root = dispatch_dir(dispatch_id)
+    # N5C (Loki ADC80409): same stale-read-before-lock hazard as withdraw
+    # (N5B) -- re-read status under packet_lock so a concurrent write
+    # (e.g. the packet going to "failed") can't be clobbered by a clear
+    # decided against a status read before this caller won the lock.
+    with packet_lock(root):
+        pkt = dispatch_read(dispatch_id)
+        if pkt.get("error"):
+            return pkt
+        st = pkt.get("status", {}).get("status")
+        if st not in ("complete", "verified"):
+            return {"error": "not_ready_for_clear", "status": st}
+        dispatch_set_status(
+            dispatch_id,
+            "cleared",
+            cleared_at=_utc_now(),
+            already_locked=True,
+        )
     if session_id:
         session_bind(target_app, session_id, "", "idle")
     return {"dispatch_id": dispatch_id, "target_app": target_app, "status": "cleared"}
@@ -1201,52 +1454,87 @@ def dispatch_withdraw(
     if pkt.get("error"):
         return pkt
     did = pkt["meta"].get("dispatch_id") or dispatch_id.upper()
-    cur = pkt.get("status", {}).get("status", "pending")
-    if cur == "withdrawn":
-        return {"error": "already", "dispatch_id": did, "status": cur}
-    forced_over: list[str] = []
-    if cur == "working":
-        bound = _sessions_bound_to(pkt["meta"].get("to_app", ""), did)
-        if bound:
+    root = dispatch_dir(did)
+    # N5B (Loki ADC80409): the decision (read status, check EBUSY) used to
+    # be made BEFORE acquiring packet_lock -- a concurrent dispatch_accept
+    # or handoff_write_v4 could land between this read and the write below,
+    # so withdraw's own "pending"/EBUSY read went stale and it overwrote a
+    # packet that had since become working and session-bound. Re-read
+    # under the lock, same discipline dispatch_accept/handoff_write_v4 use.
+    with packet_lock(root):
+        pkt = dispatch_read(did)
+        if pkt.get("error"):
+            return pkt
+        cur = pkt.get("status", {}).get("status", "pending")
+        if cur == "withdrawn":
+            return {"error": "already", "dispatch_id": did, "status": cur}
+        forced_over: list[str] = []
+        if cur == "working":
+            bound = _sessions_bound_to(pkt["meta"].get("to_app", ""), did)
             session_ids = [str(r.get("session_id")) for r in bound]
-            if force and is_orchestrator_app(by_app):
-                forced_over = session_ids
-            else:
-                to_app = pkt["meta"].get("to_app")
-                return {
-                    "error": "EBUSY",
-                    "dispatch_id": did,
-                    "status": cur,
-                    "sessions": session_ids,
-                    "reconcile": [
-                        {"tool": "session_reconcile", "app_id": to_app, "session_id": s}
-                        for s in session_ids
-                    ],
-                    "message": (
-                        f"{to_app} session(s) {', '.join(session_ids)} still bound "
-                        "to this packet as working; liveness beyond the session "
-                        "record cannot be known here. Wait for the handoff, "
-                        f"reconcile the session(s) (session_reconcile(app_id={to_app!r}, "
-                        "session_id=<id>, ...)), or — orchestrator only, for a seat "
-                        "that is gone — withdraw with force=True; the forced-over "
-                        "sessions are recorded on the packet and in FRANK."
-                    ),
-                }
-    elif cur != "pending":
-        return {"error": "invalid_transition", "from": cur, "to": "withdrawn",
-                "dispatch_id": did}
-    extra: dict[str, Any] = {}
-    if forced_over:
-        extra["forced_over_sessions"] = forced_over
-    dispatch_set_status(
-        did, "withdrawn",
-        withdrawn_at=_utc_now(),
-        withdrawn_by=by_app,
-        withdraw_reason=reason.strip(),
-        **extra,
-    )
-    out = {"dispatch_id": did, "previous": cur, "status": "withdrawn",
-           "to_app": pkt["meta"].get("to_app"), "reason": reason.strip()}
-    if forced_over:
-        out["forced_over_sessions"] = forced_over
-    return out
+            # G3 (Loki 6FC22847): accepted_session_id on status.json is now
+            # written inside the SAME lock dispatch_accept holds for the
+            # session_bind that follows it (see dispatch_accept) -- but a
+            # packet's on-disk accepted_session_id can still be the only
+            # record of a claim in flight the instant this withdraw wins
+            # the lock. Treat a non-empty accepted_session_id as bound even
+            # when no session record backs it yet: EBUSY, not a torn
+            # "withdrawn packet with a session still coming".
+            accepted_session_id = str(pkt.get("status", {}).get("accepted_session_id") or "")
+            if accepted_session_id and accepted_session_id not in session_ids:
+                # A session record's ABSENCE (not_found) is the narrow
+                # accept-race window this exists for -- nothing on disk yet
+                # to disprove the claim, so treat it as bound. A session
+                # record that DOES exist but is no longer "working" (e.g.
+                # "idle", written by session_bind when a seat legitimately
+                # releases the packet after a human closeout) means the
+                # claim was explicitly released -- this stale
+                # accepted_session_id must not resurrect it as bound
+                # forever; _sessions_bound_to above already covers the
+                # still-working case.
+                rec = session_read(pkt["meta"].get("to_app", ""), accepted_session_id)
+                if rec.get("error"):
+                    session_ids.append(accepted_session_id)
+            if session_ids:
+                if force and is_orchestrator_app(by_app):
+                    forced_over = session_ids
+                else:
+                    to_app = pkt["meta"].get("to_app")
+                    return {
+                        "error": "EBUSY",
+                        "dispatch_id": did,
+                        "status": cur,
+                        "sessions": session_ids,
+                        "reconcile": [
+                            {"tool": "session_reconcile", "app_id": to_app, "session_id": s}
+                            for s in session_ids
+                        ],
+                        "message": (
+                            f"{to_app} session(s) {', '.join(session_ids)} still bound "
+                            "to this packet as working; liveness beyond the session "
+                            "record cannot be known here. Wait for the handoff, "
+                            f"reconcile the session(s) (session_reconcile(app_id={to_app!r}, "
+                            "session_id=<id>, ...)), or — orchestrator only, for a seat "
+                            "that is gone — withdraw with force=True; the forced-over "
+                            "sessions are recorded on the packet and in FRANK."
+                        ),
+                    }
+        elif cur != "pending":
+            return {"error": "invalid_transition", "from": cur, "to": "withdrawn",
+                    "dispatch_id": did}
+        extra: dict[str, Any] = {}
+        if forced_over:
+            extra["forced_over_sessions"] = forced_over
+        dispatch_set_status(
+            did, "withdrawn",
+            withdrawn_at=_utc_now(),
+            withdrawn_by=by_app,
+            withdraw_reason=reason.strip(),
+            already_locked=True,
+            **extra,
+        )
+        out = {"dispatch_id": did, "previous": cur, "status": "withdrawn",
+               "to_app": pkt["meta"].get("to_app"), "reason": reason.strip()}
+        if forced_over:
+            out["forced_over_sessions"] = forced_over
+        return out

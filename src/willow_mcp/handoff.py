@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from . import handoff_validation as hv
-from .dispatch import dispatch_read, dispatch_set_status, packet_symlink_refused
+from .dispatch import dispatch_read, dispatch_set_status, packet_lock, packet_symlink_refused
 from .paths import dispatch_dir
 
 
@@ -19,8 +21,20 @@ def _utc_now() -> str:
 
 
 def _write_json(path: Path, data: dict) -> None:
+    """Atomic write (bite 1, dispatch 9BA76253, LOW-5): temp file + os.replace
+    so a reader never observes a partially-written handoff.json."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Same atomicity as `_write_json`, for closeout.md's plain-text body."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 # Shared reason strings (Loki EB30E84F F5): _has_completion_evidence and
@@ -44,6 +58,196 @@ def _lint_refusal_reason(lint_refusals: list) -> str:
     )
 
 
+#: Bite 1 of next-bites-2026-09-28 (dispatch 2E590F1B, plan 6AE6ACE1): a
+#: handoff only ever lands on a packet the specialist actually holds
+#: (`working`), and a packet that already closed one handoff refuses a
+#: second -- these are the states past which a write is refused rather
+#: than silently overwriting whatever verdict already landed there (the
+#: ratatosk-Gemini-vs-Loki race, gaps f9dff345ece7/71ce64eae9fd/
+#: 0147276f1097). `withdrawn` stays a separate, pre-existing refusal
+#: (invalid_transition, above) -- terminal for a different reason (the
+#: orchestrator retired the packet) with its own error shape callers
+#: already depend on. `cleared` is deliberately NOT closed here:
+#: dispatch_accept accepts a `cleared` packet again (pending/cleared ->
+#: working) for a recurring dispatch, so a handoff attempt against a
+#: `cleared` packet just hasn't been accepted yet (ESTATE), not "already
+#: closed" (ECLOSED).
+_CLOSED_STATUSES: frozenset = frozenset({"complete", "verified", "failed"})
+
+
+def _refused_sidecar_dir(dispatch_id: str) -> Path:
+    return dispatch_dir(dispatch_id) / "refused"
+
+
+def _sidecar_count(dispatch_id: str) -> int:
+    """How many refused-handoff sidecars sit next to this packet -- the
+    signal `verify_handoff` surfaces so the desk can see a race happened,
+    without reading or judging their content itself. Never raises: a
+    dispatch_id `dispatch_dir` itself refuses (malformed, e.g. from a test
+    fixture that never went through dispatch_send) reads as "no sidecars
+    to report" rather than blowing up a verify call that has nothing to do
+    with the sidecar feature."""
+    try:
+        d = _refused_sidecar_dir(dispatch_id)
+        if not d.is_dir():
+            return 0
+        return sum(1 for p in d.iterdir() if p.is_file() and not p.name.startswith("."))
+    except (OSError, ValueError):
+        return 0
+
+
+def _history_count(dispatch_id: str) -> int:
+    """How many archived cycles (F3, dispatch 1AD03A64) sit under this
+    packet's history/ -- one subdirectory per re-accept-and-archive. Same
+    never-raises discipline as _sidecar_count."""
+    try:
+        d = dispatch_dir(dispatch_id) / "history"
+        if not d.is_dir():
+            return 0
+        return sum(1 for p in d.iterdir() if p.is_dir())
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_refused_sidecar(dispatch_id: str, writer_app: str, payload: dict,
+                           reason: str, *, session_id: str = "") -> str:
+    """Write one refused-handoff sidecar next to the packet, atomically and
+    without ever colliding with another sidecar -- two writers racing a
+    closed (or not-yet-accepted) packet must both land, not clobber each
+    other, and the original handoff.json this function never touches stays
+    byte-for-byte as it was. Filename carries a UTC timestamp, the writer's
+    app_id, and a random token -- the token is what actually keeps two
+    refusals in the same wall-clock second from colliding, the timestamp
+    alone would not. Writes to a per-call temp file in the same directory
+    and `os.replace`s it into place -- atomic on POSIX, so a reader
+    (`_sidecar_count`) never sees a partial file mid-write.
+
+    Bite 1 LOW-4 (dispatch 9BA76253): a write failure here (disk full,
+    read-only mount) is caught and reported as an empty string rather than
+    propagating an OSError -- the refusal itself (ECLOSED/ESTATE/ESESSION)
+    must stand even when its sidecar could not be written; the caller
+    folds this into ``sidecar_error`` on the returned refusal."""
+    sidecar_dir = _refused_sidecar_dir(dispatch_id)
+    ts = _utc_now()
+    token = uuid.uuid4().hex[:8]
+    safe_app = re.sub(r"[^A-Za-z0-9_.-]", "_", writer_app or "unknown")
+    fname = f"{ts.replace(':', '')}-{safe_app}-{token}.json"
+    body = {
+        "writer_app": writer_app,
+        "session_id": session_id or "",
+        "dispatch_id": dispatch_id,
+        "reason": reason,
+        "written_at": ts,
+        "payload": payload,
+    }
+    try:
+        sidecar_dir.mkdir(parents=True, exist_ok=True)
+        tmp = sidecar_dir / f".{fname}.{os.getpid()}.{token}.tmp"
+        tmp.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+        target = sidecar_dir / fname
+        os.replace(tmp, target)
+    except OSError:
+        return ""
+    return str(target)
+
+
+_receipt_log_lock = threading.Lock()
+_receipt_log_singleton = None
+
+
+def _handoff_receipt_log():
+    """Lazy, module-private `ReceiptLog` -- constructed on first real use,
+    never at import time (the same `_LazySingleton` discipline server.py
+    documents at gap 035d287206e1: a receipt log construction is a real
+    side effect, `mkdir` + `sqlite3.connect`, that must not run for every
+    process that merely imports this module, including one running under a
+    uid that cannot write $WILLOW_HOME at all)."""
+    global _receipt_log_singleton
+    if _receipt_log_singleton is None:
+        with _receipt_log_lock:
+            if _receipt_log_singleton is None:
+                from .receipts import ReceiptLog
+                _receipt_log_singleton = ReceiptLog()
+    return _receipt_log_singleton
+
+
+def _record_handoff_refusal_receipt(app_id: str, dispatch_id: str, errno: str,
+                                     reason: str) -> None:
+    """A refusal is `receipts_tail`-visible (bite 1's own requirement) --
+    but strictly secondary to the refusal itself: a receipt log that can't
+    be opened (read-only $WILLOW_HOME, disk full) must never turn an honest
+    refusal into an unhandled exception."""
+    try:
+        _handoff_receipt_log().record(
+            app_id, "handoff_write_v4", f"refused_{errno.lower()}",
+            f"dispatch_id={dispatch_id} reason={reason}",
+        )
+    except Exception:  # noqa: BLE001 -- the refusal already happened; logging it failing is not itself a failure
+        pass
+
+
+def _create_handoff_exclusive(path: Path, data: dict) -> bool:
+    """Atomically create `path` (handoff.json) exactly once. `O_EXCL` means a
+    second creator gets FileExistsError rather than silently overwriting the
+    first writer's verdict. Bite 1 HIGH-1 (dispatch 9BA76253): callers here
+    already hold the cross-process `packet_lock`, which is what actually
+    keeps two writers from racing in the first place -- this is the LAST
+    LINE of defence if that lock is ever bypassed, held at the wrong
+    granularity, or simply not taken by some caller this module doesn't know
+    about. Returns False (never raises) on losing the create race; the
+    caller turns that into ECLOSED plus a sidecar, same as the state-check
+    path above it."""
+    # F6 (dispatch 1AD03A64): write to a temp file in the same directory
+    # FIRST, then `os.link` it into place -- `os.link` fails with
+    # FileExistsError exactly like O_EXCL did (same last-line exclusivity),
+    # but no reader can ever observe a zero-length or partially-written
+    # handoff.json, because the temp file is fully written and closed
+    # before the link that makes it visible under its real name.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, indent=2) + "\n"
+    tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    tmp.write_text(payload, encoding="utf-8")
+    try:
+        os.link(tmp, path)
+        return True
+    except FileExistsError:
+        return False
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _eclosed_refusal(dispatch_id: str, app_id: str, session_id: str,
+                      findings_list: list, narrative: str,
+                      checklist_resolved: bool, envelope_clean: bool,
+                      no_findings_reason, reason: str, cur: str = "complete") -> dict:
+    """Shared ECLOSED refusal shape: write the sidecar (LOW-4: a failed
+    sidecar write is caught, folded into `sidecar_error`, and the receipt is
+    still written), record the receipt, return the refusal dict. `cur` is
+    the packet's actual on-disk status (complete/verified/failed) -- NOT
+    hardcoded, so a caller can tell which closed state it lost to."""
+    payload = {
+        "app_id": app_id, "dispatch_id": dispatch_id,
+        "findings": findings_list, "narrative": narrative,
+        "checklist_resolved": checklist_resolved,
+        "envelope_clean": envelope_clean,
+        "no_findings_reason": no_findings_reason,
+    }
+    sidecar_path = _write_refused_sidecar(
+        dispatch_id, app_id, payload, reason, session_id=session_id,
+    )
+    _record_handoff_refusal_receipt(app_id, dispatch_id, "ECLOSED", reason)
+    out = {
+        "error": "ECLOSED", "message": reason, "status": cur,
+        "dispatch_id": dispatch_id, "sidecar": sidecar_path,
+    }
+    if not sidecar_path:
+        out["sidecar_error"] = "sidecar write failed; refusal stands, no sidecar on disk"
+    return out
+
+
 def handoff_write_v4(
     app_id: str,
     dispatch_id: str,
@@ -53,6 +257,7 @@ def handoff_write_v4(
     checklist_resolved: bool = True,
     envelope_clean: bool = True,
     no_findings_reason: Optional[str] = None,
+    session_id: str = "",
     **_unknown_fields,
 ) -> dict:
     # gap 21f80b2b348a / 34c8e60f4260 / sealed cdcd948c stage 2: refuse a
@@ -70,79 +275,185 @@ def handoff_write_v4(
         return pkt
     if pkt["meta"].get("to_app", "").lower() != app_id.lower():
         return {"error": "wrong_recipient", "expected": pkt["meta"].get("to_app")}
-    cur = pkt.get("status", {}).get("status", "pending")
-    if cur == "withdrawn":
-        # Terminal (gap afa515539c0a): the orchestrator retired this packet;
-        # a closeout against it would resurrect work nobody asked for.
-        return {"error": "invalid_transition", "from": cur, "to": "complete",
-                "dispatch_id": dispatch_id}
 
     findings_list = list(findings or [])
-    refusal = hv.write_refusal(
-        extra_kwargs=_unknown_fields,
-        findings=findings_list,
-        checklist_resolved=checklist_resolved,
-        no_findings_reason=no_findings_reason,
-    )
-    if refusal:
-        return refusal
 
-    # Rework of Loki's F3 (23CAD2B4; gap 34c8e60f4260): verify_handoff refused
-    # a checklist_resolved=True claim backed by nothing checkable, but the
-    # writer wrote it anyway and left the specialist to discover the refusal
-    # later. These are the EXACT SAME checks verify_handoff runs below
-    # (_has_completion_evidence, _judge_lint_claims) -- not a second, drifted
-    # copy -- called here, before the write, with the same reason strings, so
-    # a doomed handoff is refused at write time instead of round-tripping
-    # through complete -> verify_handoff -> false.
-    if checklist_resolved:
-        draft = {"narrative": narrative, "findings": findings_list}
-        if not _has_completion_evidence(draft):
-            return {
-                "error": "EINVAL",
-                "message": _NO_COMPLETION_EVIDENCE_REASON,
+    # Bite 1 (dispatch 9BA76253, rework of 2E590F1B/262F89A1): everything
+    # from here on decides who, if anyone, gets to write handoff.json --
+    # that decision is made under the cross-process packet_lock, re-reading
+    # status AFTER acquiring it (Loki F1: a read taken before the lock can
+    # be stale by the time this caller wins it).
+    with packet_lock(dispatch_dir(dispatch_id)):
+        pkt = dispatch_read(dispatch_id)
+        if pkt.get("error"):
+            return pkt
+        cur = pkt.get("status", {}).get("status", "pending")
+
+        if cur == "withdrawn":
+            # Terminal (gap afa515539c0a): the orchestrator retired this
+            # packet; a closeout against it would resurrect work nobody
+            # asked for.
+            return {"error": "invalid_transition", "from": cur, "to": "complete",
+                    "dispatch_id": dispatch_id}
+
+        # ECLOSED is checked before ESTATE (gap 70069fbb7f1b): a closed
+        # packet is never merely "not yet working", it already has a
+        # verdict on it.
+        if cur in _CLOSED_STATUSES:
+            reason = (
+                f"packet {dispatch_id!r} is already {cur!r} -- a handoff was "
+                f"already written and this packet is closed; the original "
+                f"handoff stays unchanged, this write is kept in a sidecar"
+            )
+            return _eclosed_refusal(
+                dispatch_id, app_id, session_id, findings_list, narrative,
+                checklist_resolved, envelope_clean, no_findings_reason, reason,
+                cur=cur,
+            )
+
+        if cur != "working":
+            reason = (
+                f"packet {dispatch_id!r} is {cur!r}, not 'working' -- the "
+                f"accepting seat must call dispatch_accept before writing a "
+                f"handoff"
+            )
+            # ESTATE writes no sidecar (Q1/F8): the packet was never
+            # accepted, so there is no verdict to protect and no accepting
+            # session this payload could belong to.
+            _record_handoff_refusal_receipt(app_id, dispatch_id, "ESTATE", reason)
+            return {"error": "ESTATE", "message": reason, "status": cur,
+                    "dispatch_id": dispatch_id}
+
+        # HIGH-2 (Loki F2): the packet is 'working' -- but only the SESSION
+        # that actually accepted it may write the handoff. accepted_session_id
+        # is recorded solely by dispatch_accept (see its docstring); an
+        # empty/absent value means either a legacy packet accepted before
+        # this field existed, or one accepted with no session_id supplied at
+        # all -- nothing recorded to check a caller against, so that shape
+        # keeps the pre-existing permissive behavior rather than refusing a
+        # caller for a gap in packets written before this bite.
+        accepted_session_id = str(pkt.get("status", {}).get("accepted_session_id") or "")
+        if accepted_session_id and accepted_session_id != session_id:
+            reason = (
+                f"packet {dispatch_id!r} was accepted by a different "
+                f"session -- this write's session_id does not match the "
+                f"session that called dispatch_accept. Remedy: pass the "
+                f"session_id you gave session_enter (or dispatch_accept's "
+                f"own return) as handoff_write_v4's session_id argument"
+            )
+            payload = {
+                "app_id": app_id, "dispatch_id": dispatch_id,
+                "findings": findings_list, "narrative": narrative,
+                "checklist_resolved": checklist_resolved,
+                "envelope_clean": envelope_clean,
+                "no_findings_reason": no_findings_reason,
             }
-        lint_verdicts = _judge_lint_claims(draft, findings_list)
-        lint_refusals = [v for v in lint_verdicts if v["verdict"] == "refuse"]
-        if lint_refusals:
-            return {
-                "error": "EINVAL",
-                "message": _lint_refusal_reason(lint_refusals),
-                "lint_claims": lint_verdicts,
+            sidecar_path = _write_refused_sidecar(
+                dispatch_id, app_id, payload, reason, session_id=session_id,
+            )
+            _record_handoff_refusal_receipt(app_id, dispatch_id, "ESESSION", reason)
+            out = {
+                "error": "ESESSION", "message": reason, "status": cur,
+                "dispatch_id": dispatch_id, "sidecar": sidecar_path,
             }
+            if not sidecar_path:
+                out["sidecar_error"] = "sidecar write failed; refusal stands, no sidecar on disk"
+            return out
 
-    root = dispatch_dir(dispatch_id)
-    handoff = {
-        # BC504427: format handoff_v1 is intentional — tool name reflects call-signature gen.
-        "format": "handoff_v1",
-        "dispatch_id": dispatch_id,
-        "app_id": app_id,
-        "reply_to": pkt["meta"].get("reply_to", "willow"),
-        "role": pkt["meta"].get("role"),
-        "findings": findings_list,
-        "narrative": narrative,
-        "checklist_resolved": checklist_resolved,
-        "envelope_clean": envelope_clean,
-        "written_at": _utc_now(),
-    }
-    if no_findings_reason:
-        handoff["no_findings_reason"] = no_findings_reason
-    _write_json(root / "handoff.json", handoff)
+        # Content-shape checks (B-16 pattern: gate before sanitize) run AFTER
+        # every structural/state refusal above -- a call against a withdrawn,
+        # closed, not-yet-accepted, or wrong-session packet is refused on
+        # ITS terms, not preempted by a content-shape refusal about a
+        # payload nobody with standing on this packet asked to see judged.
+        refusal = hv.write_refusal(
+            extra_kwargs=_unknown_fields,
+            findings=findings_list,
+            checklist_resolved=checklist_resolved,
+            no_findings_reason=no_findings_reason,
+        )
+        if refusal:
+            return refusal
 
-    closeout = _render_closeout(dispatch_id, app_id, handoff, pkt)
-    (root / "closeout.md").write_text(closeout, encoding="utf-8")
+        # Rework of Loki's F3 (23CAD2B4; gap 34c8e60f4260): verify_handoff
+        # refused a checklist_resolved=True claim backed by nothing
+        # checkable, but the writer wrote it anyway and left the specialist
+        # to discover the refusal later. These are the EXACT SAME checks
+        # verify_handoff runs below (_has_completion_evidence,
+        # _judge_lint_claims) -- not a second, drifted copy -- called here,
+        # before the write, with the same reason strings, so a doomed
+        # handoff is refused at write time instead of round-tripping through
+        # complete -> verify_handoff -> false.
+        if checklist_resolved:
+            draft = {"narrative": narrative, "findings": findings_list}
+            if not _has_completion_evidence(draft):
+                return {
+                    "error": "EINVAL",
+                    "message": _NO_COMPLETION_EVIDENCE_REASON,
+                }
+            lint_verdicts = _judge_lint_claims(draft, findings_list)
+            lint_refusals = [v for v in lint_verdicts if v["verdict"] == "refuse"]
+            if lint_refusals:
+                return {
+                    "error": "EINVAL",
+                    "message": _lint_refusal_reason(lint_refusals),
+                    "lint_claims": lint_verdicts,
+                }
 
-    dispatch_set_status(
-        dispatch_id,
-        "complete",
-        handoff_path=f"dispatch/{dispatch_id}/handoff.json",
-    )
-    return {
-        "dispatch_id": dispatch_id,
-        "status": "complete",
-        "reply_to": handoff["reply_to"],
-        "waiting_for": "verify_handoff",
-    }
+        root = dispatch_dir(dispatch_id)
+        handoff = {
+            # BC504427: format handoff_v1 is intentional — tool name reflects call-signature gen.
+            "format": "handoff_v1",
+            "dispatch_id": dispatch_id,
+            "app_id": app_id,
+            "reply_to": pkt["meta"].get("reply_to", "willow"),
+            "role": pkt["meta"].get("role"),
+            "findings": findings_list,
+            "narrative": narrative,
+            "checklist_resolved": checklist_resolved,
+            "envelope_clean": envelope_clean,
+            "written_at": _utc_now(),
+        }
+        if no_findings_reason:
+            handoff["no_findings_reason"] = no_findings_reason
+
+        created = _create_handoff_exclusive(root / "handoff.json", handoff)
+        if not created:
+            # F3 (dispatch 1AD03A64, Loki 10A39E21 F3): this is NOT
+            # unreachable -- a stale handoff.json left by a cleared cycle
+            # that was re-accepted without going through dispatch_accept's
+            # archive step (a legacy packet accepted before F3 shipped, or
+            # the archive step itself failing) lands here while the
+            # packet's real status is 'working', not 'complete'. `cur`
+            # (read under this same lock, above) names what actually
+            # holds, so the refusal is labelled with the packet's real
+            # state instead of a hardcoded 'complete' -- also still the
+            # backstop the mutation matrix exercises directly against
+            # O_EXCL/os.link with the lock bypassed.
+            reason = (
+                f"packet {dispatch_id!r} already has a handoff.json -- lost "
+                f"the exclusive-create race"
+            )
+            return _eclosed_refusal(
+                dispatch_id, app_id, session_id, findings_list, narrative,
+                checklist_resolved, envelope_clean, no_findings_reason, reason,
+                cur=cur,
+            )
+
+        closeout = _render_closeout(dispatch_id, app_id, handoff, pkt)
+        _write_text_atomic(root / "closeout.md", closeout)
+
+        dispatch_set_status(
+            dispatch_id,
+            "complete",
+            handoff_path=f"dispatch/{dispatch_id}/handoff.json",
+            already_locked=True,
+        )
+        return {
+            "dispatch_id": dispatch_id,
+            "status": "complete",
+            "reply_to": handoff["reply_to"],
+            "waiting_for": "verify_handoff",
+        }
 
 
 def _render_closeout(dispatch_id: str, app_id: str, handoff: dict, pkt: dict) -> str:
@@ -416,6 +727,12 @@ def verify_handoff(dispatch_id: str) -> dict:
         "checklist_resolved": handoff.get("checklist_resolved"),
         "envelope_clean": handoff.get("envelope_clean"),
         "findings_count": len(findings),
+        # Bite 1 (dispatch 2E590F1B): a sidecar count the desk can see
+        # without opening the refused/ directory itself -- verify_handoff
+        # still reads only the ORIGINAL handoff for its verdict; sidecars
+        # never change `verified`, they are exposed so a race is visible.
+        "sidecar_count": _sidecar_count(dispatch_id),
+        "history_count": _history_count(dispatch_id),
         "status": "verified" if verified else "complete",
     }
     if reasons:
