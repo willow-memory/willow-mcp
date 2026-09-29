@@ -41,10 +41,19 @@ verdict, so an edit that reopens any pass is caught by name.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import tomllib
 from pathlib import Path
 from typing import Any
+
+from .paths import willow_home
+from .project_wiring import expand_home
+
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+# Absolute path segments in evidence (repo file citations, diff paths).
+_EVIDENCE_ABS_PATH_RE = re.compile(r"(/(?:[\w.-]+/)+[\w.-]+)")
 
 _VERSION = r"(\d+(?:\.\d+){1,3}(?:[a-zA-Z0-9.+-]*)?)"
 
@@ -60,6 +69,98 @@ def _read_text(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
+
+
+def _scope_root(scope: dict, keys: tuple[str, ...]) -> str:
+    for key in keys:
+        val = scope.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def project_checkout_path(project_id: str) -> str:
+    """Filesystem checkout for a fleet project id (``mcp/projects.json``)."""
+    pid = (project_id or "").strip()
+    if not pid or not _PROJECT_ID_RE.fullmatch(pid):
+        return ""
+    reg_path = willow_home() / "mcp" / "projects.json"
+    if not reg_path.is_file():
+        return ""
+    try:
+        data = json.loads(reg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        return ""
+    entry = projects.get(pid)
+    if not isinstance(entry, dict):
+        return ""
+    raw = entry.get("path") or entry.get("root") or ""
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    return expand_home(raw.strip())
+
+
+def _repo_root_from_filesystem_path(path: Path) -> str:
+    p = path.expanduser()
+    try:
+        p = p.resolve()
+    except OSError:
+        return ""
+    if p.is_file():
+        p = p.parent
+    if not p.is_dir():
+        return ""
+    for candidate in [p, *p.parents]:
+        if (candidate / "pyproject.toml").is_file():
+            return str(candidate)
+        if (candidate / ".github" / "workflows").is_dir():
+            return str(candidate)
+    return ""
+
+
+def _evidence_repo_root(finding: dict) -> str:
+    ev = finding.get("evidence")
+    chunks: list[str] = []
+    if isinstance(ev, str) and ev.strip():
+        chunks.append(ev.strip())
+    elif isinstance(ev, list):
+        chunks.extend(str(x).strip() for x in ev if str(x).strip())
+    for chunk in chunks:
+        for m in _EVIDENCE_ABS_PATH_RE.finditer(chunk):
+            root = _repo_root_from_filesystem_path(Path(m.group(1)))
+            if root:
+                return root
+    return ""
+
+
+def lint_repo_root(
+    finding: dict,
+    handoff: dict | None = None,
+    *,
+    dispatch_meta: dict | None = None,
+) -> str:
+    """Repo whose CI ruff pin judges this finding's lint claims.
+
+    Resolution order: the finding's ``repo_root`` / ``workspace``; the
+    dispatch packet's ``gaps_project`` checkout; an evidence path's repo;
+    an explicit ``repo_root`` on the handoff; then ``WILLOW_PROJECT_ROOT``.
+    The handoff's ``workspace`` is intentionally excluded — it mirrors the
+    entering desk, not the audited repo (gap 0b5a2aa26001).
+    """
+    handoff = handoff or {}
+    dispatch_meta = dispatch_meta or {}
+    for val in (
+        _scope_root(finding, ("repo_root", "workspace")),
+        project_checkout_path(str(dispatch_meta.get("gaps_project") or "")),
+        _evidence_repo_root(finding),
+        _scope_root(handoff, ("repo_root",)),
+    ):
+        if val:
+            return val
+    return os.environ.get("WILLOW_PROJECT_ROOT", "").strip()
 
 
 def _workflow_pins(workflows_dir: Path) -> list[dict[str, str]]:
