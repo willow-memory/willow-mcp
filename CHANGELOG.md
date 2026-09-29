@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.90.3](https://github.com/willow-memory/willow-mcp/compare/v2.90.2...v2.90.3) (2026-09-29)
+
+
+### Fixed
+
+* **handoff:** lint CI pin follows dispatch project, not desk workspace ([bd2c1b2](https://github.com/willow-memory/willow-mcp/commit/bd2c1b2dd86803f02706b5d0424f95ac4e27de71))
+
 ## [2.90.2](https://github.com/willow-memory/willow-mcp/compare/v2.90.1...v2.90.2) (2026-09-29)
 
 
