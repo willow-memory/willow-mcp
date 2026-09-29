@@ -624,6 +624,17 @@ def test_env_stale_is_informational_not_severity():
     assert "env_stale" not in server._VERDICT_SEVERITY_SUBCHECKS
 
 
+def _patch_live_env_source(monkeypatch, envfp, source: dict) -> None:
+    """_diag_env_stale always calls resolve_env_source(unit); on a host with a
+    live willow-mcp-serve unit that returns unit_environment, tests that record
+    a fallback baseline would false-fail as a source flap."""
+    monkeypatch.setattr(
+        envfp,
+        "resolve_env_source",
+        lambda unit, runner=None: source,
+    )
+
+
 def test_env_stale_no_state_file_is_empty(tmp_path, monkeypatch):
     monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
     out = server._diag_env_stale()
@@ -646,7 +657,9 @@ def test_env_stale_no_diff_reports_populated_with_no_keys_changed(tmp_path, monk
     from willow_mcp import env_fingerprint as envfp
     env_path = tmp_path / "env"
     env_path.write_text("A=1\n", encoding="utf-8")
-    envfp.record_startup(source={"source": "fallback", "path": env_path})
+    src = {"source": "fallback", "path": env_path}
+    envfp.record_startup(source=src)
+    _patch_live_env_source(monkeypatch, envfp, src)
     out = server._diag_env_stale()
     assert out["state"] == "populated" and out["keys_changed"] == []
     assert out["receipt_id"] is None and out["sealed"] is False
@@ -657,7 +670,9 @@ def test_env_stale_diff_names_keys_changed_never_a_value(tmp_path, monkeypatch):
     from willow_mcp import env_fingerprint as envfp
     env_path = tmp_path / "env"
     env_path.write_text("A=1\n", encoding="utf-8")
-    envfp.record_startup(source={"source": "fallback", "path": env_path})
+    src = {"source": "fallback", "path": env_path}
+    envfp.record_startup(source=src)
+    _patch_live_env_source(monkeypatch, envfp, src)
     env_path.write_text("A=1\nSECRET=sk-do-not-leak-this-8675309\nB=2\n", encoding="utf-8")
     out = server._diag_env_stale()
     assert out["state"] == "populated"
@@ -684,6 +699,7 @@ def test_env_stale_source_mismatch_is_unreachable_not_a_diff(tmp_path, monkeypat
     # baseline recorded as unit_environment (what the unit actually loaded)
     envfp.record_startup(source={"source": "unit_environment", "pairs": [("A", "1")]})
     # live resolves to fallback (as it would after a systemctl hiccup)
+    _patch_live_env_source(monkeypatch, envfp, {"source": "fallback", "path": env_path})
     out = server._diag_env_stale()
     assert out["state"] == "unreachable"
     assert "source flap" in out["cause"] or "env_source" in out["cause"]
@@ -697,8 +713,10 @@ def test_env_stale_env_gone_missing_is_unreachable_not_a_diff(tmp_path, monkeypa
     from willow_mcp import env_fingerprint as envfp
     env_path = tmp_path / "env"
     env_path.write_text("A=1\n", encoding="utf-8")
-    envfp.record_startup(source={"source": "fallback", "path": env_path})
+    src = {"source": "fallback", "path": env_path}
+    envfp.record_startup(source=src)
     env_path.unlink()
+    _patch_live_env_source(monkeypatch, envfp, src)
     out = server._diag_env_stale()
     assert out["state"] == "unreachable"
     assert "state change" in out["cause"]
