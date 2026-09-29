@@ -1608,6 +1608,159 @@ def _apply_envelope_ratify(record: dict, path: Path, *, ledger, apps_root: Path,
     return {"pair_id": pair_id, **out}
 
 
+# ── syscall.sync (gap 7b1fee1f2861) ───────────────────────────────────────
+
+VERB_SYSCALL_SYNC = "syscall.sync"
+EVENT_SYSCALL_SYNC_APPLIED = "syscall_sync_applied"
+
+
+def _syscall_sync_pair_id(bundle_digest: str) -> str:
+    return f"sync-{bundle_digest[:16]}"
+
+
+def queue_syscall_sync_request(
+    plan: dict,
+    *,
+    actor: str = "willow-mcp",
+    project: str = "willow-mcp",
+    grants_root: Optional[Path] = None,
+) -> dict:
+    """Broker boot path: persist one signed ``syscall.sync`` pending record
+    when :func:`constitutional.evaluate_syscall_table_sync` authorizes an
+    apply but the live table is trust-owner-owned."""
+    from . import constitutional as _constitutional
+
+    if not plan.get("ok") or not plan.get("needs_apply"):
+        return {"ok": False, "error": "EINVAL", "reason": "plan does not authorize a queue"}
+
+    digest = plan.get("bundle_digest")
+    if not digest:
+        return {"ok": False, "error": "EINVAL", "reason": "plan carries no bundle_digest"}
+
+    grants_root_p = mgx._grants_root(grants_root)
+    pair_id = _syscall_sync_pair_id(digest)
+    existing = mgx._existing_request_state(grants_root_p, pair_id)
+    if existing == "done":
+        return {"ok": True, "state": "done", "pair_id": pair_id, "reason": "already applied"}
+    if existing == "pending":
+        return {"ok": True, "state": "pending", "pair_id": pair_id, "reason": "already queued"}
+
+    target = {
+        "bundle_digest": digest,
+        "bundle_path": plan.get("bundle_path"),
+        "live_path": plan.get("live_path"),
+        "added": plan.get("added") or [],
+        "amended": plan.get("amended") or [],
+        "verbs": plan.get("verbs") or [],
+        "seals": plan.get("seals") or {},
+    }
+    pending_path = mgx._pending_path(grants_root_p, pair_id)
+    pending_record = {
+        "pair_id": pair_id,
+        "verb": VERB_SYSCALL_SYNC,
+        "envelope_id": None,
+        "citation_id": None,
+        "actor": actor,
+        "target": target,
+        "project": project,
+        "requested_at": mgx._now_iso(),
+        "trigger": "boot",
+    }
+    pending_record["broker_sig"] = mgx._sign_request(pending_record, grants_root_p)
+    mgx._write_json_atomic(pending_path, pending_record)
+    return {"ok": True, "state": "queued", "pair_id": pair_id, "pending_path": str(pending_path)}
+
+
+def _apply_syscall_sync(record: dict, path: Path, *, ledger, apps_root: Path,
+                        db_path: Optional[Path], grants_root: Path) -> dict:
+    from . import constitutional as _constitutional
+
+    pair_id = record.get("pair_id")
+    target = record.get("target") or {}
+
+    def _fail(errno: str, reason_msg: str, **extra) -> dict:
+        out = {"ok": False, "error": errno, "reason": reason_msg, **extra}
+        mgx._move(path, grants_root / "failed", {**record, "result": out})
+        return {"pair_id": pair_id, **out}
+
+    dirs_ok, dirs_reason = mgx._dirs_writable(grants_root)
+    if not dirs_ok:
+        out = {"ok": False, "error": "eperm_pending", "reason": dirs_reason}
+        try:
+            mgx._move(path, grants_root / "failed", {**record, "result": out})
+        except OSError:
+            pass
+        return {"pair_id": pair_id, **out}
+
+    sig_ok, sig_reason = mgx._verify_request_signature(record, grants_root)
+    if not sig_ok:
+        return _fail("eforged", sig_reason)
+
+    bundle_digest = target.get("bundle_digest")
+    if not bundle_digest:
+        return _fail("eforged", "request carries no bundle_digest in target")
+
+    from . import paths as _paths
+
+    live_path = Path(target.get("live_path") or _paths.syscall_table_path())
+    bundle_path = Path(target.get("bundle_path") or _constitutional._default_bundle_path())
+
+    plan = _constitutional.evaluate_syscall_table_sync(
+        live_path=live_path, bundle_path=bundle_path, nestor_db_path=db_path,
+    )
+    if not plan.get("ok") or not plan.get("needs_apply"):
+        return _fail("edrift", plan.get("reason") or "re-evaluation no longer authorizes apply")
+
+    if plan.get("bundle_digest") != bundle_digest:
+        return _fail(
+            "edrift",
+            "bundle digest changed since the request was queued",
+            expected=bundle_digest, current=plan.get("bundle_digest"),
+        )
+    if (plan.get("added") or []) != (target.get("added") or []):
+        return _fail("edrift", "added row set changed since the request was queued")
+    if (plan.get("amended") or []) != (target.get("amended") or []):
+        return _fail("edrift", "amended row set changed since the request was queued")
+
+    try:
+        result = _constitutional.apply_evaluated_syscall_sync(
+            plan, live_path=live_path, ledger=ledger,
+            project=record.get("project") or "willow-mcp",
+            actor=record.get("actor") or "willow-mcp",
+        )
+    except OSError as exc:
+        return _fail(
+            "EACCES",
+            f"could not write live syscall table: {type(exc).__name__}: {exc}",
+            path=str(live_path),
+        )
+
+    if not result.get("ok"):
+        return _fail("eunexpected", result.get("reason") or "apply refused")
+
+    receipt_ids: list[str] = []
+    if ledger is not None:
+        try:
+            receipt_ids.append(ledger.append(
+                record.get("project") or "willow-mcp",
+                EVENT_SYSCALL_SYNC_APPLIED,
+                {
+                    "actor": record.get("actor"),
+                    "pair_id": pair_id,
+                    "bundle_digest": bundle_digest,
+                    "added": result.get("added"),
+                    "amended": result.get("amended"),
+                    "path": result.get("path"),
+                },
+            ))
+        except Exception:  # noqa: BLE001
+            pass
+
+    out = {**result, "receipt_ids": receipt_ids}
+    mgx._move(path, grants_root / "done", {**record, "result": out})
+    return {"pair_id": pair_id, **out}
+
+
 # ── apply-side dispatch, read by manifest_grant_executor.manifest_grant_apply ──
 
 APPLY_DISPATCH = {
@@ -1616,4 +1769,5 @@ APPLY_DISPATCH = {
     VERB_CREATE: _apply_manifest_create,
     VERB_RATIFY: _apply_federation_ratify,
     VERB_ENVELOPE_RATIFY: _apply_envelope_ratify,
+    VERB_SYSCALL_SYNC: _apply_syscall_sync,
 }

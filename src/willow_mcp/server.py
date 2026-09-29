@@ -12329,8 +12329,14 @@ def _main():
         from .governance_ledger import GovernanceLedger as _GovernanceLedger
         _pg_for_sync = get_pg()
         _sync_ledger = _GovernanceLedger(_pg_for_sync) if _pg_for_sync else None
-        _sync_result = _constitutional.sync_syscall_table_from_bundle(ledger=_sync_ledger)
-        if _sync_result.get("added"):
+        _sync_result = _constitutional.sync_syscall_table_at_boot(ledger=_sync_ledger)
+        if _sync_result.get("queued", {}).get("ok"):
+            print(
+                f"willow-mcp: syscall table sync queued for trust-owner apply "
+                f"(pair_id={_sync_result['queued'].get('pair_id')})",
+                file=sys.stderr,
+            )
+        elif _sync_result.get("added"):
             print(
                 f"willow-mcp: synced syscall table verb id(s) "
                 f"{_sync_result['added']} ({', '.join(_sync_result.get('verbs') or [])}) "
