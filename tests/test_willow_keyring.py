@@ -14,6 +14,7 @@ import stat
 import pytest
 
 from willow_mcp import keyring as keyring_mod
+from willow_mcp import reloader as reloader_mod
 
 
 @pytest.fixture
@@ -302,3 +303,191 @@ def test_no_env_no_injection_means_disabled(monkeypatch):
     monkeypatch.delenv("WILLOW_KEYRING", raising=False)
     assert keyring_mod.get_keyring() is None
     assert keyring_mod.enabled() is False
+
+
+
+# --- net-signer-unit fallback resolution ------------------------------------
+# Ruling serve-keyring-resolve-not-install-2026-09-28 (Loki 5003520D REVISE,
+# blocking, "resolve, don't install"): with no WILLOW_KEYRING and nothing
+# injected, get_keyring() tries exactly one more source before giving up --
+# the net-signer SYSTEM unit's own Environment=, with ownership/writability
+# checks. Any failed check means no keyring, never a guess.
+
+
+def _reset_unit_keyring_state(monkeypatch):
+    keyring_mod.set_keyring(None)
+    monkeypatch.setattr(keyring_mod, "_from_env", None)
+    monkeypatch.setattr(keyring_mod, "_loaded_from", None)
+    monkeypatch.setattr(keyring_mod, "_from_unit", None)
+    monkeypatch.setattr(keyring_mod, "_unit_attempted", False)
+    monkeypatch.setattr(keyring_mod, "_unit_reason", "")
+    monkeypatch.setattr(keyring_mod, "_unit_path", None)
+    monkeypatch.delenv("WILLOW_KEYRING", raising=False)
+
+
+def _public_ring_file(path, name="alice", key_hex="11" * 32, mode=0o644):
+    path.write_text(json.dumps({
+        "version": 1,
+        "verifiers": [{"name": name, "key": key_hex, "kind": "ed25519",
+                       "revoked_at": "", "compromised": False, "reason": "",
+                       "created_at": "2026-01-01T00:00:00Z"}],
+        "public_only": True,
+    }))
+    os.chmod(path, mode)
+
+
+def test_unit_resolved_ring_is_accepted(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)  # not this test's own uid
+
+    got = keyring_mod.get_keyring()
+    assert got is not None
+    assert "alice" in got
+    status = keyring_mod.unit_keyring_status()
+    assert status["attempted"] is True
+    assert status["path"] == str(ring)
+    assert status["reason"] == ""
+
+
+def test_default_fallback_source_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "default"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert "default" in status["reason"]
+
+
+def test_ring_owned_by_this_process_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)  # created by this test process -- owned by its own euid
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert "own uid" in status["reason"] or "owned by this process" in status["reason"]
+
+
+def test_group_writable_ring_file_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring, mode=0o664)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert "writable" in status["reason"]
+
+
+def test_group_writable_parent_dir_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    d = tmp_path / "egress"
+    d.mkdir()
+    ring = d / "verifiers.public.json"
+    _public_ring_file(ring)
+    os.chmod(d, 0o775)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert "writable" in status["reason"]
+
+
+def test_symlink_to_a_writable_target_is_refused(tmp_path, monkeypatch):
+    # The symlink itself lives in a SAFE directory; its resolved target's
+    # PARENT is the world-writable one. A check that used the symlink's own
+    # parent (never resolving first) would miss this entirely -- resolving
+    # first is what makes the parent-writability check mean anything.
+    _reset_unit_keyring_state(monkeypatch)
+    safe_dir = tmp_path / "safe"
+    safe_dir.mkdir()
+    os.chmod(safe_dir, 0o700)
+    writable_dir = tmp_path / "writable"
+    writable_dir.mkdir()
+    os.chmod(writable_dir, 0o777)
+    real = writable_dir / "real-ring.json"
+    _public_ring_file(real, mode=0o644)
+    link = safe_dir / "verifiers.public.json"
+    link.symlink_to(real)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (link, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert "writable" in status["reason"]
+    # names the RESOLVED target's parent directory, not the symlink's own
+    assert str(writable_dir) in status["reason"]
+
+
+def test_private_ring_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    ring.write_text(json.dumps({
+        "version": 1,
+        "verifiers": [{"name": "alice", "key": "11" * 32, "kind": "ed25519",
+                       "private": "22" * 32, "revoked_at": "", "compromised": False,
+                       "reason": "", "created_at": ""}],
+    }))
+    os.chmod(ring, 0o600)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert "public-only" in status["reason"] or "private" in status["reason"]
+
+
+def test_env_still_wins_over_unit_fallback(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    env_path = tmp_path / "env-keyring.json"
+    k = keyring_mod.Keyring(path=str(env_path))
+    k.add("env_verifier")
+    k.save()
+    monkeypatch.setenv("WILLOW_KEYRING", str(env_path))
+
+    called = []
+
+    def fake_resolve():
+        called.append(1)
+        raise AssertionError("unit resolution must not run when WILLOW_KEYRING is set")
+
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", fake_resolve)
+
+    got = keyring_mod.get_keyring()
+    assert got is not None
+    assert "env_verifier" in got
+    assert not called
+
+
+def test_unit_resolution_is_cached_once_per_process(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)
+    calls = []
+
+    def fake_resolve():
+        calls.append(1)
+        return ring, "net-signer-unit"
+
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", fake_resolve)
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+
+    first = keyring_mod.get_keyring()
+    second = keyring_mod.get_keyring()
+    assert first is second
+    assert len(calls) == 1

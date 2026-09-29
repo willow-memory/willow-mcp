@@ -7937,7 +7937,25 @@ def _diag_keyring() -> dict:
     check["configured"] = bool(path) or injected
     check["path"] = path or None
     if not check["configured"]:
+        # No env, no injection -- get_keyring() still tries the net-signer
+        # unit fallback (keyring._resolve_unit_keyring); read what THAT
+        # found rather than reporting blind not_enabled when an operator
+        # actually staged one and it is refused for a reason worth naming
+        # (Loki 5003520D: never collapse a refused fallback into "ok").
+        try:
+            _keyring.get_keyring()
+            unit_status = _keyring.unit_keyring_status()
+        except Exception as e:  # noqa: BLE001 -- a diagnostic read never raises
+            unit_status = {"attempted": False, "path": None, "reason": str(e)[:160]}
+        if unit_status.get("path"):
+            check["status"] = "ok"
+            check["source"] = "net-signer-unit"
+            check["path"] = unit_status["path"]
+            return check
         check["status"] = "not_enabled"
+        check["source"] = "none"
+        if unit_status.get("reason"):
+            check["unit_fallback_reason"] = unit_status["reason"]
         return check
     # An injected keyring (tests / explicit PR1-4 install) is in-memory and wins
     # over the env path — there is nothing on disk to refuse.
@@ -8033,6 +8051,23 @@ def _diag_keyring_drift() -> dict:
         return {"status": "unreachable",
                 "detail": f"public ring at {public_path} (resolved via {public_source}) is not a file",
                 "public_path": str(public_path), "public_source": public_source}
+    try:
+        if os.path.samefile(source_path, public_path):
+            # F5 (Loki 5003520D): once serve's own WILLOW_KEYRING IS the
+            # public ring, this comparison is a ring against itself --
+            # always "equivalent", proving nothing about drift. Its own
+            # named state, never folded into "equivalent".
+            return {
+                "status": "same_file",
+                "detail": (
+                    f"the source ring ({source_path}) and the public ring "
+                    f"({public_path}, resolved via {public_source}) are the same "
+                    f"file -- comparing a ring to itself proves nothing about drift"
+                ),
+                "public_path": str(public_path), "public_source": public_source,
+            }
+    except OSError:
+        pass  # can't confirm sameness -- fall through to the ordinary comparison
     try:
         public_ring = _net_signer.load_public_ring(public_path)
     except Exception as e:  # noqa: BLE001

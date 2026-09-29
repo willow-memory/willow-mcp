@@ -514,6 +514,13 @@ def load(path: str) -> Keyring:
 _injected: Keyring | None = None
 _from_env: Keyring | None = None
 _loaded_from: str | None = None
+#: The net-signer-unit fallback (used only when WILLOW_KEYRING is unset and
+#: nothing is injected) is resolved at most once per process -- same "read
+#: once, re-read only on a restart" contract as the env path above.
+_from_unit: Keyring | None = None
+_unit_attempted: bool = False
+_unit_reason: str = ""
+_unit_path: str | None = None
 
 
 def set_keyring(k: Keyring | None) -> None:
@@ -535,19 +542,106 @@ def keyring_path() -> str:
     the location of willow's operator trust root. It must be set by the
     environment the human controls, never by a config file that can ride along
     in a cloned working tree and silently redirect the keyring to a planted
-    file. Every caller treats ``""`` as "no keyring".
+    file. Every caller treats ``""`` as "no keyring" -- but ``""`` is no
+    longer the end of the story for :func:`get_keyring`: with no env and
+    nothing injected, it tries one more source before giving up -- the
+    net-signer SYSTEM unit's own ``Environment=`` line
+    (:func:`_resolve_unit_keyring`). That unit is root-owned system state,
+    installed by a broker verb under its own envelope, never a file that
+    rides along in a cloned working tree -- the exact hazard this function's
+    env-only design exists to close -- so trusting what it already staged
+    does not reopen that hole the way reading a tracked config file would
+    (Loki 5003520D F4).
     """
     return os.environ.get("WILLOW_KEYRING", "")
 
 
-def get_keyring() -> Keyring | None:
-    """The installed keyring, the one at ``WILLOW_KEYRING``, or ``None``.
+def _resolve_unit_keyring() -> dict:
+    """Resolve WILLOW_KEYRING from the net-signer system unit's own
+    ``Environment=`` -- the SAME fact :func:`reloader.resolve_keyring_path`
+    reads for the reloader's own rendered unit, never a second, independent
+    guess (Loki 5003520D). Accepted only when every one of these holds; the
+    first that fails names the whole resolution's ``reason``, and there is
+    no keyring from this path:
 
-    **An injected keyring wins.** Test suites and the plan's PR1-4 wiring
-    install one explicitly; anything with ``WILLOW_KEYRING`` exported in a
-    shell should not be able to silently redirect the trust root for a caller
-    that said "trust exactly these verifiers." Same reasoning as Nestor's
-    ``get_keyring`` docstring.
+    * the source is ``"net-signer-unit"`` -- the ``"default"`` fallback
+      (``~/.config/willow-mcp/egress/verifiers.public.json`` or
+      ``WILLOW_NET_SIGNER_RING`` read from THIS process's own env) is
+      refused outright: that file is uid-1000 and broker-writable, not a
+      root-owned system unit's own staged copy (F4);
+    * symlinks are resolved first;
+    * the file loads through :func:`net_signer.load_public_ring` -- public
+      halves only, no HMAC, no ``legacy_key``;
+    * the file's owner is not this process's own effective uid;
+    * neither the file nor its parent directory is group- or
+      world-writable.
+
+    Returns ``{"path": Path|None, "source": str, "reason": str}``. ``path``
+    is ``None`` whenever any check failed, with ``reason`` naming which one
+    -- reported by callers as a named state, never collapsed into "ok".
+    """
+    from . import net_signer as _net_signer
+    from . import reloader as _reloader
+
+    try:
+        raw_path, source = _reloader.resolve_keyring_path()
+    except Exception as exc:  # noqa: BLE001 -- resolution failing means no keyring, not a raise
+        return {"path": None, "source": "error",
+                "reason": f"resolution raised: {type(exc).__name__}: {exc}"}
+    if source != "net-signer-unit":
+        return {
+            "path": None, "source": source,
+            "reason": (
+                f"resolved via {source!r}, not the net-signer unit's own Environment= "
+                f"-- the {source!r} fallback ({raw_path}) is refused as a keyring "
+                f"source: it is not root-owned system state"
+            ),
+        }
+    try:
+        resolved = raw_path.resolve(strict=True)
+    except OSError as exc:
+        return {"path": None, "source": source, "reason": f"could not resolve {raw_path}: {exc}"}
+    try:
+        _net_signer.load_public_ring(resolved)
+    except Exception as exc:  # noqa: BLE001 -- a bad ring means no keyring, not a raise
+        return {"path": None, "source": source,
+                "reason": f"{resolved} does not load as a public-only ring: {exc}"}
+    try:
+        st = resolved.stat()
+        parent_st = resolved.parent.stat()
+    except OSError as exc:
+        return {"path": None, "source": source, "reason": f"could not stat {resolved}: {exc}"}
+    if st.st_uid == os.geteuid():
+        return {"path": None, "source": source,
+                "reason": (f"{resolved} is owned by this process's own uid "
+                           f"({os.geteuid()}) -- a keyring this process itself owns "
+                           f"could plant its own verifier")}
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return {"path": None, "source": source,
+                "reason": f"{resolved} is group- or world-writable (mode {oct(st.st_mode & 0o777)})"}
+    if parent_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return {"path": None, "source": source,
+                "reason": (f"{resolved.parent} is group- or world-writable "
+                           f"(mode {oct(parent_st.st_mode & 0o777)})")}
+    return {"path": resolved, "source": source, "reason": ""}
+
+
+def unit_keyring_status() -> dict:
+    """The last net-signer-unit resolution :func:`get_keyring` attempted in
+    this process -- for ``diagnostic_summary``'s ``checks.keyring``, which
+    must name why a fallback was refused rather than collapsing it into
+    "ok" (Loki 5003520D). ``{"attempted": False, ...}`` until the no-env,
+    no-injection path in :func:`get_keyring` has run at least once."""
+    return {"attempted": _unit_attempted, "path": _unit_path, "reason": _unit_reason}
+
+
+def get_keyring() -> Keyring | None:
+    """The installed keyring, the one at ``WILLOW_KEYRING``, the one resolved
+    from the net-signer unit, or ``None``.
+
+    **An injected keyring wins**, then **``WILLOW_KEYRING`` wins** over the
+    unit fallback below -- same "explicit beats implicit" precedence
+    Nestor's ``get_keyring`` docstring argues for.
 
     The environment's keyring is cached by path — read once, re-read if the
     variable moves. Editing the *file* under a running process is not picked
@@ -555,24 +649,45 @@ def get_keyring() -> Keyring | None:
     trusts halfway through a shift would be worse than one that needs a
     restart. ``willow-mcp keys`` is a separate short-lived process, and a
     revocation that must take effect now is a restart.
+
+    **With no env and nothing injected**, this tries exactly one more source
+    before giving up: :func:`_resolve_unit_keyring`, resolved and cached
+    once per process (same "needs a restart" contract as the env path
+    above). Any failed check there means ``None`` -- never a guess, never
+    the ``"default"`` fallback path (Loki 5003520D F4) -- and the reason is
+    kept at :func:`unit_keyring_status` for diagnostics to report by name.
     """
-    global _from_env, _loaded_from
+    global _from_env, _loaded_from, _from_unit, _unit_attempted, _unit_reason, _unit_path
     if _injected is not None:
         return _injected
     path = keyring_path()
-    if not path:
-        return None
-    if _from_env is not None and _loaded_from == path:
+    if path:
+        if _from_env is not None and _loaded_from == path:
+            return _from_env
+        try:
+            _from_env = load(path)
+        except KeyringError as exc:
+            raise KeyringError(
+                f"{exc} WILLOW_KEYRING points there — `unset WILLOW_KEYRING` to "
+                f"run without per-verifier identity."
+            ) from None
+        _loaded_from = path
         return _from_env
+    if _unit_attempted:
+        return _from_unit
+    _unit_attempted = True
+    result = _resolve_unit_keyring()
+    _unit_reason = result["reason"]
+    _unit_path = str(result["path"]) if result["path"] else None
+    if result["path"] is None:
+        _from_unit = None
+        return None
     try:
-        _from_env = load(path)
+        _from_unit = load(str(result["path"]))
     except KeyringError as exc:
-        raise KeyringError(
-            f"{exc} WILLOW_KEYRING points there — `unset WILLOW_KEYRING` to "
-            f"run without per-verifier identity."
-        ) from None
-    _loaded_from = path
-    return _from_env
+        _unit_reason = f"resolved but failed to load: {exc}"
+        _from_unit = None
+    return _from_unit
 
 
 def preflight() -> Keyring | None:
@@ -604,15 +719,18 @@ def isolated() -> Iterator[None]:
     and the same reason (IDEAS §6.98 records the failure mode in Nestor's
     tree).
     """
-    global _injected
+    global _injected, _unit_attempted, _from_unit, _unit_reason, _unit_path
     had_env = "WILLOW_KEYRING" in os.environ
     saved_env = os.environ.pop("WILLOW_KEYRING", None)
     saved_injected = _injected
     _injected = None
+    saved_unit = (_unit_attempted, _from_unit, _unit_reason, _unit_path)
+    _unit_attempted, _from_unit, _unit_reason, _unit_path = False, None, "", None
     try:
         yield
     finally:
         _injected = saved_injected
+        _unit_attempted, _from_unit, _unit_reason, _unit_path = saved_unit
         if had_env:
             os.environ["WILLOW_KEYRING"] = saved_env  # type: ignore[assignment]
 
