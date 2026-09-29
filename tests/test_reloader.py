@@ -626,7 +626,7 @@ def test_render_units_resolves_keyring_from_the_net_signer_units_own_environment
     real_ring = _write_ring(tmp_path, "real-signer-ring.json")
 
     def fake_show(argv, **kw):
-        assert argv[:3] == ["systemctl", "show", "willow-mcp-net-signer.service"]
+        assert argv[:3] == ["/usr/bin/systemctl", "show", "willow-mcp-net-signer.service"]
         return subprocess.CompletedProcess(
             argv, 0, f'Environment=WILLOW_HOME=/x WILLOW_NET_SIGNER_RING={real_ring}\n', "")
 

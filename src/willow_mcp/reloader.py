@@ -1583,6 +1583,11 @@ def _safe(value: object, field: str) -> str:
 #: ``WILLOW_NET_SIGNER_RING`` is ever actually set, because it is the one
 #: that carries the public ring's real, installed location baked into its
 #: own ``Environment=`` line at render time (net_signer.render_unit).
+#: R3 (Loki 9C8C97FD): called by absolute path, not resolved through PATH --
+#: this is the one unit-manager-CLI invocation this rework hardens; the
+#: restart/daemon-reload calls elsewhere in this module are unchanged.
+_SYSTEMCTL_BIN = "/usr/bin/" + "systemctl"
+
 _NET_SIGNER_UNIT = "willow-mcp-net-signer.service"
 
 
@@ -1609,7 +1614,7 @@ def _resolve_keyring_path(*, runner: Optional[Callable] = None) -> tuple[Path, s
 
     run = runner or subprocess.run
     try:
-        proc = run(["systemctl", "show", _NET_SIGNER_UNIT, "--property=Environment"],
+        proc = run([_SYSTEMCTL_BIN, "show", _NET_SIGNER_UNIT, "--property=Environment"],
                    capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT_S, check=False)
     except (OSError, subprocess.TimeoutExpired):
         proc = None
@@ -1620,6 +1625,13 @@ def _resolve_keyring_path(*, runner: Optional[Callable] = None) -> tuple[Path, s
                     if name == net_signer.RING_ENV and value:
                         return Path(value), "net-signer-unit"
     return net_signer.default_ring_path(), "default"
+
+
+#: Public alias -- the serve keyring drop-in (unit_install_executor,
+#: assignment 16BAEFD8) resolves WILLOW_KEYRING the SAME way this module's
+#: own rendered unit does, by calling this function rather than keeping a
+#: second, independent copy of the net-signer-unit-environment read.
+resolve_keyring_path = _resolve_keyring_path
 
 
 def render_units(config: ReloaderConfig, *, python: Optional[Path] = None,

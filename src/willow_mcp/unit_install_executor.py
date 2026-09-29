@@ -566,6 +566,16 @@ def timer_activates(timer_rendered: str, timer_name: str) -> str:
     return enable_effects(timer_rendered, timer_name)["activates"]
 
 
+# The drop-in install path (render_dropin_values, _dropin_broker_content_violation,
+# _DROPIN_BROKER_ALLOWED_KEYS, _execute_dropin_install) was removed under ruling
+# serve-keyring-resolve-not-install-2026-09-28 (Loki 5003520D REVISE, blocking):
+# keyring.py._resolve_unit_keyring resolves WILLOW_KEYRING directly from the
+# net-signer unit's own environment, with ownership/writability checks -- no unit
+# file, no drop-in, no daemon-reload. Sealed row 17 (197aafa5) stands unamended:
+# the broker's own unit is never a grantable unit.install target, whole-unit or
+# drop-in alike (see execute_unit_install's EPERM below, and _UNIT_RE, which
+# refuses every `.d/` shape outright).
+
 def execute_unit_install(
     app_id: str,
     *,
@@ -597,6 +607,11 @@ def execute_unit_install(
     unit = (unit or "").strip()
     source = (source or "").strip()
     if not unit or not _UNIT_RE.match(unit):
+        # `.d/` drop-ins (e.g. `willow-mcp-serve.service.d/keyring.conf`) fall
+        # through here too -- `_UNIT_RE` refuses that shape outright, whole-
+        # unit and drop-in alike (module docstring; ruling
+        # serve-keyring-resolve-not-install-2026-09-28). There is no narrower
+        # drop-in verb: keyring.py resolves WILLOW_KEYRING directly instead.
         return _refuse("EINVAL", "an install names a unit like `name.service` (or .timer/.socket/.path/.target)")
     repo, rel = parse_source(source)
     if not repo:

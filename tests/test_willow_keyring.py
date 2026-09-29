@@ -14,6 +14,7 @@ import stat
 import pytest
 
 from willow_mcp import keyring as keyring_mod
+from willow_mcp import reloader as reloader_mod
 
 
 @pytest.fixture
@@ -302,3 +303,533 @@ def test_no_env_no_injection_means_disabled(monkeypatch):
     monkeypatch.delenv("WILLOW_KEYRING", raising=False)
     assert keyring_mod.get_keyring() is None
     assert keyring_mod.enabled() is False
+
+
+
+# --- net-signer-unit fallback resolution ------------------------------------
+# Ruling serve-keyring-resolve-not-install-2026-09-28 (Loki 5003520D REVISE,
+# blocking, "resolve, don't install"): with no WILLOW_KEYRING and nothing
+# injected, get_keyring() tries exactly one more source before giving up --
+# the net-signer SYSTEM unit's own Environment=, with ownership/writability
+# checks. Any failed check means no keyring, never a guess.
+
+
+def _reset_unit_keyring_state(monkeypatch):
+    keyring_mod.set_keyring(None)
+    monkeypatch.setattr(keyring_mod, "_from_env", None)
+    monkeypatch.setattr(keyring_mod, "_loaded_from", None)
+    monkeypatch.setattr(keyring_mod, "_from_unit", None)
+    monkeypatch.setattr(keyring_mod, "_unit_attempted", False)
+    monkeypatch.setattr(keyring_mod, "_unit_reason", "")
+    monkeypatch.setattr(keyring_mod, "_unit_path", None)
+    monkeypatch.delenv("WILLOW_KEYRING", raising=False)
+
+
+def _public_ring_file(path, name="alice", key_hex="11" * 32, mode=0o644):
+    path.write_text(json.dumps({
+        "version": 1,
+        "verifiers": [{"name": name, "key": key_hex, "kind": "ed25519",
+                       "revoked_at": "", "compromised": False, "reason": "",
+                       "created_at": "2026-01-01T00:00:00Z"}],
+        "public_only": True,
+    }))
+    os.chmod(path, mode)
+
+
+def _trust_owner(monkeypatch, path):
+    """R3 (Loki 9C8C97FD) pins the ring's owner to root or the net-signer
+    unit's own User=, not merely 'not this process's own euid'. These
+    fixtures write the ring as the TEST process's own uid (neither root
+    nor willow-operator on a dev box) -- stub the trust check to accept
+    that uid so a test about writability/symlinks/private-halves is not
+    incidentally about ownership too."""
+    from willow_mcp import keyring as keyring_mod
+
+    monkeypatch.setattr(keyring_mod, "_trusted_ring_owner_uids",
+                        lambda: {os.stat(path).st_uid})
+
+
+def test_unit_resolved_ring_is_accepted(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)  # not this test's own uid
+    _trust_owner(monkeypatch, ring)
+
+    got = keyring_mod.get_keyring()
+    assert got is not None
+    assert "alice" in got
+    status = keyring_mod.unit_keyring_status()
+    assert status["attempted"] is True
+    assert status["path"] == str(ring)
+    assert status["reason"] == ""
+
+
+def test_default_fallback_source_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "default"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    # Loki 5771FE1F T1: the ring's owner is trusted here so ONLY the source
+    # gate (source != "net-signer-unit") can be responsible for the refusal
+    # -- otherwise this test passes by accident on a pytest tmp_path
+    # substring coincidence (the path is built from this test's own name,
+    # which contains "default") while the owner-pin check does the real
+    # refusing and mutant A (source gate disabled) survives. Assert the
+    # source gate's exact wording.
+    assert "resolved via 'default'" in status["reason"]
+
+
+def test_ring_owned_by_this_process_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)  # created by this test process -- not root, not willow-operator
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    # Spoof euid away from both the file's real owner AND the ancestor dirs'
+    # real owner (same test uid) -- isolates the OWNER-of-the-FILE check as
+    # the only thing that can refuse here (the ancestor-owned-by-own-euid
+    # check would otherwise backstop a disabled owner check and mask it).
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    # R3 (Loki 9C8C97FD): the owner check is now a positive allowlist (root or
+    # the net-signer unit's own User=), not merely "not this process's euid" --
+    # a ring owned by this test's own uid is refused for that reason.
+    assert "not root or" in status["reason"]
+
+
+def test_group_writable_ring_file_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring, mode=0o664)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert "writable" in status["reason"]
+
+
+def test_group_writable_parent_dir_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    d = tmp_path / "egress"
+    d.mkdir()
+    ring = d / "verifiers.public.json"
+    _public_ring_file(ring)
+    os.chmod(d, 0o775)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert "writable" in status["reason"]
+
+
+def test_symlink_to_a_writable_target_is_refused(tmp_path, monkeypatch):
+    # The symlink itself lives in a SAFE directory; its resolved target's
+    # PARENT is the world-writable one. A check that used the symlink's own
+    # parent (never resolving first) would miss this entirely -- resolving
+    # first is what makes the parent-writability check mean anything.
+    _reset_unit_keyring_state(monkeypatch)
+    safe_dir = tmp_path / "safe"
+    safe_dir.mkdir()
+    os.chmod(safe_dir, 0o700)
+    writable_dir = tmp_path / "writable"
+    writable_dir.mkdir()
+    os.chmod(writable_dir, 0o777)
+    real = writable_dir / "real-ring.json"
+    _public_ring_file(real, mode=0o644)
+    link = safe_dir / "verifiers.public.json"
+    link.symlink_to(real)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (link, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, real)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert "writable" in status["reason"]
+    # names the RESOLVED target's parent directory, not the symlink's own
+    assert str(writable_dir) in status["reason"]
+
+
+def test_private_ring_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    ring.write_text(json.dumps({
+        "version": 1,
+        "verifiers": [{"name": "alice", "key": "11" * 32, "kind": "ed25519",
+                       "private": "22" * 32, "revoked_at": "", "compromised": False,
+                       "reason": "", "created_at": ""}],
+    }))
+    os.chmod(ring, 0o600)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert "public-only" in status["reason"] or "private" in status["reason"]
+
+
+def test_env_still_wins_over_unit_fallback(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    env_path = tmp_path / "env-keyring.json"
+    k = keyring_mod.Keyring(path=str(env_path))
+    k.add("env_verifier")
+    k.save()
+    monkeypatch.setenv("WILLOW_KEYRING", str(env_path))
+
+    called = []
+
+    def fake_resolve():
+        called.append(1)
+        raise AssertionError("unit resolution must not run when WILLOW_KEYRING is set")
+
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", fake_resolve)
+
+    got = keyring_mod.get_keyring()
+    assert got is not None
+    assert "env_verifier" in got
+    assert not called
+
+
+def test_unit_resolution_is_cached_once_per_process(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)
+    calls = []
+
+    def fake_resolve():
+        calls.append(1)
+        return ring, "net-signer-unit"
+
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", fake_resolve)
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    first = keyring_mod.get_keyring()
+    second = keyring_mod.get_keyring()
+    assert first is second
+    assert len(calls) == 1
+
+
+
+# --- R1 (Loki 9C8C97FD): a malformed entry REFUSES the whole ring, and the
+# diagnostic (unit_keyring_status) and get_keyring() always agree ----------
+
+
+def _malformed_ring_file(path, verifiers, mode=0o644):
+    path.write_text(json.dumps({"version": 1, "verifiers": verifiers, "public_only": True}))
+    os.chmod(path, mode)
+
+
+def test_malformed_bad_hex_key_refuses_both_diag_and_get_keyring(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _malformed_ring_file(ring, [{"name": "alice", "key": "not-hex-at-all", "kind": "ed25519",
+                                 "revoked_at": "", "compromised": False, "reason": "",
+                                 "created_at": ""}])
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert status["path"] is None
+    assert status["reason"]
+
+
+def test_malformed_wrong_length_key_refuses_both_diag_and_get_keyring(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _malformed_ring_file(ring, [{"name": "alice", "key": "11" * 10, "kind": "ed25519",
+                                 "revoked_at": "", "compromised": False, "reason": "",
+                                 "created_at": ""}])
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert status["path"] is None
+    assert status["reason"]
+
+
+def test_malformed_missing_name_refuses_both_diag_and_get_keyring(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _malformed_ring_file(ring, [{"key": "11" * 32, "kind": "ed25519",
+                                 "revoked_at": "", "compromised": False, "reason": "",
+                                 "created_at": ""}])
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert status["path"] is None
+    assert status["reason"]
+
+
+def test_malformed_non_dict_entry_refuses_both_diag_and_get_keyring(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _malformed_ring_file(ring, ["mallory"])
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    # R2: this used to raise AttributeError out of get_keyring() the first
+    # time keyring.load() (not load_public_ring, which only SKIPPED it)
+    # hit a bare string entry. It must instead be a named refusal.
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert status["path"] is None
+    assert status["reason"]
+
+
+# --- R2 (Loki 9C8C97FD): ANY exception in the fallback is a named state ---
+
+
+def test_resolver_raising_is_a_named_no_keyring_state_not_an_exception(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+
+    def _boom():
+        raise RuntimeError("systemd bus exploded")
+
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", _boom)
+
+    got = keyring_mod.get_keyring()  # must not raise
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert status["path"] is None
+    # Tight on purpose (not just "an error was named somewhere"): this must be
+    # _resolve_unit_keyring's OWN inner guard around resolve_keyring_path()
+    # that names it, not get_keyring's outer catch-all -- the two wordings
+    # differ ("resolution raised" vs "unit keyring fallback raised") so a
+    # mutant that drops the inner guard (N7) still shows a reason (via the
+    # outer guard) but with the WRONG wording, and this assertion catches
+    # that instead of being satisfied either way.
+    assert "resolution raised" in status["reason"]
+    assert "RuntimeError" in status["reason"]
+
+
+def test_load_public_ring_bytes_raising_something_other_than_keyringerror_is_named(tmp_path, monkeypatch):
+    """A non-dict verifier entry passes _resolve_unit_keyring's own check
+    (net_signer.load_public_ring_bytes also refuses it now, R1) -- but this
+    pins the OUTER guard (get_keyring's except Exception) against whatever
+    kind of exception the load path could still raise, per R2: it must
+    never escape as a bare AttributeError/TypeError/etc."""
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)
+    _trust_owner(monkeypatch, ring)
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+
+    def _boom(data, label):
+        raise AttributeError("simulated: 'str' object has no attribute 'get'")
+
+    monkeypatch.setattr(keyring_mod, "load_bytes", _boom)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert status["path"] is None
+    assert status["reason"]
+
+
+# --- R3 (Loki 9C8C97FD): fd-bound read closes the TOCTOU window, and the
+# ancestor walk climbs past the immediate parent ----------------------------
+
+
+def test_toctou_swap_between_checks_and_load_does_not_leak_the_swapped_file(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring, name="alice")
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    real_open = os.open
+    swapped = {"done": False}
+
+    def swap_after_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        if not swapped["done"] and str(path) == str(ring):
+            swapped["done"] = True
+            # An attacker replaces the file at this PATH via a rename the
+            # instant after our fd was opened -- a NEW inode takes over
+            # ring's directory entry while our fd still references the
+            # OLD one. A path-based reopen (the pre-R3 shape) would load
+            # the NEW inode's content; the fd-bound read must not.
+            evil = ring.with_suffix(".evil")
+            _public_ring_file(evil, name="mallory")
+            os.replace(evil, ring)
+        return fd
+
+    monkeypatch.setattr(os, "open", swap_after_open)
+
+    got = keyring_mod.get_keyring()
+    assert got is not None
+    assert "alice" in got
+    assert "mallory" not in got
+    assert swapped["done"], "the swap never actually ran -- test is not exercising the window"
+
+
+def test_0777_grandparent_is_refused(tmp_path, monkeypatch):
+    _reset_unit_keyring_state(monkeypatch)
+    grandparent = tmp_path / "grandparent"
+    grandparent.mkdir()
+    os.chmod(grandparent, 0o777)
+    parent = grandparent / "egress"
+    parent.mkdir()
+    os.chmod(parent, 0o755)
+    ring = parent / "verifiers.public.json"
+    _public_ring_file(ring)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert str(grandparent) in status["reason"]
+
+
+def test_0777_grandparent_with_sticky_bit_is_accepted(tmp_path, monkeypatch):
+    """The sticky bit is the exemption the ruling explicitly allows (the
+    real /tmp shape: 1777) -- a world-writable ancestor with it set is not
+    refused."""
+    _reset_unit_keyring_state(monkeypatch)
+    grandparent = tmp_path / "grandparent"
+    grandparent.mkdir()
+    os.chmod(grandparent, 0o1777)  # world-writable + sticky
+    parent = grandparent / "egress"
+    parent.mkdir()
+    os.chmod(parent, 0o755)
+    ring = parent / "verifiers.public.json"
+    _public_ring_file(ring)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    got = keyring_mod.get_keyring()
+    assert got is not None
+    assert "alice" in got
+
+
+# --- item 4 (Loki 9C8C97FD): reloader._resolve_keyring_path's own labelling,
+# exercised directly -- not via a wholesale monkeypatch of the function
+# itself, which is what let N2/N3/N4/N9 survive against this suite ---------
+
+
+def test_resolve_keyring_path_own_env_ring_is_labelled_default(monkeypatch, tmp_path):
+    import subprocess
+
+    own_env_ring = tmp_path / "own-env-ring.json"
+    monkeypatch.setenv("WILLOW_NET_SIGNER_RING", str(own_env_ring))
+
+    def fake_run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, "", "Unit could not be found.")
+
+    path, source = reloader_mod._resolve_keyring_path(runner=fake_run)
+    assert source == "default"
+    assert path == own_env_ring
+
+
+def test_resolve_keyring_path_default_fallback_with_no_env_is_labelled_default(monkeypatch, tmp_path):
+    import subprocess
+
+    monkeypatch.delenv("WILLOW_NET_SIGNER_RING", raising=False)
+
+    def fake_run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, "", "Unit could not be found.")
+
+    path, source = reloader_mod._resolve_keyring_path(runner=fake_run)
+    assert source == "default"
+
+
+def test_resolve_keyring_path_only_the_system_units_environment_yields_net_signer_unit(monkeypatch, tmp_path):
+    import subprocess
+
+    unit_ring = tmp_path / "unit-ring.json"
+
+    def fake_run(argv, **kw):
+        assert argv[0] == reloader_mod._SYSTEMCTL_BIN
+        return subprocess.CompletedProcess(
+            argv, 0, f"Environment=WILLOW_NET_SIGNER_RING={unit_ring}\n", "")
+
+    path, source = reloader_mod._resolve_keyring_path(runner=fake_run)
+    assert source == "net-signer-unit"
+    assert path == unit_ring
+
+
+
+def test_trusted_owner_check_raising_is_caught_by_the_outer_guard(tmp_path, monkeypatch):
+    """R2/N6: an exception from a step _resolve_unit_keyring does NOT wrap
+    itself (here, _trusted_ring_owner_uids) must still be caught -- by
+    get_keyring's own outer except Exception -- rather than escaping to a
+    caller that never asked for per-verifier identity."""
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+
+    def _boom():
+        raise ValueError("simulated failure inside an inner check")
+
+    monkeypatch.setattr(keyring_mod, "_trusted_ring_owner_uids", _boom)
+
+    got = keyring_mod.get_keyring()  # must not raise
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert status["path"] is None
+    assert "unit keyring fallback raised" in status["reason"]
+    assert "ValueError" in status["reason"]
+
+
+
+def test_load_bytes_keyringerror_after_checks_pass_is_a_clean_refusal(tmp_path, monkeypatch):
+    """R1/N4/N9: if the two loaders ever diverge (load_public_ring_bytes
+    accepts a ring that keyring.load_bytes then refuses), get_keyring's
+    path/reason must reflect the REAL failure -- never report a path as
+    resolved (diag-looking 'ok') while the keyring itself is None. That
+    three-state collapse is exactly what Loki 9C8C97FD found."""
+    _reset_unit_keyring_state(monkeypatch)
+    ring = tmp_path / "verifiers.public.json"
+    _public_ring_file(ring)
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "net-signer-unit"))
+    monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
+
+    def _boom(data, label):
+        raise keyring_mod.KeyringError("simulated divergence between the two loaders")
+
+    monkeypatch.setattr(keyring_mod, "load_bytes", _boom)
+
+    got = keyring_mod.get_keyring()
+    assert got is None
+    status = keyring_mod.unit_keyring_status()
+    assert status["path"] is None
+    assert "resolved but failed to load" in status["reason"]
