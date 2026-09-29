@@ -48,6 +48,7 @@ def test_handoff_write_v4_emits_handoff_v1_format_intentional(home):
     # BC504427: tool name reflects call-signature generation; on-disk format is v1.
     sent = ds.dispatch_send("willow", "loki", "# Task\n", summary="task")
     did = sent["dispatch_id"]
+    ds.dispatch_accept(did, "loki")  # bite 1 (2E590F1B): handoff requires 'working'
     ho.handoff_write_v4(
         "loki", did, narrative="Done: 1 passed.",
         no_findings_reason="test fixture: format-marker test",
@@ -62,6 +63,7 @@ def test_handoff_write_v4_closeout_is_proper_mai(home):
         "willow", "loki", "# Task\n", role="loki", summary="task"
     )
     did = sent["dispatch_id"]
+    ds.dispatch_accept(did, "loki")  # bite 1 (2E590F1B): handoff requires 'working'
     ho.handoff_write_v4(
         "loki",
         did,
@@ -102,6 +104,7 @@ def test_full_lifecycle(home):
         did,
         findings=[{"id": "g1", "text": "gap found", "severity": "high", "evidence": ["a.py:1"]}],
         narrative="Audited.",
+        session_id="sess-1",  # bite 1 (9BA76253): must match the accepting session
     )
     assert done["status"] == "complete"
 
