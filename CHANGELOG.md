@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **unit-install:** install worker lane units; refuse any reinstall that weakens a unit ([56ac4b4](https://github.com/willow-memory/willow-mcp/commit/56ac4b4ae22a986081e2c29cc27722c274714eb8))
 * **unit-install:** install worker lane units; refuse any reinstall that weakens a unit ([a3f59a7](https://github.com/willow-memory/willow-mcp/commit/a3f59a747a6a76d2c8204bb369156e8ec8c15c27))
 
 ## [2.90.4](https://github.com/willow-memory/willow-mcp/compare/v2.90.3...v2.90.4) (2026-09-29)
