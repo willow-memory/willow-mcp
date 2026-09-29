@@ -213,6 +213,91 @@ def declared_unit_name(template_text: str, template_path: Path) -> str:
     return name[: -len(".template")] if name.endswith(".template") else name
 
 
+#: A declared name carrying this token names a FAMILY of units, one per lane:
+#: `willow-mcp-worker-@LANE@.service` declares `willow-mcp-worker-fast.service`
+#: and `willow-mcp-worker-batch.service`. The lane is read from the unit being
+#: installed, never guessed, and must be one the family lists.
+LANE_TOKEN = "@LANE@"
+
+
+def _lane_families() -> dict[str, tuple[str, ...]]:
+    """Declared lane-family names and the lanes each admits. Only a
+    registered family installs; any other `@LANE@` name is ENAME."""
+    from . import worker_service
+    return {f"{worker_service.UNIT_PREFIX}-{LANE_TOKEN}.service": tuple(worker_service.LANES)}
+
+
+def match_declared(declared: str, unit: str) -> tuple[bool, str]:
+    """``(matches, lane)``. A plain declared name matches only itself (lane
+    ``""``). A registered lane family matches ``prefix + lane + suffix`` for a
+    lane the family admits; anything else does not match."""
+    if LANE_TOKEN not in declared:
+        return declared == unit, ""
+    lanes = _lane_families().get(declared)
+    if not lanes:
+        return False, ""
+    prefix, suffix = declared.split(LANE_TOKEN, 1)
+    if not (unit.startswith(prefix) and unit.endswith(suffix)):
+        return False, ""
+    lane = unit[len(prefix):len(unit) - len(suffix)]
+    return (lane in lanes), (lane if lane in lanes else "")
+
+
+def lane_values(lane: str, clone: Path) -> dict[str, str]:
+    """The worker family's placeholders, from the same resolver the keyboard
+    installer uses (``worker_service.default_config``), so both paths render
+    the same unit. ``WORKDIR`` is the verified clone the template was read
+    from, not this process's cwd: it is also ``WILLOW_ROOT``, the work root
+    the Kart sandbox pins read-only."""
+    from . import worker_service
+    cfg = worker_service.default_config()
+    return {
+        "LANE": lane,
+        "WORKDIR": str(clone),
+        "WILLOW_PG_DB": cfg.pg_db,
+        "WILLOW_PG_USER": cfg.pg_user,
+        "APP_ID": cfg.app_id,
+        "HEARTBEAT_ROOT": str(cfg.heartbeat_root),
+        "KART_SANDBOX_CONFIG": str(cfg.sandbox_config),
+    }
+
+
+_ENV_LINE_RE = re.compile(r'^\s*Environment="?([A-Za-z_][A-Za-z0-9_]*)=([^"\n]*)"?\s*$', re.MULTILINE)
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def _env_lines(text: str) -> dict[str, str]:
+    return {m.group(1): m.group(2).strip() for m in _ENV_LINE_RE.finditer(text or "")}
+
+
+def strict_trust_root_value(existing_text: str) -> str:
+    """``@STRICT_TRUST_ROOT@``: ``1`` when this process runs strict, else
+    whatever the unit being replaced carries, else ``0`` (a fresh box). The
+    installing process is often not the process that enforces egress — the
+    desk's stdio broker runs non-strict while the Kart worker it installs
+    must stay strict — so the replaced unit's own value is carried forward
+    rather than re-derived from here."""
+    from . import lease
+    if lease.strict_trust_root():
+        return "1"
+    carried = _env_lines(existing_text).get("WILLOW_MCP_STRICT_TRUST_ROOT", "")
+    return "1" if carried.lower() in _TRUTHY else "0"
+
+
+def posture_downgrades(existing_text: str, rendered: str) -> list[str]:
+    """Security-posture ``Environment=`` settings the replaced unit carries
+    and the new render would drop. Empty for a fresh install. Any entry is
+    EDOWNGRADE: a reinstall must never quietly weaken the unit it replaces."""
+    before, after = _env_lines(existing_text), _env_lines(rendered)
+    out: list[str] = []
+    if before.get("WILLOW_MCP_STRICT_TRUST_ROOT", "").lower() in _TRUTHY and \
+            after.get("WILLOW_MCP_STRICT_TRUST_ROOT", "").lower() not in _TRUTHY:
+        out.append("WILLOW_MCP_STRICT_TRUST_ROOT would turn off")
+    if before.get("WILLOW_ROOT") and not after.get("WILLOW_ROOT"):
+        out.append("WILLOW_ROOT would be dropped")
+    return out
+
+
 def _safe(value: object, field: str) -> str:
     text = str(value)
     if not text or any(char in text for char in ("\n", "\r", '"')):
@@ -641,11 +726,17 @@ def execute_unit_install(
     if not src.get("ok"):
         return src
     declared = declared_unit_name(src["text"], src["path"])
-    if declared != unit:
+    name_ok, lane = match_declared(declared, unit)
+    if not name_ok:
         return _refuse(
             "ENAME", f"template {rel!r} declares unit {declared!r}, not {unit!r}",
             declared=declared,
         )
+    existing_path = (Path(destination) if destination is not None else unit_dir()) / unit
+    try:
+        existing_text = existing_path.read_text(encoding="utf-8") if existing_path.is_file() else ""
+    except OSError:
+        existing_text = ""
     # The timer sibling is a repo-relative path put through the SAME
     # tracked/clean/in-tree/regular-file checks as the service; an absent
     # sibling is "no timer", a present one that fails them refuses the whole
@@ -664,6 +755,11 @@ def execute_unit_install(
     # them apart is how a timer drifts from its service, which the fleet's
     # own installers render together for exactly that reason).
     vals = dict(values) if values is not None else render_values(unit)
+    if lane and values is None:
+        vals.update(lane_values(lane, clone))
+    elif lane:
+        vals.setdefault("LANE", lane)
+    vals.setdefault("STRICT_TRUST_ROOT", strict_trust_root_value(existing_text))
     vals.setdefault("SERVICE_UNIT", unit)
     if timer_name:
         vals.setdefault("TIMER_UNIT", timer_name)
@@ -677,6 +773,15 @@ def execute_unit_install(
             timer_rendered = render_template(timer_src["text"], unit, values=vals)
         except ValueError as exc:
             return _refuse("ETEMPLATE", f"timer sibling {timer_rel}: {exc}")
+
+    downgrades = posture_downgrades(existing_text, rendered)
+    if downgrades:
+        return _refuse(
+            "EDOWNGRADE",
+            f"installing {rel!r} over the current {unit} would weaken it: "
+            f"{'; '.join(downgrades)}. Fix the template, not the unit.",
+            downgrades=downgrades,
+        )
 
     # EPERM on CONTENT, not only on the argument: `enable` creates Alias=
     # names and enables Also= units, so a template naming the broker's unit

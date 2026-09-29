@@ -1,4 +1,5 @@
 # systemd --user template for a standalone willow-mcp/Kartikeya worker.
+# unit: willow-mcp-worker-@LANE@.service
 [Unit]
 Description=willow-mcp Kart worker (@LANE@ lane)
 After=network-online.target
@@ -14,6 +15,16 @@ Environment="WILLOW_PG_USER=@WILLOW_PG_USER@"
 Environment="WILLOW_APP_ID=@APP_ID@"
 Environment="WILLOW_WORKER_LANE=@LANE@"
 Environment="WILLOW_WORKER_HEARTBEAT_ROOT=@HEARTBEAT_ROOT@"
+# The work root, explicit and not inferred. Unset, willow_repo_root() falls
+# through to the installed package tree, which on an editable install is the
+# repo's src/ directory, and the read-only work-root sandbox then covers src/
+# only: pyproject.toml, .git and .venv stay writable from tasks (measured from
+# inside a task 2026-09-02).
+Environment="WILLOW_ROOT=@WORKDIR@"
+# The egress verifier runs in this worker, so strict trust root has to be set
+# here, not only in an MCP client config. The brokered install carries the value
+# forward from the unit it replaces and refuses (EDOWNGRADE) to turn it off.
+Environment="WILLOW_MCP_STRICT_TRUST_ROOT=@STRICT_TRUST_ROOT@"
 # Kart sandbox seams. These MUST be literal Environment= lines, not an
 # EnvironmentFile: the seams were added to $WILLOW_HOME/env on 2026-07-22 and
 # did not cure the fault, because a running process's environment cannot be

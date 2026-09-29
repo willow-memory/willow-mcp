@@ -30,6 +30,9 @@ class WorkerServiceConfig:
     # A worker that cannot resolve a fleet policy falls back to kartikeya's
     # vendored default and fails every task; see willow_mcp.worker.
     sandbox_config: Path
+    # WILLOW_MCP_STRICT_TRUST_ROOT for the unit: "1" or "0". The egress
+    # verifier runs in the worker, so this must be set in the unit itself.
+    strict_trust_root: str = "0"
 
 
 def default_config() -> WorkerServiceConfig:
@@ -59,6 +62,12 @@ def default_config() -> WorkerServiceConfig:
         sandbox_config=Path(
             os.environ.get("KART_SANDBOX_CONFIG", home / "kart-sandbox.json")
         ).expanduser(),
+        strict_trust_root=(
+            "1"
+            if os.environ.get("WILLOW_MCP_STRICT_TRUST_ROOT", "").strip().lower()
+            in ("1", "true", "yes", "on")
+            else "0"
+        ),
     )
 
 
@@ -108,6 +117,7 @@ def render_unit(
         "APP_ID": config.app_id,
         "HEARTBEAT_ROOT": config.heartbeat_root,
         "KART_SANDBOX_CONFIG": config.sandbox_config,
+        "STRICT_TRUST_ROOT": config.strict_trust_root,
     }
     rendered = source
     for key, value in values.items():

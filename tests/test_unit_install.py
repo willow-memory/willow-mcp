@@ -822,7 +822,7 @@ _DEPLOY_TEMPLATE_CONTENT_VALUES = {
         "WILLOW_STORE_ROOT": "/srv/store", "WILLOW_PG_DB": "willow",
         "WILLOW_PG_USER": "willow", "APP_ID": "willow", "LANE": "fast",
         "HEARTBEAT_ROOT": "/srv/hb", "KART_SANDBOX_CONFIG": "/srv/kart.json",
-        "PYTHON": "/srv/venv/bin/python",
+        "PYTHON": "/srv/venv/bin/python", "STRICT_TRUST_ROOT": "1",
     },
     "willow-mcp-worker@.service.template": {
         "WORKDIR": "/srv/wd", "WILLOW_HOME": "/srv/wh",
