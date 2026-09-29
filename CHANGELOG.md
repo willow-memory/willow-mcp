@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.90.4](https://github.com/willow-memory/willow-mcp/compare/v2.90.3...v2.90.4) (2026-09-29)
+
+
+### Fixed
+
+* **worker:** load inference-only provider keys from $WILLOW_HOME/env.kart ([0ec4c5a](https://github.com/willow-memory/willow-mcp/commit/0ec4c5aaf9e643a72633f3297f52abad261162e0))
+* **worker:** load inference-only provider keys from $WILLOW_HOME/env.kart ([2f12cff](https://github.com/willow-memory/willow-mcp/commit/2f12cffc7be057701a53d0024dcf588101b31963))
+
 ## [2.90.3](https://github.com/willow-memory/willow-mcp/compare/v2.90.2...v2.90.3) (2026-09-29)
 
 
