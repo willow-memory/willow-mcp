@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.90.1](https://github.com/willow-memory/willow-mcp/compare/v2.90.0...v2.90.1) (2026-09-29)
+
+
+### Fixed
+
+* **serve:** resolve the verifier ring from the root-owned net-signer unit; add a ring drift check ([91c66bc](https://github.com/willow-memory/willow-mcp/commit/91c66bceac6be6ea7d70f9110963e717d63afb79))
+
 ## [2.90.0](https://github.com/willow-memory/willow-mcp/compare/v2.89.0...v2.90.0) (2026-09-29)
 
 
