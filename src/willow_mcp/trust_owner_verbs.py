@@ -1628,8 +1628,6 @@ def queue_syscall_sync_request(
     """Broker boot path: persist one signed ``syscall.sync`` pending record
     when :func:`constitutional.evaluate_syscall_table_sync` authorizes an
     apply but the live table is trust-owner-owned."""
-    from . import constitutional as _constitutional
-
     if not plan.get("ok") or not plan.get("needs_apply"):
         return {"ok": False, "error": "EINVAL", "reason": "plan does not authorize a queue"}
 

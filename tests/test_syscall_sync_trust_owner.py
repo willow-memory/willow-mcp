@@ -2,16 +2,26 @@
 from __future__ import annotations
 
 import json
-import os
-import stat
 from pathlib import Path
 
 import pytest
 
+from tests.test_constitutional import _FakeLedger, _row, _write_table
 from willow_mcp import constitutional
 from willow_mcp import manifest_grant_executor as mgx
 from willow_mcp import trust_owner_verbs as tov
-from tests.test_constitutional import _FakeLedger, _row, _write_table, tables
+
+
+@pytest.fixture
+def tables(tmp_path):
+    """Same shape as test_constitutional's fixture. It is defined here, not
+    imported, because an imported fixture shadows the test argument (F811)."""
+    tmp_path.chmod(0o700)
+    live = tmp_path / "live" / "syscall-table.json"
+    bundle = tmp_path / "bundle" / "syscall-table.json"
+    live.parent.mkdir()
+    bundle.parent.mkdir()
+    return live, bundle
 
 
 def _make_unwritable_dir(path: Path) -> None:
