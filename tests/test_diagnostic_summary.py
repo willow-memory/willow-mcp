@@ -492,9 +492,22 @@ def test_diag_keyring_not_enabled_when_unset(monkeypatch):
     monkeypatch.delenv("WILLOW_KEYRING", raising=False)
     from willow_mcp import keyring as _keyring
     monkeypatch.setattr(_keyring, "_injected", None, raising=False)
+    monkeypatch.setattr(_keyring, "_from_env", None, raising=False)
+    monkeypatch.setattr(_keyring, "_loaded_from", None, raising=False)
+    monkeypatch.setattr(_keyring, "_from_unit", None, raising=False)
+    monkeypatch.setattr(_keyring, "_unit_attempted", False, raising=False)
+    monkeypatch.setattr(_keyring, "_unit_reason", "", raising=False)
+    monkeypatch.setattr(_keyring, "_unit_path", None, raising=False)
     check = server._diag_keyring()
     assert check["status"] == "not_enabled"
     assert check["configured"] is False
+    # Loki 5771FE1F T2 / mutant N9: checks.keyring must carry the refusal
+    # reason for a refused net-signer-unit fallback -- the autouse
+    # _stub_keyring_unit_fallback fixture stubs the source to the
+    # always-refused "default" -- rather than silently collapsing a
+    # refused fallback into a bare not_enabled with no reason.
+    assert check["unit_fallback_reason"]
+    assert "resolved via 'default'" in check["unit_fallback_reason"]
 
 
 def test_diag_keyring_refuses_group_readable_secret_keyring(tmp_path, monkeypatch):

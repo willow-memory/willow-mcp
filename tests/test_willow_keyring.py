@@ -372,11 +372,19 @@ def test_default_fallback_source_is_refused(tmp_path, monkeypatch):
     _public_ring_file(ring)
     monkeypatch.setattr(reloader_mod, "resolve_keyring_path", lambda: (ring, "default"))
     monkeypatch.setattr(os, "geteuid", lambda: 994)
+    _trust_owner(monkeypatch, ring)
 
     got = keyring_mod.get_keyring()
     assert got is None
     status = keyring_mod.unit_keyring_status()
-    assert "default" in status["reason"]
+    # Loki 5771FE1F T1: the ring's owner is trusted here so ONLY the source
+    # gate (source != "net-signer-unit") can be responsible for the refusal
+    # -- otherwise this test passes by accident on a pytest tmp_path
+    # substring coincidence (the path is built from this test's own name,
+    # which contains "default") while the owner-pin check does the real
+    # refusing and mutant A (source gate disabled) survives. Assert the
+    # source gate's exact wording.
+    assert "resolved via 'default'" in status["reason"]
 
 
 def test_ring_owned_by_this_process_is_refused(tmp_path, monkeypatch):
