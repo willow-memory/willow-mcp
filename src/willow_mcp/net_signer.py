@@ -131,35 +131,60 @@ def export_public_ring(source: Path, dest: Path) -> dict:
             "skipped": skipped}
 
 
-def load_public_ring(path: Path) -> dict[str, dict]:
-    """``{name: {key: bytes, kind, revoked_at, compromised}}``. Refuses a ring
-    that carries a private half or ANY non-ed25519 entry — an ``hmac``
-    ``key`` is a secret, and this process must never hold one."""
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+def load_public_ring_bytes(data: bytes, label: object = "<ring>") -> dict[str, dict]:
+    """As load_public_ring, but from bytes already read by the caller --
+    the fd-bound resolver (keyring._resolve_unit_keyring, R3 of Loki
+    9C8C97FD) opens the ring file ONCE, checks it, and loads it from that
+    SAME fd; a second open-by-path here would reopen the TOCTOU window
+    the fd-bound read exists to close.
+
+    Refuses a ring that carries a private half, ANY non-ed25519 entry, a
+    non-dict entry, a missing/non-string name, a key that is not valid
+    hex, or a key of the wrong length -- R1 (Loki 9C8C97FD): these used to
+    be silently SKIPPED, which let _resolve_unit_keyring's own check pass
+    a ring that keyring.load then refused (or raised on) later, so the
+    diagnostic and the real loader disagreed about the same file.
+    Refusing here means the two loaders always agree."""
+    raw = json.loads(data.decode("utf-8"))
     ring: dict[str, dict] = {}
     for v in raw.get("verifiers", []):
         if not isinstance(v, dict):
-            continue
+            raise ValueError(f"{label}: a verifier entry is not an object: {v!r}")
         if v.get("private"):
-            raise ValueError(f"{path}: verifier {v.get('name')!r} carries a private half — "
+            raise ValueError(f"{label}: verifier {v.get('name')!r} carries a private half -- "
                              "the signer's ring must be public-only (export-ring)")
+        name = v.get("name")
+        if not name or not isinstance(name, str):
+            raise ValueError(f"{label}: a verifier entry is missing a name: {v!r}")
         kind = str(v.get("kind", "hmac"))
         if kind != "ed25519":
-            raise ValueError(f"{path}: verifier {v.get('name')!r} is kind {kind!r}; its key is a "
-                             "shared secret — not a public ring (export-ring skips these)")
+            raise ValueError(f"{label}: verifier {name!r} is kind {kind!r}; its key is a "
+                             "shared secret -- not a public ring (export-ring skips these)")
         try:
             key = bytes.fromhex(str(v.get("key", "")))
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise ValueError(f"{label}: verifier {name!r}'s key is not valid hex") from exc
         if len(key) != 32:
-            continue
-        ring[str(v.get("name"))] = {
+            raise ValueError(f"{label}: verifier {name!r}'s ed25519 key must be 32 bytes, "
+                             f"got {len(key)}")
+        ring[name] = {
             "key": key, "kind": kind,
             "revoked_at": v.get("revoked_at"), "compromised": bool(v.get("compromised")),
         }
     if raw.get("legacy_key"):
-        raise ValueError(f"{path}: carries legacy_key (an HMAC secret) — not a public ring")
+        raise ValueError(f"{label}: carries legacy_key (an HMAC secret) -- not a public ring")
     return ring
+
+
+def load_public_ring(path: Path) -> dict[str, dict]:
+    """{name: {key: bytes, kind, revoked_at, compromised}}. Refuses a ring
+    that carries a private half or ANY non-ed25519 entry -- an hmac key is
+    a secret, and this process must never hold one. Thin read-then-parse
+    wrapper over load_public_ring_bytes."""
+    p = Path(path)
+    return load_public_ring_bytes(p.read_bytes(), p)
+
+
 
 
 def ring_is_trustworthy(path: Path) -> tuple[bool, str]:

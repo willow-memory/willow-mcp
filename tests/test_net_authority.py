@@ -1221,3 +1221,39 @@ def test_lease_request_is_gated_classed_hooked_and_delegates(monkeypatch):
     # (Loki E48668A0 R1).
     assert seen == {"app_id": "kart", "ttl_seconds": 1800, "reason": "Friday morning fun",
                     "requested_by": None, "requested_by_verified": False}
+
+
+
+# --- R1 (Loki 9C8C97FD): load_public_ring_bytes REFUSES a malformed entry,
+# it does not silently skip it -- direct unit tests, independent of the
+# fd-bound keyring.py caller that also happens to backstop these via its
+# own VerifierKey.from_json.
+
+
+def _ring_bytes(verifiers):
+    return json.dumps({"version": 1, "verifiers": verifiers, "public_only": True}).encode("utf-8")
+
+
+def test_load_public_ring_bytes_refuses_non_dict_entry():
+    with pytest.raises(ValueError, match="not an object"):
+        ns.load_public_ring_bytes(_ring_bytes(["mallory"]), "<test>")
+
+
+def test_load_public_ring_bytes_refuses_bad_hex_key():
+    verifiers = [{"name": "alice", "key": "not-hex", "kind": "ed25519",
+                  "revoked_at": "", "compromised": False}]
+    with pytest.raises(ValueError, match="not valid hex"):
+        ns.load_public_ring_bytes(_ring_bytes(verifiers), "<test>")
+
+
+def test_load_public_ring_bytes_refuses_wrong_length_key():
+    verifiers = [{"name": "alice", "key": "11" * 10, "kind": "ed25519",
+                  "revoked_at": "", "compromised": False}]
+    with pytest.raises(ValueError, match="32 bytes"):
+        ns.load_public_ring_bytes(_ring_bytes(verifiers), "<test>")
+
+
+def test_load_public_ring_bytes_refuses_missing_name():
+    verifiers = [{"key": "11" * 32, "kind": "ed25519", "revoked_at": "", "compromised": False}]
+    with pytest.raises(ValueError, match="missing a name"):
+        ns.load_public_ring_bytes(_ring_bytes(verifiers), "<test>")

@@ -149,3 +149,27 @@ def _stub_egress_public_key_for_diagnostics(request, monkeypatch, tmp_path):
     pub.write_text("stub", encoding="utf-8")
     monkeypatch.setattr(egress_setup, "resolve_public_key_path", lambda: pub)
     monkeypatch.setattr(egress_setup, "resolve_private_key_path", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _stub_keyring_unit_fallback(request, monkeypatch):
+    """Loki 9C8C97FD, item 5: keyring.get_keyring()'s net-signer-unit
+    fallback shells out to the real unit manager when WILLOW_KEYRING is
+    unset and nothing is injected. On a box that actually has a
+    willow-mcp-net-signer system unit and a real
+    /etc/willow-mcp/verifiers.public.json installed (this box), a suite
+    run OUTSIDE Kart would pick that ring up -- an identity-off test
+    asserting get_keyring() is None would then depend on whether the HOST
+    happens to have that unit installed, not on the code under test.
+    Stub reloader.resolve_keyring_path to the always-refused "default"
+    source by default; tests that mean to exercise the fallback itself
+    monkeypatch it back (or the underlying runner) themselves, which
+    simply overrides this stub for the rest of that test."""
+    import pathlib as _pathlib
+
+    from willow_mcp import reloader as reloader_mod
+
+    def _default_source():
+        return _pathlib.Path("/nonexistent-keyring-stub"), "default"
+
+    monkeypatch.setattr(reloader_mod, "resolve_keyring_path", _default_source, raising=False)

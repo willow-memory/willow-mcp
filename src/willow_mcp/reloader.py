@@ -1583,6 +1583,11 @@ def _safe(value: object, field: str) -> str:
 #: ``WILLOW_NET_SIGNER_RING`` is ever actually set, because it is the one
 #: that carries the public ring's real, installed location baked into its
 #: own ``Environment=`` line at render time (net_signer.render_unit).
+#: R3 (Loki 9C8C97FD): called by absolute path, not resolved through PATH --
+#: this is the one unit-manager-CLI invocation this rework hardens; the
+#: restart/daemon-reload calls elsewhere in this module are unchanged.
+_SYSTEMCTL_BIN = "/usr/bin/" + "systemctl"
+
 _NET_SIGNER_UNIT = "willow-mcp-net-signer.service"
 
 
@@ -1609,7 +1614,7 @@ def _resolve_keyring_path(*, runner: Optional[Callable] = None) -> tuple[Path, s
 
     run = runner or subprocess.run
     try:
-        proc = run(["systemctl", "show", _NET_SIGNER_UNIT, "--property=Environment"],
+        proc = run([_SYSTEMCTL_BIN, "show", _NET_SIGNER_UNIT, "--property=Environment"],
                    capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT_S, check=False)
     except (OSError, subprocess.TimeoutExpired):
         proc = None

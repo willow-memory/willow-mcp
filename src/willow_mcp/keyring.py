@@ -463,6 +463,31 @@ class Keyring:
         return self.path
 
 
+def load_bytes(data: bytes, label: object) -> Keyring:
+    """As load(), but from bytes already read by the caller -- the
+    fd-bound unit-fallback resolver (_resolve_unit_keyring, R3 of Loki
+    9C8C97FD) reads the ring file ONCE and builds the Keyring from that
+    SAME read; a path-based load() here would reopen the file a second
+    time by path, which is exactly the TOCTOU window the fd-bound read
+    exists to close. Does NOT run the secret-material permission check --
+    that check is filesystem-mode-based and belongs to the path-based
+    load() below; a caller reading from an fd it already vetted (owner,
+    mode, ancestors) has already covered that ground its own way."""
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except Exception as exc:
+        raise KeyringError(f"{label} is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise KeyringError(f"{label} must contain a JSON object")
+    legacy = raw.get("legacy_key") or ""
+    try:
+        legacy_key = bytes.fromhex(legacy) if legacy else None
+    except ValueError as exc:
+        raise KeyringError(f"{label}: legacy_key is not hex") from exc
+    verifiers = [VerifierKey.from_json(v) for v in raw.get("verifiers", [])]
+    return Keyring(verifiers, legacy_key=legacy_key, path=str(label))
+
+
 def load(path: str) -> Keyring:
     """Read a keyring file. Refuses one other users can read when it holds
     secret material."""
@@ -471,26 +496,15 @@ def load(path: str) -> Keyring:
         raise KeyringError(
             f"no keyring at {p}. Create one with `willow-mcp keys add NAME`."
         )
-    try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise KeyringError(f"{p} is not valid JSON: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise KeyringError(f"{p} must contain a JSON object")
-    legacy = raw.get("legacy_key") or ""
-    try:
-        legacy_key = bytes.fromhex(legacy) if legacy else None
-    except ValueError as exc:
-        raise KeyringError(f"{p}: legacy_key is not hex") from exc
-    verifiers = [VerifierKey.from_json(v) for v in raw.get("verifiers", [])]
+    kr = load_bytes(p.read_bytes(), p)
     # The permission refusal follows the key MATERIAL, not the filename
     # (Nestor#17): a file holding any secret — an hmac key, an ed25519 private
     # half, a legacy key — is refused when other users can read it, exactly as
     # before. A public-only keyring holds nothing forgeable and is deliberately
     # distributable: commit it, mirror it, hand it to the other side of an
     # import.
-    holds_secrets = bool(legacy_key) or any(
-        v.kind != "ed25519" or v.private for v in verifiers
+    holds_secrets = bool(kr.legacy_key) or any(
+        v.kind != "ed25519" or v.private for v in kr.entries()
     )
     mode = os.stat(p).st_mode
     if holds_secrets and mode & (stat.S_IRWXG | stat.S_IRWXO):
@@ -500,7 +514,7 @@ def load(path: str) -> Keyring:
             f"keyring holding only ed25519 public keys is distributable and "
             f"loads regardless of mode.)"
         )
-    return Keyring(verifiers, legacy_key=legacy_key, path=str(p))
+    return kr
 
 
 # --------------------------------------------------------------------------
@@ -556,29 +570,90 @@ def keyring_path() -> str:
     return os.environ.get("WILLOW_KEYRING", "")
 
 
+#: The identity these two system units run as -- pinned here so a ring's
+#: OWNER can be checked against a concrete, named set rather than "anyone
+#: but me" (R3, Loki 9C8C97FD): "not this process's own euid" let ANY
+#: other local uid plant a ring and pass.
+_NET_SIGNER_USER = "willow-operator"
+
+
+def _trusted_ring_owner_uids() -> set[int]:
+    """Root, or the net-signer unit's own User= -- the two identities that
+    legitimately place a ring this fallback trusts (R3). Resolved at call
+    time (not module import) so a box without a willow-operator account
+    still gets a usable set (root only) rather than an import-time
+    failure."""
+    uids = {0}
+    try:
+        import pwd
+
+        uids.add(pwd.getpwnam(_NET_SIGNER_USER).pw_uid)
+    except (KeyError, ImportError, OSError):
+        pass
+    return uids
+
+
+def _ancestor_write_hazard(path: pathlib.Path) -> str:
+    """Walk from path's PARENT up to /. Returns "" when every ancestor is
+    safe, or a reason naming the first unsafe one (R3, Loki 9C8C97FD): the
+    ruling before this rework checked only the immediate parent's
+    group/world-write bits -- a ring under a 0755 parent inside a 0777
+    GRANDparent was accepted. An ancestor directory is unsafe when it is
+    group- or world-writable without the sticky bit (a renamed-in
+    replacement, unless the sticky bit stops other users from doing that),
+    or when it is owned by this process's own euid (this process could
+    replace it itself)."""
+    euid = os.geteuid()
+    current = path.parent
+    while True:
+        try:
+            st = current.stat()
+        except OSError as exc:
+            return f"could not stat {current}: {exc}"
+        if st.st_uid == euid:
+            return f"{current} is owned by this process's own uid ({euid})"
+        if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and not (st.st_mode & stat.S_ISVTX):
+            return (f"{current} is group- or world-writable without the sticky bit "
+                    f"(mode {oct(st.st_mode & 0o7777)})")
+        parent = current.parent
+        if parent == current:
+            return ""
+        current = parent
+
+
 def _resolve_unit_keyring() -> dict:
     """Resolve WILLOW_KEYRING from the net-signer system unit's own
-    ``Environment=`` -- the SAME fact :func:`reloader.resolve_keyring_path`
-    reads for the reloader's own rendered unit, never a second, independent
-    guess (Loki 5003520D). Accepted only when every one of these holds; the
-    first that fails names the whole resolution's ``reason``, and there is
-    no keyring from this path:
+    Environment= -- the SAME fact reloader.resolve_keyring_path reads for
+    the reloader's own rendered unit, never a second, independent guess
+    (Loki 5003520D). Accepted only when every one of these holds; the
+    first that fails names the whole resolution's reason, and there is no
+    keyring from this path:
 
-    * the source is ``"net-signer-unit"`` -- the ``"default"`` fallback
-      (``~/.config/willow-mcp/egress/verifiers.public.json`` or
-      ``WILLOW_NET_SIGNER_RING`` read from THIS process's own env) is
-      refused outright: that file is uid-1000 and broker-writable, not a
+    * the source is "net-signer-unit" -- the "default" fallback
+      (~/.config/willow-mcp/egress/verifiers.public.json or
+      WILLOW_NET_SIGNER_RING read from THIS process's own env) is refused
+      outright: that file is uid-1000 and broker-writable, not a
       root-owned system unit's own staged copy (F4);
     * symlinks are resolved first;
-    * the file loads through :func:`net_signer.load_public_ring` -- public
-      halves only, no HMAC, no ``legacy_key``;
-    * the file's owner is not this process's own effective uid;
-    * neither the file nor its parent directory is group- or
-      world-writable.
+    * the file is opened EXACTLY ONCE, with O_NOFOLLOW on the resolved
+      path -- every check below (owner, mode, ancestors) and the load
+      itself run against that SAME fd, never a second open by path (R3,
+      Loki 9C8C97FD): a stat-then-reopen sequence leaves a TOCTOU window a
+      swap between the two can walk through;
+    * the file's owner is root or the net-signer unit's own User=
+      (_trusted_ring_owner_uids) -- R3: "not this process's own euid" let
+      any OTHER local uid plant a ring and pass;
+    * neither the file nor any ancestor directory up to / is unsafe
+      (_ancestor_write_hazard);
+    * the file loads through net_signer.load_public_ring_bytes -- public
+      halves only, no HMAC, no legacy_key, and a malformed entry REFUSES
+      the whole ring rather than being silently skipped (R1).
 
-    Returns ``{"path": Path|None, "source": str, "reason": str}``. ``path``
-    is ``None`` whenever any check failed, with ``reason`` naming which one
-    -- reported by callers as a named state, never collapsed into "ok".
+    Returns {"path": Path|None, "source": str, "reason": str, "keyring":
+    Keyring|None}. path/keyring are None whenever any check failed, with
+    reason naming which one -- reported by callers as a named state, never
+    collapsed into "ok". The Keyring is built from the SAME bytes read
+    above (never a second open-by-path) -- see load_bytes.
     """
     from . import net_signer as _net_signer
     from . import reloader as _reloader
@@ -601,29 +676,52 @@ def _resolve_unit_keyring() -> dict:
         resolved = raw_path.resolve(strict=True)
     except OSError as exc:
         return {"path": None, "source": source, "reason": f"could not resolve {raw_path}: {exc}"}
+
     try:
-        _net_signer.load_public_ring(resolved)
+        fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return {"path": None, "source": source, "reason": f"could not open {resolved}: {exc}"}
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError as exc:
+            return {"path": None, "source": source, "reason": f"could not stat {resolved}: {exc}"}
+        if st.st_uid not in _trusted_ring_owner_uids():
+            return {"path": None, "source": source,
+                    "reason": (f"{resolved} is owned by uid {st.st_uid}, not root or "
+                               f"{_NET_SIGNER_USER!r} -- a ring anyone else placed there is "
+                               f"not trusted")}
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return {"path": None, "source": source,
+                    "reason": f"{resolved} is group- or world-writable (mode {oct(st.st_mode & 0o777)})"}
+        hazard = _ancestor_write_hazard(resolved)
+        if hazard:
+            return {"path": None, "source": source, "reason": hazard}
+        try:
+            data = os.read(fd, 64 * 1024 * 1024)
+        except OSError as exc:
+            return {"path": None, "source": source, "reason": f"could not read {resolved}: {exc}"}
+    finally:
+        os.close(fd)
+
+    try:
+        _net_signer.load_public_ring_bytes(data, resolved)
     except Exception as exc:  # noqa: BLE001 -- a bad ring means no keyring, not a raise
         return {"path": None, "source": source,
                 "reason": f"{resolved} does not load as a public-only ring: {exc}"}
+    # Build the actual Keyring from the SAME bytes just validated above --
+    # never a second open-by-path (R3): get_keyring() used to call load(path)
+    # here, which reopened the file after every check had already run against
+    # a DIFFERENT read of it, leaving exactly the TOCTOU window this rework
+    # closes everywhere else.
     try:
-        st = resolved.stat()
-        parent_st = resolved.parent.stat()
-    except OSError as exc:
-        return {"path": None, "source": source, "reason": f"could not stat {resolved}: {exc}"}
-    if st.st_uid == os.geteuid():
+        kr = load_bytes(data, resolved)
+    except KeyringError as exc:
         return {"path": None, "source": source,
-                "reason": (f"{resolved} is owned by this process's own uid "
-                           f"({os.geteuid()}) -- a keyring this process itself owns "
-                           f"could plant its own verifier")}
-    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        return {"path": None, "source": source,
-                "reason": f"{resolved} is group- or world-writable (mode {oct(st.st_mode & 0o777)})"}
-    if parent_st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        return {"path": None, "source": source,
-                "reason": (f"{resolved.parent} is group- or world-writable "
-                           f"(mode {oct(parent_st.st_mode & 0o777)})")}
-    return {"path": resolved, "source": source, "reason": ""}
+                "reason": f"resolved but failed to load: {exc}"}
+    return {"path": resolved, "source": source, "reason": "", "keyring": kr}
+
+
 
 
 def unit_keyring_status() -> dict:
@@ -676,17 +774,33 @@ def get_keyring() -> Keyring | None:
     if _unit_attempted:
         return _from_unit
     _unit_attempted = True
-    result = _resolve_unit_keyring()
-    _unit_reason = result["reason"]
-    _unit_path = str(result["path"]) if result["path"] else None
-    if result["path"] is None:
+    try:
+        result = _resolve_unit_keyring()
+        if result["path"] is None:
+            _unit_reason = result["reason"]
+            _unit_path = None
+            _from_unit = None
+            return None
+        _from_unit = result["keyring"]
+    except Exception as exc:  # noqa: BLE001 -- R2 (Loki 9C8C97FD): ANY failure in
+        # the fallback -- a resolver raise, a non-dict verifier entry escaping
+        # as AttributeError, anything else -- becomes a named no-keyring state,
+        # never an exception loose in a caller that never asked for
+        # per-verifier identity.
+        _unit_reason = (f"resolved but failed to load: {exc}" if isinstance(exc, KeyringError)
+                        else f"unit keyring fallback raised: {type(exc).__name__}: {exc}")
+        _unit_path = None
         _from_unit = None
         return None
-    try:
-        _from_unit = load(str(result["path"]))
-    except KeyringError as exc:
-        _unit_reason = f"resolved but failed to load: {exc}"
-        _from_unit = None
+    # R1 (Loki 9C8C97FD): _unit_path is set ONLY here, after a successful load --
+    # never merely because _resolve_unit_keyring's checks passed. Before this, a
+    # ring that passed the checks but failed to LOAD (e.g. load_public_ring
+    # skipped a malformed entry that keyring.load then choked on) left
+    # _unit_path set while get_keyring() returned None, so
+    # unit_keyring_status().path read as though a keyring were in force when it
+    # was not.
+    _unit_reason = ""
+    _unit_path = str(result["path"])
     return _from_unit
 
 
