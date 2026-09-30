@@ -47,7 +47,7 @@ I looked for the joke.
 
 ```bash
 $ grep -rn "Girth erupted." --include='*.py' .
-src/willow_mcp/tree_view.py:121
+src/willow_mcp/tree_view.py:120
 ```
 
 One result. Still one. I smiled exactly the way the third gardener had

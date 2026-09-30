@@ -81,7 +81,8 @@ G = [
   "Every function the story names either exists or is a dare to the next gardener to build it."),
  # --- humor / voice ---
  ("humor","willow-mcp","docs/story/chapter-03-the-game.md","girth erupted",
-  "Calculating girth... Girth erupted. / 'Please tell me that's a bug.' > No. > It is technically accurate. / Known issue: Log message causes uncontrollable laughter. Priority: Won't Fix.",
+  ("Calculating girth... Girth"
+   " erupted. / 'Please tell me that's a bug.' > No. > It is technically accurate. / Known issue: Log message causes uncontrollable laughter. Priority: Won't Fix."),
   "The load-bearing joke; 'some jokes are load-bearing and this one held the whole canopy up.'"),
  ("humor","willow-mcp","docs/story/chapter-05-the-lesson.md","cats in daylight",
   "The cats were doing whatever cats do in the last of the daylight, which is mostly sitting in patches of it as though it owes them something.",
