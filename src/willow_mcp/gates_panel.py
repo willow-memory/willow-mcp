@@ -572,7 +572,10 @@ REQUEST_QUEUE_KIND = "consent"
 #: apart by separator (`#` names a specific PR, `:` names a base branch),
 #: not by prefix, since `pr.update` edits a PR `pr.open` already made rather
 #: than naming a new capability.
-REQUESTABLE_PREFIXES = ("lease.", "perm.", "attest.", "push.", "pr.", "unit.")
+#: `model.<name[:tag]>` is the seventh (verb 26, `model.pull`): the ask
+#: `model_pull_execute` files when it refuses for want of a lease or an
+#: envelope naming that model.
+REQUESTABLE_PREFIXES = ("lease.", "perm.", "attest.", "push.", "pr.", "unit.", "model.")
 
 #: Prefixes whose row is informational: it surfaces the ask and carries the
 #: command, and pressing it does nothing. Kept as its own set rather than as a
@@ -587,7 +590,7 @@ REQUESTABLE_PREFIXES = ("lease.", "perm.", "attest.", "push.", "pr.", "unit.")
 #: the row carries the exact `willow-mcp envelope propose/ratify` invocation.
 #: `unit.` joins them for the same reason: a `unit.reload` envelope is
 #: proposed and ratified the same two-step way, not pressed.
-UNPRESSABLE_PREFIXES = ("attest.", "push.", "pr.", "unit.")
+UNPRESSABLE_PREFIXES = ("attest.", "push.", "pr.", "unit.", "model.")
 
 
 def split_push_gate(gate_id: str) -> tuple[str, str]:
@@ -846,7 +849,7 @@ def _request_rows(store=None) -> list[GateRow]:
             # must stay that way, so it reads this rather than computing it.
             from . import remedy
 
-            if gate_id.startswith("push.") or gate_id.startswith("pr.") or gate_id.startswith("unit."):
+            if gate_id.startswith(("push.", "pr.", "unit.", "model.")):
                 # No compact CLI form yet: `envelope propose` is orchestrator-
                 # attributed and lives at the MCP tool surface, not the CLI
                 # (see `cli_envelope.py`). Ratify is a CLI, but the propose it
@@ -855,6 +858,9 @@ def _request_rows(store=None) -> list[GateRow]:
                 # rather than a paste-me line that would be a half-truth.
                 envelope_kind = (
                     "push" if gate_id.startswith("push.")
+                    # `model.<name[:tag]>` is `model.pull` (verb 26) — the
+                    # ask also covers a missing lease, told in its summary.
+                    else "model.pull" if gate_id.startswith("model.")
                     # `unit.` splits by marker the way `pr.` splits by
                     # separator: `unit.<name>@install` is `unit.install`
                     # (verb 17, sealed 197aafa5); bare `unit.<name>` is
