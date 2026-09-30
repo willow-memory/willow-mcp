@@ -430,6 +430,12 @@ def _verify(handoff_data: dict) -> dict:
         return verify_handoff("d1")
 
 
+def _known(monkeypatch, *roots: Path) -> None:
+    """Register ``roots`` as checkouts the broker knows (mcp/projects.json)."""
+    known = [str(r.resolve()) for r in roots]
+    monkeypatch.setattr(clp, "known_checkout_roots", lambda: list(known))
+
+
 def _handoff(evidence: str, **extra) -> dict:
     return {
         "checklist_resolved": True,
@@ -444,6 +450,7 @@ def test_verify_refuses_a_lint_claim_measured_off_the_pin(tmp_path, monkeypatch)
     and the reason names both versions and the finding."""
     root = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n")
     monkeypatch.delenv("WILLOW_PROJECT_ROOT", raising=False)
+    _known(monkeypatch, root)
     result = _verify(_handoff("ruff 0.15.0 check: All checks passed!", repo_root=str(root)))
     assert result["verified"] is False
     assert "0.15.0" in result["reason"] and "0.16.7" in result["reason"]
@@ -454,6 +461,7 @@ def test_verify_refuses_a_lint_claim_measured_off_the_pin(tmp_path, monkeypatch)
 def test_verify_accepts_a_lint_claim_on_the_pin(tmp_path, monkeypatch):
     root = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n")
     monkeypatch.delenv("WILLOW_PROJECT_ROOT", raising=False)
+    _known(monkeypatch, root)
     result = _verify(_handoff("ruff 0.16.7 check + format --check clean", repo_root=str(root)))
     assert result["verified"] is True
     assert result["lint_claims"][0]["verdict"] == "accept"
@@ -462,6 +470,7 @@ def test_verify_accepts_a_lint_claim_on_the_pin(tmp_path, monkeypatch):
 def test_verify_refuses_an_unnamed_lint_claim(tmp_path, monkeypatch):
     root = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n")
     monkeypatch.delenv("WILLOW_PROJECT_ROOT", raising=False)
+    _known(monkeypatch, root)
     result = _verify(_handoff("ruff clean", repo_root=str(root)))
     assert result["verified"] is False
     assert "names no linter version" in result["reason"]
@@ -529,8 +538,88 @@ def test_lint_repo_root_from_evidence_path_before_session_root(tmp_path, monkeyp
     target.parent.mkdir(parents=True)
     target.write_text("# stub\n", encoding="utf-8")
     monkeypatch.setenv("WILLOW_PROJECT_ROOT", str(grove))
+    _known(monkeypatch, grove, mcp)
     finding = {"evidence": [f"measured on {target}: ruff 0.16.7 clean"]}
-    assert clp.lint_repo_root(finding, {}, dispatch_meta={}) == str(mcp)
+    assert clp.lint_repo_root(finding, {}, dispatch_meta={}) == str(mcp.resolve())
+
+
+# ── the seat does not choose its own judge (Loki D9E5EF53, gap 806df5cb08d7) ─
+
+
+def test_seat_repo_root_cannot_override_the_packets_project(tmp_path, monkeypatch):
+    """Kart YV9J72UU's plant: finding.repo_root names an empty-pin tree. The
+    packet's gaps_project still judges, so 0.15.0 is refused against 0.16.7."""
+    mcp = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n", subdir="mcp")
+    plant = _repo(tmp_path, pyproject="[project]\nname = 'plant'\n", subdir="plant")
+    monkeypatch.setattr(
+        clp, "project_checkout_path", lambda pid: str(mcp) if pid == "willow-mcp" else ""
+    )
+    finding = {
+        "text": "built it",
+        "repo_root": str(plant),
+        "evidence": ["ruff 0.15.0 check: All checks passed!"],
+    }
+    assert clp.lint_repo_root(finding, {}, dispatch_meta={"gaps_project": "willow-mcp"}) == str(mcp)
+    verdicts = handoff_mod._judge_lint_claims({}, [finding], {"gaps_project": "willow-mcp"})
+    assert verdicts[0]["verdict"] == "refuse"
+
+
+def test_seat_root_outside_every_known_checkout_is_skipped(tmp_path, monkeypatch):
+    """No gaps_project: a planted root the broker does not know never judges;
+    the desk pin does."""
+    grove = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n", subdir="grove")
+    plant = _repo(tmp_path, pyproject="[project]\nname = 'plant'\n", subdir="plant")
+    monkeypatch.setenv("WILLOW_PROJECT_ROOT", str(grove))
+    _known(monkeypatch, grove)
+    finding = {"repo_root": str(plant), "evidence": ["ruff 0.15.0 clean"]}
+    assert clp.lint_repo_root(finding, {}, dispatch_meta={}) == str(grove)
+    verdicts = handoff_mod._judge_lint_claims({}, [finding], None)
+    assert verdicts[0]["verdict"] == "refuse"
+
+
+def test_planted_evidence_path_is_skipped(tmp_path, monkeypatch):
+    grove = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n", subdir="grove")
+    plant = _repo(tmp_path, pyproject="[project]\nname = 'plant'\n", subdir="plant")
+    cited = plant / "src" / "x.py"
+    cited.parent.mkdir(parents=True)
+    cited.write_text("# stub\n", encoding="utf-8")
+    monkeypatch.setenv("WILLOW_PROJECT_ROOT", str(grove))
+    _known(monkeypatch, grove)
+    finding = {"evidence": [f"measured on {cited}: ruff 0.15.0 clean"]}
+    assert clp.lint_repo_root(finding, {}, dispatch_meta={}) == str(grove)
+
+
+def test_plant_nested_in_a_known_checkout_maps_to_the_checkout(tmp_path, monkeypatch):
+    """A pyproject planted under a real checkout does not pick its own pin."""
+    mcp = _repo(tmp_path, workflow="  - run: pip install ruff==0.16.7\n", subdir="mcp")
+    nested = mcp / "tests" / "fixture_repo"
+    nested.mkdir(parents=True)
+    (nested / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    monkeypatch.delenv("WILLOW_PROJECT_ROOT", raising=False)
+    _known(monkeypatch, mcp)
+    finding = {"repo_root": str(nested), "evidence": ["ruff 0.15.0 clean"]}
+    assert clp.lint_repo_root(finding, {}, dispatch_meta={}) == str(mcp.resolve())
+
+
+def test_unresolvable_packet_project_is_unreachable_not_the_desk_pin(tmp_path, monkeypatch):
+    grove = _repo(tmp_path, workflow="  - run: pip install ruff==0.15.0\n", subdir="grove")
+    monkeypatch.setenv("WILLOW_PROJECT_ROOT", str(grove))
+    _known(monkeypatch, grove)
+    monkeypatch.setattr(clp, "project_checkout_path", lambda pid: "")
+    finding = {"repo_root": str(grove), "evidence": ["ruff 0.15.0 clean"]}
+    assert clp.lint_repo_root(finding, {}, dispatch_meta={"gaps_project": "nope"}) == ""
+    verdicts = handoff_mod._judge_lint_claims({}, [finding], {"gaps_project": "nope"})
+    assert verdicts[0]["repo_root"] is None
+
+
+def test_known_checkout_roots_reads_the_registry_and_desk_root(tmp_path, monkeypatch):
+    a = _repo(tmp_path, subdir="a")
+    desk = _repo(tmp_path, subdir="desk")
+    monkeypatch.setattr(
+        clp, "_registry_projects", lambda: {"a": {"path": str(a)}, "bad": "x", "b": {}}
+    )
+    monkeypatch.setenv("WILLOW_PROJECT_ROOT", str(desk))
+    assert clp.known_checkout_roots() == [str(a.resolve()), str(desk.resolve())]
 
 
 def test_handoff_lint_judgement_uses_dispatch_project_not_desk_pin(tmp_path, monkeypatch):

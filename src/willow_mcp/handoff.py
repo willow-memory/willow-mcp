@@ -756,16 +756,16 @@ def verify_handoff(dispatch_id: str) -> dict:
 # whose evidence claims lint/format clean must name the ruff version it was
 # measured with, and that version must be the one the repo's CI pins —
 # ratatosk #48 (2026-09-21) went red because 0.15.0 was clean where the
-# pinned 0.16.7 was not. The repo root, per finding: the finding's own
-# `repo_root` / `workspace`, then the dispatch packet's `gaps_project`
-# checkout, then a repo named by evidence paths, then an explicit handoff
-# `repo_root` — not the handoff's session `workspace` and not the desk's
-# WILLOW_PROJECT_ROOT until those are exhausted (gap 0b5a2aa26001). No root
-# at all → the pin is `unreachable` and the verdict is advisory — never a
-# refusal on a repo the verifier could not read.
+# pinned 0.16.7 was not. The repo root, per finding
+# (ci_lint_pin.lint_repo_root): the dispatch packet's `gaps_project` checkout
+# when the packet names one, and nothing the seat writes can move it (Loki
+# D9E5EF53); otherwise a seat-written root only inside a checkout the broker
+# knows; then the desk's WILLOW_PROJECT_ROOT. No root at all → the pin is
+# `unreachable` and the verdict is advisory — never a refusal on a repo the
+# verifier could not read.
 _NO_ROOT_PIN = {
     "state": "unreachable",
-    "reason": "no repo root: neither the finding nor the handoff names repo_root/workspace and WILLOW_PROJECT_ROOT is unset",
+    "reason": "no repo root: the packet's gaps_project does not resolve, or no known checkout was named and WILLOW_PROJECT_ROOT is unset",
     "version": None,
     "source": None,
 }
