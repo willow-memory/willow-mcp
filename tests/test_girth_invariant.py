@@ -1,5 +1,7 @@
-"""The story's one checkable joke: "Girth erupted." lives in exactly one
-place in this repository's Python.
+"""The story's one checkable joke, the girth log line, lives in exactly one
+place in this repository's Python. (This docstring does not spell it out:
+a guard that quotes the joke is a second hit. Loki 612DE2B7 caught exactly
+that here.)
 
 docs/story/README.md tells a reader to grep for it and promises a single hit;
 src/willow_mcp/tree_view.py's comment makes the same promise. For a while
