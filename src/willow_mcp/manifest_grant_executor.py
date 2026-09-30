@@ -98,7 +98,9 @@ Four preconditions, none of which an agent can satisfy on its own:
    ``grove_read``/``grove_write``, neither of which is escalation-class
    for THIS verb — both are for the guard's, which is why the guard still
    refuses a seat's own self-grant of them regardless of what this verb
-   does);
+   does). One carve-out, sealed 0161d56f: :data:`ORCHESTRATOR_ONLY_GROUPS`
+   (``web_net``) may be granted when every seat the pair names is the
+   orchestrator, and to no one else;
 4. the caller is the orchestrator seat itself (``is_orchestrator_app``) —
    this is a narrowing REFUSAL layered on top of the manifest gate that
    already authenticated ``app_id`` (the ``@_guarded`` decorator's PGP-backed
@@ -207,6 +209,28 @@ ESCALATION_GROUPS = frozenset({
     "envelope_apply", "envelope_write", "frank_write",
     "governance_propose", "governance_sync",
 })
+
+#: The one carve-out from :data:`ESCALATION_GROUPS` (sealed pair
+#: ``0161d56f``, amending ``d5504878``, 2026-09-30): these may be granted
+#: through manifest.grant when EVERY seat the pair names is the orchestrator
+#: seat, and to no other seat. ``web_net`` confers no egress on its own —
+#: every open-web tool still needs ``consent.internet`` and a live lease the
+#: operator seals — so granting it to the desk removes a second per-task seal
+#: inside a lease already sealed, not a gate. A pair naming the orchestrator
+#: beside any other seat is refused, like every other escalation group.
+ORCHESTRATOR_ONLY_GROUPS = frozenset({"web_net"})
+
+
+def _escalating_groups(apps: list[str], groups: list[str]) -> list[str]:
+    """The pair's escalation-class groups, less :data:`ORCHESTRATOR_ONLY_GROUPS`
+    when every named seat is the orchestrator. Sorted; empty means none.
+    Used at REQUEST and again at APPLY, so the two can never disagree."""
+    from .human_session import is_orchestrator_app
+
+    escalating = set(groups) & ESCALATION_GROUPS
+    if apps and all(is_orchestrator_app(a) for a in apps):
+        escalating -= ORCHESTRATOR_ONLY_GROUPS
+    return sorted(escalating)
 
 #: The strict grammar a sealed pair's ``target_text`` must match for this
 #: verb to bind a grant to it. ONE line; anything after it is free-text
@@ -520,15 +544,19 @@ def _orchestrator_target_refusal(apps: list[str], groups: list[str]) -> Optional
 
     if not any(is_orchestrator_app(a) for a in apps):
         return None
-    non_federated = sorted(g for g in groups if not g.startswith("mcp:"))
+    non_federated = sorted(
+        g for g in groups
+        if not g.startswith("mcp:") and g not in ORCHESTRATOR_ONLY_GROUPS
+    )
     if not non_federated:
         return None
     return _refuse(
         "EPERM",
         "the orchestrator seat may only receive federated mcp:<server_id>:<tool> "
-        f"groups through manifest.grant; non-federated group(s) {non_federated!r} "
+        f"groups, or {sorted(ORCHESTRATOR_ONLY_GROUPS)!r}, through manifest.grant; "
+        f"non-federated group(s) {non_federated!r} "
         "are refused regardless of seal or envelope bounds (proposal "
-        "2026-09-26-manifest-grant-federated-tools.md, ruling A)",
+        "2026-09-26-manifest-grant-federated-tools.md, ruling A; pair 0161d56f)",
         non_federated=non_federated,
     )
 
@@ -1418,7 +1446,7 @@ def _manifest_grant_request_locked(
     if seal_refusal is not None:
         return seal_refusal
 
-    escalating = sorted(set(groups) & ESCALATION_GROUPS)
+    escalating = _escalating_groups(apps, groups)
     if escalating:
         return _refuse(
             "EPERM",
@@ -1784,7 +1812,7 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
     # perfectly-signed request naming an escalation group post-request if
     # request-time enforcement were ever bypassed or the escalation list
     # widened between request and apply.
-    escalating = sorted(set(groups) & ESCALATION_GROUPS)
+    escalating = _escalating_groups(apps, groups)
     if escalating:
         return _fail("EPERM",
                       f"pair_id={pair_id!r} names escalation-class group(s) {escalating!r} at "

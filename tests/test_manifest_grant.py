@@ -2583,3 +2583,115 @@ def test_end_to_end_federated_grant_gates_exactly_the_granted_tools(
     assert gate.permitted("kart", "store_get") is True
     assert gate.permitted("kart", granted_tool) is True
     assert gate.permitted("kart", sibling_tool) is False
+
+
+# — web_net for the orchestrator seat only (sealed 0161d56f, amending d5504878) —
+
+def test_orchestrator_only_groups_is_exactly_web_net():
+    assert mgx.ORCHESTRATOR_ONLY_GROUPS == {"web_net"}
+    # Still escalation-class: the carve-out subtracts it for the orchestrator,
+    # it does not take it off the list for anyone else.
+    assert mgx.ORCHESTRATOR_ONLY_GROUPS <= mgx.ESCALATION_GROUPS
+
+
+@pytest.mark.parametrize(
+    ("apps", "groups", "escalating"),
+    [
+        (["willow"], ["web_net"], []),
+        (["kart"], ["web_net"], ["web_net"]),
+        (["willow", "kart"], ["web_net"], ["web_net"]),
+        (["kart", "willow"], ["web_net"], ["web_net"]),
+        (["willow"], ["web_net", "task_net"], ["task_net"]),
+        (["willow"], ["task_net"], ["task_net"]),
+        (["willow"], ["integration_net", "mcp_federation"], ["integration_net", "mcp_federation"]),
+        (["willow"], ["full_access"], ["full_access"]),
+        ([], ["web_net"], ["web_net"]),
+    ],
+)
+def test_escalating_groups_carves_out_web_net_for_the_orchestrator_alone(apps, groups, escalating):
+    assert mgx._escalating_groups(apps, groups) == escalating
+
+
+def test_orchestrator_target_refusal_allows_web_net_and_nothing_else_new():
+    assert mgx._orchestrator_target_refusal(["willow"], ["web_net"]) is None
+    refusal = mgx._orchestrator_target_refusal(["willow"], ["web_net", "grove_write"])
+    assert refusal["error"] == "EPERM"
+    assert refusal["non_federated"] == ["grove_write"]
+
+
+def test_web_net_for_the_orchestrator_is_granted_end_to_end(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    _charter(tmp_path, monkeypatch, grantee="willow", apps=("willow",), groups=("web_net",))
+    willow_path = _manifest(home, "willow")
+    _seal(home, store, seats=("willow",), groups=("web_net",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    req, applied = _request_and_apply(
+        home, store, ledger, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants",
+    )
+    assert req["ok"] is True, req
+    assert applied["ok"] is True, applied
+    assert json.loads(willow_path.read_text())["permissions"] == ["web_net"]
+    assert len(_receipts(pg)) == 1
+
+    from willow_mcp import gate
+    assert gate.permitted("willow", gate.WEB_NET_PERMISSION) is True
+    assert gate.permitted("willow", gate.NET_PERMISSION) is False
+
+
+@pytest.mark.parametrize("seats", [("kart",), ("willow", "kart")])
+def test_web_net_for_any_other_seat_is_eperm_at_request(
+    home, tmp_path, monkeypatch, store, ring_with_sean, seats,
+):
+    _charter(tmp_path, monkeypatch, grantee="willow", apps=seats, groups=("web_net",))
+    paths = [_manifest(home, s) for s in seats]
+    _seal(home, store, seats=seats, groups=("web_net",), kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EPERM"
+    assert out["escalating"] == ["web_net"]
+    assert not _pending_files(home / "manifest_grants")
+    for p in paths:
+        assert json.loads(p.read_text())["permissions"] == []
+
+
+def test_task_net_for_the_orchestrator_is_still_eperm(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    _charter(tmp_path, monkeypatch, grantee="willow", apps=("willow",), groups=("web_net", "task_net"))
+    _manifest(home, "willow")
+    _seal(home, store, seats=("willow",), groups=("web_net", "task_net"), kr=ring_with_sean)
+    out = _request(store=store, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants")
+    assert out["error"] == "EPERM"
+    assert out["escalating"] == ["task_net"]
+    assert not _pending_files(home / "manifest_grants")
+
+
+def test_web_net_for_another_seat_is_refused_at_apply_not_just_request(
+    home, tmp_path, monkeypatch, store, ring_with_sean,
+):
+    """Request-time escalation check bypassed on purpose: APPLY must refuse
+    web_net for a non-orchestrator seat on its own."""
+    _charter(tmp_path, monkeypatch, grantee="willow", apps=("kart",), groups=("web_net",))
+    kart_path = _manifest(home, "kart")
+    _seal(home, store, seats=("kart",), groups=("web_net",), kr=ring_with_sean)
+
+    pg = _FakeGovernancePg()
+    ledger = _ledger(pg)
+    real = mgx._escalating_groups
+    monkeypatch.setattr(mgx, "_escalating_groups", lambda apps, groups: [])
+    req = mgx.manifest_grant_request(
+        "willow", envelope_id="", pair_id="pair-mg-1", ledger=ledger, store=store,
+        apps_root=home / "mcp_apps", grants_root=home / "manifest_grants",
+    )
+    assert req["ok"] is True, req
+    monkeypatch.setattr(mgx, "_escalating_groups", real)
+
+    applied = mgx.manifest_grant_apply(
+        ledger=ledger, apps_root=home / "mcp_apps", grants_root=home / "manifest_grants",
+    )
+    assert applied["ok"] is False
+    assert applied["processed"][0]["error"] == "EPERM"
+    assert json.loads(kart_path.read_text())["permissions"] == []
+    assert not _receipts(pg)
