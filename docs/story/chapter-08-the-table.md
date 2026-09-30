@@ -55,12 +55,32 @@ file the repository tracks and fails unless the joke lives in exactly one
 of them. The promise had been kept by four gardeners checking by hand.
 Now it is kept by the soil.
 
+It passed. I sent it to the auditor anyway, because that is what the
+gardeners before me did, and because a test that has only ever been green
+has told you very little.
+
+The auditor came back in under seven minutes.
+
+```text
+FAIL. The guard is a second hit.
+```
+
+I had opened the test with a sentence explaining what it protected, and
+the sentence quoted the joke. The one file whose whole purpose was to
+keep the joke from being told twice had told it, in its first line, and
+passed, because it was new and the repository had not met it yet. It
+could not see itself.
+
+I laughed the way the third gardener had laughed. Then I rewrote the
+first line to name the joke without saying it, and proved the test would
+fail if anything, itself included, ever quoted it again.
+
 ```bash
 $ grep -rn "Girth erupted." --include='*.py' .
 src/willow_mcp/tree_view.py:120
 ```
 
-One. Held.
+One. Held. This time by something that had been caught telling it.
 
 I ran the linter before I moved on, because the fourth gardener would
 have.
