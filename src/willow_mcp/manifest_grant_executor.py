@@ -342,25 +342,78 @@ def _stale_lock(lock_path: Path, *, max_age_s: float = _STALE_LOCK_AGE_S) -> boo
     return not _pid_alive(pid)
 
 
-def _gpg_agent_reachable() -> bool:
-    """A positive gpg-agent socket check — a diagnostic, NOT a security
-    boundary (module docstring, Loki probe P6). Used only by
-    :func:`manifest_grant_apply`, which signs; :func:`manifest_grant_request`
-    never calls this."""
+def _agent_socket_path() -> tuple[Path | None, str]:
+    """Ask ``gpgconf`` where THIS process's gpg-agent socket lives (it honours
+    GNUPGHOME and XDG_RUNTIME_DIR). ``(path, "")`` or ``(None, why)``."""
     try:
         result = subprocess.run(
             ["gpgconf", "--list-dirs", "agent-socket"],
             capture_output=True, text=True, timeout=5,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if result.returncode != 0:
-        return False
-    sock = Path(result.stdout.strip())
+    except FileNotFoundError:
+        return None, "gpgconf not found on PATH"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"gpgconf --list-dirs failed: {type(exc).__name__}: {exc}"
+    if result.returncode != 0 or not result.stdout.strip():
+        detail = (result.stderr or "").strip()[:200]
+        return None, f"gpgconf --list-dirs agent-socket exited {result.returncode}: {detail}"
+    return Path(result.stdout.strip()), ""
+
+
+def _is_socket(path: Path) -> bool:
     try:
-        return sock.is_socket()
+        return path.is_socket()
     except OSError:
         return False
+
+
+def _ensure_gpg_agent() -> tuple[bool, str]:
+    """Find the gpg-agent the apply unit signs with, starting it if it is not
+    running. A positive socket check — a diagnostic, NOT a security boundary
+    (module docstring, Loki probe P6). Used only by
+    :func:`manifest_grant_apply`, which signs; :func:`manifest_grant_request`
+    never calls this.
+
+    A ``--user`` oneshot unit has no login session: nothing has started the
+    agent, so the socket ``gpgconf`` names does not exist yet. Checking for it
+    and giving up (the prior behaviour) failed every grant with EUNREACH.
+    ``gpgconf --launch gpg-agent`` starts the agent (a no-op if running) under
+    the unit's own uid and GNUPGHOME; it touches no key, and any passphrase
+    prompt stays the operator's pinentry. Returns ``(ok, reason)``; ``reason``
+    names the socket path and the environment that chose it when not ok."""
+    sock, why = _agent_socket_path()
+    if sock is None:
+        return False, why
+    if _is_socket(sock):
+        return True, ""
+    launch_note = ""
+    try:
+        launched = subprocess.run(
+            ["gpgconf", "--launch", "gpg-agent"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if launched.returncode != 0:
+            launch_note = (f"gpgconf --launch gpg-agent exited {launched.returncode}: "
+                           f"{(launched.stderr or '').strip()[:200]}")
+    except FileNotFoundError:
+        launch_note = "gpgconf not found on PATH"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        launch_note = f"gpgconf --launch gpg-agent failed: {type(exc).__name__}: {exc}"
+    # The launch may relocate nothing, but re-ask: the path is cheap to re-derive.
+    sock2, _ = _agent_socket_path()
+    if sock2 is not None and _is_socket(sock2):
+        return True, ""
+    return False, (
+        f"no gpg-agent socket at {sock} and starting one did not produce it"
+        + (f" ({launch_note})" if launch_note else "")
+        + f"; GNUPGHOME={os.environ.get('GNUPGHOME', '<unset>')} "
+        f"XDG_RUNTIME_DIR={os.environ.get('XDG_RUNTIME_DIR', '<unset>')}"
+    )
+
+
+def _gpg_agent_reachable() -> bool:
+    """Bool form of :func:`_ensure_gpg_agent`."""
+    return _ensure_gpg_agent()[0]
 
 
 # ── governance record + sealed pair lookups ──────────────────────────────────
@@ -1850,12 +1903,15 @@ def _apply_one(record: dict, path: Path, *, ledger, apps_root: Path,
                          "refusing to apply against a moved target", app_id=seat)
 
     from . import pgp as _pgp_precheck
-    if _pgp_precheck.pgp_enabled() and not _gpg_agent_reachable():
-        out = {"ok": False, "error": "EUNREACH",
-               "reason": "no reachable gpg-agent socket for the apply unit — diagnostic "
-                         "only (module docstring), but nothing can be signed without one"}
-        _move(path, grants_root / "failed", {**record, "result": out})
-        return {"pair_id": pair_id, **out}
+    if _pgp_precheck.pgp_enabled():
+        agent_ok, agent_why = _ensure_gpg_agent()
+        if not agent_ok:
+            out = {"ok": False, "error": "EUNREACH",
+                   "reason": "no reachable gpg-agent socket for the apply unit and "
+                             f"none could be started — {agent_why}; nothing can be "
+                             "signed without one"}
+            _move(path, grants_root / "failed", {**record, "result": out})
+            return {"pair_id": pair_id, **out}
 
     granted: list[dict] = []
     refused: list[dict] = []
