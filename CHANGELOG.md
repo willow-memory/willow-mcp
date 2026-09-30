@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **push:** a denied App push carries its evidence and retries once ([2096aac](https://github.com/willow-memory/willow-mcp/commit/2096aac0d0e0b1e5fd66afd74c9a466c2cbfa3b8))
 * **push:** a denied App push carries its evidence and retries once ([728b62d](https://github.com/willow-memory/willow-mcp/commit/728b62d32397d30ee247cb5e3cab43e49e71d0f9))
 
 ## [2.91.1](https://github.com/willow-memory/willow-mcp/compare/v2.91.0...v2.91.1) (2026-09-30)
