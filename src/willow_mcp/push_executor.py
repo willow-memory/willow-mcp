@@ -44,7 +44,9 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -77,9 +79,10 @@ def _file_permission_ask(out: dict, *, store, app_id: str, repo: str, permission
         out["human_required_id"] = filed["human_required_id"]
 
 
-def _git(checkout: Path, *args: str, runner: Optional[Callable] = None) -> subprocess.CompletedProcess:
+def _git(checkout: Path, *args: str, runner: Optional[Callable] = None,
+         extra_env: Optional[dict] = None) -> subprocess.CompletedProcess:
     run = runner or subprocess.run
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **(extra_env or {})}
     return run(
         ["git", "-C", str(checkout), *args],
         capture_output=True, text=True, timeout=_GIT_TIMEOUT_S, env=env, check=False,
@@ -113,6 +116,71 @@ def _push_argv_for_app_token(
         args.append("--force-with-lease")
     args += [push_remote, f"{branch}:{branch}"]
     return args
+
+
+# ── a 403 on an App-token push: evidence, then one retry (gap 58eef7c49e79) ──
+#
+# 2026-09-30: willows-bot pushes were refused "Permission to <repo>.git denied
+# to willows-bot[bot]" (HTTP 403) right after a fresh, repo-scoped mint that
+# reported contents:write, while the same App pushed to the same repos minutes
+# before and after. A refusal carried nothing that could say which side failed.
+# Now a denied App push records what the token was, what the API says that
+# token may do, and GitHub's request id, then retries once with a new token.
+
+#: git trace env for App pushes: the curl trace carries X-GitHub-Request-Id.
+#: GIT_TRACE_REDACT (on by default in modern git) masks Authorization in the
+#: trace; ``_redact`` masks it again before anything is kept.
+_TRACE_ENV = {"GIT_TRACE_CURL": "1", "GIT_TRACE_CURL_NO_DATA": "1", "GIT_TRACE_REDACT": "1"}
+_DENIED_MARKERS = ("returned error: 403", "denied to")
+_RETRY_DELAY_S = 3.0
+_sleep = time.sleep  # tests replace this
+
+_TRACE_LINE_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d+\s")
+_REQUEST_ID_RE = re.compile(r"x-github-request-id:\s*([0-9A-Fa-f:]+)", re.IGNORECASE)
+_AUTH_RE = re.compile(r"(?i)(authorization:\s*)(basic|bearer|token)?\s*\S+")
+_TOKEN_RE = re.compile(r"\bgh[sopu]_[A-Za-z0-9]+")
+
+
+def _redact(text: str) -> str:
+    text = _AUTH_RE.sub(r"\1<redacted>", text or "")
+    return _TOKEN_RE.sub("gh?_<redacted>", text)
+
+
+def _split_trace(stderr: str) -> tuple[str, list[str]]:
+    """Git's own last lines (trace lines removed) and any GitHub request ids."""
+    lines = (stderr or "").splitlines()
+    kept = [ln for ln in lines if not _TRACE_LINE_RE.match(ln)]
+    ids = sorted(set(_REQUEST_ID_RE.findall(stderr or "")))
+    return _redact("\n".join(kept[-5:])), ids
+
+
+def _is_denied(tail: str) -> bool:
+    return any(m in (tail or "") for m in _DENIED_MARKERS)
+
+
+def _token_facts(auth: dict) -> dict:
+    """What the mint said about the token; never the token."""
+    return {
+        "installation_id": auth.get("installation_id"),
+        "expires_at": auth.get("expires_at"),
+        "permissions": auth.get("permissions") or {},
+        "app_slug": auth.get("app_slug"),
+    }
+
+
+def _probe_repo_access(repo: str, token: str) -> dict:
+    """Ask the API what this same token may do on ``repo``. If the API says
+    push is allowed and git still refuses, the fault is on GitHub's git side;
+    if the API refuses too, the token itself is not good for the repo."""
+    from . import github_app_credentials as gac
+
+    got = gac._api("GET", f"{gac._API}/repos/{repo}", bearer=token, timeout=10)
+    if not got.get("ok"):
+        return {"state": "refused", "status": got.get("status"),
+                "reason": _redact(str(got.get("reason") or ""))[:200]}
+    perms = (got.get("body") or {}).get("permissions") or {}
+    return {"state": "ok", "status": got.get("status"), "push": perms.get("push"),
+            "pull": perms.get("pull")}
 
 
 _WORKFLOW_PREFIX = ".github/workflows/"
@@ -471,23 +539,94 @@ def execute_push(
             envelope_id=matches[0], citation_id=result.get("citation_id"), sha=sha,
         )
 
+    app = auth_mode == "app"
+    trace_env = _TRACE_ENV if app else None
     try:
-        pushed = _git(Path(facts["path"]), *args, runner=runner)
+        pushed = _git(Path(facts["path"]), *args, runner=runner, extra_env=trace_env)
     except subprocess.TimeoutExpired:
         return {"ok": False, "pushed": False, "error": "ETIMEDOUT",
                 "reason": f"git push exceeded {_GIT_TIMEOUT_S}s", "envelope_id": matches[0],
                 "citation_id": result.get("citation_id"), "sha": sha,
                 "auth_mode": auth_mode}
-    tail = "\n".join((pushed.stderr or pushed.stdout or "").strip().splitlines()[-5:])
+    if app:
+        tail, request_ids = _split_trace(pushed.stderr or pushed.stdout or "")
+    else:
+        tail = "\n".join((pushed.stderr or pushed.stdout or "").strip().splitlines()[-5:])
+        request_ids = []
+
+    diagnosis = None
+    if pushed.returncode != 0 and app and _is_denied(tail):
+        # One grant, one citation, at most two attempts: the retry is the same
+        # authorized act, not a second one, so it is not cited again.
+        diagnosis = {
+            "first": {**_token_facts(auth), "request_ids": request_ids, "tail": tail,
+                      "probe": _probe_repo_access(repo, auth["token"])},
+        }
+        _sleep(_RETRY_DELAY_S)
+        auth2 = gac.mint_installation_token(repo)
+        if (auth2.get("ok") and auth2.get("mode") == "app"
+                and gac.contents_perm_allows_push(auth2.get("permissions"))):
+            args2 = _push_argv_for_app_token(
+                repo=repo, branch=branch, remote=remote,
+                remote_url=facts["remote_url"], token=auth2["token"], force=force,
+            )
+            try:
+                pushed2 = _git(Path(facts["path"]), *args2, runner=runner,
+                               extra_env=_TRACE_ENV)
+            except subprocess.TimeoutExpired:
+                pushed2 = None
+            if pushed2 is None:
+                diagnosis["retry"] = {**_token_facts(auth2), "error": "ETIMEDOUT"}
+            else:
+                tail2, ids2 = _split_trace(pushed2.stderr or pushed2.stdout or "")
+                diagnosis["retry"] = {**_token_facts(auth2), "request_ids": ids2,
+                                      "returncode": pushed2.returncode, "tail": tail2}
+                if pushed2.returncode != 0:
+                    diagnosis["retry"]["probe"] = _probe_repo_access(repo, auth2["token"])
+                else:
+                    pushed, tail = pushed2, tail2
+        else:
+            diagnosis["retry"] = {"minted": False,
+                                  "reason": auth2.get("reason") or "retry mint had no write"}
+        _ink_denied(ledger, project=project, repo=repo, branch=branch, sha=sha,
+                    citation_id=result.get("citation_id"), diagnosis=diagnosis,
+                    recovered=pushed.returncode == 0)
+
     if pushed.returncode != 0:
-        return {"ok": False, "pushed": False, "error": "EPUSH",
-                "reason": tail or f"git push exited {pushed.returncode}",
-                "envelope_id": matches[0], "citation_id": result.get("citation_id"),
-                "sha": sha, "auth_mode": auth_mode}
-    return {
+        out = {"ok": False, "pushed": False, "error": "EPUSH",
+               "reason": tail or f"git push exited {pushed.returncode}",
+               "envelope_id": matches[0], "citation_id": result.get("citation_id"),
+               "sha": sha, "auth_mode": auth_mode}
+        if diagnosis is not None:
+            out["diagnosis"] = diagnosis
+            out["ask"] = _file_ask(app_id, repo=repo, branch=branch, remote=remote,
+                                   force=force, errno="EPUSH",
+                                   reason=f"GitHub refused the App token twice: {tail}",
+                                   fields=None, task_id=task_id, store=store)
+        return out
+    done = {
         "ok": True, "pushed": True, "repo": repo, "branch": branch, "remote": remote,
         "force": force, "sha": sha, "envelope_id": matches[0], "auth_mode": auth_mode,
         "citation_id": result.get("citation_id"), "git": tail,
         "checkout": facts["path"], "preflight": preflight,
         "workflow": workflow_check,
     }
+    if diagnosis is not None:
+        done["retried_after_403"] = True
+        done["diagnosis"] = diagnosis
+    return done
+
+
+def _ink_denied(ledger, *, project: str, repo: str, branch: str, sha: str,
+                citation_id, diagnosis: dict, recovered: bool) -> None:
+    """Put the denied push's evidence on the FRANK ledger beside its citation.
+    Never raises: the push outcome is already decided."""
+    if ledger is None or not hasattr(ledger, "append"):
+        return
+    try:
+        ledger.append(project or repo, "git_push_denied", {
+            "repo": repo, "branch": branch, "sha": sha, "citation_id": citation_id,
+            "recovered_on_retry": recovered, "diagnosis": diagnosis,
+        })
+    except Exception:  # noqa: BLE001 -- evidence is best-effort, the result is not
+        pass

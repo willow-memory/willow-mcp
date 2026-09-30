@@ -407,6 +407,158 @@ def test_not_a_checkout_is_einval(home, tmp_path, monkeypatch):
     assert out["error"] == "EINVAL" and "no .git" in out["reason"]
 
 
+# ── a 403 on an App-token push: evidence, then one retry (gap 58eef7c49e79) ──
+
+_DENIED = ("remote: Permission to willow-memory/willow-mcp.git denied to willows-bot[bot].\n"
+           "fatal: unable to access 'https://github.com/willow-memory/willow-mcp.git/': "
+           "The requested URL returned error: 403")
+_TRACE = ("21:15:03.123456 http.c:756              <= Recv header: x-github-request-id: "
+          "C0DE:1234:ABCD:5678:9EF0\n"
+          "21:15:03.123457 http.c:756              => Send header: Authorization: basic "
+          "eC1hY2Nlc3MtdG9rZW46Z2hzX3NlY3JldA==\n")
+
+
+class _ScriptedPushGit(_FakeGit):
+    """A fake git whose successive pushes return scripted (rc, stderr), and
+    which records the env each push ran under."""
+
+    def __init__(self, results, **kw):
+        super().__init__(**kw)
+        self.results = list(results)
+        self.push_envs = []
+
+    def __call__(self, argv, **kw):
+        rest = self._after_config(argv[3:])
+        if rest and rest[0] == "push":
+            self.calls.append(argv)
+            self.push_envs.append(kw.get("env") or {})
+            rc, err = self.results.pop(0)
+            return subprocess.CompletedProcess(argv, rc, "", err)
+        return super().__call__(argv, **kw)
+
+
+def _app_mints(monkeypatch, tokens=("ghs_first_token", "ghs_second_token"), perms="write"):
+    minted = []
+
+    def mint(repo):
+        tok = tokens[len(minted)] if len(minted) < len(tokens) else None
+        minted.append(repo)
+        if tok is None:
+            return {"ok": False, "mode": "unavailable", "reason": "mint failed HTTP 502"}
+        return {"ok": True, "mode": "app", "token": tok, "permissions": {"contents": perms},
+                "installation_id": 42, "expires_at": "2026-09-30T04:00:00Z",
+                "app_slug": "willows-bot"}
+
+    monkeypatch.setattr("willow_mcp.github_app_credentials.mint_installation_token", mint)
+    return minted
+
+
+def _probe_and_sleep(monkeypatch, probe=None):
+    seen = {"probes": [], "sleeps": []}
+
+    def fake_probe(repo, token):
+        seen["probes"].append(token)
+        return probe or {"state": "ok", "status": 200, "push": True, "pull": True}
+
+    monkeypatch.setattr(px, "_probe_repo_access", fake_probe)
+    monkeypatch.setattr(px, "_sleep", lambda s: seen["sleeps"].append(s))
+    return seen
+
+
+def _denied_rows(pg):
+    return [r for r in pg.rows if r["event_type"] == "git_push_denied"]
+
+
+def test_403_then_retry_succeeds_with_evidence_and_one_citation(
+        home, tmp_path, monkeypatch, checkout):
+    _charter(tmp_path, monkeypatch)
+    minted = _app_mints(monkeypatch)
+    seen = _probe_and_sleep(monkeypatch)
+    pg = _FakeGovernancePg()
+    git = _ScriptedPushGit([(128, _TRACE + _DENIED), (0, "done")])
+    out = _push(checkout, pg, git)
+    assert out["ok"] and out["pushed"], out
+    assert out["retried_after_403"] is True
+    first = out["diagnosis"]["first"]
+    assert first["request_ids"] == ["C0DE:1234:ABCD:5678:9EF0"]
+    assert first["installation_id"] == 42 and first["permissions"] == {"contents": "write"}
+    assert first["probe"]["push"] is True
+    assert "x-github-request-id" not in first["tail"]  # trace lines kept out of the tail
+    assert len(git.pushes) == 2 and len(minted) == 2
+    assert seen["sleeps"] == [px._RETRY_DELAY_S]
+    assert len(_citations(pg)) == 1  # the retry is the same act, not a second grant use
+    rows = _denied_rows(pg)
+    assert len(rows) == 1 and rows[0]["content"]["recovered_on_retry"] is True
+    blob = json.dumps(out) + json.dumps(pg.rows)
+    assert "ghs_first_token" not in blob and "ghs_second_token" not in blob
+    assert "eC1hY2Nlc3MtdG9rZW46Z2hzX3NlY3JldA" not in blob
+
+
+def test_403_twice_is_epush_with_both_probes_and_an_ask(home, tmp_path, monkeypatch, checkout):
+    _charter(tmp_path, monkeypatch)
+    _app_mints(monkeypatch)
+    seen = _probe_and_sleep(monkeypatch, probe={"state": "refused", "status": 403})
+    pg = _FakeGovernancePg()
+    git = _ScriptedPushGit([(128, _DENIED), (128, _DENIED)])
+    out = _push(checkout, pg, git)
+    assert out["error"] == "EPUSH"
+    assert out["diagnosis"]["first"]["probe"]["state"] == "refused"
+    assert out["diagnosis"]["retry"]["returncode"] == 128
+    assert out["diagnosis"]["retry"]["probe"]["status"] == 403
+    assert seen["probes"] == ["ghs_first_token", "ghs_second_token"]
+    assert out["ask"]["queued"] is True
+    assert _denied_rows(pg)[0]["content"]["recovered_on_retry"] is False
+
+
+def test_a_non_403_failure_is_not_retried(home, tmp_path, monkeypatch, checkout):
+    _charter(tmp_path, monkeypatch)
+    _app_mints(monkeypatch)
+    seen = _probe_and_sleep(monkeypatch)
+    pg = _FakeGovernancePg()
+    git = _ScriptedPushGit([(1, "! [rejected] feat/x -> feat/x (non-fast-forward)")])
+    out = _push(checkout, pg, git)
+    assert out["error"] == "EPUSH" and "diagnosis" not in out
+    assert len(git.pushes) == 1 and seen["probes"] == [] and _denied_rows(pg) == []
+
+
+def test_host_credential_403_is_not_retried(home, tmp_path, monkeypatch, checkout):
+    _charter(tmp_path, monkeypatch)  # default fixture: host credential helper
+    seen = _probe_and_sleep(monkeypatch)
+    git = _ScriptedPushGit([(128, _DENIED)])
+    out = _push(checkout, _FakeGovernancePg(), git)
+    assert out["error"] == "EPUSH" and "diagnosis" not in out
+    assert len(git.pushes) == 1 and seen["probes"] == []
+    assert "GIT_TRACE_CURL" not in git.push_envs[0]
+
+
+def test_app_push_runs_with_redacted_curl_trace(home, tmp_path, monkeypatch, checkout):
+    _charter(tmp_path, monkeypatch)
+    _app_mints(monkeypatch)
+    git = _ScriptedPushGit([(0, _TRACE + "done")])
+    out = _push(checkout, _FakeGovernancePg(), git)
+    assert out["ok"]
+    env = git.push_envs[0]
+    assert env["GIT_TRACE_CURL"] == "1" and env["GIT_TRACE_REDACT"] == "1"
+    assert "Authorization" not in out["git"] and "x-github-request-id" not in out["git"]
+
+
+def test_retry_mint_failure_is_recorded_not_raised(home, tmp_path, monkeypatch, checkout):
+    _charter(tmp_path, monkeypatch)
+    _app_mints(monkeypatch, tokens=("ghs_first_token",))
+    _probe_and_sleep(monkeypatch)
+    git = _ScriptedPushGit([(128, _DENIED)])
+    out = _push(checkout, _FakeGovernancePg(), git)
+    assert out["error"] == "EPUSH"
+    assert out["diagnosis"]["retry"]["minted"] is False
+    assert len(git.pushes) == 1
+
+
+def test_redact_masks_auth_headers_and_tokens():
+    s = px._redact("Authorization: basic abc123== and ghs_AbC123 and AUTHORIZATION: Bearer zz")
+    assert "abc123" not in s and "ghs_AbC123" not in s and "zz" not in s
+    assert s.count("<redacted>") >= 3
+
+
 # ── git's own failure is reported, after the citation ────────────────────────
 
 def test_git_push_failure_is_reported_with_the_citation(home, tmp_path, monkeypatch, checkout):
