@@ -13,7 +13,8 @@ Status: **shipped, off by default.** Identity binding (`agent_registry.py`,
 `WILLOW_MCP_ENFORCE_BINDING`), and session reconciliation (`session_reconcile`)
 are built; the phased path below marks each one. One join the doc draws is not
 built: `session_enter` does **not** call the binder (§4). The check-in is
-`session_bind`, and no seat on this box is registered. This doc was written as a
+`session_bind`, and an absent or empty `$WILLOW_HOME/gate/registry.json` means no
+seat is registered. This doc was written as a
 proposal, to pin how
 [`willow-gate`](https://github.com/willow-memory/willow-gate) composes with
 willow-mcp's existing authorization stack *before* any of the invasive wiring was
