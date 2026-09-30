@@ -36,7 +36,7 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **mcp:** model_pull_execute, a brokered Ollama pull under a model.pull envelope and a live lease ([0270680](https://github.com/willow-memory/willow-mcp/commit/027068029367be83505bcbed5102a8ae1c5eee44))
+* **mcp:** model_pull_execute, a brokered Ollama pull under a model.pull envelope and a live lease ([2818795](https://github.com/willow-memory/willow-mcp/commit/281879539a02b198b64d0efb330d6fc616d8c1d2))
 
 ## [2.91.3](https://github.com/willow-memory/willow-mcp/compare/v2.91.2...v2.91.3) (2026-09-30)
 
