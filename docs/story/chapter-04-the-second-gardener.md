@@ -55,7 +55,7 @@ I checked the invariant the way you check a healing wound.
 
 ```bash
 $ grep -rn "Girth erupted." --include='*.py' .
-src/willow_mcp/tree_view.py:121
+src/willow_mcp/tree_view.py:120
 ```
 
 One result. Still one. The story was still telling the truth, and now
