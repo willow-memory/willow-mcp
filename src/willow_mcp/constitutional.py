@@ -336,7 +336,9 @@ def _find_amendment_candidates(store: Store) -> list[dict]:
 
 
 def _confirm_amendment(rec: dict, *, live_row: dict, bundle_row: dict,
-                        nestor_db_path: Optional[Path] = None) -> tuple[bool, str]:
+                        nestor_db_path: Optional[Path] = None,
+                        carried_seals: Optional[dict] = None,
+                        seal_sink: Optional[dict] = None) -> tuple[bool, str]:
     """Whether governance decision ``rec`` actually authorizes
     ``live_row -> bundle_row``. Every guard is checked and named on
     failure, in order:
@@ -395,8 +397,19 @@ def _confirm_amendment(rec: dict, *, live_row: dict, bundle_row: dict,
             f"row {row_id} ({verb}): governance decision {rec.get('_id')!r} carries no "
             f"nestor_pair_id — refusing")
 
-    db_path = nestor_db_path if nestor_db_path is not None else seal_handler._nestor_db_path()
-    pair = net_authority.read_sealed_pair(pair_id, db_path)
+    if carried_seals is not None:
+        # Trust-owner apply: the sealed row rode in the broker-signed request
+        # (gap 3ecf1ed8326e); neither SOIL nor the Nestor ledger is opened.
+        # The seal is still verified against the keyring below.
+        carried = carried_seals.get(pair_id)
+        if not isinstance(carried, dict):
+            return False, (
+                f"row {row_id} ({verb}): request carries no sealed row for pair "
+                f"{pair_id!r} — refusing")
+        pair = {**carried, "state": "populated"}
+    else:
+        db_path = nestor_db_path if nestor_db_path is not None else seal_handler._nestor_db_path()
+        pair = net_authority.read_sealed_pair(pair_id, db_path)
     if pair.get("state") != "populated":
         return False, (
             f"row {row_id} ({verb}): sealed pair {pair_id!r} is not confirmed sealed "
@@ -458,6 +471,13 @@ def _confirm_amendment(rec: dict, *, live_row: dict, bundle_row: dict,
             f"row {row_id} ({verb}): sealed pair {pair_id!r}'s syscall-row-amend line "
             f"names to={amend_to!r}, which does not match the bundle row's own hash "
             f"{to_hash!r} — refused by name")
+
+    if seal_sink is not None:
+        seal_sink.update({
+            "pair_id": pair_id, "source_norm": pair.get("source_norm"),
+            "target_text": pair.get("target_text"), "verifier": pair.get("verifier"),
+            "seal_sig": pair.get("seal_sig"), "created_at": pair.get("created_at"),
+        })
 
     soil_id = rec.get("id")
     if soil_id is not None:
@@ -524,10 +544,21 @@ def evaluate_syscall_table_sync(
     bundle_path: Optional[Path] = None,
     store: Optional[Store] = None,
     nestor_db_path: Optional[Path] = None,
+    carried_seals: Optional[list] = None,
 ) -> dict:
     """Verify-only half of :func:`sync_syscall_table_from_bundle` — computes
     whether the bundle may be applied, what would be added/amended, and the
-    bundle digest, without writing the live table or FRANK ink."""
+    bundle digest, without writing the live table or FRANK ink.
+
+    ``carried_seals`` (gap 3ecf1ed8326e): the trust-owner apply uid cannot
+    read SOIL, so it passes the sealed rows the broker put in the signed
+    request (``plan["amendment_seals"]``, one ``{pair_id, source_norm,
+    target_text, verifier, seal_sig, created_at}`` each). When not ``None``
+    neither the governance store nor the Nestor ledger is opened; each seal
+    is verified against the keyring exactly as on the broker side, and a
+    missing or bad seal refuses with ``amendment_refused`` set. The plan
+    carries ``amendment_seals`` for the amendments it confirmed, so the
+    broker can queue them."""
     live_path = live_path or paths.syscall_table_path()
     bundle_path = bundle_path or _default_bundle_path()
 
@@ -572,10 +603,19 @@ def evaluate_syscall_table_sync(
     )
 
     amended: list[dict] = []
+    amendment_seals: list[dict] = []
+    carried_by_pair: Optional[dict] = None
     if changed:
         try:
-            st = store if store is not None else Store()
-            candidates = _find_amendment_candidates(st)
+            if carried_seals is not None:
+                carried_by_pair = {
+                    s["pair_id"]: s for s in carried_seals
+                    if isinstance(s, dict) and s.get("pair_id")}
+                candidates = [{"_id": f"carried:{pid}", "kind": AMENDMENT_KIND,
+                               "nestor_pair_id": pid} for pid in carried_by_pair]
+            else:
+                st = store if store is not None else Store()
+                candidates = _find_amendment_candidates(st)
         except Exception as exc:  # noqa: BLE001
             return {
                 "ok": False, "refused": True, "needs_apply": False,
@@ -592,16 +632,20 @@ def evaluate_syscall_table_sync(
             row_reasons: list[str] = []
             confirmed_pair_id = None
             for rec in candidates:
+                sink: dict = {}
                 try:
                     ok, why = _confirm_amendment(
                         rec, live_row=live_row, bundle_row=bundle_row,
-                        nestor_db_path=nestor_db_path)
+                        nestor_db_path=nestor_db_path,
+                        carried_seals=carried_by_pair, seal_sink=sink)
                 except Exception as exc:  # noqa: BLE001
                     ok, why = False, (
                         f"row {vid} ({verb}): error checking governance "
                         f"decision {rec.get('_id')!r}: {type(exc).__name__}: {exc}")
                 if ok:
                     confirmed_pair_id = rec.get("nestor_pair_id")
+                    if not any(s["pair_id"] == confirmed_pair_id for s in amendment_seals):
+                        amendment_seals.append(sink)
                     break
                 row_reasons.append(why)
             if confirmed_pair_id is None:
@@ -621,6 +665,7 @@ def evaluate_syscall_table_sync(
         if unauthorized:
             return {
                 "ok": False, "refused": True, "needs_apply": False,
+                "amendment_refused": True,
                 "reason": (f"bundle row(s) {changed} differ from the live table's "
                            f"existing content — a modification is not a merge, and "
                            f"not every changed row has a sealed amendment: "
@@ -644,6 +689,7 @@ def evaluate_syscall_table_sync(
 
     return {
         "ok": True, "needs_apply": True, "added": added, "amended": amended,
+        "amendment_seals": amendment_seals,
         "verbs": verb_names, "seals": seals,
         "bundle_digest": bundle_table_digest(bundle),
         "bundle_path": str(bundle_path),

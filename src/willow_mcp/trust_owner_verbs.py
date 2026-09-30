@@ -1649,6 +1649,10 @@ def queue_syscall_sync_request(
         "live_path": plan.get("live_path"),
         "added": plan.get("added") or [],
         "amended": plan.get("amended") or [],
+        # The sealed rows the amendments rest on (gap 3ecf1ed8326e): the apply
+        # uid cannot read SOIL, so they ride in the broker-signed request and
+        # the apply re-verifies each seal against its keyring.
+        "amendment_seals": plan.get("amendment_seals") or [],
         "verbs": plan.get("verbs") or [],
         "seals": plan.get("seals") or {},
     }
@@ -1725,7 +1729,10 @@ def _apply_syscall_sync(record: dict, path: Path, *, ledger, apps_root: Path,
 
     plan = _constitutional.evaluate_syscall_table_sync(
         live_path=live_path, bundle_path=bundle_path, nestor_db_path=db_path,
+        carried_seals=list(target.get("amendment_seals") or []),
     )
+    if plan.get("amendment_refused"):
+        return _fail("eseal_mismatch", plan.get("reason") or "amendment seal refused")
     if not plan.get("ok") or not plan.get("needs_apply"):
         return _fail("edrift", plan.get("reason") or "re-evaluation no longer authorizes apply")
 
