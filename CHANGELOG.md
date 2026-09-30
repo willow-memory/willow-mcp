@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **constitutional:** syscall.sync carries the sealed amendment in the request ([27e6715](https://github.com/willow-memory/willow-mcp/commit/27e67159948b32e96ac429e689964a603662d33b))
 * **constitutional:** syscall.sync carries the sealed amendment in the request ([d2ff65e](https://github.com/willow-memory/willow-mcp/commit/d2ff65edc5c8660f904e1ee9392de4f0d12fca49))
 
 ## [2.92.0](https://github.com/willow-memory/willow-mcp/compare/v2.91.3...v2.92.0) (2026-09-30)
