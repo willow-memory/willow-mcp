@@ -31,6 +31,20 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.93.0](https://github.com/willow-memory/willow-mcp/compare/v2.92.1...v2.93.0) (2026-09-30)
+
+
+### Added
+
+* **manifest-grant:** the orchestrator seat may receive web_net, and no one else ([4178199](https://github.com/willow-memory/willow-mcp/commit/4178199392ced025456ab7c177c1e04af7c717fd))
+* **manifest-grant:** the orchestrator seat may receive web_net, and no one else ([e7ffe5c](https://github.com/willow-memory/willow-mcp/commit/e7ffe5c83e537e43a74b820dcdb07d3af7565933))
+
+
+### Fixed
+
+* **constitutional:** syscall.sync apply signs the live table it writes ([800c6e7](https://github.com/willow-memory/willow-mcp/commit/800c6e7ee5b1183a7989be4e4e5f5b344ba802cd))
+* **constitutional:** syscall.sync apply signs the live table it writes ([8608438](https://github.com/willow-memory/willow-mcp/commit/86084380b04b3b937b4ca30bec5d586950c351b6))
+
 ## [2.92.1](https://github.com/willow-memory/willow-mcp/compare/v2.92.0...v2.92.1) (2026-09-30)
 
 
