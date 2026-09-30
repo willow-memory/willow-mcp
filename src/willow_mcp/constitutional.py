@@ -545,6 +545,8 @@ def evaluate_syscall_table_sync(
     store: Optional[Store] = None,
     nestor_db_path: Optional[Path] = None,
     carried_seals: Optional[list] = None,
+    verify_fn=None,
+    fingerprint: Optional[str] = None,
 ) -> dict:
     """Verify-only half of :func:`sync_syscall_table_from_bundle` — computes
     whether the bundle may be applied, what would be added/amended, and the
@@ -675,6 +677,23 @@ def evaluate_syscall_table_sync(
 
     added = sorted(set(bundle_rows) - set(live_rows))
     if not added and not amended:
+        stale = _live_signature_stale(live_path, verify_fn=verify_fn,
+                                      fingerprint=fingerprint)
+        if stale:
+            # Repair path (gap 90b43b45d99a): the content is already the
+            # bundle's but the detached signature does not verify — every
+            # trusted read refuses until it is re-signed. Not a no-op.
+            return {
+                "ok": True, "needs_apply": True, "resign_only": True,
+                "added": [], "amended": [], "amendment_seals": [],
+                "verbs": [], "seals": {},
+                "bundle_digest": bundle_table_digest(bundle),
+                "bundle_path": str(bundle_path),
+                "live_path": str(live_path),
+                "bundle_doc": bundle,
+                "reason": f"live table matches the bundle but its detached "
+                          f"signature does not verify ({stale}) — re-sign needed",
+            }
         return {"ok": True, "needs_apply": False, "added": [],
                 "reason": "live table already matches the bundle"}
 
@@ -705,19 +724,45 @@ def apply_evaluated_syscall_sync(
     ledger=None,
     project: str = "fleet",
     actor: str = "willow-mcp",
+    sign_fn=None,
+    fingerprint: Optional[str] = None,
 ) -> dict:
     """Trust-owner write half — applies a plan from
-    :func:`evaluate_syscall_table_sync` and inks FRANK."""
+    :func:`evaluate_syscall_table_sync` and inks FRANK.
+
+    Signs exactly as ``envelope_authoring._save_active`` does (gap
+    ``90b43b45d99a``): when PGP enforcement is on, a tmp candidate is signed
+    under ``WILLOW_PGP_FINGERPRINT`` first, the ``.sig`` is renamed into place
+    BEFORE the content, and a signing failure refuses before any write —
+    the prior table and its ``.sig`` stay byte-for-byte untouched. A
+    ``resign_only`` plan re-signs the live content without rewriting it.
+    ``sign_fn(path, local_user=...) -> (ok, detail)`` and ``fingerprint`` are
+    injection points for tests; they default to ``pgp.sign_detached`` and the
+    trust-config fingerprint."""
     if not plan.get("ok") or not plan.get("needs_apply"):
         return {"ok": False, "refused": True,
                 "reason": "plan does not authorize an apply"}
     live_path = live_path or Path(plan.get("live_path") or paths.syscall_table_path())
+    resign_only = bool(plan.get("resign_only"))
     bundle = plan.get("bundle_doc")
-    if bundle is None:
+    if bundle is None and not resign_only:
         bundle_path = Path(plan.get("bundle_path") or _default_bundle_path())
         bundle = _load_bundle(bundle_path)
 
-    _atomic_write(live_path, bundle)
+    fp = _signing_fingerprint(fingerprint)
+    if resign_only and not fp:
+        return {"ok": False, "refused": True,
+                "reason": "re-sign needed but PGP signing is not configured — "
+                          "live table untouched"}
+    if fp:
+        refusal = _publish_signed(
+            live_path, None if resign_only else bundle, fp=fp,
+            sign_fn=sign_fn,
+        )
+        if refusal is not None:
+            return refusal
+    else:
+        _atomic_write(live_path, bundle)
 
     added = plan.get("added") or []
     amended = plan.get("amended") or []
@@ -730,6 +775,8 @@ def apply_evaluated_syscall_sync(
     }
     if amended:
         result["amended"] = amended
+    if resign_only:
+        result["resigned"] = True
 
     if ledger is not None:
         try:
@@ -738,6 +785,8 @@ def apply_evaluated_syscall_sync(
                 "seals": seals, "path": str(live_path),
                 "bundle_digest": plan.get("bundle_digest"),
             }
+            if resign_only:
+                content["resigned"] = True
             if amended:
                 content["amended"] = amended
             record_id = ledger.append(project, "constitutional_sync", content)
@@ -746,6 +795,68 @@ def apply_evaluated_syscall_sync(
             result["receipt_error"] = f"{type(exc).__name__}: {exc}"
 
     return result
+
+
+def _signing_fingerprint(fingerprint: Optional[str]) -> str:
+    """The fingerprint to sign under, or ``""`` when PGP is not enforced —
+    the same gate ``envelope_authoring._save_active`` uses."""
+    if fingerprint is not None:
+        return fingerprint
+    from . import pgp
+
+    return pgp.expected_fingerprint() if pgp.pgp_enabled() else ""
+
+
+def _live_signature_stale(live_path: Path, *, verify_fn=None,
+                          fingerprint: Optional[str] = None) -> str:
+    """Empty string when PGP is off or the live table's detached signature
+    verifies; otherwise the verifier's detail (a re-sign is needed)."""
+    from . import pgp
+
+    fp = _signing_fingerprint(fingerprint)
+    if not fp:
+        return ""
+    if verify_fn is not None:
+        ok, detail = verify_fn(live_path)
+    else:
+        ok, detail = pgp.verify_detached(live_path, fingerprint=fp)
+    return "" if ok else (detail or "signature does not verify")
+
+
+def _publish_signed(path: Path, doc: Optional[dict], *, fp: str,
+                    sign_fn=None) -> Optional[dict]:
+    """Sign a tmp candidate, rename the ``.sig`` into place BEFORE the
+    content (signature first is fail-closed for any reader), and return
+    ``None`` on success or a refusal dict when signing fails — before any
+    rename, leaving the prior table and ``.sig`` untouched. ``doc=None``
+    re-signs the live bytes without changing them."""
+    from . import pgp
+
+    sign = sign_fn or pgp.sign_detached
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    if doc is None:
+        tmp.write_bytes(path.read_bytes())
+    else:
+        tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n",
+                       encoding="utf-8")
+    os.chmod(tmp, stat.S_IMODE(os.stat(tmp).st_mode) & ~0o022)
+
+    ok, detail = sign(tmp, local_user=fp)
+    tmp_sig = pgp.detached_sig_path(tmp)
+    if not ok:
+        tmp.unlink(missing_ok=True)
+        tmp_sig.unlink(missing_ok=True)
+        return {"ok": False, "refused": True, "error": "esign",
+                "reason": f"{path} could not be signed under "
+                          f"WILLOW_PGP_FINGERPRINT ({detail}) — refused before "
+                          "any write; the live table and its .sig are untouched"}
+    os.replace(tmp_sig, pgp.detached_sig_path(path))
+    if doc is None:
+        tmp.unlink(missing_ok=True)
+    else:
+        os.replace(tmp, path)
+    return None
 
 
 def _atomic_write(path: Path, doc: dict) -> None:
