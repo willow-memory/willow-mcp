@@ -79,28 +79,70 @@ def _scope_root(scope: dict, keys: tuple[str, ...]) -> str:
     return ""
 
 
-def project_checkout_path(project_id: str) -> str:
-    """Filesystem checkout for a fleet project id (``mcp/projects.json``)."""
-    pid = (project_id or "").strip()
-    if not pid or not _PROJECT_ID_RE.fullmatch(pid):
-        return ""
+def _registry_projects() -> dict:
     reg_path = willow_home() / "mcp" / "projects.json"
     if not reg_path.is_file():
-        return ""
+        return {}
     try:
         data = json.loads(reg_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return ""
-    projects = data.get("projects")
-    if not isinstance(projects, dict):
-        return ""
-    entry = projects.get(pid)
+        return {}
+    projects = data.get("projects") if isinstance(data, dict) else None
+    return projects if isinstance(projects, dict) else {}
+
+
+def _entry_path(entry: object) -> str:
     if not isinstance(entry, dict):
         return ""
     raw = entry.get("path") or entry.get("root") or ""
     if not isinstance(raw, str) or not raw.strip():
         return ""
     return expand_home(raw.strip())
+
+
+def project_checkout_path(project_id: str) -> str:
+    """Filesystem checkout for a fleet project id (``mcp/projects.json``)."""
+    pid = (project_id or "").strip()
+    if not pid or not _PROJECT_ID_RE.fullmatch(pid):
+        return ""
+    return _entry_path(_registry_projects().get(pid))
+
+
+def known_checkout_roots() -> list[str]:
+    """Every checkout the broker itself knows: each ``mcp/projects.json``
+    entry, plus ``WILLOW_PROJECT_ROOT``. Written by the operator's box, never
+    by the seat whose claims are judged (Loki D9E5EF53)."""
+    roots = [_entry_path(entry) for entry in _registry_projects().values()]
+    roots.append(os.environ.get("WILLOW_PROJECT_ROOT", "").strip())
+    out: list[str] = []
+    for root in roots:
+        if not root:
+            continue
+        try:
+            resolved = str(Path(root).expanduser().resolve())
+        except (OSError, RuntimeError):
+            continue
+        if resolved not in out:
+            out.append(resolved)
+    return out
+
+
+def _within_known_checkout(path: str) -> str:
+    """The known checkout that contains ``path``, or ``""``.
+
+    Returns the checkout's own root, never the path the seat wrote: a
+    ``pyproject.toml`` planted under a real checkout does not get to pick its
+    own pin either. The longest match wins when checkouts nest."""
+    try:
+        p = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return ""
+    best = ""
+    for root in known_checkout_roots():
+        r = Path(root)
+        if (p == r or r in p.parents) and len(root) > len(best):
+            best = root
+    return best
 
 
 def _repo_root_from_filesystem_path(path: Path) -> str:
@@ -144,22 +186,36 @@ def lint_repo_root(
 ) -> str:
     """Repo whose CI ruff pin judges this finding's lint claims.
 
-    Resolution order: the finding's ``repo_root`` / ``workspace``; the
-    dispatch packet's ``gaps_project`` checkout; an evidence path's repo;
-    an explicit ``repo_root`` on the handoff; then ``WILLOW_PROJECT_ROOT``.
-    The handoff's ``workspace`` is intentionally excluded — it mirrors the
-    entering desk, not the audited repo (gap 0b5a2aa26001).
+    The seat being judged must not choose its own judge (Loki D9E5EF53, gap
+    806df5cb08d7). So:
+
+    1. The dispatch packet's ``gaps_project``, written by the sender, is
+       authoritative. A packet that names a project which does not resolve
+       gets ``""`` (the pin is unreachable), never the desk's pin (gap
+       0b5a2aa26001).
+    2. With no ``gaps_project``: the finding's ``repo_root`` / ``workspace``,
+       then an evidence path, then the handoff's ``repo_root``, each counted
+       only when it lies inside a checkout the broker knows, and mapped to
+       that checkout's root. A root outside every known checkout is skipped.
+    3. Then ``WILLOW_PROJECT_ROOT``.
+
+    The handoff's ``workspace`` is excluded: it mirrors the entering desk,
+    not the audited repo.
     """
     handoff = handoff or {}
     dispatch_meta = dispatch_meta or {}
+    gaps_project = str(dispatch_meta.get("gaps_project") or "").strip()
+    if gaps_project:
+        return project_checkout_path(gaps_project)
     for val in (
         _scope_root(finding, ("repo_root", "workspace")),
-        project_checkout_path(str(dispatch_meta.get("gaps_project") or "")),
         _evidence_repo_root(finding),
         _scope_root(handoff, ("repo_root",)),
     ):
         if val:
-            return val
+            known = _within_known_checkout(val)
+            if known:
+                return known
     return os.environ.get("WILLOW_PROJECT_ROOT", "").strip()
 
 

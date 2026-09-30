@@ -1669,6 +1669,13 @@ def queue_syscall_sync_request(
     return {"ok": True, "state": "queued", "pair_id": pair_id, "pending_path": str(pending_path)}
 
 
+def _same_path(named: object, canonical: Path) -> bool:
+    try:
+        return Path(str(named)).expanduser().resolve() == canonical.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
 def _apply_syscall_sync(record: dict, path: Path, *, ledger, apps_root: Path,
                         db_path: Optional[Path], grants_root: Path) -> dict:
     from . import constitutional as _constitutional
@@ -1700,8 +1707,21 @@ def _apply_syscall_sync(record: dict, path: Path, *, ledger, apps_root: Path,
 
     from . import paths as _paths
 
-    live_path = Path(target.get("live_path") or _paths.syscall_table_path())
-    bundle_path = Path(target.get("bundle_path") or _constitutional._default_bundle_path())
+    # The table is read from the package and written to the configured live
+    # path, the same two paths boot uses -- never paths from the record. The
+    # broker signs the record, so a path in it is the broker's word, and the
+    # digest check only binds content to whatever file sits at that path: a
+    # planted bundle would pass it (Loki A28BD892, gap f265d9b3727b). A
+    # record naming any other path is refused, not silently corrected.
+    live_path = Path(_paths.syscall_table_path())
+    bundle_path = Path(_constitutional._default_bundle_path())
+    for key, canonical in (("live_path", live_path), ("bundle_path", bundle_path)):
+        named = target.get(key)
+        if named and not _same_path(named, canonical):
+            return _fail(
+                "eforged",
+                f"request names {key} {named!r}; syscall.sync applies only {str(canonical)!r}",
+            )
 
     plan = _constitutional.evaluate_syscall_table_sync(
         live_path=live_path, bundle_path=bundle_path, nestor_db_path=db_path,
@@ -1737,6 +1757,7 @@ def _apply_syscall_sync(record: dict, path: Path, *, ledger, apps_root: Path,
         return _fail("eunexpected", result.get("reason") or "apply refused")
 
     receipt_ids: list[str] = []
+    ink_error: str | None = None
     if ledger is not None:
         try:
             receipt_ids.append(ledger.append(
@@ -1751,10 +1772,16 @@ def _apply_syscall_sync(record: dict, path: Path, *, ledger, apps_root: Path,
                     "path": result.get("path"),
                 },
             ))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001 -- the write landed; say the ink did not
+            ink_error = f"{type(exc).__name__}: {exc}"
 
     out = {**result, "receipt_ids": receipt_ids}
+    if ink_error:
+        # The table is already written, so this is not a failure to move to
+        # failed/ -- but a done record must not read as fully receipted.
+        out["receipt_error"] = "; ".join(
+            e for e in (result.get("receipt_error"), ink_error) if e
+        )
     mgx._move(path, grants_root / "done", {**record, "result": out})
     return {"pair_id": pair_id, **out}
 
