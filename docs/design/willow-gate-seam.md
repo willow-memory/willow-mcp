@@ -8,10 +8,17 @@ description: "Maps how willow-gate's agent-side HMAC binder composes with willow
 
 # willow-gate ↔ willow-mcp: the seam
 
-Status: **proposal / mapping only** (no code yet). This pins how
+Status: **shipped, off by default.** Identity binding (`agent_registry.py`,
+`session_binder.py`), the tier ceiling inside `_gate` (behind
+`WILLOW_MCP_ENFORCE_BINDING`), and session reconciliation (`session_reconcile`)
+are built; the phased path below marks each one. One join the doc draws is not
+built: `session_enter` does **not** call the binder (§4). The check-in is
+`session_bind`, and an absent or empty `$WILLOW_HOME/gate/registry.json` means no
+seat is registered. This doc was written as a
+proposal, to pin how
 [`willow-gate`](https://github.com/willow-memory/willow-gate) composes with
-willow-mcp's existing authorization stack *before* any of the invasive wiring is
-written, so we can prototype one slice at a time without guessing the shape.
+willow-mcp's existing authorization stack *before* any of the invasive wiring was
+written. The design text stands as written; the status notes record what shipped.
 
 ## The gap it fills
 
@@ -107,6 +114,10 @@ framework-dispatched, not a passed callable list — so the funnel is
 - `check_in` ↔ `session_enter`: `session_enter` performs the willow-gate check-in
   (HMAC-verify, establish the bound tiered session subsequent `_gate` calls
   consult). Its existing `entry_mode`/assignment return is unchanged.
+  **Not built.** `session_enter` binds a session file and builds orientation;
+  it does not call the binder. The check-in shipped as its own verb,
+  `session_bind`. willows-grove `docs/design/forge-convergence.md` §6 step 5
+  moves this join to the `session_start → orient` hook row.
 - `check_out` (13-field **declare-vs-did diff**) ↔ `session_handoff_write`: what
   the agent declared on entry (`tools`, `pass_count`, `fail_count`, `drift`,
   `state_hash`) is reconciled against what it actually did — and because only
