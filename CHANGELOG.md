@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.91.3](https://github.com/willow-memory/willow-mcp/compare/v2.91.2...v2.91.3) (2026-09-30)
+
+
+### Fixed
+
+* **manifest-grant:** apply unit starts the gpg-agent it signs with ([8a27504](https://github.com/willow-memory/willow-mcp/commit/8a27504b7f2c2feaa2ecd18e3e63589f765674bb))
+* **manifest-grant:** apply unit starts the gpg-agent it signs with ([098afa7](https://github.com/willow-memory/willow-mcp/commit/098afa74bc15c603c47ef595d52ccbe559865ad8))
+
 ## [2.91.2](https://github.com/willow-memory/willow-mcp/compare/v2.91.1...v2.91.2) (2026-09-30)
 
 
