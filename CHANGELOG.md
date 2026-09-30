@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.91.1](https://github.com/willow-memory/willow-mcp/compare/v2.91.0...v2.91.1) (2026-09-30)
+
+
+### Fixed
+
+* **trust:** the caller does not choose the path it is judged by ([1dbe8f2](https://github.com/willow-memory/willow-mcp/commit/1dbe8f2233b68917eba2cdc666502e6c3cfcba38))
+
 ## [2.91.0](https://github.com/willow-memory/willow-mcp/compare/v2.90.4...v2.91.0) (2026-09-29)
 
 
