@@ -33,6 +33,13 @@ One sentence — the single outcome.
 
 - {link or reference}
 
+## Tools
+
+- **Run:** every command (git, tests, lint) goes through Kart — `task_submit`, then `task_status`. No Bash.
+- **Read code:** codebase-memory-mcp (`search_graph`, `search_code`, `get_code_snippet`, `trace_path`; project `{project_slug}`), and the Read tool for exact ranges.
+- **Rulings:** Nestor (`nestor_ask`, `nestor_check`, `nestor_match`) before asserting a ruling or convention. Prefer a sealed answer and cite its pair id; a draft is not verified. Read-only — never propose or seal.
+- No Agent tool; no subagents.
+
 ## Success criteria
 
 - {what done looks like}
