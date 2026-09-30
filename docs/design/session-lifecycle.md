@@ -10,6 +10,12 @@ description: "Draft 0.3 (2026-07-09, unratified) — session lifecycle design fo
 
 *Draft 0.3 — 2026-07-09 — unratified.*
 
+> **Superseded as the design (2026-09-30).** The session machine is now designed in
+> willows-grove [`docs/design/forge-convergence.md`](https://github.com/willow-memory/willows-grove/blob/master/docs/design/forge-convergence.md)
+> (§3–§6: the door is the hook, not the verb). What runs today is described in
+> [`docs/SESSION_FLOW.md`](../SESSION_FLOW.md). This draft is kept as the record of the
+> July design.
+
 **Product:** [willow-mcp](https://github.com/willow-memory/willow-mcp) — agent-neutral MCP server (SOIL + Postgres KB + Kart).  
 **Not in scope:** willow-2.0 fylgja hooks (`session_start.py`, persona picker, boot-done flags, Grove daemons). Those are fleet-internal; this design is what **any MCP client** gets from willow-mcp alone.
 
