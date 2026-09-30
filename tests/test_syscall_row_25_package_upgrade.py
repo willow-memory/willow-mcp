@@ -47,7 +47,7 @@ def test_row_25_note_says_unsealed_and_names_the_gap():
 
 def test_row_ids_are_dense_through_25():
     ids = sorted(_rows())
-    assert ids == list(range(1, 19)) + list(range(20, 26))
+    assert ids == list(range(1, 19)) + list(range(20, 27))  # 26: model.pull
     assert 19 not in ids
     assert 25 in ids
 

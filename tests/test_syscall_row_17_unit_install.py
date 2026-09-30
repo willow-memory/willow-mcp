@@ -61,7 +61,7 @@ def test_row_ids_are_dense_and_17_is_not_the_last_anymore():
     renumbered before any envelope citing them was ever ratified). 17 is
     just no longer the tail."""
     ids = sorted(_rows())
-    assert ids == list(range(1, 19)) + list(range(20, 26))
+    assert ids == list(range(1, 19)) + list(range(20, 27))  # 26: model.pull
     assert 19 not in ids
     assert 17 in ids
 

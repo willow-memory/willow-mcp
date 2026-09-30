@@ -225,7 +225,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 150 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 151 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -6241,6 +6241,51 @@ def package_upgrade_execute(
         )
     except Exception as exc:
         return {"ok": False, "upgraded": False, "error": f"package_upgrade_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("envelope_apply")
+def model_pull_execute(
+    app_id: str,
+    model: str,
+    envelope_id: str = "",
+    project: str = "",
+    task_id: str = "",
+) -> dict:
+    """Pull exactly `model` (a bare `name[:tag]`) through the local Ollama
+    daemon's `/api/pull` on loopback, performed by THIS process under the
+    `model.pull` envelope that governs `app_id` (verb 26, bounds `{models}`;
+    governance record `model-pull-is-a-broker-verb-2026-09-30`, Nestor pair
+    87989683 — the row needs its seal before merge) and only while `app_id`
+    holds a live egress lease (the lease is the egress key; the envelope names
+    what may be pulled). Refuses, each with its own errno: a malformed
+    reference (`EINVAL`), no live lease (`ENOLEASE`), no envelope or a
+    model/tag outside its bounds (`ENOENT`/`EAMBIG`, the failed field named),
+    a non-loopback daemon address (`EPERM`), the daemon not answering
+    (`EUNREACH`). A pull that fails mid-stream (`EPULL`) or whose manifest
+    digest the daemon cannot confirm afterwards (`EVERIFY`) does NOT spend
+    the envelope: it is cited only after a verified success. A refusal the
+    operator can remedy files an ask in the human-required queue. Returns
+    model, tag, the digest the daemon reports, bytes, the lease id, the
+    citation id and the FRANK `model_pull` receipt id."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import model_pull_executor
+        from .governance_ledger import GovernanceLedger
+
+        return model_pull_executor.execute_model_pull(
+            app_id,
+            model=model,
+            envelope_id=envelope_id,
+            project=project or "willow",
+            session=_current_orchestrator_session(),
+            task_id=task_id,
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "pulled": False, "error": f"model_pull_execute_failed: {exc}"}
 
 
 @mcp.tool(annotations=_ANNO_READ)
