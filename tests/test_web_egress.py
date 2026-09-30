@@ -25,6 +25,10 @@ def test_egress_denied_without_lease(home, monkeypatch):
     denial = web_egress.egress_denial("webby")
     assert denial is not None
     assert "lease_denied" in denial["error"]
+    # Gap b3b9a03e7348: the refusal names the ask path, not a terminal-only one.
+    assert "`lease_request`" in denial["error"]
+    assert "net_authority_drain" in denial["error"]
+    assert "No MCP tool can mint" not in denial["error"]
 
 
 # ── egress_status: the read-only, all-four-keys diagnostic (#287) ────────────

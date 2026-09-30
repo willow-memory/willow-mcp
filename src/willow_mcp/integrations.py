@@ -463,9 +463,11 @@ def egress_denial(app_id: str) -> Optional[dict]:
             f"lease_denied: integration calls require an unexpired egress lease for "
             f"'{app_id}' (status: {lease_state['status']}"
             + (f" — {lease_state['error']}" if lease_state.get("error") else "")
-            + "). Leases are issued only by the operator via `willow-mcp grant-net "
-            f"{app_id or '<app_id>'} --ttl 30m --reason ...` and they expire. "
-            "No MCP tool can mint one."
+            + "). Ask for one with `lease_request`; the operator seals the "
+            "pair in Nestor and `net_authority_drain` mints the lease, which "
+            "expires. (The operator may instead run `willow-mcp grant-net "
+            f"{app_id or '<app_id>'} --ttl 30m --reason ...` at a terminal.) "
+            "No tool mints a lease without the operator's seal."
             + gate_request.note_for_lease_denial(
                 app_id, reason="integration calls were refused for want of a lease"))}
 
