@@ -1,5 +1,10 @@
 # willow-mcp — Backlog
 
+> **Closed (2026-09-30).** All 23 items (W-01..W-23) are Done; none is Open or
+> Wontfix. The file is kept as the record of the 2026-08-24 audit. New work lives
+> in [`ideas.md`](ideas.md), [`BUGS.md`](BUGS.md), the gap backlog (`gap_list`),
+> and willows-grove `docs/design/forge-convergence.md` for the convergence steps.
+
 Concrete, actionable improvement items found by codebase audit (2026-08-24).
 Not bugs (those go in `BUGS.md`), not blue-sky ideas (those go in `ideas.md`).
 These are gaps, tech debt, and MCP server improvements discoverable from the
