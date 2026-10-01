@@ -31,6 +31,18 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.94.0](https://github.com/willow-memory/willow-mcp/compare/v2.93.1...v2.94.0) (2026-10-01)
+
+
+### Added
+
+* **broker:** add pip_sync_execute for vault-venv editable installs ([d073739](https://github.com/willow-memory/willow-mcp/commit/d073739d3d8e88da43506a040edeac428883cbe8))
+
+
+### Fixed
+
+* **counts:** bump live tool prose after pip_sync_execute ([90a427f](https://github.com/willow-memory/willow-mcp/commit/90a427f9eb6a7b60ca477aa98a8c243f8a8dc6fb))
+
 ## [2.93.1](https://github.com/willow-memory/willow-mcp/compare/v2.93.0...v2.93.1) (2026-10-01)
 
 
