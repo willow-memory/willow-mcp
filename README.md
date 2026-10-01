@@ -279,8 +279,10 @@ Setting `consent.internet` to `false` stops network tasks submitted through
 `task_submit`, immediately, without editing a single manifest. `task_net` is a
 capability (rarely granted, deliberately excluded from `full_access`);
 `consent.internet` is a switch; the lease is a **time-boxed grant** that an agent
-may ask for and never issue. No MCP tool can mint one — `grant-net` is local CLI
-only, exactly like `confirm-binding`. An agent may *request* egress and may never
+may ask for and never issue. An agent asks with `lease_request`; the operator
+seals the pair and `net_authority_drain` mints the lease, and no tool mints one
+without that seal. `grant-net` is the operator's local-CLI alternative, exactly
+like `confirm-binding`. An agent may *request* egress and may never
 *grant it to itself*. `sign-net-task` requires an interactive host terminal and
 an Ed25519 private key outside `WILLOW_HOME`/`WILLOW_STORE_ROOT`; no MCP tool or
 worker receives that key.

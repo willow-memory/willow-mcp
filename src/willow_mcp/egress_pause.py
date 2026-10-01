@@ -165,8 +165,9 @@ def pause_for_lease(app_id: str, *, task_id: str = "", request_id: str = "",
 
         message = (
             f"'{app_id}' needs an egress lease and does not have one.\n\n"
-            "No MCP tool can mint one — this asks you to grant it yourself, at "
-            "your own terminal:\n\n"
+            "No tool mints one without your seal — seal the queued lease "
+            "request in Nestor (`net_authority_drain` then mints it), or grant "
+            "it yourself at your own terminal:\n\n"
             f"    willow-mcp grant-net {app_id} --ttl 30m --reason \"...\"\n\n"
             + (f"{detail}\n\n" if detail else "")
             + (f"This ask is queued for you as request {request_id}, and also "

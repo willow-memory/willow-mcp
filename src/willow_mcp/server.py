@@ -709,8 +709,9 @@ _common_kwargs: dict[str, Any] = dict(
         "task_submit + task_status for sandboxed Kart execution. "
         "Kart tasks are network-isolated by default: egress needs THREE keys held at once — "
         "the task_net capability in your manifest, the operator's consent.internet, and an "
-        "unexpired operator-issued lease (willow-mcp grant-net). No MCP tool can mint a lease; "
-        "ask the operator. "
+        "unexpired operator-issued lease. Ask with lease_request; the operator seals the pair "
+        "and net_authority_drain mints it (or the operator runs willow-mcp grant-net). "
+        "No tool mints a lease without the operator's seal. "
         "Pass app_id on every call — it matches your manifest in $WILLOW_HOME/mcp_apps/<app_id>/manifest.json. "
         "tools/list for the willow desk advertises desk_core (≤50 verbs), not the full "
         "callable ACL; set WILLOW_MCP_ADVERTISE=full to restore the full listing."
@@ -2001,8 +2002,12 @@ def lease_request(app_id: str, ttl_seconds: int, reason: str, scope: str = "leas
     rule, and `reason`, and returns `{status: "proposed", pair_id,
     record_id, seal_this}`. The operator seals the SAME text shown here in
     the Nestor UI; the next `net_authority_drain` tick mints the lease file
-    and the app can call task_submit(allow_net=True) without a per-task
-    hold from then until the lease expires.
+    and the app holds the egress lease that `willow_web_*`, `integration_call`
+    and federated tools check until it expires. The lease does NOT skip
+    task_submit's per-task hold: `task_submit(allow_net=True)` without a
+    `network_authorization` envelope is always held for its own pair
+    (decision c8572a92), whether or not a lease is live; the standing lease
+    is consulted only on the path that brings an operator-signed envelope.
 
     Requires the `task_net` capability (`gate.NET_PERMISSION`) in this app's
     own manifest — the same key task_submit checks before honoring
@@ -3464,9 +3469,11 @@ def _task_submit_impl(
                 f"lease_denied: shared network access requires an unexpired egress lease for '{app_id}' "
                 f"(status: {lease_state['status']}"
                 + (f" — {lease_state['error']}" if lease_state.get("error") else "")
-                + "). Leases are issued only by the operator, on the host, via "
-                f"`willow-mcp grant-net {app_id or '<app_id>'} --ttl 30m --reason ...`, and they "
-                "expire. No MCP tool can mint one. Ask for a lease; do not write the file."
+                + "). Ask for one with `lease_request`; the operator seals the "
+                "pair in Nestor and `net_authority_drain` mints the lease, which "
+                "expires. (The operator may instead run `willow-mcp grant-net "
+                f"{app_id or '<app_id>'} --ttl 30m --reason ...` on the host.) "
+                "No tool mints a lease without the operator's seal; do not write the file."
                 + note)}
         # Whichever keys are within this process's own write reach are keys it
         # could have forged. Reported always; enforced only under strict mode,

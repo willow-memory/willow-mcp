@@ -78,10 +78,13 @@ def egress_denial(app_id: str, server_id: str, tool: str) -> Optional[dict]:
                 f"lease for '{app_id}' (status: {lease_state['status']}"
                 + (f" — {lease_state['error']}" if lease_state.get("error") else "")
                 + "). Loopback stdio corpus tools (e.g. corpus_search, "
-                "corpus_ask, corpus_host_card) do not need a lease. Leases "
-                "are issued only by the operator via `willow-mcp "
+                "corpus_ask, corpus_host_card) do not need a lease. Ask for "
+                "one with `lease_request`; the operator seals the pair in "
+                "Nestor and `net_authority_drain` mints the lease, which "
+                "expires. (The operator may instead run `willow-mcp "
                 f"grant-net {app_id or '<app_id>'} --ttl 30m --reason ...` "
-                "and they expire. No MCP tool can mint one."
+                "at a terminal.) No tool mints a lease without the "
+                "operator's seal."
                 + gate_request.note_for_lease_denial(
                     app_id,
                     reason=(
