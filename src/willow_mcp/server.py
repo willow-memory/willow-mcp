@@ -225,7 +225,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 151 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 152 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -6084,6 +6084,45 @@ def git_pull_execute(
         )
     except Exception as exc:
         return {"ok": False, "pulled": False, "error": f"git_pull_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("pip_sync_execute")
+def pip_sync_execute(
+    app_id: str,
+    checkout: str,
+    venv: str = "",
+    extras: Optional[list[str]] = None,
+    project: str = "",
+) -> dict:
+    """Editable-install an allowlisted checkout into `$WILLOW_HOME/venvs/<venv>`.
+
+    Host-side (this process), never Kart — vault/product `.venv` trees are
+    read-only in the sandbox (ideas A.2 / Kart `venvs_are_read_only`). Takes
+    no envelope: same receipt-only standing as `git_pull_execute` for a
+    fixed allowlist of remotes + extras tokens. When `venv` is empty, the
+    allowlist pair for the checkout's `origin` supplies it. Leaves a FRANK
+    `pip_sync` receipt (or `pip_sync_failed`). Gated on its own name;
+    `steward_sweep` / `orchestrator` / `full_access` carry it. Tagged
+    offline releases stay on `package_upgrade_execute` (syscall row 25)."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import pip_sync_executor
+        from .governance_ledger import GovernanceLedger
+
+        return pip_sync_executor.execute_pip_sync(
+            app_id,
+            venv=venv,
+            checkout=checkout,
+            extras=extras,
+            project=project or "",
+            session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "synced": False, "error": f"pip_sync_execute_failed: {exc}"}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)

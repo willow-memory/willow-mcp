@@ -1,0 +1,10 @@
+{
+  "$comment": "Broker pip_sync_execute allowlist. Checkout remotes must match a pair; extras tokens must be listed. Overridable at $WILLOW_HOME/constitutional/pip_sync_allowlist.json.",
+  "extras": ["connectors", "dev", "mcp", "nestor"],
+  "pairs": {
+    "hornbook-knowledge/Jeles": {"venv": "willow-mcp", "extras": ["connectors"]},
+    "willow-memory/willow-bot": {"venv": "willow-bot", "extras": []},
+    "willow-memory/willow-mcp": {"venv": "willow-mcp", "extras": []},
+    "willow-memory/willow-gate": {"venv": "willow-mcp", "extras": []}
+  }
+}

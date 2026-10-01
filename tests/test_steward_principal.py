@@ -110,7 +110,7 @@ def test_steward_full_grant_reaches_every_tick_verb_except_dispatch(apps_root):
 
 STEWARD_SWEEP_TOOLS = (
     "seal_drain", "net_authority_drain", "envelope_retire_sweep",
-    "gitsync_sweep",
+    "gitsync_sweep", "pip_sync_execute",
 )
 
 
