@@ -6087,6 +6087,45 @@ def git_pull_execute(
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("pip_sync_execute")
+def pip_sync_execute(
+    app_id: str,
+    checkout: str,
+    venv: str = "",
+    extras: Optional[list[str]] = None,
+    project: str = "",
+) -> dict:
+    """Editable-install an allowlisted checkout into `$WILLOW_HOME/venvs/<venv>`.
+
+    Host-side (this process), never Kart — vault/product `.venv` trees are
+    read-only in the sandbox (ideas A.2 / Kart `venvs_are_read_only`). Takes
+    no envelope: same receipt-only standing as `git_pull_execute` for a
+    fixed allowlist of remotes + extras tokens. When `venv` is empty, the
+    allowlist pair for the checkout's `origin` supplies it. Leaves a FRANK
+    `pip_sync` receipt (or `pip_sync_failed`). Gated on its own name;
+    `steward_sweep` / `orchestrator` / `full_access` carry it. Tagged
+    offline releases stay on `package_upgrade_execute` (syscall row 25)."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import pip_sync_executor
+        from .governance_ledger import GovernanceLedger
+
+        return pip_sync_executor.execute_pip_sync(
+            app_id,
+            venv=venv,
+            checkout=checkout,
+            extras=extras,
+            project=project or "",
+            session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "synced": False, "error": f"pip_sync_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
 @_guarded("envelope_apply")
 def unit_reload_execute(
     app_id: str,

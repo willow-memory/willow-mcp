@@ -122,7 +122,9 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # steward_sweep group can grant them without also granting envelope
         # authoring. Listed here too so the human orchestrator seat (which
         # held them via `envelope_apply` above) is unaffected by the split.
-        "gitsync_sweep", "git_pull_execute",
+        # pip_sync_execute is the editable-install sibling (ideas A.2):
+        # receipt-only, own name, same seats.
+        "gitsync_sweep", "git_pull_execute", "pip_sync_execute",
     }),
     "fleet_read": frozenset({
         "fleet_status", "fleet_health", "frank_read", "frank_verify",
@@ -431,7 +433,7 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
     # `orchestrator`/`full_access` for the human seat, unchanged.
     "steward_sweep": frozenset({
         "seal_drain", "net_authority_drain", "envelope_retire_sweep",
-        "gitsync_sweep",
+        "gitsync_sweep", "pip_sync_execute",
     }),
     # steward_read: every read-only tool the tick calls. human_required_list
     # (the steward checks what is already open before ever asking to add to
@@ -573,7 +575,8 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # gitsync_sweep / git_pull_execute (split off the shared
         # `envelope_apply` name by pair 163b9a70 — see "orchestrator" above
         # and server.py's git_pull_execute docstring).
-        "gitsync_sweep", "git_pull_execute",
+        # pip_sync_execute: editable vault-venv install (ideas A.2).
+        "gitsync_sweep", "git_pull_execute", "pip_sync_execute",
         # Grove — the fleet's shared messaging room (read + write; no egress
         # concern like web_net/integration_net/mcp_federation, so unlike those
         # this rides full_access, same reasoning as knowledge_read/write above)
