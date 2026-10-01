@@ -55,7 +55,7 @@ Shell front-end: `bash scripts/willow-seat.sh` (repo `willow-memory`).
 | Voice ingress | whisper + Kokoro (`willow-mcp voice`) | Pure-script state machine; models injected |
 | Cloud fallback | `WILLOW_INFERENCE_PROVIDER=auto` + keys | `consent.cloud_llm` for off-box |
 
-**Never** treat `corpus_put`, `nestor_draft`, or unsealed KB as verified. Confidence ladder: `verified > corroborated > institutional > unverified`.
+**Never** present `corpus_put`, `nestor_draft`, or unsealed KB as sealed/verified for serve. Draft/pending/asserted means the organ cannot prove a seal — not that no human ever checked. Confidence ladder for *serve*: `verified > corroborated > institutional > unverified`.
 
 ---
 
