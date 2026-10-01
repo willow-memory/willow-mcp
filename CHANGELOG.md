@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **session:** one closeout — handoff owns stack/friction/closed ([1fb5ea5](https://github.com/willow-memory/willow-mcp/commit/1fb5ea5420375923881fdd25ee15c98ac2bad904))
 * **session:** one closeout — handoff owns stack/friction/closed ([af18c40](https://github.com/willow-memory/willow-mcp/commit/af18c401a0e7f560b8b01e3c53eb61c5bbe057bd))
 
 ## [2.94.0](https://github.com/willow-memory/willow-mcp/compare/v2.93.1...v2.94.0) (2026-10-01)
