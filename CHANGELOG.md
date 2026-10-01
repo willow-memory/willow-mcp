@@ -37,7 +37,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 ### Added
 
 * **broker:** add pip_sync_execute for vault-venv editable installs ([d073739](https://github.com/willow-memory/willow-mcp/commit/d073739d3d8e88da43506a040edeac428883cbe8))
-* **broker:** pip_sync_execute for vault-venv editable installs ([59b7cca](https://github.com/willow-memory/willow-mcp/commit/59b7cca7b7a48c5bc0a6aff7aebddf98dc5669d5))
 
 
 ### Fixed
