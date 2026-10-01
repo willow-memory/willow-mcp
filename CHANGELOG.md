@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* lease refusals name the ask path; assignment template teaches the merge first-parent diff ([8b0b0df](https://github.com/willow-memory/willow-mcp/commit/8b0b0df01bc4a7fd924305dec418c0fb73a503be))
 * lease refusals name the ask path; assignment template teaches the merge first-parent diff ([bb599be](https://github.com/willow-memory/willow-mcp/commit/bb599be3cb2f9d8b39f9a2a91767efc133d47284))
 
 ## [2.93.0](https://github.com/willow-memory/willow-mcp/compare/v2.92.1...v2.93.0) (2026-09-30)
