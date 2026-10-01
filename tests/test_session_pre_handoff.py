@@ -40,11 +40,11 @@ def test_session_stop_hook_includes_pre_handoff(tmp_path, monkeypatch):
         lambda: ("willow", None),
     )
     monkeypatch.setattr(
-        "willow_mcp.session_stop_hook.write_stack_snapshot",
+        "willow_mcp.session_closeout.write_stack_snapshot",
         lambda app_id, session_id: {"ok": True},
     )
     monkeypatch.setattr(
-        "willow_mcp.session_stop_hook.scan_session_for_friction",
+        "willow_mcp.session_closeout.scan_session_for_friction",
         lambda session_id, transcript_path: {"skipped": "no_transcript_path"},
     )
     out = stop.handle({"session_id": "hook-sess-1"})

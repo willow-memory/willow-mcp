@@ -202,7 +202,7 @@ def test_session_handoff_write_human_closeout(home):
 
     assert Path(out["handoff_path"]).exists()
     sess = ds.session_read("hanuman", "sess-close")
-    assert sess["status"] == "idle"
+    assert sess["status"] == "closed"
 
 
 # ── B-54/#242: is_dispatch_party ──────────────────────────────────────────

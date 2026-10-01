@@ -1342,13 +1342,20 @@ def session_handoff_write(
         lines.extend(["## Next bite", "", next_bite, ""])
     body = "\n".join(lines)
     path.write_text(body, encoding="utf-8")
-    session_bind(app_id, session_id, "", "idle")
+    # One closeout: handoff + stack snapshot + friction + pre-handoff +
+    # mark closed. SessionEnd then skips duplicate instruments (gap 1d29f1d28f0e).
+    from .session_closeout import mark_session_closed, run_closeout_instruments
+
+    closeout = run_closeout_instruments(app_id, session_id, transcript_path="")
+    mark_session_closed(app_id, session_id)
     return {
         "entry_mode": "human",
         "format": "session_handoff_v3",
         "project": project_info,
         "handoff_path": str(path),
         "continuity_key": f"handoff/{stamp}-{hid}",
+        "closeout": closeout,
+        "session_status": "closed",
     }
 
 
