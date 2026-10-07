@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.94.2](https://github.com/willow-memory/willow-mcp/compare/v2.94.1...v2.94.2) (2026-10-07)
+
+
+### Build
+
+* **deps-dev:** bump ruff from 0.16.8 to 0.16.9 ([e7bf2c8](https://github.com/willow-memory/willow-mcp/commit/e7bf2c8f0401ff912d2bbb5521d84f1f4ba551ac))
+
 ## [2.94.1](https://github.com/willow-memory/willow-mcp/compare/v2.94.0...v2.94.1) (2026-10-01)
 
 
