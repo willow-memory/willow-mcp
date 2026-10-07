@@ -36,7 +36,7 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Build
 
-* **deps-dev:** bump ruff from 0.16.8 to 0.16.9 ([e7bf2c8](https://github.com/willow-memory/willow-mcp/commit/e7bf2c8f0401ff912d2bbb5521d84f1f4ba551ac))
+* **deps-dev:** bump ruff from 0.16.8 to 0.16.9 ([05976de](https://github.com/willow-memory/willow-mcp/commit/05976de912271ac894797e70326e3f818c6dcf9d))
 
 ## [2.94.1](https://github.com/willow-memory/willow-mcp/compare/v2.94.0...v2.94.1) (2026-10-01)
 
