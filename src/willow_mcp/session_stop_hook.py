@@ -2,16 +2,19 @@
 join (Wave 2), and stage-1 pre-handoff instruments (sealed cdcd948c):
 corpus-lens over the session log + willow-reconciler stub, each writing a
 receipt under `$WILLOW_HOME/sessions/pre_handoff/`. Fail-open throughout —
-see `session_friction_scan.py` and `session_pre_handoff.py`."""
+see `session_friction_scan.py` and `session_pre_handoff.py`.
+
+When ``session_handoff_write`` already closed the session, this hook skips
+the instruments (gap 1d29f1d28f0e) so SessionEnd does not double-write the
+stack. Grove ``deposit()`` still runs as the SessionEnd-only flush.
+"""
 
 from __future__ import annotations
 
 import json
 import sys
 
-from .session_friction_scan import scan_session_for_friction
-from .session_pre_handoff import run_pre_handoff_instruments
-from .stack_snapshot import write_stack_snapshot
+from .session_closeout import run_closeout_instruments, session_is_closed
 
 
 def handle(payload: dict) -> dict:
@@ -26,42 +29,25 @@ def handle(payload: dict) -> dict:
         or ""
     )
     transcript_path = str(payload.get("transcript_path") or "")
+
+    if app_id and session_is_closed(app_id, session_id):
+        return {
+            "skipped": "already_closed_by_handoff",
+            "app_id": app_id,
+            "session_id": session_id,
+        }
+
     if app_err or not app_id:
-        out: dict = {
-            "stack_snapshot": {
-                "error": "seat_unresolved",
-                "detail": app_err or "WILLOW_APP_ID could not be resolved",
-            }
+        # Keep the pre-closeout shape: still run friction/pre_handoff with an
+        # empty seat so SessionEnd never loses those joins on a seat miss.
+        out = run_closeout_instruments("", session_id, transcript_path)
+        out["stack_snapshot"] = {
+            "error": "seat_unresolved",
+            "detail": app_err or "WILLOW_APP_ID could not be resolved",
         }
-        seat_app = ""
-    else:
-        result = write_stack_snapshot(app_id, session_id)
-        out = {"stack_snapshot": result}
-        seat_app = app_id
+        return out
 
-    # Fail-open, belt and suspenders: scan_session_for_friction already never
-    # raises, but SessionEnd must never fail to report a result over a signal
-    # this hook only added on top of the stack snapshot it already wrote.
-    try:
-        out["friction_scan"] = scan_session_for_friction(session_id, transcript_path)
-    except Exception as exc:
-        out["friction_scan"] = {"error": "friction_scan_unavailable", "detail": str(exc)}
-
-    # Stage 1 (cdcd948c): deterministic instruments + receipts. Never raises.
-    try:
-        out["pre_handoff"] = run_pre_handoff_instruments(
-            seat_app or "unknown",
-            session_id,
-            transcript_path,
-        )
-    except Exception as exc:
-        out["pre_handoff"] = {
-            "stage": 1,
-            "state": "failed",
-            "reason": "pre_handoff_unavailable",
-            "detail": str(exc),
-        }
-    return out
+    return run_closeout_instruments(app_id, session_id, transcript_path)
 
 
 def main() -> None:
