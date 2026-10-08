@@ -225,7 +225,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 152 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 153 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -6084,6 +6084,54 @@ def git_pull_execute(
         )
     except Exception as exc:
         return {"ok": False, "pulled": False, "error": f"git_pull_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("onescript_run_execute")
+def onescript_run_execute(
+    app_id: str,
+    step: str,
+    args: Optional[dict] = None,
+    project: str = "",
+) -> dict:
+    """Run one host step of the one script's local seat run, performed by THIS
+    process — no shell, no terminal. `step` is one of a fixed table:
+    `keys_export` (public half of the signing keyring only), `checkin`,
+    `scope`, `seal` (subject + optional pair_id), `serve` (by/match/upto +
+    max_chars), `rat_turn` (model = an installed local Ollama tag, task =
+    bounded text), `turn` (bite), `checkout`. `args` is validated per step
+    against a closed shape; argv, interpreter, paths and environment are fixed
+    by the verb, never the caller's (willow-bot's `one-script` from the bot
+    venv, ratatosk from the box; the child sees only HOME, PATH, WILLOW_HOME,
+    the Nestor store path, ONESCRIPT_GROVE and a loopback OLLAMA_HOST). Returns
+    `{ok, ran, step, state, exit, reason, stdout_json | tail, duration_s,
+    receipt_id}` with state `populated` / `empty` / `unreachable` never
+    collapsed (a timeout or non-zero exit is `unreachable`, with the reason).
+    Never returns key material. Takes no envelope and no egress; leaves a FRANK
+    `onescript_run` receipt (step, arguments digest, exit, duration). Gated on
+    its OWN name (`onescript_run_execute`) like `git_pull_execute`;
+    only `orchestrator` carries it (not `full_access`, not `steward_sweep`).
+    `rat_turn` starts from an emptied proposals file and discards a failed or
+    capped run's partial rows. `seal` reports the pair that actually sealed
+    the subject. `rat_turn` can run up to 15 minutes — past a client's idle timeout the call
+    may be reported failed while still running; its receipt is the record."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import onescript_executor
+        from .governance_ledger import GovernanceLedger
+
+        return onescript_executor.execute_step(
+            app_id,
+            step,
+            args,
+            project=project or "onescript",
+            session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "ran": False, "error": f"onescript_run_execute_failed: {exc}"}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
