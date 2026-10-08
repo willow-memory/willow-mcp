@@ -34,11 +34,14 @@ Shape, deliberately narrow:
 """
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import time
 import urllib.request
@@ -316,12 +319,33 @@ def list_local_models(root: Optional[str] = None, timeout: float = 3.0) -> list[
     return names
 
 
-def _check_model(model, lister: Callable[[], list[str] | None]) -> Optional[dict]:
-    """None when ``model`` is an installed local tag; a result dict otherwise."""
+def _model_shape(model) -> str:
     if not isinstance(model, str) or not _MODEL_RE.fullmatch(model):
         raise _Refusal("EINVAL", "model must be a plain Ollama tag (letters, digits, . _ : / -)")
     if model.lower().endswith(("-cloud", ":cloud")):
         raise _Refusal("EINVAL", f"model {model!r} is a cloud model; rat_turn runs local models only")
+    return model
+
+
+def _rat_args(args: dict) -> tuple[str, str]:
+    """(task, model), every argument checked before the proposals file is touched."""
+    _only(args, {"model", "task"})
+    task = _text(args.get("task"), "task", MAX_TASK)
+    return task, _model_shape(args.get("model"))
+
+
+def _turn_args(args: dict) -> tuple[str, bool]:
+    _only(args, {"bite", "proposals"})
+    bite = _text(args.get("bite"), "bite", MAX_TASK)
+    use = args.get("proposals", True)
+    if not isinstance(use, bool):
+        raise _Refusal("EINVAL", "proposals must be true or false")
+    return bite, use
+
+
+def _check_model(model, lister: Callable[[], list[str] | None]) -> Optional[dict]:
+    """None when ``model`` is an installed local tag; a result dict otherwise."""
+    _model_shape(model)
     if not _loopback(_ollama_root()):
         return _unreachable("OLLAMA_HOST is not a loopback address; rat_turn runs local models only")
     names = lister()
@@ -462,24 +486,18 @@ def _plan(step: str, args: dict, ctx: _Ctx, lister: Callable) -> dict:
         # validated and kept for the receipt only.
         return {"argv": onescript("seal", subject), "cwd": cwd}
     if step == "turn":
-        _only(args, {"bite", "proposals"})
-        bite = _text(args.get("bite"), "bite", MAX_TASK)
-        use = args.get("proposals", True)
-        if not isinstance(use, bool):
-            raise _Refusal("EINVAL", "proposals must be true or false")
+        bite, use = _turn_args(args)
         argv = onescript("turn", bite)
         if use:
             if (bad := _require_real_box(ctx)) is not None:
                 return {"result": bad}
-            if not ctx.proposals.is_file():
-                return {"result": _unreachable(
-                    f"no proposals file at {ctx.proposals}; run rat_turn first or pass proposals=false")}
+            problem = _proposals_problem(ctx.proposals)
+            if problem is not None:
+                return {"result": _unreachable(problem)}
             argv += ["--proposal", str(ctx.proposals)]
-        return {"argv": argv, "cwd": cwd}
+        return {"argv": argv, "cwd": cwd, "uses_proposals": use}
     if step == "rat_turn":
-        _only(args, {"model", "task"})
-        task = _text(args.get("task"), "task", MAX_TASK)
-        model = args.get("model")
+        task, model = _rat_args(args)
         early = _check_model(model, lister)
         if early is not None:
             return {"result": early}
@@ -580,22 +598,55 @@ def execute_step(
         ctx.bot = resolved
         if (bad := _need_python(ctx)) is not None and step != "rat_turn":
             return _finish(step, bad, digest, ledger, project, app_id, session, ran=False)
-        plan = _plan(step, args, ctx, model_lister or list_local_models)
+        # Every argument is checked before anything on disk is touched.
+        if step == "rat_turn":
+            _rat_args(args)
+        elif step == "turn":
+            _turn_args(args)
     except _Refusal as exc:
         return _refuse(step, exc.errno, exc.reason)
 
-    if "result" in plan:
-        return _finish(step, plan["result"], digest, ledger, project, app_id, session, ran=False)
-    if step == "rat_turn":
-        # ratatosk --onescript only appends to --out: start from an empty file so
-        # `turn` never sees a row from an earlier run (Loki 9C293AC4 F1).
+    # rat_turn and turn share the proposals file: one at a time, per box.
+    lock_fd: Optional[int] = None
+    if (step == "rat_turn" or (step == "turn" and args.get("proposals", True) is True)) \
+            and _require_real_box(ctx) is None:
+        lock_fd, busy = _lock_box(ctx)
+        if busy is not None:
+            return _finish(step, _unreachable(busy), digest, ledger, project, app_id, session, ran=False)
+    try:
+        return _run_locked(step, args, ctx, home, digest, pair_id, lock_fd is not None,
+                           model_lister or list_local_models, ledger, project, app_id, session)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def _run_locked(step, args, ctx, home, digest, pair_id, locked, lister,
+                ledger, project, app_id, session) -> dict:
+    if step == "rat_turn" and locked:
+        # ratatosk --onescript only appends to --out: start from an empty file,
+        # on EVERY rat_turn that got this far, before any early exit, so a failed
+        # run can never leave an earlier run's rows for `turn` (Loki 8FA472B9 F1-R).
         why = _truncate_proposals(ctx.proposals)
         if why is not None:
             return _finish(step, _unreachable(why), digest, ledger, project, app_id, session, ran=False)
+    try:
+        plan = _plan(step, args, ctx, lister)
+    except _Refusal as exc:
+        return _refuse(step, exc.errno, exc.reason)
+    if "result" in plan:
+        return _finish(step, plan["result"], digest, ledger, project, app_id, session, ran=False)
     env = _child_env(home)
     run = _run_child(plan["argv"], env=env, cwd=plan["cwd"], timeout=TIMEOUTS[step])
     shaped = _shape(step, run)
     extra: dict = {}
+    if step == "turn" and plan.get("uses_proposals"):
+        # A run's rows are used once: whatever `turn` read, success or refusal,
+        # is gone before anything else can read it again (F1-R, second half).
+        cleared = _truncate_proposals(ctx.proposals)
+        shaped["proposals_cleared"] = cleared is None
+        if cleared is not None:
+            shaped["proposals_clear_error"] = cleared
     if step == "rat_turn" and shaped.get("exit") != 0:
         # A capped, failed or timed-out run: whatever rows it wrote are partial
         # and are never handed to `turn` (F6).
@@ -610,16 +661,64 @@ def execute_step(
     return _finish(step, shaped, digest, ledger, project, app_id, session, ran=True, extra=extra)
 
 
+def _open_regular(path: Path, flags: int) -> int:
+    """Open ``path`` without following a link and without blocking, and refuse
+    anything that is not a regular file (a FIFO would hang a plain open)."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _proposals_problem(path: Path) -> Optional[str]:
+    """Why ``turn`` may not read the proposals file, or None when it may."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return f"no proposals file at {path}; run rat_turn first or pass proposals=false"
+    except OSError as exc:
+        return f"could not stat the proposals file: {type(exc).__name__}: {exc}"
+    if stat.S_ISLNK(mode):
+        return f"refusing a symlinked proposals path: {path}"
+    if not stat.S_ISREG(mode):
+        return f"refusing a proposals path that is not a regular file: {path}"
+    return None
+
+
 def _truncate_proposals(path: Path) -> Optional[str]:
     """Empty the proposals file without following a link; None on success."""
     if path.is_symlink():
         return f"refusing a symlinked proposals path: {path}"
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        fd = _open_regular(path, os.O_WRONLY | os.O_CREAT)
     except OSError as exc:
         return f"could not reset the proposals file: {type(exc).__name__}: {exc}"
-    os.close(fd)
+    try:
+        os.ftruncate(fd, 0)
+    except OSError as exc:
+        return f"could not reset the proposals file: {type(exc).__name__}: {exc}"
+    finally:
+        os.close(fd)
     return None
+
+
+def _lock_box(ctx: _Ctx) -> tuple[Optional[int], Optional[str]]:
+    """Take the box lock (beside the box, non-blocking): (fd, None) or (None, why)."""
+    path = ctx.box.parent / "onescript.lock"
+    try:
+        fd = _open_regular(path, os.O_RDWR | os.O_CREAT)
+    except OSError as exc:
+        return None, f"could not open the box lock {path}: {type(exc).__name__}: {exc}"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None, "busy: another rat_turn or turn holds the box; nothing was run"
+    return fd, None
 
 
 def _sealed_pair(env: dict[str, str], subject, caller_pair_id) -> dict:
@@ -628,7 +727,8 @@ def _sealed_pair(env: dict[str, str], subject, caller_pair_id) -> dict:
     The seal CLI takes no pair id and finds the pair by subject, so a caller's
     ``pair_id`` is only a claim: the pair read here is what gets recorded, and a
     difference is reported, never papered over (Loki 9C293AC4 F3)."""
-    raw = env.get("NESTOR_DB") or env.get("WILLOW_NESTOR_DB")
+    # Same order as the seal CLI (willow-bot api.py:105): WILLOW_NESTOR_DB first.
+    raw = env.get("WILLOW_NESTOR_DB") or env.get("NESTOR_DB")
     out: dict = {}
     ids: list[str] | None = None
     if raw and isinstance(subject, str):

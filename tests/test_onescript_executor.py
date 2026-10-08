@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import time
 from pathlib import Path
 
@@ -32,7 +33,7 @@ pwd > "$d/call.$n.cwd"
 prev=""; out=""
 for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done
 [ -n "$out" ] && [ -f "$d/append" ] && cat "$d/append" >> "$out"
-[ -f "$d/grandchild" ] && setsid sleep 60 &
+if [ -f "$d/grandchild" ]; then setsid sleep 60 & echo $! > "$d/grandchild.pid"; fi
 [ -f "$d/sleep" ] && sleep 30
 [ -f "$d/stdout" ] && cat "$d/stdout"
 [ -f "$d/rc" ] && exit "$(cat "$d/rc")"
@@ -112,6 +113,7 @@ def box(tmp_path, monkeypatch):
     b = Box(tmp_path)
     monkeypatch.setenv("WILLOW_HOME", str(b.home))
     monkeypatch.setenv("NESTOR_DB", str(tmp_path / "nestor.db"))
+    monkeypatch.delenv("WILLOW_NESTOR_DB", raising=False)
     monkeypatch.delenv("OLLAMA_HOST", raising=False)
     return b
 
@@ -527,11 +529,212 @@ def test_grandchild_in_a_new_session_cannot_hold_the_call(box, monkeypatch):
     monkeypatch.setattr(ox, "DRAIN_BOUND", 1.0)
     box.set(box.py, sleep=True, grandchild=True)
     t0 = time.monotonic()
-    out = box.run("checkout")
-    elapsed = time.monotonic() - t0
+    try:
+        out = box.run("checkout")
+        elapsed = time.monotonic() - t0
+    finally:
+        _reap(box.py.parent / "grandchild.pid")  # the setsid grandchild outlives the kill
     assert out["state"] == "unreachable" and out["timed_out"] is True
     assert elapsed < 1 + 2 * 1.0 + 3, elapsed  # timeout + two bounded waits + slack
     assert elapsed < 30
+
+
+def _reap(pidfile: Path) -> None:
+    """Kill the stub's setsid grandchild (its own session) so no sleep outlives the test."""
+    try:
+        pid = int(pidfile.read_text().strip())
+    except (OSError, ValueError):
+        return
+    for kill in (lambda: os.killpg(pid, signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
+        try:
+            kill()
+        except OSError:
+            pass
+
+
+# ── 8FA472B9 F1-R: a run's proposals reach turn exactly once ─────────────────
+
+_RAT = {"model": "qwen3:4b", "task": "t"}
+
+
+def _stale(box) -> Path:
+    p = box.box / "proposals.jsonl"
+    p.write_text(STALE, encoding="utf-8")
+    return p
+
+
+def _expect_clean_turn_after_failed_rat(box, proposals, rat_result):
+    assert rat_result["ok"] is False and box.calls(box.rat) == []
+    assert proposals.read_text(encoding="utf-8") == ""
+    box.set(box.py, stdout="{}")
+    box.run("turn", {"bite": "b"})
+    assert proposals.read_text(encoding="utf-8") == ""
+
+
+def test_failed_rat_turn_emodel_clears_stale_rows(box):
+    p = _stale(box)
+    out = box.run("rat_turn", {"model": "mistral:7b", "task": "t"})
+    assert out["error"] == "EMODEL"
+    _expect_clean_turn_after_failed_rat(box, p, out)
+
+
+def test_failed_rat_turn_ollama_silent_clears_stale_rows(box):
+    p = _stale(box)
+    out = box.run("rat_turn", _RAT, model_lister=lambda: None)
+    assert out["state"] == "unreachable"
+    _expect_clean_turn_after_failed_rat(box, p, out)
+
+
+def test_failed_rat_turn_non_loopback_clears_stale_rows(box, monkeypatch):
+    p = _stale(box)
+    monkeypatch.setenv("OLLAMA_HOST", "http://203.0.113.9:11434")
+    out = box.run("rat_turn", _RAT)
+    assert "loopback" in out["reason"]
+    _expect_clean_turn_after_failed_rat(box, p, out)
+
+
+def test_failed_rat_turn_without_ratatosk_clears_stale_rows(box):
+    p = _stale(box)
+    box.rat.unlink()
+    out = box.run("rat_turn", _RAT)
+    assert "not installed" in out["reason"]
+    assert out["ok"] is False and p.read_text(encoding="utf-8") == ""
+    box.set(box.py, stdout="{}")
+    box.run("turn", {"bite": "b"})
+    assert "stale" not in p.read_text(encoding="utf-8")
+
+
+def test_rat_turn_refused_on_arguments_leaves_the_file_alone(box):
+    p = _stale(box)
+    assert box.run("rat_turn", {"model": "qwen3:4b"})["error"] == "EINVAL"
+    assert p.read_text(encoding="utf-8") == STALE
+
+
+def test_turn_uses_a_runs_rows_once(box):
+    p = box.box / "proposals.jsonl"
+    box.set(box.rat, stdout="done\n", append='{"new": 1}\n')
+    box.run("rat_turn", _RAT)
+    assert p.read_text(encoding="utf-8") == '{"new": 1}\n'
+    box.set(box.py, stdout="{}")
+    first = box.run("turn", {"bite": "b"})
+    assert first["proposals_cleared"] is True
+    assert p.read_text(encoding="utf-8") == ""
+    box.run("turn", {"bite": "b"})  # a second turn finds the file empty
+    assert p.read_text(encoding="utf-8") == ""
+
+
+def test_turn_that_refuses_still_clears_the_rows(box):
+    p = _stale(box)
+    box.set(box.py, stdout="refused: nope\n", rc=1)
+    assert box.run("turn", {"bite": "b"})["state"] == "unreachable"
+    assert p.read_text(encoding="utf-8") == ""
+
+
+def test_turn_without_proposals_leaves_the_file_alone(box):
+    p = _stale(box)
+    box.set(box.py, stdout="{}")
+    box.run("turn", {"bite": "b", "proposals": False})
+    assert p.read_text(encoding="utf-8") == STALE
+
+
+# ── 8FA472B9 race: one lock per box, FIFO and symlink at the proposals path ──
+
+def _hold(box):
+    import fcntl
+
+    fd = os.open(box.box.parent / "onescript.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+@pytest.mark.parametrize("step,args", [("rat_turn", _RAT), ("turn", {"bite": "b"})])
+def test_a_busy_box_is_reported_not_mixed(box, step, args):
+    p = _stale(box)
+    box.set(box.rat, stdout="done\n", append='{"new": 1}\n')
+    box.set(box.py, stdout="{}")
+    fd = _hold(box)
+    try:
+        out = box.run(step, args)
+    finally:
+        os.close(fd)
+    assert out["state"] == "unreachable" and "busy" in out["reason"] and out["ran"] is False
+    assert box.calls(box.rat) == [] and box.calls(box.py) == []
+    assert p.read_text(encoding="utf-8") == STALE  # untouched while another call holds the box
+
+
+def test_the_lock_is_released_after_every_call(box):
+    box.set(box.rat, stdout="done\n")
+    box.set(box.py, stdout="{}")
+    for _ in range(2):
+        assert box.run("rat_turn", _RAT)["state"] == "populated"
+        assert box.run("turn", {"bite": "b"})["state"] == "populated"
+
+
+def test_concurrent_turn_during_a_running_rat_turn_is_busy(box, monkeypatch):
+    import threading
+
+    monkeypatch.setitem(ox.TIMEOUTS, "rat_turn", 3)
+    box.set(box.rat, sleep=True)
+    box.set(box.py, stdout="{}")
+    seen = {}
+    t = threading.Thread(target=lambda: seen.setdefault("rat", box.run("rat_turn", _RAT)))
+    t.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not list(box.rat.parent.glob("call.*.argv")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        out = box.run("turn", {"bite": "b"})
+    finally:
+        t.join(15)
+    assert out["state"] == "unreachable" and "busy" in out["reason"]
+    assert box.calls(box.py) == []
+
+
+def test_fifo_at_the_proposals_path_is_refused_without_hanging(box):
+    p = box.box / "proposals.jsonl"
+    os.mkfifo(p)
+    box.set(box.rat, stdout="done\n")
+    out = box.run("rat_turn", _RAT)  # no reader: the non-blocking open itself fails
+    assert out["state"] == "unreachable" and out["ran"] is False and box.calls(box.rat) == []
+    reader = os.open(p, os.O_RDONLY | os.O_NONBLOCK)  # a reader lets the open succeed
+    try:
+        out = box.run("rat_turn", _RAT)
+    finally:
+        os.close(reader)
+    assert out["state"] == "unreachable" and "regular file" in out["reason"]
+    assert box.calls(box.rat) == []
+    box.set(box.py, stdout="{}")
+    out = box.run("turn", {"bite": "b"})
+    assert out["state"] == "unreachable" and "regular file" in out["reason"]
+    assert box.calls(box.py) == []
+
+
+def test_symlinked_proposals_path_is_refused_by_turn(box, tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me", encoding="utf-8")
+    (box.box / "proposals.jsonl").symlink_to(victim)
+    box.set(box.py, stdout="{}")
+    out = box.run("turn", {"bite": "b"})
+    assert out["state"] == "unreachable" and "a symlinked proposals path" in out["reason"]
+    assert box.calls(box.py) == [] and victim.read_text(encoding="utf-8") == "keep me"
+
+
+# ── 8FA472B9 F3-R: the Nestor store is looked up in the seal CLI's order ─────
+
+def test_seal_lookup_prefers_willow_nestor_db_like_the_cli(box, tmp_path, monkeypatch):
+    import sqlite3
+
+    other = tmp_path / "other-nestor.db"
+    con = sqlite3.connect(other)
+    con.execute("CREATE TABLE tm_pairs (id TEXT, target_text TEXT, status TEXT, superseded_by TEXT)")
+    con.execute("INSERT INTO tm_pairs VALUES ('from-willow-db', ?, 'sealed', '')", (SUBJECT,))
+    con.commit()
+    con.close()
+    _nestor(box, [("from-nestor-db", SUBJECT)])  # NESTOR_DB, set by the fixture
+    monkeypatch.setenv("WILLOW_NESTOR_DB", str(other))
+    box.set(box.py, stdout="{}")
+    out = box.run("seal", {"subject": SUBJECT})
+    assert out["sealed_pair_ids"] == ["from-willow-db"]
 
 
 # ── F4: anchored values ──────────────────────────────────────────────────────
