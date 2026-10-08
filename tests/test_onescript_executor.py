@@ -867,3 +867,66 @@ def test_the_tool_body_never_runs_for_a_seat_without_the_name(apps_root, monkeyp
     out = server.onescript_run_execute(app_id="seat-x", step="checkout")
     assert called == []
     assert out.get("ok") is not True
+
+
+# ── checkin resolve="put_back": clear a stray proposals.jsonl headless ───────
+
+def _stray(box, data: str = '{"path":"x","data":"y","cites":[],"claim":"z"}\n'):
+    """A leftover proposals.jsonl, as a prior rat_turn would leave it."""
+    p = box.box / "proposals.jsonl"
+    p.write_text(data, encoding="utf-8")
+    return p
+
+
+def test_put_back_removes_a_stray_proposals_file_before_checkin(box):
+    box.set(box.py, stdout="ok\n")
+    p = _stray(box)
+    out = box.run("checkin", {"resolve": "put_back"})
+    assert out["resolve"] == "put_back"
+    assert out["removed_proposals"] is True
+    assert out["removed_bytes"] > 0
+    assert not p.exists()  # the stray file is gone, so the box can open
+    assert box.calls(box.py)[0]["argv"] == _py_argv("checkin")  # CLI argv unchanged
+    assert box.ledger.rows[-1]["content"]["removed_proposals"] is True
+
+
+def test_checkin_without_resolve_leaves_the_stray_file(box):
+    box.set(box.py, stdout="ok\n")
+    p = _stray(box)
+    out = box.run("checkin")
+    assert p.exists()  # current behavior: nothing is touched without resolve
+    assert "removed_proposals" not in out
+
+
+def test_put_back_is_a_noop_when_there_is_no_stray_file(box):
+    box.set(box.py, stdout="ok\n")
+    out = box.run("checkin", {"resolve": "put_back"})
+    assert out["removed_proposals"] is False
+    assert "put_back_error" not in out
+    assert box.calls(box.py)[0]["argv"] == _py_argv("checkin")  # checkin still ran
+
+
+def test_put_back_refuses_a_symlinked_proposals_path(box, tmp_path):
+    box.set(box.py, stdout="ok\n")
+    real = tmp_path / "elsewhere.jsonl"
+    real.write_text("not mine to remove\n", encoding="utf-8")
+    link = box.box / "proposals.jsonl"
+    link.symlink_to(real)
+    out = box.run("checkin", {"resolve": "put_back"})
+    assert out["removed_proposals"] is False
+    assert "symlinked" in out["put_back_error"]
+    assert real.exists() and link.is_symlink()  # neither the link nor its target removed
+
+
+def test_checkin_rejects_an_unknown_resolve(box):
+    box.set(box.py, stdout="ok\n")
+    out = box.run("checkin", {"resolve": "zap"})
+    assert out["error"] == "EINVAL" and "resolve must be one of" in out["reason"]
+    assert box.calls(box.py) == []  # refused before anything ran
+
+
+def test_checkin_rejects_an_unknown_arg(box):
+    box.set(box.py, stdout="ok\n")
+    out = box.run("checkin", {"nope": 1})
+    assert out["error"] == "EINVAL"
+    assert box.calls(box.py) == []
