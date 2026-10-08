@@ -6112,8 +6112,12 @@ def onescript_run_execute(
     its OWN name (`onescript_run_execute`) like `git_pull_execute`;
     only `orchestrator` carries it (not `full_access`, not `steward_sweep`).
     `rat_turn` starts from an emptied proposals file and discards a failed or
-    capped run's partial rows. `seal` reports the pair that actually sealed
-    the subject. `rat_turn` can run up to 15 minutes — past a client's idle timeout the call
+    capped run's partial rows. `checkin` takes an optional
+    `resolve="put_back"` that removes a stray `proposals.jsonl` (a prior
+    `rat_turn`'s leftover that otherwise HARD CLOSES the box as "written
+    outside the run") before the review runs, so the box opens headless; the
+    removal is recorded and nothing else is touched. `seal` reports the pair
+    that actually sealed the subject. `rat_turn` can run up to 15 minutes — past a client's idle timeout the call
     may be reported failed while still running; its receipt is the record."""
     pg = get_pg()
     if not pg:

@@ -12,6 +12,11 @@ Shape, deliberately narrow:
 * **A fixed step table.** The caller names a step and its validated arguments;
   it never supplies argv, a path, an interpreter, or an environment. Every
   argument is checked against a closed shape and unknown keys are refused.
+  ``checkin`` takes one optional ``resolve="put_back"``: it removes a stray
+  ``proposals.jsonl`` (a prior ``rat_turn``'s leftover, which the box reads as
+  "written outside the run" and HARD CLOSES on) before the review runs, so the
+  box opens headless. Nothing else is removed and the removal is recorded; the
+  one-script's own gate is untouched.
 * **Fixed paths.** Interpreters come from ``$WILLOW_HOME/venvs/<venv>/bin``;
   the willow-bot checkout is resolved the way ``git_pull_execute`` resolves a
   clone (verified by its ``origin``, never a symlink); the box, the served
@@ -343,6 +348,23 @@ def _turn_args(args: dict) -> tuple[str, bool]:
     return bite, use
 
 
+#: The ways a caller may answer check-in's HARD CLOSE headless. Only the
+#: narrowest is built: ``put_back`` removes a stray ``proposals.jsonl`` — the one
+#: transient box artifact a prior ``rat_turn`` leaves unlisted — so the box can
+#: open. It never touches any other file, and it records what it removed. The
+#: one-script's own gate is unchanged: it still refuses in-process, and a HARD
+#: CLOSE from any other cause (a failing gate, a breached probe) still holds.
+_RESOLVE = {"put_back"}
+
+
+def _checkin_args(args: dict) -> Optional[str]:
+    _only(args, {"resolve"})
+    resolve = args.get("resolve")
+    if resolve is not None and (not isinstance(resolve, str) or resolve not in _RESOLVE):
+        raise _Refusal("EINVAL", f"resolve must be one of {sorted(_RESOLVE)}")
+    return resolve
+
+
 def _check_model(model, lister: Callable[[], list[str] | None]) -> Optional[dict]:
     """None when ``model`` is an installed local tag; a result dict otherwise."""
     _model_shape(model)
@@ -470,7 +492,7 @@ def _plan(step: str, args: dict, ctx: _Ctx, lister: Callable) -> dict:
         return {"argv": onescript("keys", "export", "--from", str(ctx.signing_ring),
                                   "--to", str(ctx.public_ring)), "cwd": cwd}
     if step == "checkin":
-        _no_args(args)
+        _checkin_args(args)  # resolve is broker-side; the CLI argv is unchanged
         return {"argv": onescript("checkin"), "cwd": cwd}
     if step == "checkout":
         _no_args(args)
@@ -603,6 +625,8 @@ def execute_step(
             _rat_args(args)
         elif step == "turn":
             _turn_args(args)
+        elif step == "checkin":
+            _checkin_args(args)
     except _Refusal as exc:
         return _refuse(step, exc.errno, exc.reason)
 
@@ -623,6 +647,7 @@ def execute_step(
 
 def _run_locked(step, args, ctx, home, digest, pair_id, locked, lister,
                 ledger, project, app_id, session) -> dict:
+    put_back: dict = {}
     if step == "rat_turn" and locked:
         # ratatosk --onescript only appends to --out: start from an empty file,
         # on EVERY rat_turn that got this far, before any early exit, so a failed
@@ -630,6 +655,10 @@ def _run_locked(step, args, ctx, home, digest, pair_id, locked, lister,
         why = _truncate_proposals(ctx.proposals)
         if why is not None:
             return _finish(step, _unreachable(why), digest, ledger, project, app_id, session, ran=False)
+    elif step == "checkin" and args.get("resolve") == "put_back":
+        # Clear the one stray artifact BEFORE check-in reviews the box, so the
+        # review opens instead of HARD CLOSING on it. Recorded in the receipt.
+        put_back = _put_back_proposals(ctx)
     try:
         plan = _plan(step, args, ctx, lister)
     except _Refusal as exc:
@@ -639,7 +668,7 @@ def _run_locked(step, args, ctx, home, digest, pair_id, locked, lister,
     env = _child_env(home)
     run = _run_child(plan["argv"], env=env, cwd=plan["cwd"], timeout=TIMEOUTS[step])
     shaped = _shape(step, run)
-    extra: dict = {}
+    extra: dict = dict(put_back)
     if step == "turn" and plan.get("uses_proposals"):
         # A run's rows are used once: whatever `turn` read, success or refusal,
         # is gone before anything else can read it again (F1-R, second half).
@@ -704,6 +733,37 @@ def _truncate_proposals(path: Path) -> Optional[str]:
     finally:
         os.close(fd)
     return None
+
+
+def _put_back_proposals(ctx: _Ctx) -> dict:
+    """``resolve="put_back"``: remove a stray ``proposals.jsonl`` before check-in.
+
+    A proposals file present at check-in is never part of an open run — the box
+    is being opened — so it is a leftover a prior ``rat_turn`` wrote. ``three_way``
+    reads any unlisted file on disk (empty or not) as "written outside the run"
+    and HARD CLOSES, so truncation does not clear it; the file has to go. Only
+    this one path is ever removed, a symlink is refused, and what was removed is
+    returned so the receipt records the disposition."""
+    p = ctx.proposals
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return {"resolve": "put_back", "removed_proposals": False}
+    except OSError as exc:
+        return {"resolve": "put_back", "removed_proposals": False,
+                "put_back_error": f"could not stat: {type(exc).__name__}: {exc}"}
+    if stat.S_ISLNK(st.st_mode):
+        return {"resolve": "put_back", "removed_proposals": False,
+                "put_back_error": f"refusing a symlinked proposals path: {p}"}
+    if not stat.S_ISREG(st.st_mode):
+        return {"resolve": "put_back", "removed_proposals": False,
+                "put_back_error": f"not a regular file: {p}"}
+    try:
+        os.unlink(p)
+    except OSError as exc:
+        return {"resolve": "put_back", "removed_proposals": False,
+                "put_back_error": f"could not remove: {type(exc).__name__}: {exc}"}
+    return {"resolve": "put_back", "removed_proposals": True, "removed_bytes": st.st_size}
 
 
 def _lock_box(ctx: _Ctx) -> tuple[Optional[int], Optional[str]]:
