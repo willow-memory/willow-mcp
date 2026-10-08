@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.94.3](https://github.com/willow-memory/willow-mcp/compare/v2.94.2...v2.94.3) (2026-10-08)
+
+
+### Fixed
+
+* **seals:** verify Nestor seals against the signer's public ring, not WILLOW_KEYRING ([93384dd](https://github.com/willow-memory/willow-mcp/commit/93384dd5e83d425038fbec01552007744e31c59f))
+
 ## [2.94.2](https://github.com/willow-memory/willow-mcp/compare/v2.94.1...v2.94.2) (2026-10-07)
 
 
