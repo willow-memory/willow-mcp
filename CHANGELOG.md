@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **seal-ring:** Nestor seal checks verify against the signer's public ring ([a34e106](https://github.com/willow-memory/willow-mcp/commit/a34e1061f5cfbbedfaa395429a6f35dd82430e5f))
 * **seals:** verify Nestor seals against the signer's public ring, not WILLOW_KEYRING ([93384dd](https://github.com/willow-memory/willow-mcp/commit/93384dd5e83d425038fbec01552007744e31c59f))
 
 ## [2.94.2](https://github.com/willow-memory/willow-mcp/compare/v2.94.1...v2.94.2) (2026-10-07)
