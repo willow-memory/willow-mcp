@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **hooks:** session start injects boot_context only, not the full session_enter JSON ([b01d089](https://github.com/willow-memory/willow-mcp/commit/b01d089de5ae8a516c60ae1d01e12eeb0a2a02a1))
 * **hooks:** session start injects boot_context only, not the full session_enter JSON ([ddfbebd](https://github.com/willow-memory/willow-mcp/commit/ddfbebd1ab68beffff733c05f4ba0248361c3edf))
 
 ## [2.95.0](https://github.com/willow-memory/willow-mcp/compare/v2.94.3...v2.95.0) (2026-10-08)
