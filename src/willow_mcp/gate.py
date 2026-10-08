@@ -124,7 +124,11 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # held them via `envelope_apply` above) is unaffected by the split.
         # pip_sync_execute is the editable-install sibling (ideas A.2):
         # receipt-only, own name, same seats.
+        # onescript_run_execute: the one script's host steps (fixed step table,
+        # receipt-only, own name). Orchestrator + full_access only; the
+        # steward_sweep group deliberately does not carry it.
         "gitsync_sweep", "git_pull_execute", "pip_sync_execute",
+        "onescript_run_execute",
     }),
     "fleet_read": frozenset({
         "fleet_status", "fleet_health", "frank_read", "frank_verify",
@@ -577,6 +581,8 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # and server.py's git_pull_execute docstring).
         # pip_sync_execute: editable vault-venv install (ideas A.2).
         "gitsync_sweep", "git_pull_execute", "pip_sync_execute",
+        # onescript_run_execute: the one script's host steps (own name).
+        "onescript_run_execute",
         # Grove — the fleet's shared messaging room (read + write; no egress
         # concern like web_net/integration_net/mcp_federation, so unlike those
         # this rides full_access, same reasoning as knowledge_read/write above)
