@@ -37,13 +37,12 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 ### Added
 
 * **broker:** onescript_run_execute runs the one script's host steps ([33841d1](https://github.com/willow-memory/willow-mcp/commit/33841d1b7c053156f142e683d8e8f42bd06833b2))
-* **broker:** onescript_run_execute runs the one script's host steps without a terminal ([18e66e4](https://github.com/willow-memory/willow-mcp/commit/18e66e46c29db41b3a4f4b189bef3239f8e93dc2))
 
 
 ### Fixed
 
-* **broker:** onescript_run_execute cannot feed stale proposals or outlive its timeout ([eb5e1b5](https://github.com/willow-memory/willow-mcp/commit/eb5e1b5c9dc0c0309c3af2b249bff89c18247340))
 * **broker:** onescript_run_execute uses a run's proposals once, under one box lock ([9539a94](https://github.com/willow-memory/willow-mcp/commit/9539a944cb16b4516a70735fdbdc2663abaf30a9))
+* **broker:** onescript_run_execute cannot feed stale proposals or outlive its timeout ([eb5e1b5](https://github.com/willow-memory/willow-mcp/commit/eb5e1b5c9dc0c0309c3af2b249bff89c18247340))
 
 ## [2.94.3](https://github.com/willow-memory/willow-mcp/compare/v2.94.2...v2.94.3) (2026-10-08)
 
