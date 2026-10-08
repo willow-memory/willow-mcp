@@ -124,7 +124,11 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # held them via `envelope_apply` above) is unaffected by the split.
         # pip_sync_execute is the editable-install sibling (ideas A.2):
         # receipt-only, own name, same seats.
+        # onescript_run_execute: the one script's host steps (fixed step table,
+        # receipt-only, own name). Orchestrator ONLY: neither full_access nor
+        # steward_sweep carries it (Loki 9C293AC4 F7).
         "gitsync_sweep", "git_pull_execute", "pip_sync_execute",
+        "onescript_run_execute",
     }),
     "fleet_read": frozenset({
         "fleet_status", "fleet_health", "frank_read", "frank_verify",
