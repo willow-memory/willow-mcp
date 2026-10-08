@@ -152,6 +152,38 @@ def _stub_egress_public_key_for_diagnostics(request, monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_host_seal_ring(tmp_path, monkeypatch):
+    """Nestor seals verify against the signer's public ring
+    (``seal_ring``: ``WILLOW_SEAL_RING``, else
+    ``/etc/willow-mcp/verifiers.public.json``). A box that has that file
+    installed (this one) must not decide a test's outcome: point every test
+    at a path with nothing in it. A test that means to verify a seal
+    publishes a ring with ``publish_seal_ring``, which overrides this."""
+    monkeypatch.setenv("WILLOW_SEAL_RING", str(tmp_path / "no-seal-ring.json"))
+
+
+@pytest.fixture
+def publish_seal_ring(tmp_path, monkeypatch):
+    """``publish_seal_ring(keyring)`` exports the keyring's public halves to
+    a file and points ``WILLOW_SEAL_RING`` at it, the way the operator's
+    ``export-ring`` produces ``/etc/willow-mcp/verifiers.public.json``.
+    Returns the path. Deliberately independent of ``WILLOW_KEYRING`` /
+    ``keyring.set_keyring``: the seal ring and the seat keyring are two
+    files and tests can make them disagree."""
+    from pathlib import Path
+
+    from willow_mcp import net_signer
+
+    def _publish(kr, name="seal-ring.public.json"):
+        dest = tmp_path / name
+        net_signer.export_public_ring(Path(kr.path), dest)
+        monkeypatch.setenv("WILLOW_SEAL_RING", str(dest))
+        return dest
+
+    return _publish
+
+
+@pytest.fixture(autouse=True)
 def _stub_keyring_unit_fallback(request, monkeypatch):
     """Loki 9C8C97FD, item 5: keyring.get_keyring()'s net-signer-unit
     fallback shells out to the real unit manager when WILLOW_KEYRING is

@@ -348,14 +348,16 @@ def test_identical_tables_write_no_frank_ink(tables):
 # `ring_with_sean` uses for find_sealing_decision.
 
 @pytest.fixture
-def ring_with_sean(tmp_path):
+def ring_with_sean(tmp_path, publish_seal_ring):
     """A keyring with a REAL ed25519 "sean campbell" entry active -- what
-    `_confirm_amendment` now verifies every candidate seal against. Yields
-    the `Keyring` so a test can sign with its private half."""
+    `_confirm_amendment` now verifies every candidate seal against (via the
+    SEAL ring published from it). Yields the `Keyring` so a test can sign
+    with its private half."""
     with keyring_mod.isolated():
         k = keyring_mod.Keyring(path=str(tmp_path / "keys.json"))
         k.add("sean campbell", kind="ed25519")
         k.save()
+        publish_seal_ring(k)
         keyring_mod.set_keyring(k)
         try:
             yield k
@@ -453,6 +455,46 @@ def test_sealed_amendment_with_matching_hashes_applies_the_change(tables, tmp_pa
     assert written["verbs"][0]["bounds"] == {"apps": "new description"}
     assert len(ledger.rows) == 1
     assert ledger.rows[0]["content"]["amended"] == out["amended"]
+
+
+def _amend_scenario(tables, tmp_path, signer):
+    live, bundle = tables
+    row_live = _row(18, "manifest.grant", bounds={"apps": "old description"})
+    row_bundle = _row(18, "manifest.grant", bounds={"apps": "new description"})
+    _write_table(live, [row_live])
+    _write_table(bundle, [row_bundle])
+    nestor_db = tmp_path / "nestor.db"
+    _sealed_amend_pair(nestor_db, signer, "pairABC", row_id=18, verb="manifest.grant",
+                       from_hash=constitutional._row_hash(row_live),
+                       to_hash=constitutional._row_hash(row_bundle))
+    return constitutional.sync_syscall_table_from_bundle(
+        live_path=live, bundle_path=bundle, ledger=_FakeLedger(), project="fleet",
+        store=_FakeGovStore([_gov_record(nestor_pair_id="pairABC")]), nestor_db_path=nestor_db)
+
+
+def test_amendment_verifies_against_the_seal_ring_not_the_seat_keyring(
+        tables, tmp_path, ring_with_sean):
+    """Seal signed by A; the seal ring holds A; the seat's WILLOW_KEYRING
+    holds a DIFFERENT 'sean campbell' key B. The amendment applies."""
+    seat_b = keyring_mod.Keyring(path=str(tmp_path / "seat-b.json"))
+    seat_b.add("sean campbell", kind="ed25519")
+    seat_b.save()
+    keyring_mod.set_keyring(seat_b)
+    out = _amend_scenario(tables, tmp_path, ring_with_sean)
+    assert out["ok"] is True, out
+
+
+def test_amendment_is_refused_when_only_the_seat_keyring_holds_the_signer(
+        tables, tmp_path, ring_with_sean, publish_seal_ring):
+    """Reversed: the seat keyring holds A (the signer), the seal ring holds B.
+    The seat keyring must not rescue the seal."""
+    ring_b = keyring_mod.Keyring(path=str(tmp_path / "ring-b.json"))
+    ring_b.add("sean campbell", kind="ed25519")
+    ring_b.save()
+    publish_seal_ring(ring_b)
+    out = _amend_scenario(tables, tmp_path, ring_with_sean)   # seat keyring still A
+    assert out["ok"] is False and out["refused"] is True
+    assert "does not verify" in out["reason"]
 
 
 def test_missing_row_with_no_amendment_at_all_is_refused(tables, tmp_path):
@@ -795,9 +837,10 @@ def test_soil_record_disagreeing_with_sealed_text_is_refused(tables, tmp_path, r
 
 
 def test_no_keyring_configured_does_not_authorize(tables, tmp_path):
-    """No keyring at all -- a seal cannot be verified without a ring to
-    verify it against, so this refuses exactly like an unverifiable seal,
-    never like "no amendment exists"."""
+    """No SEAL ring at all (the autouse fixture points WILLOW_SEAL_RING at
+    nothing) -- a seal cannot be verified without a ring to verify it
+    against, so this refuses exactly like an unverifiable seal, never like
+    "no amendment exists"."""
     assert keyring_mod.get_keyring() is None  # sanity: no ring fixture in play
     live, bundle = tables
     row18_live = _row(18, "manifest.grant", bounds={"apps": "old"})
@@ -819,7 +862,7 @@ def test_no_keyring_configured_does_not_authorize(tables, tmp_path):
         live_path=live, bundle_path=bundle, store=gov, nestor_db_path=nestor_db)
 
     assert out["ok"] is False and out["refused"] is True
-    assert "no keyring configured" in out["reason"]
+    assert "seal ring unreachable" in out["reason"]
     assert live.read_text() == before
 
 

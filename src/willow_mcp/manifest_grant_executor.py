@@ -583,21 +583,6 @@ def _load_sealed_ruling(pair_id: str, *, db_path: Optional[Path] = None) -> dict
     return sealed
 
 
-def _ring_from_keyring(kr) -> dict[str, dict]:
-    """The verify_seal ring shape (``{name: {key, kind, revoked_at,
-    compromised}}``) built from the process's OWN keyring
-    (``config/verifiers.json`` via :func:`keyring.get_keyring`) — never from
-    :mod:`net_signer`'s separate exported public-only ring file, which
-    hard-refuses a keyring holding any private half. The operator's own
-    signing entries legitimately carry a private half in this same file;
-    verification only ever reads ``.key`` (the public half), never
-    ``.private``."""
-    return {
-        e.name: {"key": e.key, "kind": e.kind, "revoked_at": e.revoked_at, "compromised": e.compromised}
-        for e in kr.entries()
-    }
-
-
 # ── the broker's own signature over a pending request ───────────────────────
 #
 # Loki audit 3, finding 2 ("forgeable pending/"): apply used to re-verify only
@@ -821,7 +806,6 @@ def _verify_seal_only(pair_id: str, *, db_path: Optional[Path] = None,
     apply-time callers pass ``sealed_row`` (they never open nestor.db at
     all — see the module-level note above :data:`_SEALED_ROW_FIELDS`).
     """
-    from . import keyring as _keyring
     from . import net_signer
 
     if sealed_row is not None:
@@ -860,11 +844,13 @@ def _verify_seal_only(pair_id: str, *, db_path: Optional[Path] = None,
             "is not enough on its own; the pair itself must be sealed",
         ), None
 
-    ring_kr = _keyring.get_keyring()
-    if ring_kr is None:
+    from . import seal_ring as _seal_ring
+
+    seal_ring, ring_err = _seal_ring.load_seal_ring()
+    if seal_ring is None:
         return _refuse(
             "EACCES",
-            "no keyring configured (config/verifiers.json via WILLOW_KEYRING) — "
+            f"seal ring unreachable ({ring_err['cause']}) — "
             "a grant cannot verify a seal without a ring to verify it against",
         ), None
     # Loki audit 3, finding 1: "a permission grant is not a lease." The
@@ -875,7 +861,7 @@ def _verify_seal_only(pair_id: str, *, db_path: Optional[Path] = None,
     # actual revocation path is supersession: _load_sealed_ruling already
     # refuses a pair whose row carries superseded_by (net_authority.
     # read_sealed_pair), and that check runs before verify_seal is reached.
-    ok, reason, field = net_signer.verify_seal(sealed, _ring_from_keyring(ring_kr), max_age_s=None)
+    ok, reason, field = net_signer.verify_seal(sealed, seal_ring, max_age_s=None)
     if not ok:
         return _refuse(
             "EACCES",

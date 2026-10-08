@@ -187,6 +187,24 @@ straight from the process environment — there's no `--keyring` flag on
 the same path the MCP server uses fails with "WILLOW_KEYRING is not set"
 even though the server-side keyring is configured correctly.
 
+### Nestor seals use a different ring
+
+`WILLOW_KEYRING` is the seat's own keyring: session attestation signs with it.
+It is **not** where a Nestor seal is checked. A seal is signed by whoever runs
+nestor-ui (the signer's keyring, `$WILLOW_HOME/verifiers.json`), so every
+seal check in willow-mcp (the reloader's restart confirm, `manifest.grant`
+and the other trust-owner verbs, boot corrections, syscall-row amendments)
+verifies against the signer's **public-only** export instead:
+`WILLOW_SEAL_RING`, defaulting to `/etc/willow-mcp/verifiers.public.json`.
+
+- The file must carry public halves only. One with a `private` half, a
+  `legacy_key` or a non-ed25519 entry is refused.
+- A missing or unreadable ring reports `unreachable` and no seal passes. It
+  never falls back to `WILLOW_KEYRING`.
+- Regenerating or rotating the seat keyring no longer changes who can seal.
+  After rotating the signer's key, re-export the public ring (see
+  `docs/design/nestor-seal-keyring.md` in willows-grove).
+
 With `WILLOW_OPERATOR_VERIFIER` set, the SessionStart hook opens the
 system pinentry (presence proof — the ed25519 private half is not
 passphrase-protected; see `docs/design/approval-broker.md` §5b), then

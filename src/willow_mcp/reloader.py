@@ -212,40 +212,19 @@ def default_config() -> ReloaderConfig:
 
 # ── the confirm: a sealed decision naming the receipt ─────────────────────────
 
-def _ring_from_keyring(kr) -> dict[str, dict]:
-    """The ``verify_seal`` ring shape (``{name: {key, kind, revoked_at,
-    compromised}}``), built from the process's OWN keyring — the same shape
-    :func:`manifest_grant_executor._ring_from_keyring` builds, duplicated
-    here (a few lines) rather than imported, so this module carries no
-    dependency on a file another packet owns."""
-    return {
-        e.name: {"key": e.key, "kind": e.kind, "revoked_at": e.revoked_at, "compromised": e.compromised}
-        for e in kr.entries()
-    }
-
-
 def _load_verify_ring() -> tuple[Optional[dict], Optional[dict]]:
-    """Load the ``verify_seal`` ring from this process's own keyring
-    (``WILLOW_KEYRING``). Returns ``(ring, None)`` on success, or ``(None,
-    unreachable_state)`` when no keyring is configured or a configured one
-    could not be loaded -- the SAME "no ring to check against" verdict
-    either way. Factored out of :func:`find_sealing_decision` (T2, Loki
-    BE590C53) so :func:`_ruling_sealed`'s pinned-pair check shares the
-    identical trust anchor a per-receipt seal already uses, rather than a
-    second, independent guess at how to load one."""
-    from . import keyring as _keyring
+    """Load the ``verify_seal`` ring from the SIGNER's public seal ring
+    (:mod:`seal_ring`: ``WILLOW_SEAL_RING``, else
+    ``/etc/willow-mcp/verifiers.public.json``) -- never ``WILLOW_KEYRING``,
+    which is the seat's own session keyring and may hold a different key
+    under the same verifier name. Returns ``(ring, None)`` on success, or
+    ``(None, unreachable_state)`` when the ring is missing, unreadable, not
+    public-only, or empty. Factored out of :func:`find_sealing_decision`
+    (T2, Loki BE590C53) so :func:`_ruling_sealed`'s pinned-pair check shares
+    the identical trust anchor a per-receipt seal already uses."""
+    from . import seal_ring
 
-    try:
-        ring_kr = _keyring.get_keyring()
-    except _keyring.KeyringError as exc:
-        return None, {"state": "unreachable",
-                      "cause": f"WILLOW_KEYRING={_keyring.keyring_path()!r} is configured but "
-                               f"could not be loaded: {exc}"}
-    if ring_kr is None:
-        return None, {"state": "unreachable",
-                      "cause": "no keyring configured (WILLOW_KEYRING) — a seal cannot be "
-                               "verified without a ring to verify it against"}
-    return _ring_from_keyring(ring_kr), None
+    return seal_ring.load_seal_ring()
 
 
 def find_sealing_decision(receipt_id: str, db_path: Path) -> dict:

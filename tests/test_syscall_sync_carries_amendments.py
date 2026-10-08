@@ -33,11 +33,12 @@ def tables(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def ring(tmp_path):
+def ring(tmp_path, publish_seal_ring):
     with keyring_mod.isolated():
         k = keyring_mod.Keyring(path=str(tmp_path / "keys.json"))
         k.add("sean campbell", kind="ed25519")
         k.save()
+        publish_seal_ring(k)
         keyring_mod.set_keyring(k)
         try:
             yield k
