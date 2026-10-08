@@ -100,11 +100,13 @@ def _run_full(
         monkeypatch.setenv("WILLOW_OPERATOR_VERIFIER", operator_verifier)
     payload = {"session_id": session_id}
     result = session_start_hook.handle(payload)
+    # additional_context is the boot_context prose, never JSON. The old
+    # session_enter JSON keys the tests read are rebuilt from what the hook
+    # still exposes: the prose itself and the hoisted top-level auto_sign.
     ctx_raw = result["additional_context"]
-    try:
-        ctx = json.loads(ctx_raw)
-    except (ValueError, TypeError):
-        ctx = {"_raw": ctx_raw}
+    ctx = {"_raw": ctx_raw, "boot_context": ctx_raw}
+    if result.get("auto_sign"):
+        ctx["auto_sign_note"] = result["auto_sign"]
     return ctx, result
 
 

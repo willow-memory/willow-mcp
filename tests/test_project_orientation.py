@@ -204,7 +204,9 @@ def test_session_start_bridge_invokes_session_enter_without_legacy_hook(monkeypa
     monkeypatch.setenv("WILLOW_APP_ID", "hanuman")
     result = handle({"session_id": "s", "workspace": "/workspace/project"})
     assert seen["workspace"] == "/workspace/project"
-    assert "persona" in json.loads(result["additional_context"])
+    # additional_context is boot prose now, not the session_enter JSON.
+    assert "agent=hanuman" in result["additional_context"]
+    assert "persona" not in result["additional_context"]
 
 
 # ── §3.1 dispatch_read grant, pinned so compile-agents cannot erase it ───────

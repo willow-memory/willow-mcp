@@ -177,6 +177,14 @@ def build_boot_lines(
 ) -> list[str]:
     lite_inject = is_continuation_source(source) if lite is None else lite
     lines: list[str] = [utc_clock_line(), f"agent={app_id}  postgres={postgres_status()}"]
+    # The hook injects this text alone (not the session_enter JSON), so the
+    # seat's mode, session and any packet must be readable from it. A packet
+    # is pointed to, never inlined: the body comes from dispatch_read.
+    seat = f"session={session_id}  entry_mode={enter_result.get('entry_mode') or '?'}"
+    dispatch_id = enter_result.get("dispatch_id")
+    if dispatch_id:
+        seat += f"  dispatch_id={dispatch_id} (assignment: dispatch_read)"
+    lines.append(seat)
 
     orientation = enter_result.get("orientation") or {}
     snap = orientation.get("stack_snapshot") or read_stack_snapshot(app_id)
