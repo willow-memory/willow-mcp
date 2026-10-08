@@ -183,10 +183,10 @@ def _serve_args(args: dict) -> list[str]:
 def _seal_args(args: dict) -> tuple[list[str], list[str]]:
     _only(args, {"subject", "pair_id"})
     subject = args.get("subject")
-    if not isinstance(subject, str) or not _SUBJECT_RE.match(subject):
+    if not isinstance(subject, str) or not _SUBJECT_RE.fullmatch(subject):
         raise _Refusal("EINVAL", "subject must be serve:<hash> or proposal:<hash>")
     pair_id = args.get("pair_id")
-    if pair_id is not None and (not isinstance(pair_id, str) or not _PAIR_ID_RE.match(pair_id)):
+    if pair_id is not None and (not isinstance(pair_id, str) or not _PAIR_ID_RE.fullmatch(pair_id)):
         raise _Refusal("EINVAL", "pair_id must be a Nestor pair id")
     return [subject], []
 
@@ -257,7 +257,8 @@ def _resolve_bot(bot_checkout: Optional[Path], runner: Optional[Callable]) -> Pa
     if clone.is_symlink():
         return _unreachable(f"refusing a symlinked checkout: {clone}", error="EINVAL")
     one = clone / "one-script"
-    if one.is_symlink() or not (one / "onescript" / "__main__.py").is_file():
+    pkg = one / "onescript"
+    if one.is_symlink() or pkg.is_symlink() or not (pkg / "__main__.py").is_file():
         return _unreachable(f"{one} is not a real one-script directory", error="ENOCLONE")
     return clone
 
@@ -317,7 +318,7 @@ def list_local_models(root: Optional[str] = None, timeout: float = 3.0) -> list[
 
 def _check_model(model, lister: Callable[[], list[str] | None]) -> Optional[dict]:
     """None when ``model`` is an installed local tag; a result dict otherwise."""
-    if not isinstance(model, str) or not _MODEL_RE.match(model):
+    if not isinstance(model, str) or not _MODEL_RE.fullmatch(model):
         raise _Refusal("EINVAL", "model must be a plain Ollama tag (letters, digits, . _ : / -)")
     if model.lower().endswith(("-cloud", ":cloud")):
         raise _Refusal("EINVAL", f"model {model!r} is a cloud model; rat_turn runs local models only")
@@ -343,6 +344,32 @@ def _child_env(home: Path) -> dict[str, str]:
     return env
 
 
+#: After a timeout kill, how long the pipes get to drain before they are closed
+#: and abandoned. A grandchild that left the process group (``setsid``) still
+#: holds the pipe's write end, so an unbounded second ``communicate()`` would
+#: outlive the step's own timeout (Loki 9C293AC4 F2).
+DRAIN_BOUND = 5.0
+
+
+def _drain_after_kill(proc: "subprocess.Popen") -> tuple[str, str]:
+    """Collect what a killed child wrote, within ``DRAIN_BOUND`` seconds."""
+    try:
+        return proc.communicate(timeout=DRAIN_BOUND)
+    except subprocess.TimeoutExpired:
+        pass
+    for pipe in (proc.stdout, proc.stderr):
+        try:
+            if pipe is not None:
+                pipe.close()
+        except (OSError, ValueError):
+            pass
+    try:
+        proc.wait(timeout=DRAIN_BOUND)
+    except subprocess.TimeoutExpired:
+        pass
+    return "", ""
+
+
 def _run_child(argv: list[str], *, env: dict[str, str], cwd: Path, timeout: float) -> dict:
     """Run one fixed argv in its own session so a timeout kills the whole tree."""
     started = time.monotonic()
@@ -362,7 +389,7 @@ def _run_child(argv: list[str], *, env: dict[str, str], cwd: Path, timeout: floa
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             proc.kill()
-        out, err = proc.communicate()
+        out, err = _drain_after_kill(proc)
         timed_out = True
     return {
         "rc": proc.returncode, "out": (out or "")[:MAX_STDOUT], "err": (err or "")[:MAX_STDOUT],
@@ -413,6 +440,9 @@ def _plan(step: str, args: dict, ctx: _Ctx, lister: Callable) -> dict:
         _no_args(args)
         if not ctx.signing_ring.is_file():
             return {"result": _unreachable(f"no signing keyring at {ctx.signing_ring}")}
+        for part in (ctx.public_ring.parent, ctx.public_ring):
+            if part.is_symlink():
+                return {"result": _unreachable(f"refusing a symlinked export target: {part}")}
         return {"argv": onescript("keys", "export", "--from", str(ctx.signing_ring),
                                   "--to", str(ctx.public_ring)), "cwd": cwd}
     if step == "checkin":
@@ -556,10 +586,80 @@ def execute_step(
 
     if "result" in plan:
         return _finish(step, plan["result"], digest, ledger, project, app_id, session, ran=False)
-    run = _run_child(plan["argv"], env=_child_env(home), cwd=plan["cwd"], timeout=TIMEOUTS[step])
+    if step == "rat_turn":
+        # ratatosk --onescript only appends to --out: start from an empty file so
+        # `turn` never sees a row from an earlier run (Loki 9C293AC4 F1).
+        why = _truncate_proposals(ctx.proposals)
+        if why is not None:
+            return _finish(step, _unreachable(why), digest, ledger, project, app_id, session, ran=False)
+    env = _child_env(home)
+    run = _run_child(plan["argv"], env=env, cwd=plan["cwd"], timeout=TIMEOUTS[step])
     shaped = _shape(step, run)
-    extra = {"pair_id": pair_id} if pair_id else {}
+    extra: dict = {}
+    if step == "rat_turn" and shaped.get("exit") != 0:
+        # A capped, failed or timed-out run: whatever rows it wrote are partial
+        # and are never handed to `turn` (F6).
+        discarded = _truncate_proposals(ctx.proposals)
+        shaped["partial_rows_discarded"] = discarded is None
+        shaped["reason"] = (shaped.get("reason") or f"{step} did not finish") + (
+            "; its partial proposals were discarded, nothing reaches turn"
+            if discarded is None else f"; its partial proposals could not be cleared: {discarded}")
+        shaped["state"] = "unreachable"
+    if step == "seal" and shaped.get("exit") == 0:
+        extra = _sealed_pair(env, args.get("subject"), pair_id)
     return _finish(step, shaped, digest, ledger, project, app_id, session, ran=True, extra=extra)
+
+
+def _truncate_proposals(path: Path) -> Optional[str]:
+    """Empty the proposals file without following a link; None on success."""
+    if path.is_symlink():
+        return f"refusing a symlinked proposals path: {path}"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        return f"could not reset the proposals file: {type(exc).__name__}: {exc}"
+    os.close(fd)
+    return None
+
+
+def _sealed_pair(env: dict[str, str], subject, caller_pair_id) -> dict:
+    """Which live sealed Nestor pair actually covers ``subject`` (read-only).
+
+    The seal CLI takes no pair id and finds the pair by subject, so a caller's
+    ``pair_id`` is only a claim: the pair read here is what gets recorded, and a
+    difference is reported, never papered over (Loki 9C293AC4 F3)."""
+    raw = env.get("NESTOR_DB") or env.get("WILLOW_NESTOR_DB")
+    out: dict = {}
+    ids: list[str] | None = None
+    if raw and isinstance(subject, str):
+        import sqlite3
+
+        try:
+            con = sqlite3.connect(f"file:{Path(raw).resolve()}?mode=ro", uri=True, timeout=5)
+            try:
+                ids = [r[0] for r in con.execute(
+                    "SELECT id FROM tm_pairs WHERE target_text = ? AND status = 'sealed' "
+                    "AND superseded_by = '' ORDER BY id", (subject,))]
+            finally:
+                con.close()
+        except sqlite3.Error:
+            ids = None
+    if ids is None:
+        out["pair_check"] = "unreachable: Nestor's store could not be read to see which pair sealed the subject"
+        if caller_pair_id:
+            out["caller_pair_id"] = caller_pair_id
+        return out
+    out["sealed_pair_ids"] = ids
+    match = [i for i in ids if caller_pair_id and i.lower().startswith(caller_pair_id.lower())]
+    actual = match[0] if match else (ids[0] if ids else None)
+    if actual:
+        out["pair_id"] = actual
+    if caller_pair_id and caller_pair_id not in ids and not match:
+        out["pair_id_mismatch"] = True
+        out["caller_pair_id"] = caller_pair_id
+    if not ids:
+        out["pair_check"] = "empty: no live sealed pair covers this subject in Nestor's store"
+    return out
 
 
 def _finish(step, shaped, digest, ledger, project, app_id, session, *, ran, extra=None) -> dict:

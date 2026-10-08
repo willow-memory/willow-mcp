@@ -8,6 +8,8 @@ assert what the child actually received, not what the code meant to send.
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,10 @@ n=$(ls "$d" | grep -c '^call\.[0-9]*\.argv$')
 printf '%s\0' "$@" > "$d/call.$n.argv"
 env > "$d/call.$n.env"
 pwd > "$d/call.$n.cwd"
+prev=""; out=""
+for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done
+[ -n "$out" ] && [ -f "$d/append" ] && cat "$d/append" >> "$out"
+[ -f "$d/grandchild" ] && setsid sleep 60 &
 [ -f "$d/sleep" ] && sleep 30
 [ -f "$d/stdout" ] && cat "$d/stdout"
 [ -f "$d/rc" ] && exit "$(cat "$d/rc")"
@@ -68,9 +74,14 @@ class Box:
         self.box.mkdir(parents=True)
         self.ledger = _Ledger()
 
-    def set(self, which: Path, *, stdout: str = "", rc: int | None = None, sleep: bool = False):
+    def set(self, which: Path, *, stdout: str = "", rc: int | None = None, sleep: bool = False,
+            append: str | None = None, grandchild: bool = False):
         d = which.parent
         (d / "stdout").write_text(stdout, encoding="utf-8")
+        if append is not None:
+            (d / "append").write_text(append, encoding="utf-8")
+        if grandchild:
+            (d / "grandchild").write_text("", encoding="utf-8")
         if rc is not None:
             (d / "rc").write_text(str(rc), encoding="utf-8")
         if sleep:
@@ -146,9 +157,45 @@ def test_scope_defaults_by_who(box):
 @pytest.mark.parametrize("subject", [SUBJECT, PROPOSAL])
 def test_seal_argv_and_pair_id_not_passed(box, subject):
     box.set(box.py, stdout="{}")
+    _nestor(box, [("3613d55e-aaaa", subject)])
     out = box.run("seal", {"subject": subject, "pair_id": "3613d55e"})
-    assert out["pair_id"] == "3613d55e"
+    assert out["pair_id"] == "3613d55e-aaaa" and "pair_id_mismatch" not in out
     assert box.calls(box.py)[0]["argv"] == _py_argv("seal", subject)
+
+
+def _nestor(box, rows):
+    """A throwaway Nestor store: (id, target_text) rows, all live and sealed."""
+    import sqlite3
+
+    con = sqlite3.connect(os.environ["NESTOR_DB"])
+    con.execute("CREATE TABLE IF NOT EXISTS tm_pairs (id TEXT, target_text TEXT, "
+                "status TEXT, superseded_by TEXT)")
+    con.executemany("INSERT INTO tm_pairs VALUES (?, ?, 'sealed', '')", rows)
+    con.commit()
+    con.close()
+
+
+def test_seal_records_the_pair_that_actually_sealed_not_the_callers(box):
+    box.set(box.py, stdout="{}")
+    _nestor(box, [("realpair-1", SUBJECT)])
+    out = box.run("seal", {"subject": SUBJECT, "pair_id": "feedbeef"})
+    assert out["pair_id"] == "realpair-1" and out["pair_id_mismatch"] is True
+    assert out["caller_pair_id"] == "feedbeef" and out["sealed_pair_ids"] == ["realpair-1"]
+    assert box.ledger.rows[-1]["content"]["pair_id"] == "realpair-1"
+
+
+def test_seal_with_no_live_pair_says_so_and_does_not_echo_the_caller(box):
+    box.set(box.py, stdout="{}")
+    _nestor(box, [("other", PROPOSAL)])
+    out = box.run("seal", {"subject": SUBJECT, "pair_id": "feedbeef"})
+    assert "pair_id" not in out and out["sealed_pair_ids"] == []
+    assert out["pair_id_mismatch"] is True and "no live sealed pair" in out["pair_check"]
+
+
+def test_seal_with_an_unreadable_store_is_reported_not_guessed(box):
+    box.set(box.py, stdout="{}")
+    out = box.run("seal", {"subject": SUBJECT, "pair_id": "feedbeef"})
+    assert "pair_id" not in out and out["pair_check"].startswith("unreachable")
 
 
 def test_serve_argv(box):
@@ -397,6 +444,109 @@ def test_symlinked_box_is_refused(box, tmp_path):
     assert box.calls(box.rat) == []
 
 
+def test_symlinked_onescript_package_is_refused(box, tmp_path):
+    pkg = box.bot / "one-script" / "onescript"
+    real = tmp_path / "elsewhere-pkg"
+    pkg.rename(real)
+    pkg.symlink_to(real, target_is_directory=True)
+    out = box.run("checkin")
+    assert out["state"] == "unreachable" and "one-script" in out["reason"]
+    assert box.calls(box.py) == []
+
+
+@pytest.mark.parametrize("which", ["dir", "file"])
+def test_symlinked_keys_export_target_is_refused(box, tmp_path, which):
+    cfg = box.home / "config"
+    target = cfg / "verifiers.public.json"
+    if which == "dir":
+        real = tmp_path / "elsewhere-cfg"
+        real.mkdir()
+        cfg.symlink_to(real, target_is_directory=True)
+    else:
+        cfg.mkdir()
+        elsewhere = tmp_path / "victim.json"
+        elsewhere.write_text("x", encoding="utf-8")
+        target.symlink_to(elsewhere)
+    out = box.run("keys_export")
+    assert out["state"] == "unreachable" and "symlink" in out["reason"]
+    assert box.calls(box.py) == []
+
+
+# ── F1/F6: proposals are this run's, or nothing ──────────────────────────────
+
+STALE = '{"stale": "row from an earlier run"}\n'
+
+
+def test_stale_proposals_never_reach_turn(box):
+    proposals = box.box / "proposals.jsonl"
+    proposals.write_text(STALE, encoding="utf-8")
+    box.set(box.rat, stdout="done\n")  # a ratatosk that appends nothing
+    assert box.run("rat_turn", {"model": "qwen3:4b", "task": "t"})["state"] == "populated"
+    assert proposals.read_text(encoding="utf-8") == ""
+    box.set(box.py, stdout="{}")
+    box.run("turn", {"bite": "b"})
+    assert box.calls(box.py)[0]["argv"][-1] == str(proposals)
+    assert "stale" not in proposals.read_text(encoding="utf-8")
+
+
+def test_this_runs_rows_survive_and_only_they_do(box):
+    proposals = box.box / "proposals.jsonl"
+    proposals.write_text(STALE, encoding="utf-8")
+    box.set(box.rat, stdout="done\n", append='{"new": 1}\n')
+    box.run("rat_turn", {"model": "qwen3:4b", "task": "t"})
+    assert proposals.read_text(encoding="utf-8") == '{"new": 1}\n'
+
+
+def test_symlinked_proposals_path_is_refused_and_not_written_through(box, tmp_path):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me", encoding="utf-8")
+    (box.box / "proposals.jsonl").symlink_to(victim)
+    box.set(box.rat, stdout="done\n")
+    out = box.run("rat_turn", {"model": "qwen3:4b", "task": "t"})
+    assert out["state"] == "unreachable" and "symlink" in out["reason"]
+    assert victim.read_text(encoding="utf-8") == "keep me"
+    assert box.calls(box.rat) == []
+
+
+def test_capped_run_stays_unreachable_and_its_partial_rows_are_discarded(box):
+    proposals = box.box / "proposals.jsonl"
+    box.set(box.rat, stdout="[onescript] capped\n", rc=1, append='{"partial": 1}\n')
+    out = box.run("rat_turn", {"model": "qwen3:4b", "task": "t"})
+    assert out["state"] == "unreachable" and out["exit"] == 1 and not out["ok"]
+    assert out["partial_rows_discarded"] is True and "discarded" in out["reason"]
+    assert proposals.read_text(encoding="utf-8") == ""
+    box.set(box.py, stdout="{}")
+    box.run("turn", {"bite": "b"})
+    assert "partial" not in proposals.read_text(encoding="utf-8")
+
+
+# ── F2: a timeout returns within timeout + the drain bound ───────────────────
+
+def test_grandchild_in_a_new_session_cannot_hold_the_call(box, monkeypatch):
+    monkeypatch.setitem(ox.TIMEOUTS, "checkout", 1)
+    monkeypatch.setattr(ox, "DRAIN_BOUND", 1.0)
+    box.set(box.py, sleep=True, grandchild=True)
+    t0 = time.monotonic()
+    out = box.run("checkout")
+    elapsed = time.monotonic() - t0
+    assert out["state"] == "unreachable" and out["timed_out"] is True
+    assert elapsed < 1 + 2 * 1.0 + 3, elapsed  # timeout + two bounded waits + slack
+    assert elapsed < 30
+
+
+# ── F4: anchored values ──────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("step,args", [
+    ("seal", {"subject": SUBJECT + "\n"}),
+    ("seal", {"subject": SUBJECT, "pair_id": "3613d55e\n"}),
+    ("rat_turn", {"model": "qwen3:4b\n", "task": "t"}),
+])
+def test_trailing_newline_values_are_refused(box, step, args):
+    out = box.run(step, args)
+    assert out["ok"] is False and out["ran"] is False and out["error"] == "EINVAL"
+    assert box.calls(box.py) == [] and box.calls(box.rat) == []
+
+
 # ── keys_export never carries key material ───────────────────────────────────
 
 def test_keys_export_returns_names_and_counts_only(box):
@@ -488,14 +638,15 @@ def test_tool_is_gated_on_its_own_name():
     assert server._gate_tool_catalogue()["onescript_run_execute"] == "onescript_run_execute"
     groups = gate.PERMISSION_GROUPS
     assert "onescript_run_execute" in groups["orchestrator"]
-    assert "onescript_run_execute" in groups["full_access"]
-    for other in ("steward_sweep", "envelope_apply", "fleet_read", "dispatch_write"):
+    holders = {g for g, names in groups.items() if "onescript_run_execute" in names}
+    assert holders == {"orchestrator"}, holders  # F7: orchestrator only
+    for other in ("full_access", "steward_sweep", "envelope_apply", "fleet_read", "dispatch_write"):
         assert "onescript_run_execute" not in groups[other]
 
 
 @pytest.mark.parametrize("perms,allowed", [
     (["orchestrator"], True),
-    (["full_access"], True),
+    (["full_access"], False),
     (["steward_sweep"], False),
     (["envelope_apply"], False),
     (["fleet_read", "dispatch_write"], False),

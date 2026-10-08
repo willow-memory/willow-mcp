@@ -41,7 +41,16 @@ step table, no free-form argv, no shell.
 - Timeouts: `checkin` 300 s (it runs the tests gate), `rat_turn` 900 s, the rest
   120 s. A timeout kills the child's whole process group.
 - `seal` finds the sealed pair by subject in Nestor's store (the CLI takes no
-  pair id); `pair_id` is validated and kept in the receipt only.
+  pair id). After it runs, the verb reads which live sealed pair covers the
+  subject and records that one (`pair_id`, `sealed_pair_ids`); a caller's
+  `pair_id` that differs is reported as `pair_id_mismatch` + `caller_pair_id`.
+- `rat_turn` truncates `proposals.jsonl` (no symlink, `O_NOFOLLOW`) before the
+  run, because ratatosk only appends. A run that does not exit 0 (including a
+  capped one) is `unreachable` and its partial rows are truncated away
+  (`partial_rows_discarded`), never handed to `turn`.
+- After a timeout the process group is killed and the pipes are drained for at
+  most `DRAIN_BOUND` (5 s), then closed: a grandchild in another session cannot
+  hold the call past timeout + 5 s.
 - A leading `-` in free text (`task`, `bite`) is refused so it cannot parse as a flag.
 
 ## Result
@@ -63,8 +72,8 @@ state. No envelope, no egress, nothing pushed.
 
 ## ACL
 
-Own gate name `onescript_run_execute`. In `orchestrator` and `full_access`;
-**not** in `steward_sweep` or `envelope_apply`. The `willow` desk manifest
-already lists `orchestrator` and `full_access`, so no manifest change or
+Own gate name `onescript_run_execute`. In `orchestrator` only;
+**not** in `full_access`, `steward_sweep` or `envelope_apply`. The `willow` desk manifest
+already lists `orchestrator`, so no manifest change or
 re-sign is needed to grant it. The tool is not in `DESK_CORE` (held at the
 50-tool Glama cap); a desk reaches it by name.
