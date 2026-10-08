@@ -213,10 +213,11 @@ def handle(payload: dict) -> dict:
         boot_lines.append("")
         boot_lines.append(f"[attribution] {auto_sign_note}")
     result["boot_context"] = "\n".join(boot_lines)
-    # Also hoist to the top-level returned dict so a client that renders
-    # top-level keys (rather than parsing additional_context JSON) shows
-    # it prominently. Belt-and-braces alongside the boot_context line.
-    outer = {"additional_context": json.dumps(result, sort_keys=True)}
+    # Inject only the boot text. The full session_enter result (~174k chars
+    # measured 2026-10-08, gap e142d00a7117) stays out of the client's
+    # context; the agent reads it by calling session_enter itself. The
+    # attribution note is also hoisted to a top-level key below.
+    outer = {"additional_context": result["boot_context"]}
     if auto_sign_note:
         outer["auto_sign"] = auto_sign_note
     return outer

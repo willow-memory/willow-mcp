@@ -822,9 +822,41 @@ def test_session_start_includes_boot_context(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(sl, "seed_corpus_corrections", lambda: 0)
     out = ssh.handle({"session_id": "s1", "source": "startup"})
-    payload = json.loads(out["additional_context"])
-    assert "boot_context" in payload
-    assert "[CLOCK]" in payload["boot_context"]
+    ctx = out["additional_context"]
+    assert isinstance(ctx, str)
+    assert "[CLOCK]" in ctx
+    assert "agent=hanuman" in ctx
+    assert "session=s1  entry_mode=human" in ctx
+    assert len(ctx) < 8000
+    with pytest.raises(ValueError):
+        json.loads(ctx)
+
+
+def test_session_start_injects_boot_context_not_the_enter_payload(monkeypatch):
+    """The hook must not dump session_enter's whole result into the client
+    context (174,392 chars measured 2026-10-08, gap e142d00a7117)."""
+    from willow_mcp import session_start_hook as ssh
+    from willow_mcp import server
+
+    monkeypatch.setenv("WILLOW_APP_ID", "hanuman")
+    monkeypatch.setattr(
+        server,
+        "session_enter",
+        lambda **kwargs: {
+            "entry_mode": "dispatch",
+            "dispatch_id": "44DC1113",
+            "assignment": "SECRET-ASSIGNMENT-BODY " * 10000,
+            "orientation": {},
+        },
+    )
+    monkeypatch.setattr(sl, "seed_corpus_corrections", lambda: 0)
+    out = ssh.handle({"session_id": "s2", "source": "startup"})
+    ctx = out["additional_context"]
+    assert len(ctx) < 8000
+    assert "SECRET-ASSIGNMENT-BODY" not in ctx
+    assert "entry_mode=dispatch" in ctx
+    assert "dispatch_id=44DC1113" in ctx
+    assert "dispatch_read" in ctx
 
 
 # ── trust-root boot fault: fail closed, not mid-task denial ──────────────────
@@ -1074,9 +1106,10 @@ def test_session_start_handle_survives_boot_context_fault(monkeypatch):
 
     monkeypatch.setattr(ssh, "build_boot_lines", boom)
     out = ssh.handle({"session_id": "s1", "source": "startup"})
-    payload = json.loads(out["additional_context"])
-    assert "boot_context" in payload
-    assert "degraded" in payload["boot_context"]
+    ctx = out["additional_context"]
+    assert "[boot_context] degraded" in ctx
+    assert "simulated boot_context fault" in ctx
+    assert len(ctx) < 8000
 
 
 def test_boot_lines_healthy_seat_no_false_alarms(monkeypatch):

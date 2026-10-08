@@ -33,17 +33,13 @@ def test_session_start_calls_session_enter_only(monkeypatch):
     monkeypatch.setenv("WILLOW_APP_ID", "willow")
     out = ssh.handle({"session_id": "s", "source": "startup", "workspace": "/w"})
     assert calls and calls[0]["app_id"] == "willow"
-    import json
-
-    payload = json.loads(out["additional_context"])
-    assert payload["entry_mode"] == "human_orchestrator"
-    assert "boot_context" in payload
-    assert "orientation" in payload
+    ctx = out["additional_context"]
+    assert "entry_mode=human_orchestrator" in ctx
+    assert "handoff: handoffs/x.md" in ctx
+    assert len(ctx) < 8000
 
 
 def test_continuation_source_trims_boot(monkeypatch):
-    import json
-
     import willow_mcp.server as server
 
     monkeypatch.setattr(
@@ -54,5 +50,5 @@ def test_continuation_source_trims_boot(monkeypatch):
     monkeypatch.setattr(ssh, "seed_corpus_corrections", lambda: 0)
     monkeypatch.setenv("WILLOW_APP_ID", "hanuman")
     out = ssh.handle({"session_id": "s", "source": "compact"})
-    ctx = json.loads(out["additional_context"])["boot_context"]
+    ctx = out["additional_context"]
     assert "trimmed boot" in ctx or "continuation" in ctx
