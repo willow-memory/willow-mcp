@@ -197,15 +197,17 @@ SOURCE_NORM = "restart the broker"
 
 
 @pytest.fixture
-def ring_with_sean(tmp_path):
+def ring_with_sean(tmp_path, publish_seal_ring):
     """A keyring with a REAL ed25519 ``"sean campbell"`` entry active —
     what `find_sealing_decision` (F5) now verifies every candidate seal
-    against, the same pattern `test_manifest_grant.py`'s `ring_with_sean`
+    against, via the SEAL ring published from it (the signer's public
+    ring), the same pattern `test_manifest_grant.py`'s `ring_with_sean`
     uses. Yields the `Keyring` so a test can sign with its private half."""
     with keyring_mod.isolated():
         k = keyring_mod.Keyring(path=str(tmp_path / "keys.json"))
         k.add("sean campbell", kind="ed25519")
         k.save()
+        publish_seal_ring(k)
         keyring_mod.set_keyring(k)
         try:
             yield k
@@ -312,7 +314,7 @@ def test_seal_lookup_unloadable_keyring_is_unreachable_not_a_traceback(tmp_path,
     target_text = "yes — restart onto pull receipt receipt-7"
     sig = priv.sign(ns.seal_message(SOURCE_NORM, target_text, "sean campbell")).hex()
     db = _nestor_db(tmp_path, ("pair-1", target_text, "sealed", sig, "", "decision", "sean campbell"))
-    monkeypatch.setenv("WILLOW_KEYRING", str(tmp_path / "no-such-keyring.json"))
+    monkeypatch.setenv("WILLOW_SEAL_RING", str(tmp_path / "no-such-ring.json"))
     out = reloader.find_sealing_decision("receipt-7", db)  # must not raise
     assert out["state"] == "unreachable" and "cause" in out
 

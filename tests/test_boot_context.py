@@ -731,9 +731,8 @@ def test_boot_context_escapes_forged_pair_id_newline_at_boot(tmp_path, monkeypat
         pub = Ed25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         return {"sean campbell": {"key": pub, "kind": "ed25519", "revoked_at": None, "compromised": False}}
 
-    from willow_mcp import keyring as _keyring
-    monkeypatch.setattr(_keyring, "get_keyring", lambda: object())
-    monkeypatch.setattr(sl, "_ring_from_keyring", _fake_ring)
+    from willow_mcp import seal_ring as _seal_ring
+    monkeypatch.setattr(_seal_ring, "load_seal_ring", lambda: (_fake_ring(None), None))
     _quiet_boot_but_memory_lane(monkeypatch)
 
     lines = _bc.build_boot_lines("heimdallr", "sess-forged-pair-id", "startup", {"orientation": {}})
@@ -767,9 +766,8 @@ def test_boot_context_names_refused_seals_when_all_candidates_fail(tmp_path, mon
         pub = Ed25519PrivateKey.generate().public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         return {"sean campbell": {"key": pub, "kind": "ed25519", "revoked_at": None, "compromised": False}}
 
-    from willow_mcp import keyring as _keyring
-    monkeypatch.setattr(_keyring, "get_keyring", lambda: object())
-    monkeypatch.setattr(sl, "_ring_from_keyring", _fake_ring)
+    from willow_mcp import seal_ring as _seal_ring
+    monkeypatch.setattr(_seal_ring, "load_seal_ring", lambda: (_fake_ring(None), None))
     _quiet_boot_but_memory_lane(monkeypatch)
 
     lines = _bc.build_boot_lines("heimdallr", "sess-refused-boot", "startup", {"orientation": {}})

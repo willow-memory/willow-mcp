@@ -719,18 +719,6 @@ def _boot_correction_marker(text: str) -> tuple[str, str] | None:
     return scope, rest
 
 
-def _ring_from_keyring(kr) -> dict[str, dict]:
-    """The `net_signer.verify_seal` ring shape, built from the process's
-    own keyring — the same shape `manifest_grant_executor._ring_from_keyring`
-    and `reloader._ring_from_keyring` build, duplicated here rather than
-    imported (this codebase's established pattern for this exact helper:
-    a few lines, no cross-packet dependency)."""
-    return {
-        e.name: {"key": e.key, "kind": e.kind, "revoked_at": e.revoked_at, "compromised": e.compromised}
-        for e in kr.entries()
-    }
-
-
 def load_sealed_corrections(*, db_path: Path | None = None,
                              ring: dict[str, dict] | None = None) -> dict[str, Any]:
     """Sealed governance decisions eligible as boot 'operator' corrections
@@ -760,9 +748,10 @@ def load_sealed_corrections(*, db_path: Path | None = None,
     whenever it is non-empty, in EITHER state — a refusal is never
     optional detail, never silently folded into "empty".
 
-    `ring` is an injection seam for tests (the same shape
-    :func:`_ring_from_keyring` builds) — production always resolves it
-    from the process's own keyring when omitted.
+    `ring` is an injection seam for tests (the `net_signer.verify_seal`
+    ring shape) — production always resolves it from the signer's public
+    seal ring (`seal_ring.load_seal_ring`) when omitted, never from
+    `WILLOW_KEYRING`.
 
     Returns `{"items": [...], "total": N, "state":
     "populated"|"refused"|"empty"|"unreachable", "unverifiable": [...]}`.
@@ -800,19 +789,12 @@ def load_sealed_corrections(*, db_path: Path | None = None,
     from . import net_signer
 
     if ring is None:
-        from . import keyring as _keyring
+        from . import seal_ring as _seal_ring
 
-        try:
-            ring_kr = _keyring.get_keyring()
-        except _keyring.KeyringError as exc:
+        ring, ring_err = _seal_ring.load_seal_ring()
+        if ring is None:
             return {"items": [], "total": 0, "state": "unreachable",
-                    "cause": f"keyring unusable: {exc}", "unverifiable": []}
-        if ring_kr is None:
-            return {"items": [], "total": 0, "state": "unreachable",
-                    "cause": "no keyring configured — a seal cannot be verified "
-                             "without a ring to verify it against",
-                    "unverifiable": []}
-        ring = _ring_from_keyring(ring_kr)
+                    "cause": ring_err["cause"], "unverifiable": []}
 
     items: list[dict[str, str]] = []
     unverifiable: list[str] = []

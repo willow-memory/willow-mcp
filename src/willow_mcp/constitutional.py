@@ -211,18 +211,6 @@ def _amend_line(row_id: int, verb: str, from_sha256: str, to_sha256: str) -> str
     return f"syscall-row-amend: id={row_id} verb={verb} from={from_sha256} to={to_sha256}"
 
 
-def _ring_from_keyring(kr) -> dict[str, dict]:
-    """The ``verify_seal`` ring shape (``{name: {key, kind, revoked_at,
-    compromised}}``), built from the process's OWN keyring — the same shape
-    :func:`reloader._ring_from_keyring` builds, duplicated here (a few
-    lines) rather than imported, so this module carries no dependency on a
-    file another packet owns."""
-    return {
-        e.name: {"key": e.key, "kind": e.kind, "revoked_at": e.revoked_at, "compromised": e.compromised}
-        for e in kr.entries()
-    }
-
-
 def _canonical_json(obj) -> str:
     """Sorted keys, no whitespace, ``ensure_ascii=True`` (``json.dumps``'
     own default) — the one serialization every hash in this module is
@@ -416,20 +404,14 @@ def _confirm_amendment(rec: dict, *, live_row: dict, bundle_row: dict,
             f"in the Nestor ledger (state={pair.get('state')!r}: "
             f"{pair.get('why') or pair.get('cause') or 'unknown'})")
 
-    from . import keyring as _keyring
     from . import net_signer
+    from . import seal_ring as _seal_ring
 
-    try:
-        ring_kr = _keyring.get_keyring()
-    except _keyring.KeyringError as exc:
+    ring, ring_err = _seal_ring.load_seal_ring()
+    if ring is None:
         return False, (
-            f"row {row_id} ({verb}): WILLOW_KEYRING is configured but could not be "
-            f"loaded: {exc} — refusing")
-    if ring_kr is None:
-        return False, (
-            f"row {row_id} ({verb}): no keyring configured (WILLOW_KEYRING) — a seal "
+            f"row {row_id} ({verb}): seal ring unreachable ({ring_err['cause']}) — a seal "
             f"cannot be verified without a ring to verify it against — refusing")
-    ring = _ring_from_keyring(ring_kr)
 
     sealed = {"source_norm": pair.get("source_norm"), "target_text": pair.get("target_text"),
               "verifier": pair.get("verifier"), "seal_sig": pair.get("seal_sig"),

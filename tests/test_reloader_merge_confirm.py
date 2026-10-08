@@ -249,11 +249,12 @@ def _ruling_db(tmp_path, *, row=True, status="sealed", superseded="", source_lan
 
 
 @pytest.fixture
-def ring_with_sean(tmp_path):
+def ring_with_sean(tmp_path, publish_seal_ring):
     with keyring_mod.isolated():
         k = keyring_mod.Keyring(path=str(tmp_path / "keys.json"))
         k.add("sean campbell", kind="ed25519")
         k.save()
+        publish_seal_ring(k)
         keyring_mod.set_keyring(k)
         try:
             yield k
@@ -957,10 +958,14 @@ def test_run_once_v2_wrong_pin_falls_back_and_writes_named_refusal(
 # -- N6: the em dash in the no-keyring cause text -------------------------------
 
 def test_load_verify_ring_no_keyring_cause_uses_em_dash(monkeypatch):
-    # Minor (Loki PASS 0D8EA229 INFO): isolate WILLOW_KEYRING explicitly --
-    # this test wants "no keyring configured" specifically, not whatever
-    # happened to be (un)set in the ambient environment.
+    # Minor (Loki PASS 0D8EA229 INFO): isolate the ring explicitly --
+    # this test wants "no seal ring" specifically, not whatever happened to
+    # be (un)set in the ambient environment. WILLOW_KEYRING is irrelevant
+    # to seals now; it is cleared only to show that it is not consulted.
     monkeypatch.delenv("WILLOW_KEYRING", raising=False)
+    monkeypatch.delenv("WILLOW_SEAL_RING", raising=False)
+    monkeypatch.setattr("willow_mcp.seal_ring.DEFAULT_SEAL_RING",
+                        __import__("pathlib").Path("/nonexistent-seal-ring/verifiers.public.json"))
     ring, err = reloader._load_verify_ring()
     assert ring is None
     assert err["state"] == "unreachable"

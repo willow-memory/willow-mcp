@@ -211,14 +211,16 @@ def store(tmp_path):
 
 
 @pytest.fixture
-def ring_with_sean(tmp_path):
+def ring_with_sean(tmp_path, publish_seal_ring):
     """A keyring with a REAL ed25519 'sean' entry active — the operator's
     canonical verifier for these tests. Yields the `Keyring` so tests can
-    sign with `sean`'s private half via `_sign_seal`."""
+    sign with `sean`'s private half via `_sign_seal`. Its public half is
+    also published as the SEAL ring, which is what a seal verifies against."""
     with keyring_mod.isolated():
         k = keyring_mod.Keyring(path=str(tmp_path / "keys.json"))
         k.add("sean", kind="ed25519")
         k.save()
+        publish_seal_ring(k)
         keyring_mod.set_keyring(k)
         try:
             yield k
@@ -273,15 +275,16 @@ def test_unknown_verifier_is_eacces(home, tmp_path, store):
     _seal(home, store, verifier="sean")
     out = _request(store=store)
     assert out["error"] == "EACCES"
-    assert "keyring" in out["reason"]
+    assert "seal ring" in out["reason"]
 
 
-def test_compromised_verifier_is_eacces(home, tmp_path, store):
+def test_compromised_verifier_is_eacces(home, tmp_path, store, publish_seal_ring):
     with keyring_mod.isolated():
         k = keyring_mod.Keyring(path=str(tmp_path / "keys.json"))
         k.add("sean", kind="ed25519")
         k.revoke("sean", reason="test", compromised=True)
         k.save()
+        publish_seal_ring(k)
         keyring_mod.set_keyring(k)
         try:
             _seal(home, store, verifier="sean")
