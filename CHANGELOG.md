@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.95.1](https://github.com/willow-memory/willow-mcp/compare/v2.95.0...v2.95.1) (2026-10-08)
+
+
+### Fixed
+
+* **hooks:** session start injects boot_context only, not the full session_enter JSON ([ddfbebd](https://github.com/willow-memory/willow-mcp/commit/ddfbebd1ab68beffff733c05f4ba0248361c3edf))
+
 ## [2.95.0](https://github.com/willow-memory/willow-mcp/compare/v2.94.3...v2.95.0) (2026-10-08)
 
 
