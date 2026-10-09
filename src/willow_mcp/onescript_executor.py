@@ -72,6 +72,7 @@ TIMEOUTS = {
     "rat_turn": 900,
     "turn": 120,
     "checkout": 120,
+    "pooled": 120,
 }
 
 STEPS = tuple(TIMEOUTS)
@@ -497,6 +498,10 @@ def _plan(step: str, args: dict, ctx: _Ctx, lister: Callable) -> dict:
     if step == "checkout":
         _no_args(args)
         return {"argv": onescript("checkout"), "cwd": cwd}
+    if step == "pooled":
+        # A pure read: the session's pooled, unsealed `pass` proposals as JSONL.
+        _no_args(args)
+        return {"argv": onescript("pooled"), "cwd": cwd}
     if step == "scope":
         return {"argv": onescript("scope", *_scope_args(args)), "cwd": cwd}
     if step == "serve":
@@ -534,6 +539,49 @@ def _plan(step: str, args: dict, ctx: _Ctx, lister: Callable) -> dict:
     raise _Refusal("EINVAL", f"unknown step {step!r}; steps are {list(STEPS)}")
 
 
+#: The five keys every pooled line must carry (willow-bot ``onescript pooled``).
+POOLED_KEYS = ("subject", "path", "data", "cites", "claim")
+
+
+def _shape_pooled(base: dict, rc, out: str, err: str) -> dict:
+    """``onescript pooled`` prints JSON lines, one object per line. Each line is
+    parsed on its own; a line that is not an object carrying the contract keys
+    makes the whole read ``unreachable`` — a malformed line is never dropped."""
+    if rc != 0:
+        why = next((ln for ln in (err + "\n" + out).splitlines() if ln.startswith("refused:")), "")
+        return {**base, "state": "unreachable",
+                "reason": _redact(why) or _redact(_tail(err)) or f"pooled exited {rc}",
+                "tail": _redact(_tail(out or err))}
+    if len(out) >= MAX_STDOUT:
+        # _run_child cuts stdout at MAX_STDOUT with no marker; a cut on a newline
+        # leaves every surviving line valid JSON, i.e. a silent subset. The whole
+        # read is unreachable rather than a populated partial pool.
+        return {**base, "state": "unreachable",
+                "reason": f"pooled stdout reached the {MAX_STDOUT}-byte stdout cap; "
+                          "the pool may be truncated, so nothing was read"}
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    if not lines:
+        return {**base, "state": "empty", "reason": "the pool is empty",
+                "tail": _redact(_tail(err))}
+    records: list[dict] = []
+    for n, line in enumerate(lines, 1):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            return {**base, "state": "unreachable",
+                    "reason": f"pooled line {n} is not valid JSON; nothing was read"}
+        if not isinstance(obj, dict):
+            return {**base, "state": "unreachable",
+                    "reason": f"pooled line {n} is not a JSON object; nothing was read"}
+        missing = [k for k in POOLED_KEYS if k not in obj]
+        if missing:
+            return {**base, "state": "unreachable",
+                    "reason": f"pooled line {n} lacks {missing}; nothing was read"}
+        records.append(obj)
+    return {**base, "state": "populated", "reason": "",
+            "stdout_json": {"pooled": records, "count": len(records)}}
+
+
 def _shape(step: str, run: dict) -> dict:
     """Turn a finished child into the three-state result."""
     if "spawn_error" in run:
@@ -553,6 +601,8 @@ def _shape(step: str, run: dict) -> dict:
                     "stdout_json": summary}
         why = summary["refused"][0] if summary["refused"] else f"keys export exited {rc}"
         return {**base, "state": "unreachable", "reason": why, "stdout_json": summary}
+    if step == "pooled":
+        return _shape_pooled(base, rc, out, err)
     if rc != 0:
         why = next((ln for ln in out.splitlines() if ln.startswith(("refused:", "BOX WON'T OPEN"))), "")
         return {**base, "state": "unreachable",

@@ -225,7 +225,7 @@ def _read_call_credential() -> Optional[dict]:
     from the `ServerRequestContext` the SDK hands it. SDK 1.x had an ambient
     `mcp.server.lowlevel.server.request_ctx`; 2.0 removed it deliberately and
     injects `Context` into tool functions instead — an injection that does not
-    reach a decorator wrapping 153 tools. See willow_mcp/request_context.py for
+    reach a decorator wrapping 154 tools. See willow_mcp/request_context.py for
     why the replacement is a ContextVar we own rather than one the SDK might
     move again.
     """
@@ -6136,6 +6136,50 @@ def onescript_run_execute(
         )
     except Exception as exc:
         return {"ok": False, "ran": False, "error": f"onescript_run_execute_failed: {exc}"}
+
+
+@mcp.tool(annotations=_ANNO_WRITE)
+@_guarded("onescript_deposit")
+def onescript_deposit(app_id: str, project: str = "onescript") -> dict:
+    """Deposit the one script's pooled set as governance DRAFTS — propose, never
+    seal. Runs the pure `pooled` read step (the session's pooled, unsealed
+    `pass` proposals as JSON lines) and, for each pooled pair, records it as a
+    `projects_willow_governance_decisions` record (title from the claim; the
+    ruling is the claim plus its supporting data and cites; origin
+    willow-seat-scoped) via `store_put`'s store, then proposes it with
+    `decision_propose`'s bridge so a human can seal the draft in Nestor.
+
+    Three-state, passed straight through: when the pooled read is
+    `unreachable` (a refusal, a timeout, a malformed line) or `empty`, NOTHING
+    is deposited and that state comes back as read. Idempotent on the pooled
+    `subject` (`proposal:<hash>`): each record carries its `subject`, and a
+    re-run that finds a governance record already carrying it REUSES that
+    record (no second `store_put`) and `decision_propose` answers
+    `already_linked` for a record that already holds a draft — no duplicates.
+
+    Seals NOTHING: no Nestor seal, no `seal_drain`, no HMAC; only a human's
+    key ratifies. Returns `{ok, state, count, deposited: [{subject, record_id,
+    pair_id, status}], receipt_id}`; a pair that cannot be proposed (e.g. a
+    `title_collision`) is listed with `status: "error"` and its `error`, never
+    dropped. Leaves a FRANK `onescript_deposit` receipt (subjects, record and
+    pair ids). Gated on its OWN name (`onescript_deposit`); only `orchestrator`
+    carries it."""
+    pg = get_pg()
+    if not pg:
+        return _postgres_unavailable()
+    try:
+        from . import onescript_deposit as _dep
+        from .governance_ledger import GovernanceLedger
+
+        return _dep.deposit(
+            app_id,
+            project=project or "onescript",
+            session=_current_orchestrator_session(),
+            ledger=GovernanceLedger(pg),
+        )
+    except Exception as exc:
+        return {"ok": False, "deposited": [], "count": 0,
+                "error": f"onescript_deposit_failed: {exc}"}
 
 
 @mcp.tool(annotations=_ANNO_WRITE)
