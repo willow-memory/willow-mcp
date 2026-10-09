@@ -31,6 +31,15 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.97.0](https://github.com/willow-memory/willow-mcp/compare/v2.96.0...v2.97.0) (2026-10-09)
+
+
+### Added
+
+* **onescript:** broker deposit for the pooled set — ProposeOnly, never seals ([bf9785a](https://github.com/willow-memory/willow-mcp/commit/bf9785a7dc75ab4cabd19ac2d50c2ca071a73594))
+* **onescript:** broker deposit for the pooled set (pooled read step + onescript_deposit) ([77f9cb9](https://github.com/willow-memory/willow-mcp/commit/77f9cb971ea5aeeab278ad9936bb0d1d78c8f24b))
+* **onescript:** deposit rework - no privileged marker from a pooled claim, no silent subset, no silent content reuse ([c4d4c6c](https://github.com/willow-memory/willow-mcp/commit/c4d4c6cfcce54be8cd126e7aeb70095616584534))
+
 ## [2.96.0](https://github.com/willow-memory/willow-mcp/compare/v2.95.1...v2.96.0) (2026-10-08)
 
 
