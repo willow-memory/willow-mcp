@@ -154,6 +154,9 @@ TOOL_CLASS: dict[str, str] = {
     "gitsync_sweep": EXECUTE, "git_pull_execute": EXECUTE,
     "pip_sync_execute": EXECUTE,
     "onescript_run_execute": EXECUTE,
+    # onescript_deposit: reads the pool (pure local step) then store_put +
+    # decision_propose per subject — governance drafts only, never a seal.
+    "onescript_deposit": WRITE,
     # unit_install_execute / unit_reload_execute ride @_guarded("envelope_apply")
     # (same shared gate as other brokered envelope acts). unit_ops_status rides
     # @_guarded("fleet_read") — classify the gate name, not the tool function.

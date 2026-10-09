@@ -869,6 +869,85 @@ def test_the_tool_body_never_runs_for_a_seat_without_the_name(apps_root, monkeyp
     assert out.get("ok") is not True
 
 
+# ── pooled: a pure read; JSON lines, never one document ──────────────────────
+
+def _pair(n: int) -> dict:
+    return {"subject": f"proposal:{n:016x}", "path": f"p/{n}", "data": {"n": n},
+            "cites": [f"c{n}"], "claim": f"claim {n}"}
+
+
+def _jsonl(*pairs) -> str:
+    return "".join(json.dumps(p, ensure_ascii=True) + "\n" for p in pairs)
+
+
+def test_pooled_is_a_step_with_its_own_timeout():
+    assert "pooled" in ox.STEPS and ox.TIMEOUTS["pooled"] == 120
+
+
+def test_pooled_populated_parses_every_line(box):
+    box.set(box.py, stdout=_jsonl(_pair(1), _pair(2), _pair(3)))
+    out = box.run("pooled")
+    assert out["state"] == "populated" and out["ok"]
+    assert out["stdout_json"]["count"] == 3
+    assert [p["claim"] for p in out["stdout_json"]["pooled"]] == ["claim 1", "claim 2", "claim 3"]
+    [call] = box.calls(box.py)
+    assert call["argv"] == _py_argv("pooled")
+    assert call["cwd"] == str((box.bot / "one-script").resolve())
+
+
+def test_pooled_single_line_is_a_list_of_one(box):
+    box.set(box.py, stdout=_jsonl(_pair(1)))
+    assert box.run("pooled")["stdout_json"]["count"] == 1
+
+
+def test_pooled_empty_pool(box):
+    box.set(box.py, stdout="")
+    out = box.run("pooled")
+    assert out["state"] == "empty" and out["exit"] == 0
+    assert out["reason"] == "the pool is empty"
+    assert "stdout_json" not in out
+
+
+def test_pooled_refused_is_unreachable_with_the_reason(box):
+    box.set(box.py, stdout="refused: the box is not open\n", rc=2)
+    out = box.run("pooled")
+    assert out["state"] == "unreachable" and out["exit"] == 2 and not out["ok"]
+    assert out["reason"] == "refused: the box is not open"
+
+
+def test_pooled_timeout_is_unreachable(box, monkeypatch):
+    monkeypatch.setitem(ox.TIMEOUTS, "pooled", 1)
+    box.set(box.py, sleep=True)
+    out = box.run("pooled")
+    assert out["state"] == "unreachable" and out["timed_out"] is True
+
+
+@pytest.mark.parametrize("bad", [
+    "not json at all\n",
+    "[1, 2]\n",
+    '{"subject": "proposal:aa", "path": "p"}\n',  # an object missing contract keys
+])
+def test_pooled_a_malformed_line_is_never_dropped(box, bad):
+    box.set(box.py, stdout=_jsonl(_pair(1)) + bad + _jsonl(_pair(2)))
+    out = box.run("pooled")
+    assert out["state"] == "unreachable"
+    assert "line 2" in out["reason"]
+    assert "stdout_json" not in out
+
+
+def test_pooled_takes_no_arguments(box):
+    out = box.run("pooled", {"x": 1})
+    assert out["ok"] is False and out["error"] == "EINVAL"
+    assert box.calls(box.py) == []
+
+
+def test_pooled_is_a_pure_read_of_the_box(box):
+    box.set(box.py, stdout=_jsonl(_pair(1)))
+    before = sorted(p.name for p in box.box.iterdir())
+    box.run("pooled")
+    assert sorted(p.name for p in box.box.iterdir()) == before
+
+
 # ── checkin resolve="put_back": clear a stray proposals.jsonl headless ───────
 
 def _stray(box, data: str = '{"path":"x","data":"y","cites":[],"claim":"z"}\n'):

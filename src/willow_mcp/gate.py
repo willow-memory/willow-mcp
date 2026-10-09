@@ -129,6 +129,9 @@ PERMISSION_GROUPS: dict[str, frozenset] = {
         # steward_sweep carries it (Loki 9C293AC4 F7).
         "gitsync_sweep", "git_pull_execute", "pip_sync_execute",
         "onescript_run_execute",
+        # onescript_deposit: the pooled set -> governance drafts (propose-only,
+        # never a seal). Orchestrator ONLY, like onescript_run_execute.
+        "onescript_deposit",
     }),
     "fleet_read": frozenset({
         "fleet_status", "fleet_health", "frank_read", "frank_verify",

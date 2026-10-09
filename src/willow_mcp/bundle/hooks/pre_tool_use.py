@@ -949,7 +949,7 @@ _SEAT_WRITE_TOOLS = frozenset({
     "friction_scan",
     "gap_delete", "gap_log", "gap_promote", "gap_purge_topic", "gap_resolve", "gap_retopic",
     "git_pull_execute", "gitsync_sweep", "pip_sync_execute",
-    "onescript_run_execute",
+    "onescript_run_execute", "onescript_deposit",
     "grove_ack", "grove_bus_send", "grove_flag", "grove_heartbeat",
     "grove_reply", "grove_send_message", "grove_unflag",
     "handoff_write_v4",
