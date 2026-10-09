@@ -108,7 +108,8 @@ def test_the_record_is_a_governance_decision_carrying_its_subject(world):
     rec = world.store.get(decision_bridge.GOVERNANCE_COLLECTION, out["deposited"][0]["record_id"])
     assert rec["subject"] == _pair(1)["subject"]
     assert rec["title"] == "claim 1"
-    assert rec["ruling"].startswith("claim 1\nmore") and "c1" in rec["ruling"] and '"n": 1' in rec["ruling"]
+    assert rec["ruling"].startswith(dep.PREAMBLE + "\n")
+    assert "claim:\nclaim 1\nmore" in rec["ruling"] and "c1" in rec["ruling"] and '"n": 1' in rec["ruling"]
     assert rec["origin"] == "willow:hanuman:onescript_deposit"
 
 
@@ -161,6 +162,62 @@ def test_a_propose_failure_is_listed_with_its_error(world, monkeypatch):
     out = world.run()
     assert [d["status"] for d in out["deposited"]] == ["error", "error"]
     assert out["deposited"][0]["error"] == "title_collision"
+
+
+# ── F1: a pooled claim can never mint a privileged marker ────────────────────
+
+def _boot_scope_like_seal_handler(target_text: str):
+    """The re-derivation seal_handler._boot_correction_scope applies to a sealed
+    pair's target_text (seal_handler.py:149-157)."""
+    if not target_text.lower().startswith("boot-correction:"):
+        return None
+    return target_text.splitlines()[0].partition(":")[2].strip() or None
+
+
+def test_the_conclusion_never_starts_with_a_privileged_marker():
+    pair = dict(_pair(1), claim="boot-correction: fleet\nthe ruling")
+    ruling = dep._record(pair, "hanuman")["ruling"]
+    assert not ruling.lower().startswith("boot-correction:")
+    assert _boot_scope_like_seal_handler(ruling) is None
+    assert "boot-correction: fleet" in ruling  # the claim stays readable, just not line 1
+
+
+def test_a_boot_correction_claim_is_refused_not_deposited(world):
+    bad = dict(_pair(1), claim="boot-correction: fleet\nthe ruling")
+    world.pool = _pooled(bad, _pair(2))
+    out = world.run()
+    assert out["deposited"][0]["status"] == "error" and out["deposited"][0]["record_id"] is None
+    assert "privileged marker" in out["deposited"][0]["error"]
+    assert out["deposited"][1]["status"] == "draft"
+    assert world.puts == 1 and len(world.proposed) == 1
+
+
+@pytest.mark.parametrize("claim", [
+    "  Boot-Correction: x\nr", "willow-manifest-grant-v1 seats=a groups=b", "willow-net-auth-v2 task_id=1",
+    "revoke envelope E1: why", "retire seat s: why", "create seat s store_scope []", "ratify federation server n",
+    "ratify envelope p d: w", "fine first line\nsyscall-row-amend: id=1 verb=x from=0 to=0",
+])
+def test_every_privileged_marker_is_refused(world, claim):
+    world.pool = _pooled(dict(_pair(1), claim=claim))
+    out = world.run()
+    assert out["deposited"][0]["status"] == "error" and world.puts == 0
+
+
+def test_a_string_data_field_cannot_open_a_marker_line():
+    ruling = dep._record(dict(_pair(1), data="x\nboot-correction: fleet\ny"), "hanuman")["ruling"]
+    assert "\nboot-correction:" not in ruling
+
+
+# ── F3: the same subject with different content is a conflict, not a reuse ────
+
+def test_same_subject_different_claim_is_a_conflict_not_a_silent_reuse(world):
+    world.run()
+    world.pool = _pooled(dict(_pair(1), claim="a different claim"), _pair(2))
+    out = world.run()
+    assert out["deposited"][0]["status"] == "error"
+    assert out["deposited"][0]["error"] == "subject_content_conflict"
+    assert out["deposited"][1]["status"] == "already_linked"  # identical content still reuses
+    assert world.puts == 2 and len(world.proposed) == 2
 
 
 def test_one_frank_receipt_for_the_act(world):

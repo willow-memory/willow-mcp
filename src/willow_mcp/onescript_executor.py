@@ -552,6 +552,13 @@ def _shape_pooled(base: dict, rc, out: str, err: str) -> dict:
         return {**base, "state": "unreachable",
                 "reason": _redact(why) or _redact(_tail(err)) or f"pooled exited {rc}",
                 "tail": _redact(_tail(out or err))}
+    if len(out) >= MAX_STDOUT:
+        # _run_child cuts stdout at MAX_STDOUT with no marker; a cut on a newline
+        # leaves every surviving line valid JSON, i.e. a silent subset. The whole
+        # read is unreachable rather than a populated partial pool.
+        return {**base, "state": "unreachable",
+                "reason": f"pooled stdout reached the {MAX_STDOUT}-byte stdout cap; "
+                          "the pool may be truncated, so nothing was read"}
     lines = [ln for ln in out.splitlines() if ln.strip()]
     if not lines:
         return {**base, "state": "empty", "reason": "the pool is empty",

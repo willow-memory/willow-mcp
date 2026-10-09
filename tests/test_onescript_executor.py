@@ -935,6 +935,21 @@ def test_pooled_a_malformed_line_is_never_dropped(box, bad):
     assert "stdout_json" not in out
 
 
+def test_pooled_stdout_at_the_cap_on_a_newline_is_unreachable_not_a_subset(box):
+    # F2 (Loki 7A2ED3DA): 1000-byte lines, so the MAX_STDOUT cut lands exactly on
+    # a newline and every surviving line is valid JSON — a silent subset unless
+    # the cap itself is treated as unreachable.
+    base = dict(_pair(1))
+    pad = 1000 - 1 - len(json.dumps(dict(base, claim=""), ensure_ascii=True))
+    line = json.dumps(dict(base, claim="x" * pad), ensure_ascii=True) + "\n"
+    assert len(line) == 1000 and ox.MAX_STDOUT % 1000 == 0
+    box.set(box.py, stdout=line * (ox.MAX_STDOUT // 1000 + 50))
+    out = box.run("pooled")
+    assert out["state"] == "unreachable"
+    assert "stdout cap" in out["reason"] and "truncated" in out["reason"]
+    assert "stdout_json" not in out
+
+
 def test_pooled_takes_no_arguments(box):
     out = box.run("pooled", {"x": 1})
     assert out["ok"] is False and out["error"] == "EINVAL"
