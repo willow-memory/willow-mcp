@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.96.0](https://github.com/willow-memory/willow-mcp/compare/v2.95.1...v2.96.0) (2026-10-08)
+
+
+### Added
+
+* **onescript:** checkin resolve="put_back" clears a stray proposals.jsonl headless ([59acd50](https://github.com/willow-memory/willow-mcp/commit/59acd50149f507b44a42f6dbf8ba4f11ab2389e6))
+
 ## [2.95.1](https://github.com/willow-memory/willow-mcp/compare/v2.95.0...v2.95.1) (2026-10-08)
 
 
