@@ -34,7 +34,7 @@ from importlib import util as _importlib_util
 from pathlib import Path
 
 _MODULE_PATH = (
-    Path(__file__).resolve().parents[1] / "deploy" / "manifest-grant" / "sync_constitutional.py"
+    Path(__file__).resolve().parents[1] / "src" / "willow_mcp" / "install_steps" / "sync_constitutional.py"
 )
 _spec = _importlib_util.spec_from_file_location("sync_constitutional", _MODULE_PATH)
 sync_constitutional = _importlib_util.module_from_spec(_spec)

@@ -382,8 +382,15 @@ and `--check` prints all of them and exits 2 instead of stopping at the first:
 5. willow-mcp is installed, and nothing in the venv is editable — no
    `__editable__*`/`_editable_impl_*` marker, `.egg-link` or
    `easy-install.pth`, no `direct_url.json` with `"editable": true`, and no
-   `.pth` line that puts a path outside the venv on `sys.path` (for **any**
-   package, not only willow-mcp);
+   `.pth` line that puts a path outside the venv on `sys.path`, and no
+   *executable* `.pth` line (one starting `import ` or `import<TAB>`, which
+   `site.py` runs at every interpreter start) — for **any** package, not
+   only willow-mcp. There is no allowlist: a clean build of this venv has no
+   `.pth` file at all (setuptools' `distutils-precedence.pth` is refused too;
+   the venv never installs setuptools). Live finding on the old venv:
+   `_ratatosk_checkout.pth` = `import ratatosk_path_hook`, a module that did
+   `sys.path.insert(0, <ratatosk checkout>)` — a checkout Kart tasks can
+   write, ahead of the standard library;
 6. only when 1–5 pass (root never runs an interpreter that failed them): the
    apply path imports, with `-I`, from inside the venv;
 7. the unit file beside `install.sh` has `ExecStart=$PY -m willow_mcp
@@ -394,6 +401,26 @@ A plain install builds the venv first when it is missing or fails a check
 
 ## 0a. Provision the trust-owner venv
 
+### Privileged steps run only from this venv
+
+`rotate_resign`, `sync_constitutional` and `seed_envelope_ratify` used to be
+scripts beside `install.sh`, run with the trust-owner interpreter from the
+operator-writable checkout: whoever could edit them got code run as root or
+as the trust owner. They now ship in the willow-mcp wheel as
+`willow_mcp.install_steps.<name>` and `install.sh` runs them as
+`"$PY" -I -m willow_mcp.install_steps.<name>`, so they live in
+`/opt/willow-operator/venv` and are covered by the same tree, ACL and
+editable checks. The constitutional seed bundle step 1c syncs is read from
+the installed package too, not from the checkout. Every interpreter call in
+`install.sh` carries `-I` (no current directory, `PYTHON*` variables or user
+site on `sys.path`). The venv records the commit it was built from
+(`.built-from-head`); a plain install rebuilds it when that is not the
+checkout's `HEAD`, so these steps and the bundle always match the commit you
+are installing. Commit before you install: an uncommitted edit to the steps
+or the bundle is not used. (The steps' docstrings still name their old
+`deploy/manifest-grant/` paths; the files are byte-identical to before the
+move.)
+
     sudo bash install.sh --provision-venv     # rebuild only this, then check it
     sudo bash install.sh --check              # dry-run: every [ok]/[FAIL] line, changes nothing
 
@@ -403,8 +430,8 @@ rebuild is destructive (`rm -rf /opt/willow-operator/venv`, then recreate):
 while it runs the apply timer fails closed. The unit and the rest of the box
 are untouched until a plain `sudo bash install.sh` repoints the unit — so the
 venv can be audited first. Re-run `--provision-venv` after pulling new
-willow-mcp source; a plain install does not rebuild a venv that already passes
-every check. Not exercised off the real box: root, the network build, the
+willow-mcp source (a plain install also rebuilds it when its recorded build
+commit is not the checkout's `HEAD`). Not exercised off the real box: root, the network build, the
 real two-uid run (see the legs list under `--rotate`).
 
 ## 0. Find out why mcp_apps reads uid 65534 — before touching ownership
@@ -523,7 +550,7 @@ box. Measured 2026-09-22: the box's table was 22 rows, stale by one row
 froze every envelope ratification behind it, because the verb could never
 be governed at all (`UnknownVerbError`).
 
-    deploy/manifest-grant/sync_constitutional.py <checkout>/src/willow_mcp/bundle/constitutional $H/constitutional
+    /opt/willow-operator/venv/bin/python -I -m willow_mcp.install_steps.sync_constitutional <venv site-packages>/willow_mcp/bundle/constitutional $H/constitutional
 
 `constitutional/` holds POLICY (`syscall-table.json`) and LIVE STATE
 (`pre-approved.json`, the active envelope register; `review_queue.json`;

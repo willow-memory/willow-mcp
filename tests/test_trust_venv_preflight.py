@@ -379,10 +379,43 @@ def test_editable_refuses_a_pth_pointing_outside_the_venv(tree, tmp_path):
     assert any("a1_coverage.pth" in ln and "outside the venv" in ln for ln in out), out
 
 
-def test_editable_accepts_a_pth_inside_the_venv_and_an_import_line(tree, tmp_path):
-    (tree.sp / "inside.pth").write_text(f"{tree.sp}/extra\nimport sys\n# comment\n")
+def test_editable_accepts_a_pth_inside_the_venv_and_comments(tree, tmp_path):
+    (tree.sp / "inside.pth").write_text(f"{tree.sp}/extra\n\n# comment\n")
     assert _editable(tree, tmp_path) == []
 
+
+# Live finding (operator box, 2026-10-11): the old trust venv held
+# _ratatosk_checkout.pth = `import ratatosk_path_hook`, and that module did
+# sys.path.insert(0, "<ratatosk checkout>") -- a checkout Kart tasks can write,
+# ahead of the standard library, run at every interpreter start. site.py
+# executes any .pth line that starts with `import ` or `import<TAB>`.
+
+@pytest.mark.parametrize("name, content", [
+    ("plain_import.pth", "import sys\n"),
+    ("_ratatosk_checkout.pth", "import ratatosk_path_hook\n"),
+    ("tab_import.pth", "import\tsys\n"),
+    ("after_a_path.pth", "/inside/ok\nimport os; os.system('x')\n"),
+    # a stock setuptools file is also refused: a clean build of this venv has no
+    # setuptools and creates no .pth at all, so there is no allowlist
+    ("distutils-precedence.pth", "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; enabled and __import__('_distutils_hack').add_shim(); \n"),
+])
+def test_editable_refuses_an_executable_pth_line(tree, tmp_path, name, content):
+    (tree.sp / name).write_text(content)
+    out = _editable(tree, tmp_path)
+    assert any(name in ln and "executable line" in ln for ln in out), out
+
+
+def test_editable_refuses_a_sys_path_inserting_hook_module(tree, tmp_path):
+    (tree.sp / "ratatosk_path_hook.py").write_text('import sys\nsys.path.insert(0, "/home/x/github/ratatosk")\n')
+    (tree.sp / "_ratatosk_checkout.pth").write_text("import ratatosk_path_hook\n")
+    out = _editable(tree, tmp_path)
+    assert any("_ratatosk_checkout.pth" in ln and "executable line" in ln for ln in out), out
+
+
+def test_report_fails_on_an_executable_pth_line(tree, tmp_path):
+    (tree.sp / "hook.pth").write_text("import hook\n")
+    rc, out = _report(tree, tmp_path)
+    assert rc == 1 and "executable line" in out and "regular install" in out, out
 
 def test_editable_refuses_when_willow_mcp_is_absent(tree, tmp_path):
     shutil.rmtree(tree.sp / "willow_mcp-1.2.3.dist-info")
@@ -446,3 +479,140 @@ def test_non_executable_interpreter_is_refused(tree, tmp_path):
 def test_real_world_writable_stat_bits_are_what_we_test(tree):
     """Guard for the helpers above: the tree really is 755 before any breaker."""
     assert stat.S_IMODE((tree.anchor / "opt").stat().st_mode) == 0o755
+
+
+# ---- privileged steps run only code from the root-owned venv ------------------
+# Gap 1 (operator-approved follow-up to the venv split): install.sh used to run
+# deploy/manifest-grant/{rotate_resign,sync_constitutional,seed_envelope_ratify}.py
+# from $HERE -- the operator-writable checkout -- with $PY, as root or (as_to)
+# as the trust owner. Whoever could edit those files got code run as root/trust
+# owner, the same hole as the editable install. They now ship in the wheel as
+# willow_mcp.install_steps.* and run as `$PY -I -m ...` from /opt/willow-operator/venv.
+
+_STEPS_DIR = _REPO / "src" / "willow_mcp" / "install_steps"
+_MOVED_STEPS = ("rotate_resign", "sync_constitutional", "seed_envelope_ratify")
+
+
+def _code_lines(install_text: str) -> list[str]:
+    body = install_text.split("set -euo pipefail", 1)[-1]
+    return [ln for ln in body.splitlines() if not ln.lstrip().startswith("#")]
+
+
+# A checkout path (or a script file) handed to an interpreter / shell, sourced,
+# or put on PYTHONPATH. Unit/env templates that are only read (`sed`, `install`,
+# `[ -f ]`, grep) are data and deliberately do not match.
+_CHECKOUT_REF = r'\$\{?(?:HERE|CHECKOUT)\}?'
+_CHECKOUT_EXEC = re.compile(
+    r'(?:"\$\{?PY\}?"|"\$\{?TRUST_PY_BASE\}?"|\bpython3?[\d.]*|\bbash|\bsh)(?:\s+-\S+)*\s+"?' + _CHECKOUT_REF
+    + r'|' + _CHECKOUT_REF + r'[^\s"]*\.(?:py|sh)\b'
+    + r'|(?:^\s*|[;&|(]\s*)"?' + _CHECKOUT_REF + r'[^\s"]*"?\s*(?:$|[;&|)])'
+    + r'|PYTHONPATH=[^\n]*' + _CHECKOUT_REF
+    + r'|\b(?:source|\.)\s+"?' + _CHECKOUT_REF
+)
+
+
+def _checkout_code_executed(install_text: str) -> list[str]:
+    return [ln.strip() for ln in _code_lines(install_text) if _CHECKOUT_EXEC.search(ln)]
+
+
+def _py_calls_without_isolation(install_text: str) -> list[str]:
+    """Interpreter calls that would put the cwd / user site / PYTHON* on sys.path
+    (root runs install.sh from whatever directory the operator is in)."""
+    return [
+        ln.strip() for ln in _code_lines(install_text)
+        if re.search(r'"\$(?:PY|TRUST_PY_BASE)"\s+(?!-I\b)-', ln) or re.search(r'"\$PY"\s+(?!-I\b)"', ln)
+    ]
+
+
+def test_plant_checkout_code_scans_catch_their_violation():
+    pre = "set -euo pipefail\n"
+    assert _checkout_code_executed(pre + '"$PY" "$HERE/rotate_resign.py" --check\n')
+    assert _checkout_code_executed(pre + 'as_to FOO=1 "$PY" -I "$HERE/seed_envelope_ratify.py"\n')
+    assert _checkout_code_executed(pre + 'as_op "$PY" "$CHECKOUT/x.py"\n')
+    assert _checkout_code_executed(pre + 'bash "$HERE/helper.sh"\n')
+    assert _checkout_code_executed(pre + 'source "$HERE/lib.sh"\n')
+    assert _checkout_code_executed(pre + '. "$HERE/lib.sh"\n')
+    assert _checkout_code_executed(pre + '"$HERE/helper"\n')
+    assert _checkout_code_executed(pre + 'PYTHONPATH="$CHECKOUT/src" "$PY" -m x\n')
+    assert _checkout_code_executed(pre + 'python3 "$CHECKOUT/x.py"\n')
+    # data reads are not code
+    assert _checkout_code_executed(
+        pre + 'install -m 644 "$HERE/willow-mcp-manifest-grant.service" /etc/\n'
+        'sed -e s/a/b/ "$HERE/manifest-grant.env" > "$T"\n'
+        '[ -f "$HERE/$f" ] || stop x\n'
+        'up=$(tvc_unit_problems "$HERE/willow-mcp-manifest-grant.service" "$PY")\n'
+        '# "$PY" "$HERE/rotate_resign.py"\n'
+    ) == []
+    assert _py_calls_without_isolation(pre + '"$PY" -m pip install x\n')
+    assert _py_calls_without_isolation(pre + '"$PY" - "$s" <<EOF\n')
+    assert _py_calls_without_isolation(pre + '"$TRUST_PY_BASE" -m venv v\n')
+    assert _py_calls_without_isolation(pre + '"$PY" -I -m pip install x\n') == []
+    assert _py_calls_without_isolation(pre + '"$PY" -I - "$s" <<EOF\n') == []
+
+
+def test_install_sh_runs_no_code_from_the_operator_writable_checkout():
+    assert _checkout_code_executed(_INSTALL_SH) == []
+    # the three steps, by name, run only as modules of the installed package
+    for name in _MOVED_STEPS:
+        assert not re.search(rf'"\$PY"[^\n]*{name}\.py', "\n".join(_code_lines(_INSTALL_SH))), name
+        assert re.search(rf'"\$PY" -I -m willow_mcp\.install_steps\.{name}\b', _INSTALL_SH), name
+
+
+def test_every_privileged_interpreter_call_is_isolated():
+    assert _py_calls_without_isolation(_INSTALL_SH) == []
+
+
+def _steps_layout_problems(steps_dir: Path, deploy_dir: Path, pyproject_text: str) -> list[str]:
+    """The three steps must be modules of the wheel's package and absent beside install.sh."""
+    out = [f"{n}.py missing from install_steps" for n in _MOVED_STEPS if not (steps_dir / f"{n}.py").is_file()]
+    out += [f"{n}.py is still beside install.sh" for n in _MOVED_STEPS if (deploy_dir / f"{n}.py").exists()]
+    if not (steps_dir / "__init__.py").is_file():
+        out.append("install_steps/__init__.py missing")
+    # the wheel takes the whole willow_mcp package, subpackages included
+    if 'packages = ["src/willow_mcp"]' not in pyproject_text:
+        out.append("the wheel no longer packages src/willow_mcp")
+    return out
+
+
+def test_plant_steps_layout_scan_catches_its_violation(tmp_path):
+    steps, deploy = tmp_path / "steps", tmp_path / "deploy"
+    steps.mkdir(); deploy.mkdir()
+    assert len(_steps_layout_problems(steps, deploy, "")) == len(_MOVED_STEPS) + 2
+    for n in _MOVED_STEPS:
+        (steps / f"{n}.py").write_text("")
+    (steps / "__init__.py").write_text("")
+    assert _steps_layout_problems(steps, deploy, 'packages = ["src/willow_mcp"]') == []
+    (deploy / "rotate_resign.py").write_text("")
+    assert _steps_layout_problems(steps, deploy, 'packages = ["src/willow_mcp"]') == ["rotate_resign.py is still beside install.sh"]
+
+
+def test_the_moved_steps_ship_in_the_wheel_not_in_deploy():
+    assert _steps_layout_problems(_STEPS_DIR, _DEPLOY, (_REPO / "pyproject.toml").read_text(encoding="utf-8")) == []
+
+
+def test_the_constitutional_seed_bundle_comes_from_the_installed_package():
+    assert re.search(r'^BUNDLE_CONSTITUTIONAL="\$WILLOW_PKG_DIR/bundle/constitutional"$', _INSTALL_SH, re.M)
+    assert re.search(r'^WILLOW_PKG_DIR=\$\("\$PY" -I -c ', _INSTALL_SH, re.M)
+    assert not [ln for ln in _code_lines(_INSTALL_SH) if re.search(r'BUNDLE_CONSTITUTIONAL=.*CHECKOUT', ln)]
+
+
+def test_the_venv_is_rebuilt_when_it_was_built_from_another_commit():
+    body = _INSTALL_SH.split("provision_trust_venv() {", 1)[1].split("\n}\n", 1)[0]
+    assert re.search(r'^TVC_STAMP=', _INSTALL_SH, re.M)
+    assert 'rev-parse HEAD > "$TRUST_VENV/$TVC_STAMP"' in body
+    skip = body.split('if [ -z "$force" ]', 1)[1].split("return 0", 1)[0]
+    assert '"$head_now" = "$head_built"' in skip and '[ -n "$head_now" ]' in skip
+
+
+def test_the_moved_steps_still_run_as_modules_from_an_installed_tree(tmp_path):
+    """-I -m resolves each step from a package directory, with no checkout path."""
+    import sys
+    for name in _MOVED_STEPS:
+        r = subprocess.run(
+            [sys.executable, "-I", "-m", f"willow_mcp.install_steps.{name}", "--help"],
+            capture_output=True, text=True, cwd=tmp_path,
+            env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(_REPO / "src")},
+        )
+        # -I ignores PYTHONPATH: the editable install of this repo supplies the
+        # package; what matters is that the module is found and its argparse runs.
+        assert "No module named" not in r.stderr, (name, r.stderr)

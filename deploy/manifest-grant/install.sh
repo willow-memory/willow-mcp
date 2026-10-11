@@ -216,6 +216,7 @@ TRUST_PY_BASE=/usr/bin/python3.14   # what the operator's box already resolves t
 # tests/test_trust_venv_preflight.py fails if they drift apart.
 TRUST_VENV_DEPS=("psycopg2-binary>=2.9,<3.0" "cryptography>=42.0,<51.0")
 PY="$TRUST_VENV/bin/python"
+TVC_STAMP=.built-from-head   # inside the venv: the commit its wheel was built from
 
 say()  { printf '%s\n' "$*"; }
 stop() { printf 'STOP: %s\n' "$*" >&2; exit 2; }
@@ -335,8 +336,10 @@ tvc_installed_version() {
 
 # tvc_editable_problems VENV -- willow_mcp absent, or ANY editable install in
 # the venv (not only willow_mcp): an __editable__/_editable_impl_ marker, an
-# .egg-link, easy-install.pth, a direct_url.json with "editable": true, or a
-# .pth line that resolves outside the venv.
+# .egg-link, easy-install.pth, a direct_url.json with "editable": true, a
+# .pth line that resolves outside the venv, or ANY executable .pth line (one
+# starting `import `/`import<TAB>`: a path hook that sys.path.insert()s ahead of
+# the standard library).
 tvc_editable_problems() {
   local venv=$1 vreal d f line t sp=0
   for d in "$venv"/lib/python*/site-packages "$venv"/lib64/python*/site-packages; do
@@ -357,7 +360,17 @@ tvc_editable_problems() {
     for f in "$d"/*.pth; do
       [ -f "$f" ] || continue
       while IFS= read -r line || [ -n "$line" ]; do
-        case "$line" in ''|'#'*|import\ *|import$'\t'*) continue ;; esac
+        case "$line" in ''|'#'*) continue ;; esac
+        # site.py EXECUTES a .pth line that starts with `import ` / `import<TAB>`
+        # at every interpreter start, before any script runs. Live finding
+        # (operator box, 2026-10-11): _ratatosk_checkout.pth = `import
+        # ratatosk_path_hook`, whose module did sys.path.insert(0, <a checkout
+        # Kart tasks can write>) -- ahead of the standard library. No allowlist:
+        # a clean build of this venv (willow-mcp, psycopg2-binary, cryptography,
+        # cffi, pycparser; no setuptools) creates no .pth file at all.
+        case "$line" in
+          import\ *|import$'\t'*) printf '%s has an executable line (runs at interpreter start): %s\n' "$f" "${line:0:80}"; continue ;;
+        esac
         case "$line" in /*) t=$(readlink -m -- "$line") ;; *) t=$(readlink -m -- "$d/$line") ;; esac
         case "$t" in "$vreal"|"$vreal"/*) ;; *) printf '%s puts %s on sys.path, outside the venv\n' "$f" "$t" ;; esac
       done < "$f"
@@ -434,11 +447,21 @@ tvc_report() {
 # clone, so the build writes nothing into the operator-writable checkout and
 # runs no operator-writable build code beyond the commit being installed).
 provision_trust_venv() {
-  local force=${1:-} problems
+  local force=${1:-} problems head_now head_built
   local -a wheels
+  # The privileged steps (rotate_resign, sync_constitutional,
+  # seed_envelope_ratify, the constitutional seed bundle) now run FROM the
+  # venv, so a venv built from an older HEAD would run older steps than the
+  # checkout holds: skip only when it passes every check AND was built from the
+  # checkout's current HEAD (the stamp is written below, inside the venv).
   if [ -z "$force" ] && tvc_report "$TRUST_VENV" "$PY" 0 / >/dev/null 2>&1; then
-    say "== 0a. trust-owner venv $TRUST_VENV already passes every check -- not rebuilt (sudo bash install.sh --provision-venv rebuilds it from this checkout)"
-    return 0
+    head_now=$(git -c safe.directory="$CHECKOUT" -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || true)
+    head_built=$(cat "$TRUST_VENV/$TVC_STAMP" 2>/dev/null || true)
+    if [ -n "$head_now" ] && [ "$head_now" = "$head_built" ]; then
+      say "== 0a. trust-owner venv $TRUST_VENV already passes every check and was built from HEAD ${head_now:0:12} -- not rebuilt (sudo bash install.sh --provision-venv rebuilds it from this checkout)"
+      return 0
+    fi
+    say "== 0a. trust-owner venv $TRUST_VENV passes its checks but its recorded build commit (${head_built:0:12}) is not the checkout HEAD (${head_now:0:12}) -- rebuilding so the privileged steps match the checkout"
   fi
   say "== 0a. build the trust-owner venv at $TRUST_VENV (root:root, non-editable, from $CHECKOUT)"
   [ -x "$TRUST_PY_BASE" ] || stop "$TRUST_PY_BASE is not executable -- the trust-owner venv is built from the root-owned system python (edit TRUST_PY_BASE in install.sh if this box's system python is another version)"
@@ -451,17 +474,19 @@ provision_trust_venv() {
     || stop "could not clone $CHECKOUT to build from"
   rm -rf -- "$TRUST_VENV"
   install -d -o root -g root -m 755 "$(dirname "$TRUST_VENV")"
-  ( umask 022; "$TRUST_PY_BASE" -m venv "$TRUST_VENV" ) \
+  ( umask 022; "$TRUST_PY_BASE" -I -m venv "$TRUST_VENV" ) \
     || stop "could not create the venv with $TRUST_PY_BASE (Debian/Ubuntu: apt install python3-venv)"
   export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 PYTHONNOUSERSITE=1
-  ( umask 022; "$PY" -m pip install --quiet "${TRUST_VENV_DEPS[@]}" ) \
+  ( umask 022; "$PY" -I -m pip install --quiet "${TRUST_VENV_DEPS[@]}" ) \
     || stop "pip could not install ${TRUST_VENV_DEPS[*]} into $TRUST_VENV"
-  ( umask 022; "$PY" -m pip wheel --quiet --no-deps --wheel-dir "$TVC_BUILD/wheels" "$TVC_BUILD/src" ) \
+  ( umask 022; "$PY" -I -m pip wheel --quiet --no-deps --wheel-dir "$TVC_BUILD/wheels" "$TVC_BUILD/src" ) \
     || stop "could not build a willow-mcp wheel from $CHECKOUT"
   mapfile -t wheels < <(find "$TVC_BUILD/wheels" -maxdepth 1 -name 'willow_mcp-*.whl')
   [ "${#wheels[@]}" = 1 ] || stop "expected exactly one willow_mcp wheel, found ${#wheels[@]}"
-  ( umask 022; "$PY" -m pip install --quiet --no-deps "${wheels[0]}" ) \
+  ( umask 022; "$PY" -I -m pip install --quiet --no-deps "${wheels[0]}" ) \
     || stop "could not install ${wheels[0]##*/} into $TRUST_VENV"
+  git -C "$TVC_BUILD/src" rev-parse HEAD > "$TRUST_VENV/$TVC_STAMP" \
+    || stop "could not record the commit the venv was built from"
   chown -R root:root "$TRUST_VENV"
   chmod -R u=rwX,go=rX "$TRUST_VENV"
   say "  installed ${wheels[0]##*/} (non-editable) + ${TRUST_VENV_DEPS[*]}"
@@ -625,7 +650,7 @@ governed_files() {
   # ratified (skip, never include on a read failure).
   for s in "$H"/seeds/*.json; do
     [ -e "$s" ] || continue
-    if "$PY" - "$s" <<'PYEOF'
+    if "$PY" -I - "$s" <<'PYEOF'
 import json, sys
 try:
     doc = json.load(open(sys.argv[1]))
@@ -667,7 +692,7 @@ strip_pgp_pin() {
   # trust-owner python: strip ONLY the WILLOW_PGP_FINGERPRINT= token from
   # each Environment= line, rebuild the line from whatever tokens remain,
   # and drop the line entirely only if nothing remains on it.
-  "$PY" - "$dropin" <<'PYEOF'
+  "$PY" -I - "$dropin" <<'PYEOF'
 import re, shlex, sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
@@ -794,11 +819,11 @@ sign_and_publish_trust() {
   local old_fpr="$2"   # may be empty -- nothing to retire
   mapfile -t FILES < <(governed_files)
   say "  re-signing ${#FILES[@]} governed path(s) under $new_fpr (trust NOT switched yet)"
-  if ! "$PY" "$HERE/rotate_resign.py" --sign-as "$TRUST_OWNER" --gnupg-home "$GNUPGHOME_TO" \
+  if ! "$PY" -I -m willow_mcp.install_steps.rotate_resign --sign-as "$TRUST_OWNER" --gnupg-home "$GNUPGHOME_TO" \
        --fingerprint "$new_fpr" "${FILES[@]}"; then
     stop "re-signing failed -- rotate_resign.py already restored every file it touched this run to its previous signature, and $TRUST_ENV was not written, so the box is exactly as it was before this step started. Nothing to revert by hand; fix the failure above and retry."
   fi
-  as_op "$PY" "$HERE/rotate_resign.py" --check --fingerprint "$new_fpr" "${FILES[@]}" \
+  as_op "$PY" -I -m willow_mcp.install_steps.rotate_resign --check --fingerprint "$new_fpr" "${FILES[@]}" \
     || stop "post-sign verification found a file that does not verify under $new_fpr -- see the table above. $TRUST_ENV was not written; the box still trusts whatever it trusted before. Fix the mismatch and retry."
   say "  every governed file verifies under $new_fpr -- safe to switch trust now"
 
@@ -850,7 +875,7 @@ if [ -n "$CHECK_SIGNATURES" ]; then
   if [ -z "$CUR_FPR" ]; then
     say "  $TRUST_ENV not set (or does not exist yet) -- report-only mode: naming"
     say "  who signed each governed file right now, nothing to compare against."
-    as_op "$PY" "$HERE/rotate_resign.py" --check "${FILES[@]}"
+    as_op "$PY" -I -m willow_mcp.install_steps.rotate_resign --check "${FILES[@]}"
     exit $?
   fi
   # Loki A38D41C2, F8: root can read BOTH $H/env (0600) and $TRUST_ENV
@@ -863,7 +888,7 @@ if [ -n "$CHECK_SIGNATURES" ]; then
   if [ -n "$STALE_HOME_FPR" ]; then
     say "  WARNING: $H/env still names WILLOW_PGP_FINGERPRINT=$STALE_HOME_FPR -- the fingerprint's one source is now $TRUST_ENV ($CUR_FPR). A leftover value in \$H/env is inert to pgp.py (which no longer reads that file for this key) UNLESS something exports it into a process's own environment, in which case it competes with $TRUST_ENV and pgp.expected_fingerprint() refuses. Remove the line from $H/env (rerun a plain install to migrate it automatically) or confirm nothing sources it."
   fi
-  as_op "$PY" "$HERE/rotate_resign.py" --check --fingerprint "$CUR_FPR" "${FILES[@]}"
+  as_op "$PY" -I -m willow_mcp.install_steps.rotate_resign --check --fingerprint "$CUR_FPR" "${FILES[@]}"
   exit $?
 fi
 
@@ -1024,7 +1049,7 @@ REG="$H/constitutional/pre-approved.json"
 PROPOSALS="$H/proposals/proposals.json"
 if [ -f "$REG" ]; then
   SPLIT_TMP=$(mktemp)
-  "$PY" - "$REG" "$PROPOSALS" > "$SPLIT_TMP" <<'PYEOF'
+  "$PY" -I - "$REG" "$PROPOSALS" > "$SPLIT_TMP" <<'PYEOF'
 import json, os, sys
 reg_path, prop_path = sys.argv[1:3]
 doc = json.load(open(reg_path))
@@ -1181,8 +1206,13 @@ fi
 # it). syscall-table.json is signed HERE, once — no longer re-signed in
 # step 6's loop below.
 say "== 1c. sync + sign constitutional policy files from the checkout bundle (one act)"
-BUNDLE_CONSTITUTIONAL="$CHECKOUT/src/willow_mcp/bundle/constitutional"
-"$PY" "$HERE/sync_constitutional.py" "$BUNDLE_CONSTITUTIONAL" "$H/constitutional" \
+# The seed policy files come from the INSTALLED package (root-owned, built from
+# the checkout's committed HEAD), never from the operator-writable checkout: the
+# trust owner signs what this step copies.
+WILLOW_PKG_DIR=$("$PY" -I -c 'import os, willow_mcp; print(os.path.dirname(willow_mcp.__file__))') \
+  || stop "cannot locate the installed willow_mcp package under $PY"
+BUNDLE_CONSTITUTIONAL="$WILLOW_PKG_DIR/bundle/constitutional"
+"$PY" -I -m willow_mcp.install_steps.sync_constitutional "$BUNDLE_CONSTITUTIONAL" "$H/constitutional" \
   --sign-as "$TRUST_OWNER" --gnupg-home "$GNUPGHOME_TO" --fingerprint "$FPR" \
   || stop "constitutional bundle sync/sign failed — see the STOP line above; sync_and_sign() has already restored the box's constitutional/ to exactly what it was before this step ran"
 
@@ -1218,7 +1248,7 @@ BUNDLE_CONSTITUTIONAL="$CHECKOUT/src/willow_mcp/bundle/constitutional"
 # see the module's own docstring for why its bounds are the unbounded
 # {"proposal_ids": ["*"]} wildcard rather than a proposal-id-bounded shape.
 say "== 1d. seed the envelope.ratify bootstrap envelope"
-as_to WILLOW_HOME="$H" WILLOW_PGP_FINGERPRINT="$FPR" "$PY" "$HERE/seed_envelope_ratify.py" \
+as_to WILLOW_HOME="$H" WILLOW_PGP_FINGERPRINT="$FPR" "$PY" -I -m willow_mcp.install_steps.seed_envelope_ratify \
   || stop "seeding the envelope.ratify bootstrap envelope failed — see the STOP line above; ratify_proposal_row() refuses before any write on every failure path, so the register is untouched"
 
 # ---------------------------------------------------- 2. retire the --user unit
@@ -1312,7 +1342,7 @@ say "== 6b. withdraw every request minted before this install"
 for req in "$H"/manifest_grants/pending/*.json; do
   [ -e "$req" ] || continue
   pid=$(basename "$req" .json)
-  "$PY" - "$req" "$H/manifest_grants/failed/$pid.json" "$FPR" <<'PYEOF'
+  "$PY" -I - "$req" "$H/manifest_grants/failed/$pid.json" "$FPR" <<'PYEOF'
 import json, sys, datetime
 src, dst, fpr = sys.argv[1:4]
 rec = json.load(open(src))
