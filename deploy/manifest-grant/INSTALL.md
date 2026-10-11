@@ -618,8 +618,15 @@ move.)
 
 Needs, on the box: `python3.14` with `venv` (Debian/Ubuntu: `python3.14-venv`),
 `git`, `acl`, and network access to the package index for the build. The
-rebuild is destructive (`rm -rf /opt/willow-operator/venv`, then recreate):
-while it runs the apply timer fails closed. The unit and the rest of the box
+rebuild is atomic: the new venv is built in a sibling release directory
+(`/opt/willow-operator/venv.rel.<random>`, root:root 755, at the path it will
+keep), checked in full there, and `/opt/willow-operator/venv` then becomes a
+root-owned symlink to it, swapped with a single `renameat2(2)` (the first run on
+a box where `venv` is still a real directory exchanges the two in one step).
+The unit's `ExecStart=/opt/willow-operator/venv/bin/python` line is unchanged
+and the apply timer never sees a missing interpreter; the old venv is deleted
+only after the swap and a second check at the live path, and a failed build or
+check leaves the live venv untouched. The unit and the rest of the box
 are untouched until a plain `sudo bash install.sh --expect-head <sha>` repoints the unit — so the
 venv can be audited first. Re-run `--provision-venv` after pulling new
 willow-mcp source (a plain install also rebuilds it when its recorded build

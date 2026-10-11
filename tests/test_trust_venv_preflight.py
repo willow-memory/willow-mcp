@@ -261,8 +261,16 @@ def test_the_unit_check_refuses_a_unit_that_runs_another_interpreter(tmp_path):
 def test_the_preflight_is_called_with_root_uid_0_and_anchor_slash():
     """The test seam must not weaken production: every real call site passes
     uid 0 and `/`, and nothing reads either from the environment."""
-    calls = re.findall(r"tvc_report [^\n]*", _INSTALL_SH.split("# END trust-venv-check", 1)[1])
-    assert calls and all(c.startswith('tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE"') for c in calls), calls
+    after = _INSTALL_SH.split("# END trust-venv-check", 1)[1]
+    calls = re.findall(r"tvc_report [^\n]*", after)
+    # the two inside tvc_publish take the uid and anchor as parameters (the test
+    # seam); the only caller passes 0 and /.
+    seam = [c for c in calls if '"$ru" "$anchor"' in c]
+    assert len(seam) == 2 and all('"$TRUST_PY_BASE"' in c for c in seam), seam
+    assert [c for c in calls if c not in seam] and all(
+        c.startswith('tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE"') for c in calls if c not in seam), calls
+    assert re.findall(r"^\s*tvc_publish [^\n]*", after, re.M).count('  tvc_publish "$TVC_STAGE" 0 /') == 1
+    assert not [c for c in re.findall(r"^\s*tvc_publish \"\$TVC_STAGE\"[^\n]*", after, re.M) if c.strip() != 'tvc_publish "$TVC_STAGE" 0 /']
     assert "ROOT_UID=${" not in _INSTALL_SH and "ANCHOR=${" not in _INSTALL_SH
 
 
@@ -693,7 +701,8 @@ def test_the_constitutional_seed_bundle_comes_from_the_installed_package():
 def test_the_venv_is_rebuilt_when_it_was_built_from_another_commit():
     body = _INSTALL_SH.split("provision_trust_venv() {", 1)[1].split("\n}\n", 1)[0]
     assert re.search(r'^TVC_STAMP=', _INSTALL_SH, re.M)
-    assert 'printf \'%s\\n\' "$HEAD_SHA" > "$TRUST_VENV/$TVC_STAMP"' in body
+    stage = re.search(r"^tvc_build_stage\(\) \{\n.*?^\}\n", _INSTALL_SH, re.S | re.M).group(0)
+    assert 'printf \'%s\\n\' "$HEAD_SHA" > "$stage/$TVC_STAMP"' in stage and "tvc_build_stage" in body
     skip = body.split('if [ -z "$force" ]', 1)[1].split("return 0", 1)[0]
     assert '"$HEAD_SHA" = "$head_built"' in skip and '[ -n "$HEAD_SHA" ]' in skip
 
@@ -747,7 +756,7 @@ def _unhashed_pip_lines(install_text: str) -> list[str]:
         elif re.search(r'-r "\$', ln):
             if not all(f in ln for f in ("--require-hashes", "--only-binary=:all:", "--no-deps")):
                 bad.append(ln)
-        elif '"${wheels[0]}"' in ln:
+        elif '"${wheels[0]}"' in ln or '"$wheel"' in ln:
             if not all(f in ln for f in ("--no-deps", "--no-index")):
                 bad.append(ln)
         else:
@@ -817,8 +826,11 @@ def test_install_sh_installs_only_hash_pinned_things():
     assert "$HERE/trust-venv" not in _INSTALL_SH and "$CHECKOUT/deploy" not in _INSTALL_SH
     # the backend is installed before the wheel is built, the wheel built before the trust venv is touched
     body = _INSTALL_SH.split("provision_trust_venv() {", 1)[1]
-    order = [body.index(k) for k in ('-r "$build_reqs"', "pip wheel", 'rm -rf -- "$TRUST_VENV"', '-r "$reqs"', '"${wheels[0]}"')]
+    order = [body.index(k) for k in ('-r "$build_reqs"', "pip wheel", 'mktemp -d "$TRUST_VENV.rel.', "tvc_build_stage ", "tvc_publish ")]
     assert order == sorted(order), order
+    # ... and the dependencies, then the local wheel, are installed into the release directory, in that order
+    stage = _INSTALL_SH.split("tvc_build_stage() {", 1)[1].split("\n}\n", 1)[0]
+    assert stage.index('-r "$reqs"') < stage.index('"$wheel"') < stage.index("TVC_STAMP")
     # a requirements file is vetted before pip sees it
     assert body.index("tvc_requirements_problems") < body.index('-r "$build_reqs"')
 

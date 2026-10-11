@@ -612,6 +612,9 @@ tvc_chain_problems() {
 tvc_acl_problems() {
   local anchor=$1 file=$2 venv=$3 out
   local -a chain
+  # $TRUST_VENV is a root-owned symlink to its release directory (the atomic
+  # swap, provision_trust_venv); getfacl -R must walk the tree it points at.
+  venv=$(readlink -f -- "$venv" 2>/dev/null || printf '%s' "$venv")
   command -v getfacl >/dev/null 2>&1 || {
     printf 'the ACL check cannot be performed: getfacl is not installed (install the acl package)\n'; return 0; }
   mapfile -t chain < <(tvc_chain_paths "$anchor" "$file")
@@ -636,7 +639,9 @@ tvc_acl_problems() {
 # ROOT_UID, or (non-symlink) writable by group or other.
 tvc_tree_problems() {
   local venv=$1 ru=$2 out
-  out=$(find "$venv" \( \( -type l ! -uid "$ru" \) -o \( ! -type l \( ! -uid "$ru" -o -perm /022 \) \) \) -print 2>/dev/null || true)
+  # -H: $TRUST_VENV is a root-owned symlink to its release directory; a bare
+  # `find <symlink>` would inspect the link and walk nothing.
+  out=$(find -H "$venv" \( \( -type l ! -uid "$ru" \) -o \( ! -type l \( ! -uid "$ru" -o -perm /022 \) \) \) -print 2>/dev/null || true)
   [ -z "$out" ] || printf '%s\n' "$out" | head -8 | sed 's/^/not root-owned or writable by others: /'
   return 0
 }
@@ -1243,6 +1248,114 @@ mg_report() {
 }
 # END trust-venv-check
 
+# ---- the atomic swap (Q50, 2026-10-11) -----------------------------------------
+# Rebuilding the venv in place left a window (observed on the box during the
+# 8b53488 deploy: a manifest-grant timer tick found $TRUST_VENV half-deleted and
+# failed `No module named willow_mcp`). Now $TRUST_VENV is a root-owned SYMLINK
+# to a release directory beside it:
+#   /opt/willow-operator/venv            -> venv.rel.<random>   (the live one)
+#   /opt/willow-operator/venv.rel.<random>   a complete venv, built AT that
+#                                            permanent name, so its baked-in
+#                                            path (pyvenv.cfg, shebangs) never
+#                                            changes after the swap
+# The unit's `ExecStart=/opt/willow-operator/venv/bin/python ...` line stays
+# valid: the symlink is transparent to the kernel and to CPython (it finds
+# pyvenv.cfg beside the path it was exec'd by). The preflight already walks the
+# lexical AND the readlink -f chain of the interpreter and requires every
+# component, symlinks included, to be root-owned (a symlink's own mode is
+# ignored, only its owner counts), and /opt/willow-operator is a root:root 755
+# directory, so only root can repoint it. The first run on a box whose
+# $TRUST_VENV is still a real directory swaps with renameat2(RENAME_EXCHANGE),
+# which trades the directory and the symlink in one step; the old directory is
+# deleted only afterwards.
+
+TVC_STAGE=""            # the release directory being built; removed on any failure before the swap
+TVC_SWAP_PY=$TRUST_PY_BASE   # runs the rename; a plain assignment, never read from the environment
+TVC_OWNER=root:root          # tests override it; production is root:root
+
+# tvc_stop MESSAGE -- discard the unfinished release directory, then stop.
+tvc_stop() {
+  if [ -n "$TVC_STAGE" ]; then rm -rf -- "$TVC_STAGE"; TVC_STAGE=""; fi
+  stop "$@"
+}
+
+# tvc_rename MODE SRC DST -- one renameat2(2): MODE is exchange (RENAME_EXCHANGE,
+# both must exist) or noreplace (RENAME_NOREPLACE). Never falls back to a
+# non-atomic copy: a filesystem without the flag is an error.
+tvc_rename() {
+  "$TVC_SWAP_PY" -I -c '
+import ctypes, os, sys
+mode, src, dst = sys.argv[1:4]
+flags = {"exchange": 2, "noreplace": 1}[mode]
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.renameat2(-100, os.fsencode(src), -100, os.fsencode(dst), flags) != 0:
+    sys.stderr.write("renameat2(%s, %s): %s\n" % (src, dst, os.strerror(ctypes.get_errno())))
+    sys.exit(1)
+' "$1" "$2" "$3"
+}
+
+# tvc_build_stage STAGE REQS WHEEL -- the venv, the hash-pinned dependencies and
+# the wheel, built at STAGE's own permanent path. $TRUST_VENV is not touched.
+tvc_build_stage() {
+  local stage=$1 reqs=$2 wheel=$3
+  chown "$TVC_OWNER" "$stage" && chmod 755 "$stage" || tvc_stop "could not set the release directory $stage root:root 755"
+  ( umask 022; "$TRUST_PY_BASE" -I -m venv "$stage" ) \
+    || tvc_stop "could not create the venv with $TRUST_PY_BASE (Debian/Ubuntu: apt install python3-venv)"
+  ( umask 022; "$stage/bin/python" -I -m pip install --quiet --require-hashes --only-binary=:all: --no-deps -r "$reqs" ) \
+    || tvc_stop "pip could not install the hash-pinned dependencies from ${reqs#"$TVC_BUILD/src/"} into $stage (a hash mismatch refuses the install); $TRUST_VENV is unchanged"
+  ( umask 022; "$stage/bin/python" -I -m pip install --quiet --no-deps --no-index "$wheel" ) \
+    || tvc_stop "could not install ${wheel##*/} into $stage; $TRUST_VENV is unchanged"
+  printf '%s\n' "$HEAD_SHA" > "$stage/$TVC_STAMP" \
+    || tvc_stop "could not record the commit the venv was built from"
+  chown -R "$TVC_OWNER" "$stage" && chmod -R u=rwX,go=rX "$stage" || tvc_stop "could not set $stage root:root, go-w"
+}
+
+# tvc_publish STAGE ROOT_UID ANCHOR -- check STAGE with the FULL preflight at its
+# own path, swap it in with one rename, check again at $TRUST_VENV (the chain
+# now holds the symlink), roll back by the same rename if that fails, and only
+# then delete what was live. Production: tvc_publish "$stage" 0 /.
+tvc_publish() {
+  local stage=$1 ru=$2 anchor=$3 live=$TRUST_VENV link old had=""
+  stage=$(readlink -f -- "$stage")
+  tvc_report "$stage" "$stage/bin/python" "$ru" "$anchor" "$TRUST_PY_BASE" \
+    || tvc_stop "the venv just built at $stage failed its own preflight -- see the FAIL lines above; $TRUST_VENV is unchanged"
+  link="$live.swap.$$"
+  rm -rf -- "$link"
+  ln -s -- "${stage##*/}" "$link" || tvc_stop "could not create the symlink $link"
+  if [ -e "$live" ] || [ -L "$live" ]; then
+    had=1
+    tvc_rename exchange "$link" "$live" || { rm -f -- "$link"; tvc_stop "could not swap $stage in at $live; $live is unchanged"; }
+  else
+    tvc_rename noreplace "$link" "$live" || { rm -f -- "$link"; tvc_stop "could not move $stage into place at $live"; }
+  fi
+  TVC_STAGE=""   # live now; from here a failure rolls back, it does not just delete
+  if ! tvc_report "$live" "$live/bin/python" "$ru" "$anchor" "$TRUST_PY_BASE"; then
+    if [ -n "$had" ]; then
+      tvc_rename exchange "$link" "$live" || stop "swapped-in venv failed its preflight at $live and the rollback rename failed -- repair $live by hand ($link holds the previous one)"
+      rm -f -- "$link"
+    else
+      rm -f -- "$live"
+    fi
+    rm -rf -- "$stage"
+    stop "the venv at $live failed its preflight after the swap; the previous venv was put back"
+  fi
+  if [ -n "$had" ]; then
+    if [ -L "$link" ]; then
+      old=$(readlink -f -- "$link" || true)
+      rm -f -- "$link"
+      case "$old" in "$live".rel.*) [ "$old" = "$stage" ] || rm -rf -- "$old" ;; esac
+    else
+      rm -rf -- "$link"
+    fi
+  fi
+  # release directories a crashed earlier run left behind (never the live one)
+  for old in "$live".rel.* "$live".swap.*; do
+    [ -e "$old" ] || [ -L "$old" ] || continue
+    [ "$(readlink -f -- "$old" 2>/dev/null)" = "$stage" ] || rm -rf -- "$old"
+  done
+  say "  $live -> ${stage##*/} (swapped with one rename; the previous venv removed afterwards)"
+}
+
 # provision_trust_venv [force] -- root builds $TRUST_VENV from this checkout.
 # Skipped when the venv already passes every check, unless forced
 # (--provision-venv). Rebuilds from the checkout's COMMITTED HEAD (a local
@@ -1292,20 +1405,13 @@ provision_trust_venv() {
     || stop "could not build a willow-mcp wheel from the committed HEAD ${HEAD_SHA:0:12}"
   mapfile -t wheels < <(find "$TVC_BUILD/wheels" -maxdepth 1 -name 'willow_mcp-*.whl')
   [ "${#wheels[@]}" = 1 ] || stop "expected exactly one willow_mcp wheel, found ${#wheels[@]}"
-  rm -rf -- "$TRUST_VENV"
+  # Build into a sibling release directory and swap it in with ONE rename(2);
+  # $TRUST_VENV is never deleted, emptied or half-built (see tvc_publish).
   install -d -o root -g root -m 755 "$(dirname "$TRUST_VENV")"
-  ( umask 022; "$TRUST_PY_BASE" -I -m venv "$TRUST_VENV" ) \
-    || stop "could not create the venv with $TRUST_PY_BASE (Debian/Ubuntu: apt install python3-venv)"
-  ( umask 022; "$PY" -I -m pip install --quiet --require-hashes --only-binary=:all: --no-deps -r "$reqs" ) \
-    || stop "pip could not install the hash-pinned dependencies from ${reqs#"$TVC_BUILD/src/"} into $TRUST_VENV (a hash mismatch refuses the install)"
-  ( umask 022; "$PY" -I -m pip install --quiet --no-deps --no-index "${wheels[0]}" ) \
-    || stop "could not install ${wheels[0]##*/} into $TRUST_VENV"
-  printf '%s\n' "$HEAD_SHA" > "$TRUST_VENV/$TVC_STAMP" \
-    || stop "could not record the commit the venv was built from"
-  chown -R root:root "$TRUST_VENV"
-  chmod -R u=rwX,go=rX "$TRUST_VENV"
-  say "  installed ${wheels[0]##*/} (non-editable) + the hash-pinned dependencies in ${TRUST_REQS_REL##*/}"
-  tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE" || stop "the venv just built failed its own preflight -- see the FAIL lines above"
+  TVC_STAGE=$(mktemp -d "$TRUST_VENV.rel.XXXXXXXX") || stop "could not create a release directory beside $TRUST_VENV"
+  tvc_build_stage "$TVC_STAGE" "$reqs" "${wheels[0]}"
+  say "  installed ${wheels[0]##*/} (non-editable) + the hash-pinned dependencies in ${TRUST_REQS_REL##*/} into ${TVC_STAGE}"
+  tvc_publish "$TVC_STAGE" 0 /
 }
 
 # enforce_trust_interpreter -- the preflight: refuse (stop) unless every check passes.
