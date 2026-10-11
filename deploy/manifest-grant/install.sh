@@ -1267,7 +1267,7 @@ case "$OPTS" in *all_squash*|*idmapped*) stop "mcp_apps mount options ($OPTS) re
 say "plain $FSTYPE — ownership will stick; continuing"
 if [ "$CHECK_ONLY" = "--check" ]; then
   if [ -n "$CHECK_FAILED" ]; then
-    say "check-only: stopping before any change -- the trust-owner interpreter checks above FAILED (a plain install, or --provision-venv, builds the venv)"
+    say "check-only: stopping before any change -- a check above reported [FAIL] (an interpreter [FAIL]: --provision-venv rebuilds the venv; an installed unit/timer/env [FAIL]: a plain install replaces them from the committed HEAD)"
     exit 2
   fi
   say "check-only: stopping before any change"
