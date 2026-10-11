@@ -10,7 +10,7 @@ federation.ratify — syscall-table rows 20-23, renumbered from an original
 19-22 draft per Loki audit BFCC5C79 finding F4) beyond
 mcp_apps/manifest_grants.
 
-Divergence note (this PR's own finding, not a bug): `src/willow_mcp/bundle/
+Divergence note (this PR's own finding; the template has since been deleted, Loki R2): `src/willow_mcp/bundle/
 deploy/willow-mcp-manifest-grant.service.template` is the OLD `--user`
 BROKER-owned unit design this install retires outright (INSTALL.md step 2 —
 `systemctl --user disable --now willow-mcp-manifest-grant.timer`); it is a
@@ -39,7 +39,7 @@ _STEPS = Path(__file__).resolve().parents[1] / "src" / "willow_mcp" / "install_s
 _BUNDLE_TEMPLATE = (
     Path(__file__).resolve().parents[1] / "src" / "willow_mcp" / "bundle" / "deploy"
     / "willow-mcp-manifest-grant.service.template"
-)
+)  # DELETED (Loki R2); kept only so a test can assert it stays gone
 
 _SEALED_PAIRS = ("1fdfbdf3", "1bd6fd29")
 
@@ -893,15 +893,12 @@ def test_install_sh_strips_the_serve_units_own_pgp_pin():
     assert _install_sh_missing_pgp_dropin_strip(text) is False
 
 
-def test_bundle_manifest_grant_template_is_the_retired_user_unit_design():
-    """No existing template covers the NEW system-unit shape this PR adds
-    (the assignment's own "if there is none, say so in the handoff" clause);
-    the OLD one is the --user design this install RETIRES (INSTALL.md step
-    2), and is not expected to match it — a different deployment model."""
-    if not _BUNDLE_TEMPLATE.is_file():
-        pytest.skip("no bundle template for the --user manifest-grant unit exists at all")
-    old_text = _BUNDLE_TEMPLATE.read_text(encoding="utf-8")
+def test_bundle_manifest_grant_template_stays_deleted():
+    """Loki R2: the bundled `--user` template (`@PYTHON@ -m ...`, no `-I`) was
+    the design this install retires (INSTALL.md step 2) and nothing rendered
+    it; it is deleted. The only manifest-grant service unit is the committed
+    system unit, which must stay `-I`."""
+    assert not _BUNDLE_TEMPLATE.exists()
     new_text = (_DEPLOY / "willow-mcp-manifest-grant.service").read_text(encoding="utf-8")
-    assert _old_template_has_a_fixed_user_line(old_text) is False
     assert _service_unit_missing(new_text) == []
-    assert old_text != new_text
+    assert "python -I -m willow_mcp manifest-grant apply" in new_text

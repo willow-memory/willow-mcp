@@ -451,8 +451,71 @@ def test_the_exec_names_the_clones_install_sh_and_carries_the_marker_after_the_c
     body = _PRE_BLOCK.split("mg_pre_reexec() {", 1)[1].split("\n}\n", 1)[0]
     exec_text = body.split("  exec ", 1)[1]
     assert 'MG_REEXEC="$HEAD_SHA"' in exec_text and 'MG_REEXEC_BUILD="$TVC_BUILD"' in exec_text
-    assert '"$BASH" "$HEAD_CLONE/$MG_INSTALL_REL" "$@"' in exec_text and 'PATH="$orig_path"' in exec_text
+    assert '"$BASH" --noprofile --norc "$HEAD_CLONE/$MG_INSTALL_REL" "$@"' in exec_text and 'PATH="$orig_path"' in exec_text
     assert body.index("ensure_head_clone") < body.index("  exec ")
+
+
+# ---- Loki R1: the re-exec scrubs the shell-startup environment -------------------------------
+
+_SCRUBBED = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS")
+
+
+def _exec_scrub_problems(exec_text: str) -> list[str]:
+    """What the exec line lacks: `env -u` for each startup variable, and `--noprofile --norc`."""
+    flat = " ".join(exec_text.replace("\\\n", " ").split())
+    head = flat.split("PATH=", 1)[0]
+    out = [f"-u {v}" for v in _SCRUBBED if f"-u {v} " not in head]
+    if not flat.startswith("/usr/bin/env "):
+        out.append("/usr/bin/env first")
+    if '"$BASH" --noprofile --norc "$HEAD_CLONE' not in flat:
+        out.append("--noprofile --norc")
+    return out
+
+
+def _real_exec_text() -> str:
+    body = _PRE_BLOCK.split("mg_pre_reexec() {", 1)[1].split("\n}\n", 1)[0]
+    return body.split("  exec ", 1)[1]
+
+
+def test_plant_exec_scrub_scan_catches_its_violation():
+    good = ('/usr/bin/env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \\\n    PATH="$p" M=1 \\\n'
+            '    "$BASH" --noprofile --norc "$HEAD_CLONE/$R" "$@"')
+    assert _exec_scrub_problems(good) == []
+    assert _exec_scrub_problems(good.replace("-u ENV ", "")) == ["-u ENV"]
+    assert _exec_scrub_problems(good.replace("-u SHELLOPTS ", "")) == ["-u SHELLOPTS"]
+    assert _exec_scrub_problems(good.replace("--noprofile --norc ", "")) == ["--noprofile --norc"]
+    assert _exec_scrub_problems('/usr/bin/env PATH="$p" "$BASH" "$HEAD_CLONE/$R"') == [
+        "-u BASH_ENV", "-u ENV", "-u SHELLOPTS", "-u BASHOPTS", "--noprofile --norc"]
+
+
+def test_the_exec_line_scrubs_shell_startup_variables_and_skips_rc_files():
+    assert _exec_scrub_problems(_real_exec_text()) == []
+
+
+def test_bash_env_env_and_shellopts_do_not_reach_the_pinned_copy(repo):
+    hook = repo.tmp / "hook.sh"
+    fired = repo.tmp / "hook-fired"
+    hook.write_text(f'echo "$0" >> "{fired}"\n')
+    repo.script.write_text(_harness("committed-C", 'echo "OPTS=$SHELLOPTS"; echo "BASHOPTS_X=${BASHOPTS:-}"'))
+    _git(repo.co, "add", "-A")
+    _git(repo.co, "commit", "-q", "-m", "C")
+    c = _git(repo.co, "rev-parse", "HEAD")
+    # positive control: plain bash does honour all of them
+    ctl = subprocess.run(["bash", "-c", "echo $SHELLOPTS"], capture_output=True, text=True,
+                         env={**_ID, "SHELLOPTS": "xtrace"})
+    assert "xtrace" in ctl.stdout
+    ctl = subprocess.run(["bash", "-c", ":"], capture_output=True, text=True, env={**_ID, "BASH_ENV": str(hook)})
+    assert fired.read_text().count("\n") == 1, "positive control: BASH_ENV did not fire for plain bash"
+    fired.unlink()
+    r = repo.run("--expect-head", c, env={"BASH_ENV": str(hook), "ENV": str(hook),
+                                          "SHELLOPTS": "xtrace", "BASHOPTS": "extglob"})
+    assert r.returncode == 0 and "REACHED committed-C" in r.stdout, (r.stdout, r.stderr)
+    # the typed (stage 1) copy runs from the checkout and may fire the hook once, as any bash does;
+    # the pinned copy (under the temp build dir) must never
+    runs = fired.read_text().splitlines() if fired.exists() else []
+    assert all(str(repo.co) in ln for ln in runs) and len(runs) <= 1, runs
+    assert _kv(r.stdout)["OPTS"] and "xtrace" not in _kv(r.stdout)["OPTS"]
+    assert "extglob" not in _kv(r.stdout)["BASHOPTS_X"].split(":")
 
 
 # ---- F2: every root git call is neutral -----------------------------------------------------------

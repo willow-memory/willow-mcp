@@ -791,7 +791,6 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 _BUNDLE_DEPLOY_DIR = (Path(__file__).resolve().parent.parent / "src" / "willow_mcp"
                       / "bundle" / "deploy")
 _BUNDLE_DEPLOY_TEMPLATE_NAMES = (
-    "willow-mcp-manifest-grant.service.template",
     "willow-mcp-manifest-grant.timer.template",
 )
 
@@ -831,15 +830,6 @@ _DEPLOY_TEMPLATE_CONTENT_VALUES = {
         "WILLOW_PG_USER": "willow", "APPID": "willow",
         "HEARTBEAT_ROOT": "/srv/hb", "KART_SANDBOX_CONFIG": "/srv/kart.json",
         "VENV": "/srv/venv/bin/python",
-    },
-    # WILLOW_KEYRING / WILLOW_PGP_FINGERPRINT are deliberately absent here:
-    # the fixed template no longer asks for either as a content placeholder
-    # (EnvironmentFile=@WILLOW_HOME@/env supplies them at run time instead —
-    # see the template's own header comment) — these are the ONLY keys
-    # render_values() actually resolves for this unit.
-    "willow-mcp-manifest-grant.service.template": {
-        "WILLOW_HOME": "/srv/wh", "PYTHON": "/srv/venv/bin/python",
-        "NESTOR_DB": "/srv/wh/nestor.db",
     },
     "willow-mcp-manifest-grant.timer.template": {"SERVICE_UNIT": "willow-mcp-manifest-grant.service"},
     "willow-mcp-unit-ops.service.template": {

@@ -391,8 +391,14 @@ mg_pre_reexec() {
   ensure_head_clone "$expect"
   [ -f "$HEAD_CLONE/$MG_INSTALL_REL" ] \
     || stop "$MG_INSTALL_REL is not in commit ${expect:0:12}: that commit predates the pinned installer"
-  exec /usr/bin/env PATH="$orig_path" MG_REEXEC="$HEAD_SHA" MG_REEXEC_BUILD="$TVC_BUILD" \
-    "$BASH" "$HEAD_CLONE/$MG_INSTALL_REL" "$@" \
+  # Scrub the vars a non-interactive bash reads before line 1 of the script
+  # (BASH_ENV/ENV run a file; SHELLOPTS/BASHOPTS turn on xtrace, etc.), and
+  # skip profile/rc files. Not CDPATH/GLOBIGNORE/PS4/IFS: bash ignores or
+  # resets IFS, and the other three have no effect before the pinned copy's
+  # own code runs and the copy sets what it needs itself.
+  exec /usr/bin/env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
+    PATH="$orig_path" MG_REEXEC="$HEAD_SHA" MG_REEXEC_BUILD="$TVC_BUILD" \
+    "$BASH" --noprofile --norc "$HEAD_CLONE/$MG_INSTALL_REL" "$@" \
     || stop "could not exec the clone's install.sh"
 }
 # END pre-reexec
