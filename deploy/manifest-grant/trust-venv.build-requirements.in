@@ -1,0 +1,6 @@
+# Inputs to trust-venv.build-requirements.txt: the build backend named by
+# pyproject.toml's [build-system] requires, which install.sh installs into a
+# throwaway root-owned build venv (never fetched at build time). Regenerate the
+# .txt per INSTALL.md, "Regenerating the hash-pinned files"; review the diff.
+hatchling
+hatch-vcs

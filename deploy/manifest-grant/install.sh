@@ -140,6 +140,13 @@
 # interpreter, every path component to it (symlinks resolved), and everything
 # inside the venv is root-owned and unwritable by any other uid, carries no
 # non-root write ACL, and is not an editable install. See INSTALL.md.
+#
+# Rework 4 (follow-ups to the venv split): the privileged steps run from the
+# venv (willow_mcp.install_steps.*), not the checkout; every interpreter call
+# is `-I`; the venv's dependencies and the wheel's build backend install only
+# from the hash-pinned trust-venv*.requirements.txt files (`pip install
+# --require-hashes --only-binary=:all: --no-deps`, wheel built with
+# --no-build-isolation in a throwaway build venv). See INSTALL.md.
 
 set -euo pipefail
 
@@ -212,9 +219,14 @@ TRUST_PY_BASE=/usr/bin/python3.14   # what the operator's box already resolves t
 # manifest-grant apply` and the trust_owner_verbs / manifest_grant_executor /
 # mcp_federation / envelope_authoring modules it calls need psycopg2 and
 # cryptography only -- not mcp, starlette, kartikeya, jeles, nestor, ratatosk,
-# forge or willow-gate). Same specifiers as pyproject.toml's dependencies;
-# tests/test_trust_venv_preflight.py fails if they drift apart.
-TRUST_VENV_DEPS=("psycopg2-binary>=2.9,<3.0" "cryptography>=42.0,<51.0")
+# forge or willow-gate). Everything third-party that goes into the venv, and
+# every build tool that builds the wheel, is installed ONLY from the two
+# hash-pinned files below (read from the committed HEAD, never from the working
+# tree) with `pip install --require-hashes --only-binary=:all: --no-deps`; no
+# range specifier is ever handed to pip. Their ranges are the .in files, which
+# tests/test_trust_venv_preflight.py keeps equal to pyproject.toml's.
+TRUST_REQS_REL=deploy/manifest-grant/trust-venv.requirements.txt
+TRUST_BUILD_REQS_REL=deploy/manifest-grant/trust-venv.build-requirements.txt
 PY="$TRUST_VENV/bin/python"
 TVC_STAMP=.built-from-head   # inside the venv: the commit its wheel was built from
 
@@ -400,6 +412,31 @@ tvc_unit_problems() {
   return 0
 }
 
+# tvc_requirements_problems FILE -- FILE must be a plain hash-pinned list and
+# nothing else: `name==version \`, `--hash=sha256:<64 hex>` lines and comments.
+# No pip option (--index-url, --find-links, -r, -e, ...), no URL or path
+# requirement, no range, no unhashed entry: a requirements file can redirect
+# pip, and root installs whatever it says.
+tvc_requirements_problems() {
+  local f=$1 n
+  [ -f "$f" ] || { printf 'no such file: %s\n' "$f"; return 0; }
+  # (no {64} interval: mawk, Debian's default awk, may not support it; a sha256
+  # line is 4 spaces + "--hash=sha256:" + 64 hex = 82 chars, 84 with " \")
+  awk '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    /^[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9._+!-]+ \\$/ { cur = $1; hashes[cur] = 0; total++; next }
+    /^    --hash=sha256:[0-9a-f]+( \\)?$/ && (length($0) == 82 || length($0) == 84) {
+      if (cur == "") { printf "line %d: a hash before any requirement\n", NR; next }
+      hashes[cur]++; if ($0 !~ / \\$/) cur = ""; next }
+    { printf "line %d is not a pinned name==version or a sha256 hash: %.60s\n", NR, $0 }
+    END { for (n in hashes) if (hashes[n] == 0) printf "%s has no --hash=sha256 entry\n", n
+          if (total == 0) print "no requirements in the file" }
+  ' "$f" | head -8
+  n=$(grep -c -- '--hash=sha256:' "$f" || true)
+  [ "$n" -gt 0 ] || printf '%s carries no --hash=sha256: entry\n' "$f"
+  return 0
+}
+
 # tvc_emit LABEL PROBLEMS -- one report line per check; 1 when PROBLEMS is set.
 tvc_emit() {
   if [ -z "$2" ]; then printf '  [ok]   %s\n' "$1"; return 0; fi
@@ -447,7 +484,7 @@ tvc_report() {
 # clone, so the build writes nothing into the operator-writable checkout and
 # runs no operator-writable build code beyond the commit being installed).
 provision_trust_venv() {
-  local force=${1:-} problems head_now head_built
+  local force=${1:-} problems head_now head_built reqs build_reqs f
   local -a wheels
   # The privileged steps (rotate_resign, sync_constitutional,
   # seed_envelope_ratify, the constitutional seed bundle) now run FROM the
@@ -472,24 +509,38 @@ provision_trust_venv() {
   trap 'rm -rf "${TVC_BUILD:-}"' EXIT
   git -c safe.directory="$CHECKOUT" clone --quiet --no-hardlinks "$CHECKOUT" "$TVC_BUILD/src" \
     || stop "could not clone $CHECKOUT to build from"
+  # Both hash-pinned files come from the committed HEAD in the root-owned clone.
+  reqs="$TVC_BUILD/src/$TRUST_REQS_REL"; build_reqs="$TVC_BUILD/src/$TRUST_BUILD_REQS_REL"
+  for f in "$reqs" "$build_reqs"; do
+    problems=$(tvc_requirements_problems "$f")
+    [ -z "$problems" ] || stop "${f#"$TVC_BUILD/src/"} is not a plain hash-pinned requirements file (committed HEAD): $problems"
+  done
+  export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 PYTHONNOUSERSITE=1
+  # Throwaway build venv (root-owned temp dir, deleted on exit). The build
+  # backend (hatchling, hatch-vcs and their dependencies) is installed into it
+  # from the hash-pinned file; the wheel is then built with --no-build-isolation
+  # --no-index, so nothing unpinned is fetched while root builds.
+  ( umask 022; "$TRUST_PY_BASE" -I -m venv "$TVC_BUILD/buildvenv" ) \
+    || stop "could not create the build venv with $TRUST_PY_BASE (Debian/Ubuntu: apt install python3-venv)"
+  ( umask 022; "$TVC_BUILD/buildvenv/bin/python" -I -m pip install --quiet --require-hashes --only-binary=:all: --no-deps -r "$build_reqs" ) \
+    || stop "pip could not install the hash-pinned build tools from ${build_reqs#"$TVC_BUILD/src/"} (a hash mismatch refuses the install)"
+  ( umask 022; "$TVC_BUILD/buildvenv/bin/python" -I -m pip wheel --quiet --no-deps --no-build-isolation --no-index --wheel-dir "$TVC_BUILD/wheels" "$TVC_BUILD/src" ) \
+    || stop "could not build a willow-mcp wheel from $CHECKOUT"
+  mapfile -t wheels < <(find "$TVC_BUILD/wheels" -maxdepth 1 -name 'willow_mcp-*.whl')
+  [ "${#wheels[@]}" = 1 ] || stop "expected exactly one willow_mcp wheel, found ${#wheels[@]}"
   rm -rf -- "$TRUST_VENV"
   install -d -o root -g root -m 755 "$(dirname "$TRUST_VENV")"
   ( umask 022; "$TRUST_PY_BASE" -I -m venv "$TRUST_VENV" ) \
     || stop "could not create the venv with $TRUST_PY_BASE (Debian/Ubuntu: apt install python3-venv)"
-  export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 PYTHONNOUSERSITE=1
-  ( umask 022; "$PY" -I -m pip install --quiet "${TRUST_VENV_DEPS[@]}" ) \
-    || stop "pip could not install ${TRUST_VENV_DEPS[*]} into $TRUST_VENV"
-  ( umask 022; "$PY" -I -m pip wheel --quiet --no-deps --wheel-dir "$TVC_BUILD/wheels" "$TVC_BUILD/src" ) \
-    || stop "could not build a willow-mcp wheel from $CHECKOUT"
-  mapfile -t wheels < <(find "$TVC_BUILD/wheels" -maxdepth 1 -name 'willow_mcp-*.whl')
-  [ "${#wheels[@]}" = 1 ] || stop "expected exactly one willow_mcp wheel, found ${#wheels[@]}"
-  ( umask 022; "$PY" -I -m pip install --quiet --no-deps "${wheels[0]}" ) \
+  ( umask 022; "$PY" -I -m pip install --quiet --require-hashes --only-binary=:all: --no-deps -r "$reqs" ) \
+    || stop "pip could not install the hash-pinned dependencies from ${reqs#"$TVC_BUILD/src/"} into $TRUST_VENV (a hash mismatch refuses the install)"
+  ( umask 022; "$PY" -I -m pip install --quiet --no-deps --no-index "${wheels[0]}" ) \
     || stop "could not install ${wheels[0]##*/} into $TRUST_VENV"
   git -C "$TVC_BUILD/src" rev-parse HEAD > "$TRUST_VENV/$TVC_STAMP" \
     || stop "could not record the commit the venv was built from"
   chown -R root:root "$TRUST_VENV"
   chmod -R u=rwX,go=rX "$TRUST_VENV"
-  say "  installed ${wheels[0]##*/} (non-editable) + ${TRUST_VENV_DEPS[*]}"
+  say "  installed ${wheels[0]##*/} (non-editable) + the hash-pinned dependencies in ${TRUST_REQS_REL##*/}"
   tvc_report "$TRUST_VENV" "$PY" 0 / || stop "the venv just built failed its own preflight -- see the FAIL lines above"
 }
 

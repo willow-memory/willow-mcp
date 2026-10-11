@@ -113,14 +113,72 @@ def _trust_venv_from_install_sh() -> str:
     return venv
 
 
-def _deps_not_in_pyproject(install_text: str, pyproject_text: str) -> list[str]:
-    """The TRUST_VENV_DEPS specifiers pyproject.toml does not carry verbatim
-    (an empty or missing array also reports, as a sentinel)."""
-    m = re.search(r"^TRUST_VENV_DEPS=\((.*?)\)$", install_text, re.M)
-    deps = re.findall(r'"([^"]+)"', m.group(1)) if m else []
-    if not deps:
-        return ["<no TRUST_VENV_DEPS>"]
-    return [d for d in deps if f'"{d}"' not in pyproject_text]
+def _spec_lines(in_text: str) -> list[str]:
+    """The requirement specifiers of a pip-compile .in file (comments and blanks dropped)."""
+    return [ln.strip() for ln in in_text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def _specs_not_in_pyproject(in_text: str, pyproject_text: str) -> list[str]:
+    """The .in specifiers pyproject.toml does not carry verbatim as a dependency
+    (an empty file also reports, as a sentinel)."""
+    specs = _spec_lines(in_text)
+    if not specs:
+        return ["<no specifiers>"]
+    return [d for d in specs if f'"{d}"' not in pyproject_text]
+
+
+def _build_requires(pyproject_text: str) -> list[str]:
+    m = re.search(r"^\[build-system\]\nrequires = \[(.*?)\]", pyproject_text, re.M | re.S)
+    return re.findall(r'"([^"]+)"', m.group(1)) if m else []
+
+
+def _pins(txt: str) -> dict[str, str]:
+    """name -> pinned version from a pip-compile --generate-hashes file."""
+    return {m.group(1).lower(): m.group(2) for m in re.finditer(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==(\S+) \\$", txt, re.M)}
+
+
+def _vkey(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def _violates(version: str, spec: str) -> bool:
+    """True when VERSION breaks a `>=a,<b` style range (only those operators are used)."""
+    for part in spec.split(","):
+        m = re.fullmatch(r"\s*(>=|<=|<|>|==)\s*([\w.]+)\s*", part)
+        assert m, f"unsupported specifier {part!r}"
+        op, bound = m.groups()
+        a, b = _vkey(version), _vkey(bound)
+        n = max(len(a), len(b)); a += (0,) * (n - len(a)); b += (0,) * (n - len(b))
+        if not {">=": a >= b, "<=": a <= b, "<": a < b, ">": a > b, "==": a == b}[op]:
+            return True
+    return False
+
+
+def _pin_problems(in_text: str, txt: str) -> list[str]:
+    """Pinned versions that break a range of the .in file, ranges with no pin, and
+    any requirement / hash line that is not a plain `name==ver \\` + sha256 hashes."""
+    pins, out = _pins(txt), []
+    for spec in _spec_lines(in_text):
+        m = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)\s*(.*)", spec)
+        name, rng = m.group(1).lower(), m.group(2)
+        if name not in pins:
+            out.append(f"{name} has no pin")
+        elif rng and _violates(pins[name], rng):
+            out.append(f"{name}=={pins[name]} violates {rng}")
+    for ln in txt.splitlines():
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*==[\w.+!-]+ \\", ln):
+            continue
+        elif re.fullmatch(r"    --hash=sha256:[0-9a-f]{64}( \\)?", ln):
+            continue
+        else:
+            out.append(f"not a pin or sha256 hash line: {ln[:60]}")
+    # every requirement block must carry a hash line right after it
+    for m in re.finditer(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==[\w.+!-]+ \\\n((?:    --hash=sha256:\S+.*\n?)*)", txt, re.M):
+        if not m.group(2).strip():
+            out.append(f"{m.group(1)} has no hash")
+    return out
 
 
 def _editable_pip_lines(install_text: str) -> list[str]:
@@ -132,9 +190,9 @@ def _editable_pip_lines(install_text: str) -> list[str]:
 def test_plant_the_trust_venv_scans_catch_their_violation():
     assert _trust_venv_in("PY=x\n") is None
     assert _trust_venv_in("TRUST_VENV=/opt/a/venv\n") == "/opt/a/venv"
-    assert _deps_not_in_pyproject("nothing\n", '"x"') == ["<no TRUST_VENV_DEPS>"]
-    assert _deps_not_in_pyproject('TRUST_VENV_DEPS=("a>=1" "b>=2")\n', '"a>=1"') == ["b>=2"]
-    assert _deps_not_in_pyproject('TRUST_VENV_DEPS=("a>=1")\n', '"a>=1"') == []
+    assert _specs_not_in_pyproject("# c\n", '"x"') == ["<no specifiers>"]
+    assert _specs_not_in_pyproject("a>=1\nb>=2\n", '"a>=1"') == ["b>=2"]
+    assert _specs_not_in_pyproject("# c\na>=1\n", '"a>=1"') == []
     assert _editable_pip_lines('set -euo pipefail\n"$PY" -m pip install -e /src\n') != []
     assert _editable_pip_lines('set -euo pipefail\n# never pip install -e\n"$PY" -m pip install x\n') == []
 
@@ -178,7 +236,8 @@ def test_the_preflight_is_called_with_root_uid_0_and_anchor_slash():
 
 
 def test_dependencies_mirror_pyproject_and_the_install_is_not_editable():
-    assert _deps_not_in_pyproject(_INSTALL_SH, (_REPO / "pyproject.toml").read_text()) == []
+    pyproject = (_REPO / "pyproject.toml").read_text()
+    assert _specs_not_in_pyproject((_DEPLOY / "trust-venv.requirements.in").read_text(), pyproject) == []
     assert _editable_pip_lines(_INSTALL_SH) == []
     body = _INSTALL_SH.split("set -euo pipefail", 1)[1]
     assert "-m pip wheel" in body and "--no-deps" in body
@@ -616,3 +675,161 @@ def test_the_moved_steps_still_run_as_modules_from_an_installed_tree(tmp_path):
         # -I ignores PYTHONPATH: the editable install of this repo supplies the
         # package; what matters is that the module is found and its argparse runs.
         assert "No module named" not in r.stderr, (name, r.stderr)
+
+
+# ---- hash-pinned dependencies and build tools -------------------------------------
+# Gap 2/3: provision_trust_venv used to install psycopg2-binary / cryptography by
+# range and let the wheel build pull hatchling / hatch-vcs from the index as root.
+# Now both sets come from hash-pinned files (generated with uv pip compile
+# --generate-hashes) and pip runs with --require-hashes --no-deps.
+
+_RUNTIME_IN = _DEPLOY / "trust-venv.requirements.in"
+_RUNTIME_TXT = _DEPLOY / "trust-venv.requirements.txt"
+_BUILD_IN = _DEPLOY / "trust-venv.build-requirements.in"
+_BUILD_TXT = _DEPLOY / "trust-venv.build-requirements.txt"
+_H = "a" * 64
+
+
+def _pip_lines(install_text: str) -> list[str]:
+    """Executable lines (and their `\\` continuations) that run pip."""
+    code = "\n".join(_code_lines(install_text)).replace("\\\n", " ")
+    return [ln.strip() for ln in code.splitlines() if re.search(r"-m pip (?:install|wheel|download)\b", ln)]
+
+
+def _unhashed_pip_lines(install_text: str) -> list[str]:
+    """pip install/wheel/download calls that can fetch or install something not
+    pinned by hash: a dependency install without --require-hashes /
+    --only-binary / --no-deps / -r FILE, a wheel build that isolates (and so
+    fetches its own backend) or may reach the index, a local-wheel install that
+    may reach the index, or any version range on a pip line."""
+    bad = []
+    for ln in _pip_lines(install_text):
+        if re.search(r"[<>]=?\d|==\d|~=", ln):
+            bad.append(ln)
+        elif " pip wheel " in ln:
+            if not all(f in ln for f in ("--no-build-isolation", "--no-index", "--no-deps")):
+                bad.append(ln)
+        elif re.search(r'-r "\$', ln):
+            if not all(f in ln for f in ("--require-hashes", "--only-binary=:all:", "--no-deps")):
+                bad.append(ln)
+        elif '"${wheels[0]}"' in ln:
+            if not all(f in ln for f in ("--no-deps", "--no-index")):
+                bad.append(ln)
+        else:
+            bad.append(ln)
+    return bad
+
+
+def test_the_pinned_files_are_complete_hash_pinned_and_satisfy_pyproject():
+    pyproject = (_REPO / "pyproject.toml").read_text(encoding="utf-8")
+    run_in, run_txt = _RUNTIME_IN.read_text(), _RUNTIME_TXT.read_text()
+    assert _pin_problems(run_in, run_txt) == []
+    # psycopg2-binary + cryptography and the transitive deps (cffi, pycparser), nothing else
+    assert set(_pins(run_txt)) == {"psycopg2-binary", "cryptography", "cffi", "pycparser"}
+    # every line that is not a comment, blank, pin or sha256 hash is a failure (above); and
+    # every hash line really is sha256
+    assert "--hash=sha256:" in run_txt and "--hash=md5" not in run_txt
+    build_in, build_txt = _BUILD_IN.read_text(), _BUILD_TXT.read_text()
+    assert _pin_problems(build_in, build_txt) == []
+    assert sorted(_spec_lines(build_in)) == sorted(_build_requires(pyproject))
+    assert {"hatchling", "hatch-vcs"} <= set(_pins(build_txt))
+    assert _specs_not_in_pyproject(run_in, pyproject) == []
+
+
+def test_plant_pin_scans_catch_their_violation():
+    assert _build_requires('[build-system]\nrequires = ["a", "b>=1"]\nx = 1\n') == ["a", "b>=1"]
+    assert _build_requires("nothing") == []
+    pin = f"x==1.2 \\\n    --hash=sha256:{_H}\n"
+    assert _pin_problems("x>=1,<2\n", pin) == []
+    assert _pin_problems("x>=1,<2\n", pin.replace("1.2", "2.0")) == ["x==2.0 violates >=1,<2"]
+    assert _pin_problems("x>=1,<2\n", pin.replace("1.2", "0.9")) == ["x==0.9 violates >=1,<2"]
+    assert _pin_problems("y>=1\n", pin) == ["y has no pin"]
+    assert _pin_problems("x\n", "x==1.2 \\\n    # via z\n") == ["x has no hash"]
+    assert _pin_problems("x\n", f"x==1.2\n    --hash=sha256:{_H}\n")  # not `name==ver \\`
+    assert _pin_problems("x\n", pin.replace("sha256", "md5"))
+    assert _pin_problems("x\n", pin + "evil @ https://h/e.whl\n")
+    assert _pin_problems("x\n", pin + "--index-url https://h/\n")
+    assert _pin_problems("x\n", pin.replace(_H, "ab" * 5))
+    ok = ('( umask 022; "$PY" -I -m pip install --quiet --require-hashes --only-binary=:all: --no-deps -r "$reqs" ) \\\n  || stop x\n'
+          '"$X" -I -m pip wheel --quiet --no-deps --no-build-isolation --no-index --wheel-dir w s\n'
+          '"$PY" -I -m pip install --quiet --no-deps --no-index "${wheels[0]}"\n')
+    pre = "set -euo pipefail\n"
+    assert _unhashed_pip_lines(pre + ok) == []
+    assert len(_pip_lines(pre + ok)) == 3
+    assert _unhashed_pip_lines(pre + '"$PY" -m pip install "psycopg2-binary>=2.9,<3.0"\n')
+    assert _unhashed_pip_lines(pre + '"$PY" -m pip install psycopg2-binary\n')
+    assert _unhashed_pip_lines(pre + ok.replace("--require-hashes ", ""))
+    assert _unhashed_pip_lines(pre + ok.replace("--only-binary=:all: ", ""))
+    assert _unhashed_pip_lines(pre + ok.replace("--no-build-isolation ", ""))
+    assert _unhashed_pip_lines(pre + ok.replace("--no-index ", ""))
+    assert _unhashed_pip_lines(pre + ok.replace("--no-deps --no-index", "--no-index"))
+    assert _unhashed_pip_lines(pre + '"$PY" -m pip install x==1.0\n')
+    assert _unhashed_pip_lines(pre + "# pip install x\n") == []
+
+
+def test_install_sh_installs_only_hash_pinned_things():
+    assert "TRUST_VENV_DEPS" not in _INSTALL_SH
+    assert _unhashed_pip_lines(_INSTALL_SH) == []
+    lines = _pip_lines(_INSTALL_SH)
+    # four pip calls: build tools (hashed), wheel build, dependencies (hashed), local wheel
+    assert len(lines) == 4, lines
+    assert sum("--require-hashes" in ln for ln in lines) == 2
+    assert 'TRUST_REQS_REL=deploy/manifest-grant/trust-venv.requirements.txt' in _INSTALL_SH
+    assert 'TRUST_BUILD_REQS_REL=deploy/manifest-grant/trust-venv.build-requirements.txt' in _INSTALL_SH
+    # the pinned files are read from the committed HEAD in the root-owned clone, not the working tree
+    assert 'reqs="$TVC_BUILD/src/$TRUST_REQS_REL"' in _INSTALL_SH
+    assert 'build_reqs="$TVC_BUILD/src/$TRUST_BUILD_REQS_REL"' in _INSTALL_SH
+    assert "$HERE/trust-venv" not in _INSTALL_SH and "$CHECKOUT/deploy" not in _INSTALL_SH
+    # the backend is installed before the wheel is built, the wheel built before the trust venv is touched
+    body = _INSTALL_SH.split("provision_trust_venv() {", 1)[1]
+    order = [body.index(k) for k in ('-r "$build_reqs"', "pip wheel", 'rm -rf -- "$TRUST_VENV"', '-r "$reqs"', '"${wheels[0]}"')]
+    assert order == sorted(order), order
+    # a requirements file is vetted before pip sees it
+    assert body.index("tvc_requirements_problems") < body.index('-r "$build_reqs"')
+
+
+def _req_problems(tmp_path: Path, content: str) -> list[str]:
+    f = tmp_path / "r.txt"
+    f.write_text(content)
+    return _problems(tmp_path, "tvc_requirements_problems", str(f))
+
+
+def test_the_requirements_guard_accepts_the_committed_files_and_refuses_redirects(tmp_path):
+    for committed in (_RUNTIME_TXT, _BUILD_TXT):
+        assert _req_problems(tmp_path, committed.read_text()) == [], committed
+    pin = f"x==1.2 \\\n    --hash=sha256:{_H}\n"
+    assert _req_problems(tmp_path, pin) == []
+    for bad in (
+        pin + "--index-url https://evil.example/simple\n",
+        pin + "--extra-index-url https://evil.example/simple\n",
+        pin + "-f https://evil.example/\n",
+        pin + "-r other.txt\n",
+        pin + "-e /home/x/checkout\n",
+        pin + f"evil @ https://evil.example/e.whl \\\n    --hash=sha256:{_H}\n",
+        pin + "y>=1 \\\n",
+        f"x==1.2 \\\n    --hash=sha256:{'a' * 63}\n",
+        f"x==1.2 \\\n    --hash=md5:{'a' * 32}\n",
+        "x==1.2\n",
+        "x==1.2 \\\n",
+        f"    --hash=sha256:{_H}\n",
+        "# only a comment\n",
+        "",
+    ):
+        assert _req_problems(tmp_path, bad), bad
+    assert _problems(tmp_path, "tvc_requirements_problems", str(tmp_path / "missing"))
+
+
+def _install_md_pin_gaps(text: str) -> list[str]:
+    need = ("uv pip compile --generate-hashes --python-version 3.14", "--python-platform x86_64-manylinux_2_28",
+            "trust-venv.requirements.txt", "trust-venv.build-requirements.txt", "reviewed change",
+            "--require-hashes", "--no-build-isolation")
+    return [n for n in need if n not in text]
+
+
+def test_plant_install_md_pin_scan_catches_its_violation():
+    assert len(_install_md_pin_gaps("nothing")) == 7
+    assert _install_md_pin_gaps("reviewed change") != []
+
+
+def test_install_md_documents_regenerating_the_pinned_files():
+    assert _install_md_pin_gaps((_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")) == []

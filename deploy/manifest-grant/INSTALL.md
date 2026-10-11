@@ -355,8 +355,8 @@ What `install.sh` now builds and requires:
 |---|---|---|
 | Path | `/opt/willow-operator/venv` (`TRUST_VENV`, and `PY=$TRUST_VENV/bin/python`; the unit's `ExecStart=` names the same path and the preflight stops if it does not) | `/opt` is the FHS home for add-on software, outside `$H` and `/home`. `/etc/willow-mcp` is configuration, and `/var/lib/willow-mcp/manifest-grant` is the trust owner's own *writable* state (its gnupg home, a unit `ReadWritePaths=`): an interpreter may sit in neither, or the uid that runs it could rewrite it. Under `ProtectSystem=strict` `/opt` is read-only to the unit as well. |
 | Owner / mode | `root:root`, 755 dirs, 644 files (755 for executables) | No non-root uid can write it, the trust owner included. |
-| Build | `python3.14 -m venv` (`TRUST_PY_BASE=/usr/bin/python3.14`, what the box's current venv already resolves to), then a **non-editable** install of a wheel built from a local clone of this checkout's committed `HEAD` | The build writes nothing into the operator-writable checkout; the installed code is a copy, not a pointer back at the checkout. |
-| Packages | `willow-mcp` (the wheel, `--no-deps`), `psycopg2-binary`, `cryptography` — nothing else | Traced 2026-10-11: `python -m willow_mcp manifest-grant apply` (`__main__` dispatches before `server` loads) and the modules it calls — `manifest_grant_executor`, `trust_owner_verbs`, `mcp_federation`, `envelope_authoring`, `governance_ledger`, `human_session`, `net_signer`, `pgp` — import `psycopg2` (the FRANK ledger, `db`) and `cryptography` (ed25519 verification of the sealed pair) and no other third-party package. `mcp`, `starlette`, `kartikeya`, `jeles`, `nestor`, `ratatosk`, `forge`, `willow-gate`, `requests` and the reconciler are not pulled in. The preflight's last line imports exactly those modules from inside the venv; add a package to `TRUST_VENV_DEPS` only if that import (or a new apply-path module) needs it. |
+| Build | `python3.14 -m venv` (`TRUST_PY_BASE=/usr/bin/python3.14`, what the box's current venv already resolves to), then a **non-editable** install of a wheel built from a local clone of this checkout's committed `HEAD`. The wheel is built in a throwaway root-owned build venv whose backend (hatchling, hatch-vcs and their dependencies) is installed from `trust-venv.build-requirements.txt`, then `pip wheel --no-build-isolation --no-index`; the dependencies go into the trust venv from `trust-venv.requirements.txt` with `pip install --require-hashes --only-binary=:all: --no-deps -r`; the wheel is installed by file with `--no-deps --no-index`. Both requirements files are read from the committed `HEAD` in the root-owned clone, and refused unless every line is a `name==version` pin or a `--hash=sha256:` entry (no `--index-url`, `-r`, URL or range). | The build writes nothing into the operator-writable checkout; the installed code is a copy, not a pointer back at the checkout. |
+| Packages | `willow-mcp` (the wheel, `--no-deps`), `psycopg2-binary`, `cryptography` and their transitive dependencies `cffi` and `pycparser`, each pinned by sha256 — nothing else | Traced 2026-10-11: `python -m willow_mcp manifest-grant apply` (`__main__` dispatches before `server` loads) and the modules it calls — `manifest_grant_executor`, `trust_owner_verbs`, `mcp_federation`, `envelope_authoring`, `governance_ledger`, `human_session`, `net_signer`, `pgp` — import `psycopg2` (the FRANK ledger, `db`) and `cryptography` (ed25519 verification of the sealed pair) and no other third-party package. `mcp`, `starlette`, `kartikeya`, `jeles`, `nestor`, `ratatosk`, `forge`, `willow-gate`, `requests` and the reconciler are not pulled in. The preflight's last line imports exactly those modules from inside the venv; add a package to `trust-venv.requirements.in` (and regenerate) only if that import (or a new apply-path module) needs it. |
 
 ### Preflight
 
@@ -400,6 +400,35 @@ A plain install builds the venv first when it is missing or fails a check
 (step 0a below); `--rotate` and `--check-signatures` only enforce the checks.
 
 ## 0a. Provision the trust-owner venv
+
+### Regenerating the hash-pinned files
+
+`trust-venv.requirements.txt` (runtime) and `trust-venv.build-requirements.txt`
+(build backend) are generated from the `.in` files beside them, which hold the
+same ranges as `pyproject.toml` (`psycopg2-binary`, `cryptography`; and
+`[build-system] requires`). Regenerate them on any machine with network
+access, from this directory, with [uv](https://docs.astral.sh/uv/):
+
+    cd deploy/manifest-grant
+    uv pip compile --generate-hashes --python-version 3.14 \
+        --python-platform x86_64-manylinux_2_28 \
+        -o trust-venv.requirements.txt trust-venv.requirements.in
+    uv pip compile --generate-hashes --python-version 3.14 \
+        --python-platform x86_64-manylinux_2_28 \
+        -o trust-venv.build-requirements.txt trust-venv.build-requirements.in
+
+(`pip-compile --generate-hashes --allow-unsafe` from pip-tools works the
+same.) Regenerating is a **reviewed change**: a hash here is what root and
+the trust owner will run, so the diff goes through a pull request like code.
+Read it for new packages (the runtime set must stay `psycopg2-binary`,
+`cryptography`, `cffi`, `pycparser`), version jumps, and any line that is not
+a `name==version` pin or a `--hash=sha256:` entry. The tests fail if a pin
+drifts out of the `pyproject.toml` range, a line lacks a hash, or `install.sh`
+installs anything not hash-pinned. The files list every release artifact's
+hash for the pinned version (wheels for all platforms and the sdist);
+`--only-binary=:all:` makes pip refuse the sdist, so nothing is built from
+source on the box. Only `pip` itself, which `python -m venv` seeds from the
+root-owned system python, is outside the pinned set.
 
 ### Privileged steps run only from this venv
 
