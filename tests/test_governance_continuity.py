@@ -695,6 +695,18 @@ def test_roster_real_shape_still_loads(monkeypatch, tmp_path):
     assert fleet_roster.load_roster() == {"agents": {"hanuman": _GOOD_ROW}}
 
 
+def test_roster_live_box_top_level_metadata_still_loads(monkeypatch, tmp_path):
+    # The operator box's fleet.json top level (2026-10-11): metadata no consumer
+    # reads. "soil_manifest" matches the authority pattern by name only.
+    doc = {
+        "schema": "fleet/v1", "description": "x", "updated": "2026-10-11",
+        "constitutional_ref": "CONST-III-2", "soil_manifest": "soil/manifest.json",
+        "soil_store": "soil/store.db", "agents": {"hanuman": _GOOD_ROW},
+    }
+    _roster(monkeypatch, tmp_path, doc)
+    assert fleet_roster.load_roster() == {"agents": {"hanuman": _GOOD_ROW}}
+
+
 def test_roster_strips_unlisted_benign_keys(monkeypatch, tmp_path):
     _roster(monkeypatch, tmp_path, {"note": "x", "agents": {"hanuman": {**_GOOD_ROW, "emoji": "x"}}})
     assert fleet_roster.load_roster() == {"agents": {"hanuman": _GOOD_ROW}}

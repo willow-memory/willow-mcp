@@ -15,6 +15,12 @@ from pathlib import Path
 # refused outright. If the roster ever needs such a field, flip the read below to
 # governance=True (trust-owner-owned + signed) instead of widening this list.
 _TOP_KEYS = frozenset({"agents"})
+# Known top-level metadata in the live fleet.json (operator box, 2026-10-11),
+# read by no consumer: excluded from the authority scan and then dropped like
+# any other unlisted key. "soil_manifest" would otherwise trip the pattern.
+_INERT_TOP_KEYS = frozenset(
+    {"schema", "description", "updated", "constitutional_ref", "soil_manifest", "soil_store"}
+)
 _ROW_KEYS = frozenset({"role", "trust"})
 _FORBIDDEN_KEY = re.compile(
     r"capabilit|permission|grant|manifest|trust|fingerprint|fpr|syscall|envelope"
@@ -42,7 +48,7 @@ def _guard_schema(data: dict) -> dict:
     agents = data.get("agents")
     # The one allowed trust-ish key per row ("trust" under agents/<name>) is
     # removed from the scan; anything else matching the pattern is a refusal.
-    scan = {k: v for k, v in data.items() if k != "agents"}
+    scan = {k: v for k, v in data.items() if k != "agents" and k not in _INERT_TOP_KEYS}
     if isinstance(agents, dict):
         scan["agents"] = {
             name: ({k: v for k, v in row.items() if k not in _ROW_KEYS} if isinstance(row, dict) else row)
