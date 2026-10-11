@@ -1,8 +1,11 @@
 # The rename-away hole: options for a root-owned trust root
 
-Contents: §1 The hole, precisely · §2 Why F-C rejected the env-var fix · §3 Options (A root-owned subtree outside `$H`, B root-owned `$H`, C fd and `openat2` checks, D better options) · §4 Comparison · §5 Recommendation · §6 Questions for the operator
+Contents: §1 The hole, precisely · §2 Why F-C rejected the env-var fix · §3 Options (A root-owned subtree outside `$H`, B root-owned `$H`, C fd and `openat2` checks, D better options) · §4 Comparison · §5 Recommendation · §6 Questions for the operator · §7 Operator rulings
 
 Status: **design options for the operator to rule on. No code, no unit, no install step, no file on the box is changed by this document.** Written 2026-10-11 against `master` at `fd9bbad`. Operator ruling (2026-10-11): "yes" to making this the next design chunk, starting with a design doc with options.
+
+**D4: implemented in 846f97a, pending Loki** (branch `fix/d4-trust-marker`, not pushed; a narrow Loki audit happens before the marker is written on the box). Nothing is deployed by merging: the marker appears only when the operator runs the installer.
+
 
 Vault rule: `$H` (`/home/sean-campbell/sean-data-vault/willow-operator-box`) is the operator's data-vault box, and the vault is the operator's key. Nothing here reads, moves, rotates, re-keys or adds vault material. The trust-bearing files at issue (`constitutional/`, `mcp_apps/`, `trust.env`) are governance files and a public fingerprint, not key material, but they do sit inside the vault box today. Where an option relocates them, or leaves them where they are but changes who owns the path, §3 says so, and that step is an explicit operator act. The trust owner's GPG keyring is already outside `$H` (`/var/lib/willow-mcp/manifest-grant/gnupg`) and no option touches it. `$H/env`, `$H/vault.db`, `$H/config/`, and `manifest_grants/broker_signing_key` stay exactly where they are in every option.
 
@@ -184,7 +187,7 @@ This is the cheapest bite and the one the analysis in §1.4 points to.
 
 ## §5 Recommendation
 
-**Staged: D4 first, then D2 (bind mount + identity check), with A held in reserve.** Confidence: **68%** that this ordering is the right one for this box (the uncertainty is mostly the unmeasured bits: the Kart config shape, whether `RESOLVE_BENEATH` matters at all if D2 lands, and whether the operator wants the files physically out of the vault box, in which case A is the answer and the others are stepping stones).
+**Staged: D4 now, then D1 (fd-based reads plus a root-owned `(dev, ino)` record). A and D2 are out by operator ruling Q36 ("keep them in the vault box").** The original text below recommended D2 as the second bite; that rests on moving the backing store out of the vault box, which the ruling excludes. Confidence: **68%** that this ordering is the right one for this box (the uncertainty is mostly the unmeasured bits: the Kart config shape, whether `RESOLVE_BENEATH` matters at all if D2 lands, and whether the operator wants the files physically out of the vault box, in which case A is the answer and the others are stepping stones).
 
 Why.
 
@@ -216,3 +219,15 @@ Rulings needed.
 6. **manifest_grants.** Leave in `$H` (my recommendation; the broker writes `pending/` and holds `broker_signing_key` there), or schedule a later split with a root/trust-owner parent and a broker-writable `pending/`?
 7. **Loki.** Should the D4 change get a narrow Loki audit before the marker is written on the box (it changes what "absent" means for every PGP reader), as Q13's venv change did?
 8. **Unverified items to settle by reading, before D2/A.** The kernel version (for `openat2`), the Kart config's source-versus-target binding shape, whether the gate compares a manifest's `app_id` to its directory (cross-seat replay), and whether any freshness binding exists on signed manifests. I did not run any of these.
+
+## §7 Operator rulings (2026-10-11)
+
+| Q | Ruling |
+|---|---|
+| Q35 | D4 approved, dispatch. A narrow Loki audit happens before the marker is written on the box. |
+| Q36 | "keep them in the vault box". `constitutional/` and `mcp_apps/` physically stay in `$H`. That rules out option A and the D2 backing-store move. The follow-on after D4 is D1 (fd-based reads plus a root-owned `(dev, ino)` record). |
+| Q37 | On a provisioned box, `WILLOW_MCP_APPS_ROOT`, `WILLOW_CHARTER_REPO` and `WILLOW_ENVELOPE_REGISTRY` are ignored for trust inputs, with a loud log line (once per process per variable) if set. Implemented, and extended to `WILLOW_SYSCALL_TABLE` (same class; steers the syscall table). |
+| Q38 | A fail-closed outage on rename-away is acceptable for now. |
+| Q39 | `manifest_grants/` stays in `$H` for now. |
+
+Q36 was open when this document was written; the ruling above settles it and supersedes the Q36 wording in §6 item 1.
