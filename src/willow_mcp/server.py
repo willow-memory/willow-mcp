@@ -8820,6 +8820,17 @@ def _derive_problems(store: dict, postgres: dict, manifest: dict, mode: str,
                 "fix": (f"from an operator terminal: sudo chmod 644 {lease_state.get('path')} "
                         f"— do not re-issue; a fresh grant-net from the same root shell "
                         f"writes the same unreadable file")})
+        elif status == "untrusted":
+            problems.append({
+                "severity": "warn", "check": "net_lease",
+                "detail": (f"egress lease at {lease_state.get('path')} is not in a trust-owned tree"
+                           + (f": {lease_state['error']}" if lease_state.get("error") else "")
+                           + " — this host carries a trust-provisioned marker, so a lease must sit"
+                             " in an apps root / lease directory / file owned by the trust owner or"
+                             " root and writable by neither group nor other (Loki D06A0EF3);"
+                             " allow_net is denied."),
+                "fix": "have the trust owner (or root) re-issue it: `willow-mcp grant-net <app_id> --ttl 30m` "
+                       "run as that uid, after repairing the ownership of the lease directory"})
         elif status in ("malformed", "mismatch"):
             problems.append({
                 "severity": "warn", "check": "net_lease",

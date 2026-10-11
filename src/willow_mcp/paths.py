@@ -6,10 +6,12 @@ Import from here — do not scatter path joins across the codebase.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import stat
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,18 +108,118 @@ def provisioned_lstat(target: Path, marker, *, want_dir: bool) -> os.stat_result
     info = os.lstat(target)
     kind_ok = stat.S_ISDIR(info.st_mode) if want_dir else stat.S_ISREG(info.st_mode)
     if not kind_ok:
-        raise PermissionError(
+        raise ProvisionedViolation(
             f"{target} is not a plain {'directory' if want_dir else 'file'} "
             "(symlink or special file refused)"
         )
     if stat.S_IMODE(info.st_mode) & 0o022 or info.st_uid not in provisioned_allowed_uids(marker):
-        raise PermissionError(
+        raise ProvisionedViolation(
             f"untrusted ownership or permissions on {target} (uid {info.st_uid}; "
             f"this host is trust-provisioned, so it must be owned by the trust "
             f"owner ({marker.trust_owner_uid}) or root and not group/other-writable "
             "-- Loki D06A0EF3)"
         )
     return info
+
+
+class ProvisionedViolation(PermissionError):
+    """A D4.5 ownership/kind/identity rule was broken (as opposed to the OS
+    refusing this process access, which is a plain ``PermissionError`` with an
+    errno). Subclasses ``PermissionError`` so existing callers still catch it."""
+
+
+def read_pinned(path: Path, info: os.stat_result) -> bytes:
+    """Read ``path`` through an O_NOFOLLOW fd and require it to be the very
+    inode ``info`` (an lstat taken after the ownership checks) described.
+    A symlink at ``path`` or a different inode raises
+    :class:`ProvisionedViolation`."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ProvisionedViolation(f"{path} is a symlink (refused)") from exc
+        raise
+    try:
+        now = os.fstat(fd)
+        if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
+            raise ProvisionedViolation(f"{path} changed between check and open")
+        chunks = []
+        while True:
+            b = os.read(fd, 1 << 20)
+            if not b:
+                break
+            chunks.append(b)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def provisioned_read(marker, dirs: Sequence[Path], file: Path) -> bytes:
+    """The D4.5 read: each of ``dirs`` (outermost first) must be a real
+    directory and ``file`` a regular file, all trust-owner- or root-owned and
+    not group/other-writable (:func:`provisioned_lstat`), then ``file`` is read
+    through the pinned O_NOFOLLOW + (dev, ino) read. Raises
+    ``FileNotFoundError`` when something on the way is absent,
+    :class:`ProvisionedViolation` on a rule break."""
+    for d in dirs:
+        provisioned_lstat(d, marker, want_dir=True)
+    info = provisioned_lstat(file, marker, want_dir=False)
+    return read_pinned(file, info)
+
+
+def reader_apps_root() -> Path:
+    """The ``mcp_apps`` root a lease/binding READER uses: ``$WILLOW_HOME/mcp_apps``,
+    with the ``WILLOW_MCP_APPS_ROOT`` lever honoured only when no valid trust
+    marker binds this host (Q37, ``trust_marker.trust_input_env``). Never
+    raises: a marker that cannot be trusted drops the lever here, and the
+    read itself (:func:`marker_gated_read`) reports the marker error."""
+    from . import trust_marker
+
+    home = Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
+    try:
+        override = trust_marker.trust_input_env("WILLOW_MCP_APPS_ROOT")
+    except trust_marker.TrustMarkerError:
+        override = ""
+    return Path(override) if override else home / "mcp_apps"
+
+
+#: ``marker_gated_read`` states. ``unmarked``: no marker on this host, the
+#: caller reads exactly as it always did. ``absent``: the file (or a directory
+#: above it) does not exist. ``ok``: bytes read from a trust-owned tree.
+#: ``untrusted``: an ownership/kind/identity rule broke or the marker is
+#: unusable -- the caller treats it as no record and says so. ``unreadable``:
+#: the OS refused this process (a mode problem, not an ownership one).
+READ_UNMARKED = "unmarked"
+READ_ABSENT = "absent"
+READ_OK = "ok"
+READ_UNTRUSTED = "untrusted"
+READ_UNREADABLE = "unreadable"
+
+
+def marker_gated_read(dirs: Sequence[Path], file: Path) -> "tuple[str, bytes | None, str]":
+    """``(state, data, detail)`` for a lease/binding record: when a valid trust
+    marker binds this host, ``file`` is read only through
+    :func:`provisioned_read`; otherwise the state is ``unmarked`` and nothing is
+    read. Never raises for the cases above; a ``TrustMarkerError`` is
+    ``untrusted`` (fail closed)."""
+    from . import trust_marker
+
+    try:
+        marker = trust_marker.active_marker()
+    except trust_marker.TrustMarkerError as exc:
+        return READ_UNTRUSTED, None, f"the trust-provisioned marker is not usable: {str(exc)[:300]}"
+    if marker is None:
+        return READ_UNMARKED, None, ""
+    try:
+        return READ_OK, provisioned_read(marker, dirs, file), ""
+    except FileNotFoundError:
+        return READ_ABSENT, None, ""
+    except ProvisionedViolation as exc:
+        return READ_UNTRUSTED, None, str(exc)[:300]
+    except PermissionError as exc:
+        return READ_UNREADABLE, None, f"permission denied: {str(exc)[:200]}"
+    except OSError as exc:
+        return READ_UNTRUSTED, None, f"cannot read it safely: {str(exc)[:200]}"
 
 
 def _trusted_read_provisioned(path: Path, marker) -> None:

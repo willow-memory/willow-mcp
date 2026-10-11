@@ -351,3 +351,11 @@ def test_the_swap_is_one_renameat2_and_never_a_copy_or_a_delete_first():
 def test_unit_interpreter_path_is_unchanged():
     assert re.search(r"^TRUST_VENV=/opt/willow-operator/venv$", _INSTALL_SH, re.M)
     assert 'PY="$TRUST_VENV/bin/python"' in _INSTALL_SH
+
+
+def test_the_function_extractor_catches_a_name_install_sh_does_not_define():
+    """`_fn` is the scan these tests stand on: a missing function is an
+    AssertionError, never an empty body that every static check would pass."""
+    with pytest.raises(AssertionError):
+        _fn("tvc_no_such_function")
+    assert _fn("tvc_publish").startswith("tvc_publish() {")

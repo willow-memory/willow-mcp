@@ -308,4 +308,5 @@ Not decided here and left to the operator: whether D2-style relocation is ever r
 | Q-D1-6 | Yes: on a recorded box a missing recorded directory is refused, not re-created |
 | Q-D1-8 | `install.sh` mode: re-record is `--re-record-trust-identity`, inheriting `--expect-head` and the `env -i` re-exec |
 | Q47 (D4.5 `app_id`) | A manifest without `app_id` stays allowed under the marker for now; backfill `app_id` later for jeles-corpus, willow-bot, willow-mcp and willow-seal-watch (the four live manifests that lack it, 2026-10-11) through the trust-owner path, then deny an absent `app_id` under the marker |
+| Q49/Q50 (2026-10-11) | F1 lease/binding ownership under the marker and an atomic venv swap, folded in 6925f8b and the commit that adds this row without a further audit (operator ruling Q51) |
 | Q-D1-10 | Answered: `findmnt -nT "$H"` = `/  /dev/mapper/ubuntu--vg-ubuntu--lv ext4 rw,relatime`. `$H` is on the root filesystem (LVM), not its own mount |

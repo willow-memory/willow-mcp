@@ -755,22 +755,11 @@ MANIFEST_APP_ID_MISMATCH = "app_id_mismatch"
 
 
 def _read_pinned(path: Path, info: os.stat_result) -> bytes:
-    """Read ``path`` through an O_NOFOLLOW fd and require it to be the very
-    inode ``info`` (an lstat taken after the ownership checks) described."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        now = os.fstat(fd)
-        if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
-            raise PermissionError(f"{path} changed between check and open")
-        chunks = []
-        while True:
-            b = os.read(fd, 1 << 20)
-            if not b:
-                break
-            chunks.append(b)
-        return b"".join(chunks)
-    finally:
-        os.close(fd)
+    """The shared D4.5 pinned read (``paths.read_pinned``): an O_NOFOLLOW fd
+    that must be the very inode ``info`` described."""
+    from . import paths
+
+    return paths.read_pinned(path, info)
 
 
 def _read_provisioned_manifest(root: Path, app_id: str, marker) -> tuple[bytes, Optional[bytes]]:

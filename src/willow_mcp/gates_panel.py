@@ -400,6 +400,7 @@ def _app_rows(app_id: str) -> list[GateRow]:
             "none": "no lease on disk", "expired": "expired",
             "malformed": lst.get("error", "malformed"),
             "mismatch": lst.get("error", "app_id mismatch"),
+            "untrusted": lst.get("error", "not in a trust-owned tree"),
         }.get(status, status)
         rows.append(GateRow(
             id=f"lease.{app_id}", label="egress lease", scope=app_id, state="off",
@@ -478,6 +479,7 @@ def _build_lease_rows() -> list[GateRow]:
             "expired": f"{blurb} — expired",
             "malformed": f"{blurb} — {lst.get('error', 'malformed')}",
             "mismatch": f"{blurb} — {lst.get('error', 'tool name mismatch')}",
+            "untrusted": f"{blurb} — {lst.get('error', 'not in a trust-owned tree')}",
         }.get(status, f"{blurb} — {status}")
         return GateRow(
             id=f"build.{family}", label="build lease", scope=family,
