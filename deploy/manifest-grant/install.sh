@@ -426,7 +426,41 @@ if [ "${1:-}" != "--dry-run-sign" ]; then
 fi
 
 
+# BEGIN operator-check
+# mg_operator_problems NAME [HOME_BASE] -- why NAME is not a real, non-root, regular
+# user whose home is /home/NAME, one reason per line; silent when it is (Loki R2).
+# $SUDO_USER is the only thing that names the operator, and everything below
+# (H, the vault, `sudo -u`, chown, the user systemd manager) is derived from it,
+# so it is checked before any of that is used: a plain login name, a uid in the
+# human range (>= 1000, not 65534/nobody), and a real directory (not a symlink)
+# at HOME_BASE/NAME owned by that uid. HOME_BASE is /home in production; a test
+# passes a temp dir.
+mg_operator_problems() {
+  local op=$1 base=${2:-/home} u h owner
+  [[ $op =~ ^[a-z_][a-z0-9_-]*$ ]] || { printf 'operator name %q is not a plain login name ([a-z_][a-z0-9_-]*)\n' "$op"; return 0; }
+  u=$(id -u -- "$op" 2>/dev/null) || { printf 'operator %s is not a known user (id -u failed)\n' "$op"; return 0; }
+  [[ $u =~ ^[0-9]+$ ]] || { printf 'operator %s has a non-numeric uid %q\n' "$op" "$u"; return 0; }
+  if [ "$u" -lt 1000 ] || [ "$u" -eq 65534 ]; then
+    printf 'operator %s has uid %s: not a regular user (need >= 1000 and not 65534)\n' "$op" "$u"; return 0
+  fi
+  h=$base/$op
+  if [ -L "$h" ] || [ ! -d "$h" ]; then
+    printf 'operator home %s is not a real directory\n' "$h"; return 0
+  fi
+  owner=$(stat -c %u -- "$h" 2>/dev/null) || owner=""
+  [ "$owner" = "$u" ] || printf 'operator home %s is owned by uid %s, not %s\n' "$h" "${owner:-?}" "$u"
+  return 0
+}
+# END operator-check
+
 OPERATOR=${SUDO_USER:-sean-campbell}
+# --dry-run-sign touches nothing and needs no root (it only prints the sign
+# sequence), so it keeps the bare `id -u` and does not require a real /home/NAME;
+# every mode that acts on the box checks the operator first.
+if [ "${1:-}" != "--dry-run-sign" ]; then
+  out=$(mg_operator_problems "$OPERATOR")
+  [ -z "$out" ] || stop "operator check failed (SUDO_USER=${SUDO_USER:-<unset>}): $out"
+fi
 OPERATOR_UID=$(id -u "$OPERATOR")
 H=/home/$OPERATOR/sean-data-vault/willow-operator-box
 TRUST_OWNER=willow-operator

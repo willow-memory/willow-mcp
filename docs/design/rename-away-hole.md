@@ -229,5 +229,6 @@ Rulings needed.
 | Q37 | On a provisioned box, `WILLOW_MCP_APPS_ROOT`, `WILLOW_CHARTER_REPO` and `WILLOW_ENVELOPE_REGISTRY` are ignored for trust inputs, with a loud log line (once per process per variable) if set. Implemented, and extended to `WILLOW_SYSCALL_TABLE` (same class; steers the syscall table). |
 | Q38 | A fail-closed outage on rename-away is acceptable for now. |
 | Q39 | `manifest_grants/` stays in `$H` for now. |
+| Loki audit | Loki audit of 456849a..2ef4419: VERIFIED 92%; deployed 2026-10-11 (marker written); residuals R1–R3 folded in this commit without a further audit (operator ruling). |
 
 Q36 was open when this document was written; the ruling above settles it and supersedes the Q36 wording in §6 item 1.

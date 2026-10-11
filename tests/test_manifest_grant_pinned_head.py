@@ -450,7 +450,9 @@ def test_the_call_is_the_first_thing_that_runs_and_is_skipped_only_for_the_dry_r
     assert sum("mg_pre_reexec 0" in ln for ln in code) == 1 and _INSTALL_SH.count(_CALL) == 1
     after = _INSTALL_SH.split(_CALL, 1)[1]
     first_commands = _toplevel_commands(after)[:2]
-    assert all(re.match(r"^[A-Z_]+=", c) for c in first_commands), first_commands   # variable assignments follow
+    # variable assignments follow, then (Loki R2) the operator sanity check, itself skipped for --dry-run-sign
+    assert re.match(r"^[A-Z_]+=", first_commands[0]), first_commands
+    assert first_commands[1] == 'if [ "${1:-}" != "--dry-run-sign" ]; then', first_commands
     assert _INSTALL_SH.index(_CALL) < _INSTALL_SH.index("provision_trust_venv() {") < _INSTALL_SH.index("# ---- gap 18affe49e198")
 
 
