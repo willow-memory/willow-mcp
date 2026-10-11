@@ -76,11 +76,14 @@ against the commit you are about to install:
     sha256sum deploy/manifest-grant/install.sh                              # the two must match
 
 The initial `sudo` invocation of `install.sh` itself starts before any of this can help: it
-relies on sudo's environment scrubbing (`env_reset` and sudo's hardcoded
+relies on sudo's own startup (`env_reset` and sudo's hardcoded
 `BASH_ENV`/`ENV`/`SHELLOPTS`/`BASHOPTS` blacklist). To run it as root without
 sudo, use `env -i PATH=/usr/bin:/bin bash install.sh --expect-head <sha> ...` so
-no startup variable reaches bash. The re-exec into the pinned copy then clears
-those four variables itself and passes `--noprofile --norc`.
+no startup variable reaches bash. The re-exec into the pinned copy no longer
+depends on sudo: it runs under `/usr/bin/env -i` with a fixed allowlist
+(`SUDO_USER`, plus `PATH` and the two `MG_REEXEC*` markers) and
+`--noprofile --norc`, so `LD_PRELOAD`, `LD_LIBRARY_PATH`, `IFS`, `PYTHON*`,
+`GIT_*` and every startup variable are dropped before it runs.
 
 Every command below therefore carries `--expect-head <sha>`; write the same sha
 on each (re-run `git ls-remote` if the branch moved).

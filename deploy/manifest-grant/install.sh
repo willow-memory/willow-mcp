@@ -391,12 +391,30 @@ mg_pre_reexec() {
   ensure_head_clone "$expect"
   [ -f "$HEAD_CLONE/$MG_INSTALL_REL" ] \
     || stop "$MG_INSTALL_REL is not in commit ${expect:0:12}: that commit predates the pinned installer"
-  # Scrub the vars a non-interactive bash reads before line 1 of the script
-  # (BASH_ENV/ENV run a file; SHELLOPTS/BASHOPTS turn on xtrace, etc.), and
-  # skip profile/rc files. Not CDPATH/GLOBIGNORE/PS4/IFS: bash ignores or
-  # resets IFS, and the other three have no effect before the pinned copy's
-  # own code runs and the copy sets what it needs itself.
-  exec /usr/bin/env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \
+  # The pinned copy starts from an empty environment (`env -i`), plus the fixed
+  # allowlist below and PATH/MG_REEXEC/MG_REEXEC_BUILD. Nothing else of the
+  # typed copy's environment reaches it: not BASH_ENV/ENV/SHELLOPTS/BASHOPTS
+  # (a non-interactive bash reads those before line 1 of the script), not
+  # LD_PRELOAD/LD_LIBRARY_PATH (the dynamic loader reads them before any code),
+  # not IFS (bash inherits it from the environment; it would only apply at the
+  # script's own expansions, and now never reaches the copy at all), nor
+  # PYTHON*, GIT_*, PS4, CDPATH, GLOBIGNORE, TMPDIR and the rest. --noprofile
+  # --norc skips the profile/rc files. Allowlist, each passed only if set:
+  #   SUDO_USER -- `OPERATOR=${SUDO_USER:-sean-campbell}`: whose vault, uid and
+  #     user systemd manager the installer acts on; without it the operator
+  #     silently defaults to the wrong account.
+  # Considered and left out: SUDO_UID/SUDO_GID/HOME/LOGNAME/USER (never read;
+  # the script derives the uid with `id -u "$OPERATOR"`, as_op/as_to go through
+  # `sudo -u`, which sets its own HOME), TERM/LANG/LC_* (cosmetic; the script
+  # sets LC_ALL=C itself where it parses output), TMPDIR (bare `mktemp` then
+  # uses /tmp), XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS (as_op sets them),
+  # GNUPGHOME (as_to sets it), PIP_*/PYTHONNOUSERSITE (set by the script).
+  local keep=() v
+  # shellcheck disable=SC2043  # a one-name allowlist today; the loop is where a name is added
+  for v in SUDO_USER; do
+    if [ -n "${!v+x}" ]; then keep+=("$v=${!v}"); fi
+  done
+  exec /usr/bin/env -i ${keep[@]+"${keep[@]}"} \
     PATH="$orig_path" MG_REEXEC="$HEAD_SHA" MG_REEXEC_BUILD="$TVC_BUILD" \
     "$BASH" --noprofile --norc "$HEAD_CLONE/$MG_INSTALL_REL" "$@" \
     || stop "could not exec the clone's install.sh"

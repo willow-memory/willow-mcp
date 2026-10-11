@@ -57,15 +57,20 @@ def _git(cwd: Path, *a: str) -> str:
     return r.stdout.strip()
 
 
+# The pinned copy runs under `env -i`, so the harness bakes its log paths in rather than reading them
+# from the environment (the per-test temp dir, set by _Repo).
+_LOG_TMP = Path("/dev/null")
+
+
 def _harness(marker: str, tail: str = "") -> str:
     """The real pre-reexec section + a tail standing in for 'everything privileged'."""
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 {_SECTION}
 eval "$(declare -f ensure_head_clone | sed '1s/^ensure_head_clone/ensure_head_clone_real/')"
-ensure_head_clone() {{ echo clone >> "$CLONE_LOG"; ensure_head_clone_real "$@"; }}
+ensure_head_clone() {{ echo clone >> "{_LOG_TMP}/clone.log"; ensure_head_clone_real "$@"; }}
 eval "$(declare -f mg_git | sed '1s/^mg_git/mg_git_real/')"
-mg_git() {{ printf '%s\\n' "$*" >> "$GIT_LOG"; mg_git_real "$@"; }}
+mg_git() {{ printf '%s\\n' "$*" >> "{_LOG_TMP}/git.log"; mg_git_real "$@"; }}
 mg_pre_reexec "$(id -u)" "$@"
 echo "REACHED {marker}"
 echo "HEAD_SHA=$HEAD_SHA"
@@ -81,6 +86,8 @@ class _Repo:
     """A checkout with commit A, then B (HEAD, master); install.sh is the harness."""
 
     def __init__(self, tmp: Path):
+        global _LOG_TMP
+        _LOG_TMP = tmp
         self.tmp = tmp
         self.co = tmp / "checkout"
         self.script = self.co / _REL
@@ -451,45 +458,71 @@ def test_the_exec_names_the_clones_install_sh_and_carries_the_marker_after_the_c
     body = _PRE_BLOCK.split("mg_pre_reexec() {", 1)[1].split("\n}\n", 1)[0]
     exec_text = body.split("  exec ", 1)[1]
     assert 'MG_REEXEC="$HEAD_SHA"' in exec_text and 'MG_REEXEC_BUILD="$TVC_BUILD"' in exec_text
-    assert '"$BASH" --noprofile --norc "$HEAD_CLONE/$MG_INSTALL_REL" "$@"' in exec_text and 'PATH="$orig_path"' in exec_text
+    flat = " ".join(exec_text.replace("\\\n", " ").split())
+    assert flat.startswith('/usr/bin/env -i ${keep[@]+"${keep[@]}"} PATH="$orig_path" MG_REEXEC="$HEAD_SHA" '
+                           'MG_REEXEC_BUILD="$TVC_BUILD" "$BASH" --noprofile --norc "$HEAD_CLONE/$MG_INSTALL_REL" "$@"'), flat
     assert body.index("ensure_head_clone") < body.index("  exec ")
 
 
 # ---- Loki R1: the re-exec scrubs the shell-startup environment -------------------------------
 
-_SCRUBBED = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS")
+# Names the pinned copy must never be handed: the loader, the shell-startup, the parsing and the
+# tool-config variables (a prefix ends in "*").
+_FORBIDDEN = ("LD_*", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "IFS", "PYTHON*", "GIT_*", "PS4", "CDPATH",
+              "GLOBIGNORE", "TMPDIR", "PATH", "MG_*")
+_ALLOWED = ("SUDO_USER",)
 
 
-def _exec_scrub_problems(exec_text: str) -> list[str]:
-    """What the exec line lacks: `env -u` for each startup variable, and `--noprofile --norc`."""
+def _forbidden(name: str) -> bool:
+    return any(name == f or (f.endswith("*") and name.startswith(f[:-1])) for f in _FORBIDDEN)
+
+
+def _exec_scrub_problems(exec_text: str, body: str = "") -> list[str]:
+    """What the exec lacks: `/usr/bin/env -i` first, `--noprofile --norc`, and an allowlist (the
+    `for v in ...` loop in BODY, the function text) free of any forbidden name and equal to _ALLOWED."""
     flat = " ".join(exec_text.replace("\\\n", " ").split())
-    head = flat.split("PATH=", 1)[0]
-    out = [f"-u {v}" for v in _SCRUBBED if f"-u {v} " not in head]
-    if not flat.startswith("/usr/bin/env "):
-        out.append("/usr/bin/env first")
+    out = []
+    if not flat.startswith("/usr/bin/env -i "):
+        out.append("/usr/bin/env -i first")
     if '"$BASH" --noprofile --norc "$HEAD_CLONE' not in flat:
         out.append("--noprofile --norc")
+    if body:
+        m = re.search(r"^\s*for v in ([^;]*); do$", body, re.M)
+        names = m.group(1).split() if m else []
+        out += [f"forbidden {n}" for n in names if _forbidden(n)]
+        if not m or tuple(names) != _ALLOWED:
+            out.append(f"allowlist {names} != {list(_ALLOWED)}")
     return out
 
 
+def _real_body() -> str:
+    return _PRE_BLOCK.split("mg_pre_reexec() {", 1)[1].split("\n}\n", 1)[0]
+
+
 def _real_exec_text() -> str:
-    body = _PRE_BLOCK.split("mg_pre_reexec() {", 1)[1].split("\n}\n", 1)[0]
-    return body.split("  exec ", 1)[1]
+    return _real_body().split("  exec ", 1)[1]
 
 
 def test_plant_exec_scrub_scan_catches_its_violation():
-    good = ('/usr/bin/env -u BASH_ENV -u ENV -u SHELLOPTS -u BASHOPTS \\\n    PATH="$p" M=1 \\\n'
+    body = "  local keep=() v\n  for v in SUDO_USER; do\n    :\n  done\n"
+    good = ('/usr/bin/env -i ${keep[@]+"${keep[@]}"} \\\n    PATH="$p" M=1 \\\n'
             '    "$BASH" --noprofile --norc "$HEAD_CLONE/$R" "$@"')
-    assert _exec_scrub_problems(good) == []
-    assert _exec_scrub_problems(good.replace("-u ENV ", "")) == ["-u ENV"]
-    assert _exec_scrub_problems(good.replace("-u SHELLOPTS ", "")) == ["-u SHELLOPTS"]
-    assert _exec_scrub_problems(good.replace("--noprofile --norc ", "")) == ["--noprofile --norc"]
-    assert _exec_scrub_problems('/usr/bin/env PATH="$p" "$BASH" "$HEAD_CLONE/$R"') == [
-        "-u BASH_ENV", "-u ENV", "-u SHELLOPTS", "-u BASHOPTS", "--noprofile --norc"]
+    assert _exec_scrub_problems(good, body) == []
+    assert _exec_scrub_problems(good.replace("env -i ", "env "), body) == ["/usr/bin/env -i first"]
+    assert _exec_scrub_problems(good.replace("/usr/bin/env", "env"), body) == ["/usr/bin/env -i first"]
+    assert _exec_scrub_problems(good.replace("--noprofile --norc ", ""), body) == ["--noprofile --norc"]
+    assert _exec_scrub_problems(good.replace("--norc ", ""), body) == ["--noprofile --norc"]
+    for bad in ("LD_PRELOAD", "LD_LIBRARY_PATH", "BASH_ENV", "IFS", "PYTHONPATH", "GIT_DIR", "TMPDIR", "PS4"):
+        assert _exec_scrub_problems(good, body.replace("SUDO_USER", f"SUDO_USER {bad}")) == [
+            f"forbidden {bad}", "allowlist ['SUDO_USER', '%s'] != ['SUDO_USER']" % bad]
+    assert _exec_scrub_problems(good, body.replace("SUDO_USER", "SUDO_UID")) == ["allowlist ['SUDO_UID'] != ['SUDO_USER']"]
+    assert _exec_scrub_problems(good, body.replace("for v in SUDO_USER; do", "for v in ; do")) == [
+        "allowlist [] != ['SUDO_USER']"]
+    assert _exec_scrub_problems(good, "  nothing here\n") == ["allowlist [] != ['SUDO_USER']"]
 
 
-def test_the_exec_line_scrubs_shell_startup_variables_and_skips_rc_files():
-    assert _exec_scrub_problems(_real_exec_text()) == []
+def test_the_exec_line_runs_under_env_i_with_a_fixed_allowlist_and_skips_rc_files():
+    assert _exec_scrub_problems(_real_exec_text(), _real_body()) == []
 
 
 def test_bash_env_env_and_shellopts_do_not_reach_the_pinned_copy(repo):
@@ -516,6 +549,38 @@ def test_bash_env_env_and_shellopts_do_not_reach_the_pinned_copy(repo):
     assert all(str(repo.co) in ln for ln in runs) and len(runs) <= 1, runs
     assert _kv(r.stdout)["OPTS"] and "xtrace" not in _kv(r.stdout)["OPTS"]
     assert "extglob" not in _kv(r.stdout)["BASHOPTS_X"].split(":")
+
+
+_LEAKY = {"LD_LIBRARY_PATH": "/nonexistent-ld", "FOO_LEAK": "1", "IFS": "x", "PYTHONPATH": "/tmp/evil",
+          "TMPDIR": "/tmp/evil-tmp", "GIT_DIR": "/tmp/evil-git", "CDPATH": "/tmp/evil", "PS4": "EVIL",
+          "GLOBIGNORE": "*", "HOME": "/tmp/evil-home", "LANG": "xx_XX", "TERM": "evil"}
+
+
+def _env_dump_tail(out: Path) -> str:
+    # `env -0` from the pinned copy, written before it consumes the markers
+    return f'/usr/bin/env -0 > "{out}"; echo "OPERATOR=${{SUDO_USER:-sean-campbell}}"'
+
+
+def test_only_the_allowlist_reaches_the_pinned_copy_and_the_operator_survives(repo):
+    dump = repo.tmp / "pinned.env"
+    repo.script.write_text(_harness("committed-C", _env_dump_tail(dump)))
+    _git(repo.co, "add", "-A")
+    _git(repo.co, "commit", "-q", "-m", "C")
+    c = _git(repo.co, "rev-parse", "HEAD")
+    # positive control: a plain /usr/bin/env child sees every one of them
+    ctl = subprocess.run(["/usr/bin/env", "-0"], capture_output=True, env={**_ID, **_LEAKY, "SUDO_USER": "opx"})
+    seen = dict(kv.split("=", 1) for kv in ctl.stdout.decode().split("\0") if "=" in kv)
+    assert all(seen.get(k) == v for k, v in _LEAKY.items()) and seen["SUDO_USER"] == "opx"
+    r = repo.run("--expect-head", c, env={**_LEAKY, "SUDO_USER": "opx", "LD_PRELOAD": "/nonexistent/libleak.so",
+                                           "SHELLOPTS": "xtrace", "BASH_ENV": "/nonexistent/h"})
+    assert r.returncode == 0 and "REACHED committed-C" in r.stdout, (r.stdout, r.stderr)
+    assert _kv(r.stdout)["MARKER_ENV"] == "unset"            # the MG_ markers were consumed
+    got = dict(kv.split("=", 1) for kv in dump.read_bytes().decode().split("\0") if "=" in kv)
+    for k in (*_LEAKY, "LD_PRELOAD", "SHELLOPTS", "BASH_ENV", "ENV", "BASHOPTS", "CLONE_LOG", "GIT_LOG"):
+        assert k not in got, (k, got.get(k))
+    assert got["SUDO_USER"] == "opx" and _kv(r.stdout)["OPERATOR"] == "opx"   # install.sh's OPERATOR=${SUDO_USER:-...}
+    assert not [k for k in got if k.startswith(("LD_", "PYTHON", "GIT_", "MG_"))], sorted(got)
+    assert set(got) <= {"SUDO_USER", "PATH", "PWD", "SHLVL", "_", "OLDPWD"}, sorted(got)
 
 
 # ---- F2: every root git call is neutral -----------------------------------------------------------
