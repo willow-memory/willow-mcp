@@ -121,7 +121,9 @@ indirection at all). See `paths.trust_config_path()`'s own docstring for
 the full argument.
 
 **The rename-away hole (Loki audit `D06A0EF3`) is UNCHANGED by either
-rework and still open on this box.** `$H` is owned by the broker's own
+rework and still open on this box until step 6 has written the D4 marker
+(see "D4: the trust-provisioned marker" after step 6), which closes its
+fail-open half.** `$H` is owned by the broker's own
 uid, mode `700`, so the broker can rename `$H/constitutional` away
 entirely and put an empty, self-owned directory of the same name back —
 `constitutional/` then reads as "never provisioned," trust.env as
@@ -1003,6 +1005,55 @@ fingerprint change reads "no ratified servers" and silently drops every
 other entry. `trust_owner_verbs._apply_federation_ratify` also carries a
 defensive check refusing `EACCES` before ever reaching
 `mcp_federation.ratify()` if the registry does not verify, as a backstop.
+
+## D4: the trust-provisioned marker (rename-away hole, Loki `D06A0EF3`)
+
+Step 6 (and `--rotate`) ends by writing `/etc/willow-mcp/trust-provisioned`,
+`root:root 0644`, atomically (temp file beside it, chmod, chown, `mv`), and
+only after `trust.env` carries a real 40-hex fingerprint. Two lines:
+
+    willow_home=<realpath of $H>
+    trust_owner_uid=<uid of the trust owner>
+
+What it does. Its mere presence tells every reader this `$WILLOW_HOME` has
+been provisioned for trust, a fact the broker's uid cannot erase (it is
+root-owned, in a root-owned directory chain). With it present and valid:
+
+* `pgp.pgp_enabled()` is True or it RAISES. A missing, unreadable or empty
+  `trust.env`, or a `constitutional/` that is not a plain directory owned by
+  the trust owner (a rename-away and plant), refuses instead of reading as
+  "enforcement off". The gate denies the seat's manifest; the broker refuses
+  to start (`refusing to start`, exit 1).
+* `paths.trusted_read` drops the own-euid branch for governance inputs: the
+  envelope register, the syscall table, the FRANK head anchor and anything
+  else read through it must be owned (file and parent) by the trust owner or
+  root, and the file must carry a verifying signature. The fleet roster
+  (`$H/fleet.json`, broker-owned) keeps the old shape.
+* `WILLOW_MCP_APPS_ROOT`, `WILLOW_CHARTER_REPO`, `WILLOW_ENVELOPE_REGISTRY`
+  and `WILLOW_SYSCALL_TABLE` are ignored for trust inputs (the default path
+  under `$H` is used) with one loud `ERROR` log line per variable per process.
+* A process whose `$WILLOW_HOME` realpath differs from the marker's refuses
+  trust-sensitive reads, rather than running unenforced.
+
+An invalid marker (symlink, not root-owned, group/other-writable, bad parent,
+malformed) is refused, never read as absent. `--check` prints `[ok]` for a
+valid marker, `[FAIL]` for an invalid one, and `[info]` when absent.
+
+Removing the marker re-opens the bootstrap fail-open (an absent `trust.env` in
+a non-trust-owner `constitutional/` reads as "never provisioned"). Do not
+remove it to "fix" an outage; repair the cause.
+
+What it does not close: rollback to an older genuine trust-owner copy,
+renaming `$H` or an ancestor, and the outage itself (next step: D1, fd reads
+plus a root-owned `(dev, ino)` record). `manifest_grants/` stays in `$H`.
+
+Outage recovery (accepted, operator ruling Q38): if something renames
+`constitutional/` away, every PGP reader refuses with an error naming
+`D06A0EF3` and the marker. As root: move the planted directory aside, move
+the genuine trust-owner-owned `constitutional/` back (or restore it), then
+`sudo deploy/manifest-grant/install.sh --check`, and restart the broker.
+If only `trust.env` is gone, re-run the install (step 6 rewrites it, then
+the marker). Do not edit the marker by hand; install.sh rewrites it.
 
 ## 6b. Withdraw every request minted before this install
 

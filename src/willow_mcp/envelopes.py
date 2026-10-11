@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import fnmatch
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,14 +19,18 @@ def registry_path() -> Path:
     ``$WILLOW_HOME/constitutional/pre-approved.json`` (see
     ``paths.envelope_registry_path``).
     """
-    configured = os.environ.get("WILLOW_ENVELOPE_REGISTRY", "").strip()
+    from . import trust_marker
+
+    configured = trust_marker.trust_input_env("WILLOW_ENVELOPE_REGISTRY")
     if configured:
         return Path(configured).expanduser()
     return envelope_registry_path()
 
 
 def syscall_path() -> Path:
-    configured = os.environ.get("WILLOW_SYSCALL_TABLE", "").strip()
+    from . import trust_marker
+
+    configured = trust_marker.trust_input_env("WILLOW_SYSCALL_TABLE")
     if configured:
         return Path(configured).expanduser()
     return registry_path().with_name(syscall_table_path().name)

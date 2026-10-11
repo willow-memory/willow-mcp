@@ -462,7 +462,7 @@ def test_an_env_rendered_for_another_database_is_drift(box):
 def test_not_yet_installed_is_info_not_a_failure(box):
     r = box.report(box.committed_dir())
     assert r.returncode == 0, r.stdout
-    assert r.stdout.count("[info]") == 3 and "FAIL" not in r.stdout
+    assert r.stdout.count("[info]") == 4 and "FAIL" not in r.stdout  # unit, timer, env + the D4 marker
 
 
 def test_the_report_fails_on_a_bad_committed_file_or_stamp(box):

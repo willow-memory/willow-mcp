@@ -18,7 +18,7 @@ LAYOUT_VERSION = 1
 logger = logging.getLogger(__name__)
 
 
-def trusted_read(path: Path) -> None:
+def trusted_read(path: Path, *, governance: bool = True) -> None:
     """Fail-closed authentication of a policy/source file before it is trusted.
 
     Loki B5FB7E2B §4.6: an envelope registry, syscall table, or fleet roster the
@@ -46,11 +46,30 @@ def trusted_read(path: Path) -> None:
     fallback chain that gets more permissive on failure: a missing or
     non-verifying signature on a trust-owner-owned file is a refusal, full
     stop — it never falls through to being trusted on ownership alone.
+
+    D4 (rename-away hole, Loki D06A0EF3): when a valid root-owned
+    ``trust-provisioned`` marker binds this ``$WILLOW_HOME`` and ``governance``
+    is true (the default), the own-euid branch is dropped. The file and its
+    parent must be owned by the trust owner or root (a broker process no
+    longer believes a broker-planted register/syscall table), and the FILE
+    must carry a verifying signature either way. ``governance=False`` keeps
+    the old shape for a broker-owned input that is not a governance input
+    (the fleet roster). An invalid marker refuses (``PermissionError``).
     """
     if path.is_symlink() or path.parent.is_symlink():
         raise PermissionError(f"symlinked source path refused: {path}")
     euid = os.geteuid()
     trust_owner_uid = _trust_owner_uid()
+    if governance:
+        from . import trust_marker
+
+        try:
+            marker = trust_marker.active_marker()
+        except trust_marker.TrustMarkerError as exc:
+            raise PermissionError(f"{path}: {exc}") from exc
+        if marker is not None:
+            _trusted_read_provisioned(path, marker)
+            return
     for target in (path.parent, path):
         if not target.exists():
             raise PermissionError(f"source path missing: {target}")
@@ -68,6 +87,28 @@ def trusted_read(path: Path) -> None:
         raise PermissionError(
             f"untrusted ownership or permissions on source path: {target}"
         )
+
+
+def _trusted_read_provisioned(path: Path, marker) -> None:
+    """The ``trusted_read`` shape on a provisioned box: trust-owner- or
+    root-owned file and parent, no group/other write bit, detached signature
+    required on the file. Own-euid ownership is NOT accepted."""
+    from . import trust_marker
+
+    allowed = {marker.trust_owner_uid, trust_marker._GOVERNANCE_ROOT_UID}
+    for target in (path.parent, path):
+        if not target.exists():
+            raise PermissionError(f"source path missing: {target}")
+        info = target.stat()
+        if stat.S_IMODE(info.st_mode) & 0o022 or info.st_uid not in allowed:
+            raise PermissionError(
+                f"untrusted ownership or permissions on source path: {target} "
+                f"(uid {info.st_uid}; this host is trust-provisioned, so a "
+                f"governance input must be owned by the trust owner "
+                f"({marker.trust_owner_uid}) or root, never by this "
+                "process's own uid — Loki D06A0EF3)"
+            )
+    _require_trust_owner_signature(path)
 
 
 def _trust_owner_uid() -> "int | None":
@@ -267,7 +308,9 @@ def trust_config_path() -> Path:
 
 def charter_repo() -> Path | None:
     """Grove charter repository (``WILLOW_CHARTER_REPO``)."""
-    raw = os.environ.get("WILLOW_CHARTER_REPO", "").strip()
+    from . import trust_marker
+
+    raw = trust_marker.trust_input_env("WILLOW_CHARTER_REPO")
     return Path(raw).expanduser() if raw else None
 
 
@@ -539,7 +582,9 @@ def package_dir(package_name: str) -> Path:
 # ── mcp_apps / store ──────────────────────────────────────────────────────────
 
 def mcp_apps_root() -> Path:
-    override = os.environ.get("WILLOW_MCP_APPS_ROOT", "").strip()
+    from . import trust_marker
+
+    override = trust_marker.trust_input_env("WILLOW_MCP_APPS_ROOT")
     if override:
         return Path(override)
     return willow_home() / "mcp_apps"

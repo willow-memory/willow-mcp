@@ -16,7 +16,9 @@ def load_roster() -> dict:
     # Authenticate the roster's trust root before reconciling from it (§4.6).
     from .paths import trusted_read
 
-    trusted_read(roster_path())
+    # Not a governance input in the D4 sense: the roster lives at
+    # $WILLOW_HOME/fleet.json, broker-owned. Kept on the own-euid shape.
+    trusted_read(roster_path(), governance=False)
     data = json.loads(roster_path().read_text(encoding="utf-8"))
     agents = data.get("agents")
     if not isinstance(agents, dict):

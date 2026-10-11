@@ -92,6 +92,21 @@ os.environ.pop("NESTOR_DB", None)
 os.environ.pop("NESTOR_REQUIRE_SEAL_KEY", None)
 
 
+@pytest.fixture(autouse=True)
+def _no_host_trust_marker(tmp_path_factory, monkeypatch):
+    """D4: the real /etc/willow-mcp/trust-provisioned marker must never leak
+    into a test on a provisioned host. Point the compiled-in constant at a
+    path that does not exist (marker ABSENT == today's behaviour); tests of
+    the marker itself monkeypatch ``trust_marker._MARKER_PATH`` again."""
+    from willow_mcp import trust_marker
+
+    monkeypatch.setattr(
+        trust_marker, "_MARKER_PATH",
+        tmp_path_factory.mktemp("nomarker") / "etc" / "willow-mcp" / "trust-provisioned",
+    )
+    trust_marker._logged_levers.clear()
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """Per-test isolated $WILLOW_HOME + aligned mcp_apps/store roots."""

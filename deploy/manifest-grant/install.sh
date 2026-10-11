@@ -928,6 +928,7 @@ tvc_report() {
 MG_SERVICE=willow-mcp-manifest-grant.service
 MG_TIMER=willow-mcp-manifest-grant.timer
 MG_ENV=manifest-grant.env
+MG_MARKER=trust-provisioned   # D4: $ETC/trust-provisioned, root:root 0644
 MG_DEPLOY_REL=deploy/manifest-grant   # inside the checkout / the HEAD clone
 
 # mg_ini_problems FILE SPEC -- FILE against SPEC, lines "KIND<TAB>SECTION<TAB>TEXT":
@@ -1070,6 +1071,56 @@ mg_installed_problems() {
   return 0
 }
 
+# mg_marker_problems MARKER H TRUST_OWNER ROOT_USER ROOT_GROUP -- D4 (Loki
+# D06A0EF3, docs/design/rename-away-hole.md): the root-owned marker the
+# broker's uid cannot erase. Valid = a regular file (no symlink), root:root
+# 0644, in a directory chain (its parent and grandparent) that is root-owned
+# and not group/other-writable, with exactly `willow_home=<realpath of $H>`
+# and `trust_owner_uid=<uid of the trust owner>`. Mirrors the reader in
+# src/willow_mcp/trust_marker.py; the two must agree.
+mg_marker_problems() {
+  local m=$1 h=$2 to=$3 ru=${4:-root} rg=${5:-root} st d mode want_home want_uid lines
+  [ ! -L "$m" ] || { printf '%s is a symlink\n' "$m"; return 0; }
+  [ -f "$m" ] || { printf '%s is not a regular file\n' "$m"; return 0; }
+  st=$(stat -c '%U:%G %a' -- "$m" 2>/dev/null || true)
+  [ "$st" = "$ru:$rg 644" ] || printf '%s is %s, expected %s:%s 644\n' "$m" "${st:-unreadable}" "$ru" "$rg"
+  d=$(dirname -- "$m")
+  for d in "$d" "$(dirname -- "$d")"; do
+    if [ -L "$d" ] || [ ! -d "$d" ]; then printf '%s is not a plain directory\n' "$d"; continue; fi
+    st=$(stat -c '%U %a' -- "$d" 2>/dev/null || true)
+    mode=${st#* }
+    if [ "${st%% *}" != "$ru" ]; then printf '%s is owned by %s, expected %s\n' "$d" "${st%% *}" "$ru"; fi
+    if [ -z "$mode" ] || [ $(( 8#$mode & 8#022 )) -ne 0 ]; then printf '%s is group/other-writable or unreadable (%s)\n' "$d" "${mode:-?}"; fi
+  done
+  want_home=$(readlink -f -- "$h" 2>/dev/null || true)
+  want_uid=$(id -u "$to" 2>/dev/null || true)
+  [ -n "$want_home" ] && [ -n "$want_uid" ] || { printf 'cannot resolve %s or trust owner %s\n' "$h" "$to"; return 0; }
+  lines=$(cat -- "$m" 2>/dev/null || true)
+  [ "$lines" = "willow_home=$want_home
+trust_owner_uid=$want_uid" ] || printf '%s does not read exactly willow_home=%s and trust_owner_uid=%s\n' "$m" "$want_home" "$want_uid"
+  return 0
+}
+
+# mg_write_marker MARKER H TRUST_OWNER ROOT_USER ROOT_GROUP -- write the marker
+# atomically (temp file beside it, 0644, root:root, mv) and validate what
+# landed; returns 1 (nothing left half-written) if it does not validate.
+mg_write_marker() {
+  local m=$1 h=$2 to=$3 ru=${4:-root} rg=${5:-root} tmp p home uid
+  home=$(readlink -f -- "$h" 2>/dev/null || true)
+  uid=$(id -u "$to" 2>/dev/null || true)
+  [ -n "$home" ] && [ -n "$uid" ] || { printf 'cannot resolve %s or trust owner %s\n' "$h" "$to" >&2; return 1; }
+  tmp=$(mktemp -- "$(dirname -- "$m")/.trust-provisioned.XXXXXX") || return 1
+  printf 'willow_home=%s\ntrust_owner_uid=%s\n' "$home" "$uid" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 0644 -- "$tmp" && chown "$ru:$rg" -- "$tmp" || { rm -f -- "$tmp"; return 1; }
+  # validate the temp file BEFORE it replaces anything: a bad write must not
+  # clobber an existing valid marker
+  p=$(mg_marker_problems "$tmp" "$h" "$to" "$ru" "$rg")
+  [ -z "$p" ] || { printf '%s\n' "$p" >&2; rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$m" || { rm -f -- "$tmp"; return 1; }
+  p=$(mg_marker_problems "$m" "$h" "$to" "$ru" "$rg")
+  [ -z "$p" ] || { printf '%s\n' "$p" >&2; return 1; }
+}
+
 # mg_stamp_problems STAMPFILE HEADSHA -- the venv and the units must come from
 # the same commit: the venv's recorded build commit is the HEAD clone's.
 mg_stamp_problems() {
@@ -1126,6 +1177,15 @@ mg_report() {
     mg_emit "installed env matches the render of committed HEAD" "installed env differs from the render of committed HEAD ($etc/$MG_ENV)" "$p" || rc=1
   else
     printf '  [info] %s is not installed yet\n' "$etc/$MG_ENV"
+  fi
+  # D4: the trust-provisioned marker. Absent is [info] (a box that has not
+  # been through step 6 yet, or one that never will); present-but-wrong is a
+  # [FAIL] -- the reader refuses an invalid marker, it never reads it as absent.
+  if [ -e "$etc/$MG_MARKER" ] || [ -L "$etc/$MG_MARKER" ]; then
+    p=$(mg_marker_problems "$etc/$MG_MARKER" "$h" "$to" "$ru" "$rg")
+    mg_emit "trust-provisioned marker $etc/$MG_MARKER is valid (rename-away protection ON)" "trust-provisioned marker $etc/$MG_MARKER is invalid (every PGP reader on this box refuses until it is repaired)" "$p" || rc=1
+  else
+    printf '  [info] %s is absent: rename-away protection (Loki D06A0EF3) is OFF; a plain install writes it after step 6\n' "$etc/$MG_MARKER"
   fi
   return "$rc"
 }
@@ -1516,6 +1576,21 @@ retire_stale_key_if_marked() {
   fi
 }
 
+# write_trust_marker -- D4 (Loki D06A0EF3). Run right after sign_and_publish_trust
+# (the step that makes $TRUST_ENV real): writes $ETC/trust-provisioned, the
+# root-owned fact the broker cannot erase, so a rename-away of constitutional/
+# becomes a fail-closed refusal instead of "enforcement off". Refuses to
+# write it unless $TRUST_ENV carries a real 40-hex fingerprint (an empty
+# fingerprint on a marked box is refused by the reader, so the marker would
+# lock the box out). Never touches vault material: it writes one file in $ETC.
+write_trust_marker() {
+  grep -Eq '^(export )?WILLOW_PGP_FINGERPRINT=[0-9A-Fa-f]{40}$' "$TRUST_ENV" \
+    || stop "$TRUST_ENV carries no 40-hex WILLOW_PGP_FINGERPRINT after publishing: refusing to write the trust-provisioned marker (a marked box with no fingerprint refuses every PGP read)"
+  mg_write_marker "$ETC/$MG_MARKER" "$H" "$TRUST_OWNER" root root \
+    || stop "could not write a valid $ETC/$MG_MARKER"
+  say "  wrote $ETC/$MG_MARKER (root:root 0644): rename-away protection ON for $(readlink -f "$H")"
+}
+
 # sign_and_publish_trust: the ONE code path for "change what is trusted" --
 # Loki re-audit 93D0F057, N1: the plain install used to publish trust.env at
 # step 1b and re-sign at step 6, many steps and several stop points later
@@ -1648,6 +1723,7 @@ if [ -n "$ROTATE" ]; then
   # yet — "the register is signed by a key the broker does not trust", the
   # 2026-09-23 incident, verbatim).
   sign_and_publish_trust "$NEW_FPR" "$OLD_FPR"
+  write_trust_marker
 
   for fpr in "${RETIRE_FPRS[@]}"; do
     if sudo -u "$OPERATOR" gpg --batch --yes --delete-key "$fpr"; then
@@ -1821,11 +1897,17 @@ fi
 # assumed closed.
 H_UID=$(stat -c %u "$H")
 if [ "$H_UID" = "$OPERATOR_UID" ]; then
-  say "  NOTE: $H is owned by the broker (uid $OPERATOR_UID) -- the rename-away hole"
-  say "  (Loki D06A0EF3) is NOT closed. Closing it needs \$WILLOW_HOME itself to resolve"
-  say "  to a root-provisioned location outside the broker's own writable tree, not an"
-  say "  env-var override any process (including the broker) can set -- see F-C, Loki"
-  say "  audit 23DE8AA9, and INSTALL.md."
+  if [ -f "$ETC/$MG_MARKER" ] && [ -z "$(mg_marker_problems "$ETC/$MG_MARKER" "$H" "$TRUST_OWNER" root root)" ]; then
+    say "  NOTE: $H is owned by the broker (uid $OPERATOR_UID), but the root-owned marker"
+    say "  $ETC/$MG_MARKER is valid: a rename-away of constitutional/ is now a fail-closed"
+    say "  refusal, not 'enforcement off' (Loki D06A0EF3, D4). NOT closed: rollback to an"
+    say "  older genuine trust-owner copy, renaming \$H or an ancestor, and the outage"
+    say "  itself (next: D1, fd reads plus a root-owned (dev, ino) record) -- see INSTALL.md."
+  else
+    say "  NOTE: $H is owned by the broker (uid $OPERATOR_UID) and no valid"
+    say "  $ETC/$MG_MARKER exists yet -- the rename-away fail-open (Loki D06A0EF3) is"
+    say "  NOT closed until step 6 writes the marker. See INSTALL.md (D4)."
+  fi
 else
   say "  $H is not broker-owned -- the rename-away hole is closed"
 fi
@@ -2037,6 +2119,7 @@ sudo -u "$TRUST_OWNER" psql -d "$PG_DB" -qtc 'select 1' >/dev/null || stop "peer
 # only fires when they genuinely differ.
 say "== 6. re-sign everything under $FPR, then publish $TRUST_ENV"
 sign_and_publish_trust "$FPR" "$OLD_TRUST_FPR"
+write_trust_marker
 
 # ------------------ 6b. guard: no request minted before this install may apply
 # Sealed 33654f35 (2026-09-22): d23a3726's pending request "is withdrawn, not

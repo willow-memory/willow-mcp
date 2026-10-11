@@ -31,8 +31,11 @@ _APP_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 
 
 def _apps_root() -> Path:
+    from . import trust_marker
+
     home = Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
-    return Path(os.environ.get("WILLOW_MCP_APPS_ROOT", home / "mcp_apps"))
+    override = trust_marker.trust_input_env("WILLOW_MCP_APPS_ROOT")
+    return Path(override) if override else home / "mcp_apps"
 
 
 def _validate_app_id(app_id: str) -> str:
@@ -773,7 +776,18 @@ def _read_manifest(app_id: str) -> tuple[Optional[dict], str, str]:
         # #183: opt-in PGP enforcement. Every caller of _load_manifest already
         # treats None as "deny" (fail-closed) -- checking here, once, means an
         # unsigned or tampered manifest is denied everywhere a manifest is read.
-        if pgp.pgp_enabled():
+        try:
+            enforced = pgp.pgp_enabled()
+        except (pgp.PgpSourceUnreadable, pgp.PgpFingerprintConflict) as e:
+            # D4 (Loki D06A0EF3): on a trust-provisioned box pgp_enabled()
+            # raises rather than report "off". The gate treats it as a denial,
+            # never as "no enforcement, accept the manifest".
+            logger.error("gate: trust root unusable for %s: %s — denied", app_id, e)
+            return None, MANIFEST_UNSIGNED, (
+                f"{manifest_path} exists and parses, but the PGP trust root "
+                f"could not be established: {str(e)[:300]}"
+            )
+        if enforced:
             ok, detail = pgp.verify_detached(manifest_path)
             if not ok:
                 logger.error(
