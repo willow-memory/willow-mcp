@@ -294,3 +294,17 @@ Questions for the operator, each with a recommendation. Q-numbers are local to t
 | Q-D1-10 | Is `$H` on its own mount (affects the `st_dev`-equals-parent rule in §3.1 step 6)? | Check `findmnt -nT "$H"` on the box; the rule is exempt at `$H` either way | 60% that it is not a separate mount |
 
 Not decided here and left to the operator: whether D2-style relocation is ever revisited (Q36 says no for now), and the timing of bites against Loki's review queue.
+
+## §8 Operator rulings (2026-10-11)
+
+| Q | Ruling |
+|---|---|
+| Q-D1-9 (as "D4.5") | Yes: dispatched as its own change ahead of D1 (gate ownership check under the marker, and `app_id` must equal the directory name) |
+| Q-D1-1 | Yes: a read-only audit of the live box before the first record is written |
+| Q-D1-2 | Hold: whether any Kart task reads `mcp_apps/` or governed files is not ruled; bite 6 stays optional |
+| Q-D1-3 | Agreed: a separate record file, `/etc/willow-mcp/trust-identity` |
+| Q-D1-4 | Yes: the public `trust_fingerprint` pin goes in the record |
+| Q-D1-5 | Agreed: `i_generation` best-effort, no birth time in v1 |
+| Q-D1-6 | Yes: on a recorded box a missing recorded directory is refused, not re-created |
+| Q-D1-8 | Not yet ruled (the recommendation stands: an `install.sh` mode) |
+| Q-D1-10 | Answered: `findmnt -nT "$H"` = `/  /dev/mapper/ubuntu--vg-ubuntu--lv ext4 rw,relatime`. `$H` is on the root filesystem (LVM), not its own mount |
