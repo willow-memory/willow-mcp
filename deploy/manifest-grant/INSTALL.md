@@ -11,12 +11,15 @@ this document used to walk through one keyboard line at a time are no longer
 the operator's to type; `install.sh` (beside this file) collapses them into
 one root act:
 
-    sudo bash install.sh                       # do it
+    sudo bash install.sh                       # do it (from the COMMITTED HEAD: commit
+                                                 # before you install)
     sudo bash install.sh --check               # detect-only, change nothing — stops
                                                  # after step 0, before any mutation;
                                                  # prints one [ok]/[FAIL] line per
-                                                 # trust-owner-interpreter check and
-                                                 # exits 2 if any fails
+                                                 # trust-owner-interpreter check, one per
+                                                 # unit/timer/env check, and any drift of
+                                                 # /etc from the committed HEAD; exits 2 if
+                                                 # any fails
     sudo bash install.sh --provision-venv       # build (or rebuild) ONLY the trust-owner
                                                  # venv, check it, touch nothing else
     sudo bash install.sh --check-signatures     # read-only: which fingerprint does
@@ -362,7 +365,8 @@ What `install.sh` now builds and requires:
 
 The script refuses to start unless: it is run as root; `$H` exists; the
 `willow-operator` trust-owner user already exists (`trust_root_setup` has
-run on this box); the three unit/env files sit beside `install.sh`;
+run on this box); the three unit/env files are in the checkout's **committed
+HEAD** (see "The unit, timer and env come from the committed HEAD" below);
 `/etc/willow-mcp/verifiers.public.json` (the net-signer's public ring) is
 already present; `$H/env` names `WILLOW_PG_DB`; and **the trust owner's
 interpreter passes every check below** (Loki audit BFCC5C79, F7 — it is used
@@ -393,11 +397,73 @@ and `--check` prints all of them and exits 2 instead of stopping at the first:
    write, ahead of the standard library;
 6. only when 1–5 pass (root never runs an interpreter that failed them): the
    apply path imports, with `-I`, from inside the venv;
-7. the unit file beside `install.sh` has `ExecStart=$PY -m willow_mcp
-   manifest-grant apply`, exactly.
+7. the venv's `.built-from-head` stamp equals the commit of the root-owned
+   HEAD clone the units are read from (refused if they differ: the units and
+   the venv must come from the same commit);
+8. the committed `willow-mcp-manifest-grant.service` is exactly the
+   allowlisted directive set, the `.timer` only its expected keys and
+   `manifest-grant.env` only its expected keys (next section).
 
 A plain install builds the venv first when it is missing or fails a check
 (step 0a below); `--rotate` and `--check-signatures` only enforce the checks.
+
+### The unit, timer and env come from the committed HEAD
+
+The service runs as the trust owner and root installs it, so
+`willow-mcp-manifest-grant.service`, `.timer` and `manifest-grant.env` are
+code-equivalent. They used to be copied from the working tree beside
+`install.sh` (writable by the operator uid, the bot and the agents) with only
+`ExecStart=` checked. Now:
+
+- **One root-owned clone of the committed HEAD per run** (`ensure_head_clone`,
+  the clone the venv build already used). The venv's wheel and pinned
+  requirements, the unit, the timer and the env template are all read from it
+  and from nowhere else; `install.sh` reads nothing privileged from `$HERE`.
+  **Commit before you install**: an uncommitted edit to any of the three is
+  not installed (and not validated as if it were). The clone's commit must
+  equal the venv's `.built-from-head` stamp; a mismatch stops the install
+  (`sudo bash install.sh --provision-venv` rebuilds the venv from HEAD).
+- **The whole file is validated, not just `ExecStart=`** (`mg_service_problems`,
+  `mg_timer_problems`, `mg_env_problems`, in the `trust-venv-check` block of
+  `install.sh`). Exact-line allowlists, each line once, per section; a
+  comment or blank line is skipped, anything else (including an indented
+  directive, a trailing-backslash continuation, a duplicate, a missing line or
+  a directive in the wrong section) stops the install.
+  - service `[Unit]`: `Description=`, `After=network.target postgresql.service`,
+    `RequiresMountsFor=$H`. `[Service]`: `Type=oneshot`, `User=` and `Group=`
+    the trust owner, `UMask=0027`, `EnvironmentFile=/etc/willow-mcp/manifest-grant.env`,
+    `Environment="WILLOW_HOME=$H"`, `Environment="GNUPGHOME=/var/lib/willow-mcp/manifest-grant/gnupg"`,
+    `ExecStart=$PY -m willow_mcp manifest-grant apply`, `NoNewPrivileges=true`,
+    `PrivateTmp=true`, `ProtectSystem=strict`, `ProtectHome=read-only`, four
+    `ReadWritePaths=` (`$H/manifest_grants`, `$H/mcp_apps`, `$H/constitutional`,
+    `/var/lib/willow-mcp/manifest-grant`), `ProtectKernelTunables=true`,
+    `ProtectControlGroups=true`, `RestrictSUIDSGID=true`, `LockPersonality=true`.
+    So no `ExecStartPre`/`ExecStartPost`/`ExecStop*`/`ExecReload`/`ExecCondition`,
+    no second `ExecStart`, no other `Environment`/`EnvironmentFile`.
+  - timer: `[Unit]` `Description=`; `[Timer]` `OnBootSec=2min`,
+    `OnUnitActiveSec=60s`, optionally `Unit=willow-mcp-manifest-grant.service`
+    (and nothing else); `[Install]` `WantedBy=timers.target`.
+  - env (committed, and again as rendered): `WILLOW_KEYRING=` and
+    `WILLOW_SEAL_RING=` `/etc/willow-mcp/verifiers.public.json`,
+    `WILLOW_PG_DB=` (empty in the template, the database name once rendered),
+    `WILLOW_PG_USER=` the trust owner, `WILLOW_MCP_STRICT_TRUST_ROOT=1`. No
+    other key. The render is plain shell (`mg_render_env`: drop any
+    `WILLOW_PGP_FINGERPRINT=` line, set `WILLOW_PG_DB=`), no `sed`, so the
+    value read from `$H/env` is never a replacement string; a newline in it
+    would render a second line and the allowlist stops it.
+  - Because the unit names `$H` (`WILLOW_HOME`, `RequiresMountsFor=`,
+    `ReadWritePaths=`) literally, it only validates on a box whose operator is
+    the one `install.sh` derives (`SUDO_USER`, default `sean-campbell`); on
+    another operator the install stops here instead of installing a unit that
+    points at someone else's box.
+- **Drift is checked after the install and by `--check`.** Step 4 compares
+  what is really in `/etc/systemd/system` and `/etc/willow-mcp` (bytes, owner,
+  mode, not a symlink) with what was rendered from HEAD and stops on any
+  difference. `--check` prints `[ok] installed unit matches committed HEAD`
+  or `[FAIL] installed unit differs from committed HEAD` (and the same for the
+  timer and the env), `[info]` for a file not installed yet, and exits 2 on a
+  FAIL. A systemd drop-in directory for the unit (`*.service.d/`) is not
+  inspected.
 
 ## 0a. Provision the trust-owner venv
 
@@ -796,13 +862,17 @@ reads `trust.env` directly as the one source of truth.
 ## 4. Env file, units
 
     install -d -m 755 /etc/willow-mcp
-    # manifest-grant.env, with WILLOW_PG_DB filled in. WILLOW_PGP_FINGERPRINT
+    # Rendered from, and installed from, the root-owned clone of the committed
+    # HEAD (never the working tree); validated whole first; compared with /etc
+    # afterwards. manifest-grant.env, with WILLOW_PG_DB filled in. WILLOW_PGP_FINGERPRINT
     # is NOT rendered here (dispatch 0CB0C85C, dissolving Loki A38D41C2's F8):
     # the trust-owner apply unit reads trust.env directly -- the same file
     # everything else reads -- so there is no second copy of the fingerprint
     # to keep in sync, or to drift, here at all.
-    install -o root -g willow-operator -m 640 manifest-grant.env /etc/willow-mcp/manifest-grant.env
-    install -o root -g root -m 644 willow-mcp-manifest-grant.{service,timer} /etc/systemd/system/
+    install -o root -g willow-operator -m 640 <rendered manifest-grant.env> /etc/willow-mcp/manifest-grant.env
+    install -o root -g root -m 644 <HEAD>/deploy/manifest-grant/willow-mcp-manifest-grant.{service,timer} /etc/systemd/system/
+    # then: installed files == the render of HEAD (bytes, root:root 644 /
+    # root:willow-operator 640), else STOP
     systemctl daemon-reload
 
 ## 5. Postgres role for the apply half

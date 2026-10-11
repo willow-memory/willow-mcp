@@ -215,8 +215,12 @@ def test_the_unit_and_install_sh_name_the_same_interpreter():
 
 
 def _problems_unit(unit: str, py: str) -> list[str]:
+    """The whole-unit check (mg_service_problems) with the box's production arguments."""
+    h = "/home/sean-campbell/sean-data-vault/willow-operator-box"
     r = subprocess.run(
-        ["bash", "-c", _BLOCK + f'\ntvc_unit_problems "{unit}" "{py}"'], capture_output=True, text=True
+        ["bash", "-c", _BLOCK + f'\nmg_service_problems "{unit}" "{py}" willow-operator "{h}" '
+         f'/var/lib/willow-mcp/manifest-grant/gnupg /etc/willow-mcp'],
+        capture_output=True, text=True,
     )
     return [ln for ln in r.stdout.splitlines() if ln]
 
@@ -579,7 +583,10 @@ def _py_calls_without_isolation(install_text: str) -> list[str]:
     (root runs install.sh from whatever directory the operator is in)."""
     return [
         ln.strip() for ln in _code_lines(install_text)
-        if re.search(r'"\$(?:PY|TRUST_PY_BASE)"\s+(?!-I\b)-', ln) or re.search(r'"\$PY"\s+(?!-I\b)"', ln)
+        # "$PY" passed as an ARGUMENT to one of the block's own shell functions
+        # (mg_service_problems ... "$PY" "$TRUST_OWNER") is a path string, not an exec
+        if not re.search(r'\b(?:mg|tvc)_\w+ ', ln)
+        and (re.search(r'"\$(?:PY|TRUST_PY_BASE)"\s+(?!-I\b)-', ln) or re.search(r'"\$PY"\s+(?!-I\b)"', ln))
     ]
 
 
@@ -599,13 +606,14 @@ def test_plant_checkout_code_scans_catch_their_violation():
         pre + 'install -m 644 "$HERE/willow-mcp-manifest-grant.service" /etc/\n'
         'sed -e s/a/b/ "$HERE/manifest-grant.env" > "$T"\n'
         '[ -f "$HERE/$f" ] || stop x\n'
-        'up=$(tvc_unit_problems "$HERE/willow-mcp-manifest-grant.service" "$PY")\n'
+        'up=$(some_check "$HERE/willow-mcp-manifest-grant.service" "$PY")\n'
         '# "$PY" "$HERE/rotate_resign.py"\n'
     ) == []
     assert _py_calls_without_isolation(pre + '"$PY" -m pip install x\n')
     assert _py_calls_without_isolation(pre + '"$PY" - "$s" <<EOF\n')
     assert _py_calls_without_isolation(pre + '"$TRUST_PY_BASE" -m venv v\n')
     assert _py_calls_without_isolation(pre + '"$PY" -I -m pip install x\n') == []
+    assert _py_calls_without_isolation(pre + 'up=$(mg_service_problems "$U" "$PY" "$TO")\n') == []
     assert _py_calls_without_isolation(pre + '"$PY" -I - "$s" <<EOF\n') == []
 
 
@@ -658,9 +666,9 @@ def test_the_constitutional_seed_bundle_comes_from_the_installed_package():
 def test_the_venv_is_rebuilt_when_it_was_built_from_another_commit():
     body = _INSTALL_SH.split("provision_trust_venv() {", 1)[1].split("\n}\n", 1)[0]
     assert re.search(r'^TVC_STAMP=', _INSTALL_SH, re.M)
-    assert 'rev-parse HEAD > "$TRUST_VENV/$TVC_STAMP"' in body
+    assert 'printf \'%s\\n\' "$HEAD_SHA" > "$TRUST_VENV/$TVC_STAMP"' in body
     skip = body.split('if [ -z "$force" ]', 1)[1].split("return 0", 1)[0]
-    assert '"$head_now" = "$head_built"' in skip and '[ -n "$head_now" ]' in skip
+    assert '"$HEAD_SHA" = "$head_built"' in skip and '[ -n "$HEAD_SHA" ]' in skip
 
 
 def test_the_moved_steps_still_run_as_modules_from_an_installed_tree(tmp_path):

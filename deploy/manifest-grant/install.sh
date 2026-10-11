@@ -18,7 +18,7 @@
 # question: every judgement left to the operator is detected here and either
 # acted on or reported as a stop.
 #
-#   sudo bash install.sh            # run from the directory holding the units
+#   sudo bash install.sh            # installs from the checkout's COMMITTED HEAD
 #   sudo bash install.sh --check    # detect-only, change nothing (reports the
 #                                   # trust-owner interpreter checks too)
 #   sudo bash install.sh --provision-venv
@@ -147,6 +147,17 @@
 # from the hash-pinned trust-venv*.requirements.txt files (`pip install
 # --require-hashes --only-binary=:all: --no-deps`, wheel built with
 # --no-build-isolation in a throwaway build venv). See INSTALL.md.
+#
+# Rework 5 (the unit, timer and env are code too): the service runs as the trust
+# owner, so willow-mcp-manifest-grant.service, .timer and manifest-grant.env are
+# no longer installed from $HERE (the operator-writable working tree). They come
+# from the same root-owned clone of the committed HEAD the venv is built from
+# (ensure_head_clone, one per run); the clone's commit must equal the venv's
+# .built-from-head stamp; the WHOLE unit, timer and env are checked against an
+# allowlist of the directives the committed files carry (mg_*); and after the
+# install the files really in /etc are compared to what was rendered from HEAD
+# (--check reports drift). Commit before you install: an uncommitted edit to any
+# of the three is not installed.
 
 set -euo pipefail
 
@@ -156,6 +167,7 @@ H=/home/$OPERATOR/sean-data-vault/willow-operator-box
 TRUST_OWNER=willow-operator
 GNUPGHOME_TO=/var/lib/willow-mcp/manifest-grant/gnupg
 ETC=/etc/willow-mcp
+SYSD=/etc/systemd/system   # where the unit and the timer are installed
 # Dispatch 0CB0C85C (amending B291C0C7/E29CCFC7): a fingerprint is public --
 # only a key's PRIVATE half is a secret. $H/env is 0600 (every provider API
 # key); the trust-owner apply unit (uid willow-operator) cannot read it, so a
@@ -405,13 +417,6 @@ tvc_import_problems() {
   return 0
 }
 
-# tvc_unit_problems UNIT PY -- the unit file must run PY, exactly.
-tvc_unit_problems() {
-  grep -qxF "ExecStart=$2 -m willow_mcp manifest-grant apply" "$1" 2>/dev/null \
-    || printf 'ExecStart= in %s is not "%s -m willow_mcp manifest-grant apply"\n' "$1" "$2"
-  return 0
-}
-
 # tvc_requirements_problems FILE -- FILE must be a plain hash-pinned list and
 # nothing else: `name==version \`, `--hash=sha256:<64 hex>` lines and comments.
 # No pip option (--index-url, --find-links, -r, -e, ...), no URL or path
@@ -476,7 +481,244 @@ tvc_report() {
   fi
   return "$rc"
 }
+# ------------------------------------------------ the units and env, whole
+# Rework 5. The service, the timer and manifest-grant.env are installed by root
+# into /etc and the service then RUNS as the trust owner, so they are code: they
+# are read ONLY from the root-owned clone of the committed HEAD (never from the
+# operator-writable working tree) and validated WHOLE, not just ExecStart=.
+# The allowlists below are the directive sets the committed files carry today;
+# a line outside them, a duplicate, a missing line, a continuation backslash, or
+# a directive in the wrong section is a problem. Every function prints one
+# problem per line and returns 0 (empty = clean). Paths and names are ARGUMENTS
+# so tests/test_trust_venv_preflight.py runs them against tmp trees.
+MG_SERVICE=willow-mcp-manifest-grant.service
+MG_TIMER=willow-mcp-manifest-grant.timer
+MG_ENV=manifest-grant.env
+MG_DEPLOY_REL=deploy/manifest-grant   # inside the checkout / the HEAD clone
+
+# mg_ini_problems FILE SPEC -- FILE against SPEC, lines "KIND<TAB>SECTION<TAB>TEXT":
+# R = this exact line, exactly once, in SECTION; O = same, at most once;
+# K = a line starting TEXT (a key and its "="), exactly once, any value.
+# SECTION is "[Name]" or "" (a section-less env file). Comments (# ;) and blank
+# lines are skipped; anything else, including indented directives, must match.
+mg_ini_problems() {
+  [ -e "$1" ] || { printf 'no such file: %s\n' "$1"; return 0; }
+  MG_SPEC=$2 awk '
+    BEGIN {
+      n = split(ENVIRON["MG_SPEC"], sp, "\n")
+      for (i = 1; i <= n; i++) {
+        if (sp[i] == "") continue
+        split(sp[i], f, "\t")
+        secs[f[2]] = 1
+        if (f[1] == "K") key[f[2] SUBSEP f[3]] = 1; else exact[f[2] SUBSEP f[3]] = 1
+        order[++m] = f[1] SUBSEP f[2] SUBSEP f[3]
+      }
+      sec = ""
+    }
+    /\\$/ { printf "line %d ends in a backslash (a continuation): %.60s\n", FNR, $0; next }
+    /^[ \t]*$/ || /^[#;]/ { next }
+    /^\[.*\]$/ {
+      if (!($0 in secs)) printf "line %d: section %s is not expected\n", FNR, $0
+      sec = $0; next }
+    {
+      if (!(sec in secs)) { printf "line %d: a directive outside the expected sections (%s): %.60s\n", FNR, sec, $0; next }
+      idx = index($0, "="); k = (idx > 0) ? substr($0, 1, idx) : $0
+      if ((sec SUBSEP $0) in exact) { id = sec SUBSEP $0 }
+      else if ((sec SUBSEP k) in key) { id = sec SUBSEP k }
+      else { printf "line %d: not an allowed line in %s: %.70s\n", FNR, (sec == "" ? "the file" : sec), $0; next }
+      if (++seen[id] > 1) printf "line %d: %.70s appears more than once in %s\n", FNR, $0, (sec == "" ? "the file" : sec)
+    }
+    END {
+      for (i = 1; i <= m; i++) {
+        split(order[i], o, SUBSEP)
+        if (o[1] != "O" && !((o[2] SUBSEP o[3]) in seen))
+          printf "missing from %s: %s\n", (o[2] == "" ? "the file" : o[2]), o[3]
+      }
+    }' "$1" | head -8
+  return 0
+}
+
+# mg_line KIND SECTION TEXT -- one spec line.
+mg_line() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
+
+# mg_service_problems UNIT PY TRUST_OWNER H GNUPGHOME ETC -- the whole service
+# unit: the directive set the committed unit carries, User/Group the trust
+# owner, ExecStart exactly "$PY -m willow_mcp manifest-grant apply", the two
+# Environment= lines and the one EnvironmentFile= expected, every hardening
+# directive present, and NO other line (so no ExecStartPre/Post/Stop*/Reload,
+# no second ExecStart, no drop-in style extras).
+mg_service_problems() {
+  local py=$2 to=$3 h=$4 gnupg=$5 etc=$6 spec
+  spec=$(
+    mg_line K '[Unit]' 'Description='
+    mg_line R '[Unit]' 'After=network.target postgresql.service'
+    mg_line R '[Unit]' "RequiresMountsFor=$h"
+    mg_line R '[Service]' 'Type=oneshot'
+    mg_line R '[Service]' "User=$to"
+    mg_line R '[Service]' "Group=$to"
+    mg_line R '[Service]' 'UMask=0027'
+    mg_line R '[Service]' "EnvironmentFile=$etc/$MG_ENV"
+    mg_line R '[Service]' "Environment=\"WILLOW_HOME=$h\""
+    mg_line R '[Service]' "Environment=\"GNUPGHOME=$gnupg\""
+    mg_line R '[Service]' "ExecStart=$py -m willow_mcp manifest-grant apply"
+    mg_line R '[Service]' 'NoNewPrivileges=true'
+    mg_line R '[Service]' 'PrivateTmp=true'
+    mg_line R '[Service]' 'ProtectSystem=strict'
+    mg_line R '[Service]' 'ProtectHome=read-only'
+    mg_line R '[Service]' "ReadWritePaths=$h/manifest_grants"
+    mg_line R '[Service]' "ReadWritePaths=$h/mcp_apps"
+    mg_line R '[Service]' "ReadWritePaths=$h/constitutional"
+    mg_line R '[Service]' "ReadWritePaths=$(dirname -- "$gnupg")"
+    mg_line R '[Service]' 'ProtectKernelTunables=true'
+    mg_line R '[Service]' 'ProtectControlGroups=true'
+    mg_line R '[Service]' 'RestrictSUIDSGID=true'
+    mg_line R '[Service]' 'LockPersonality=true'
+  )
+  mg_ini_problems "$1" "$spec"
+}
+
+# mg_timer_problems TIMER -- only the committed [Timer]/[Install] keys; Unit=,
+# if present, must name the service.
+mg_timer_problems() {
+  local spec
+  spec=$(
+    mg_line K '[Unit]' 'Description='
+    mg_line R '[Timer]' 'OnBootSec=2min'
+    mg_line R '[Timer]' 'OnUnitActiveSec=60s'
+    mg_line O '[Timer]' "Unit=$MG_SERVICE"
+    mg_line R '[Install]' 'WantedBy=timers.target'
+  )
+  mg_ini_problems "$1" "$spec"
+}
+
+# mg_env_problems ENV TRUST_OWNER ETC PGDB -- only the expected keys, with the
+# expected values; WILLOW_PG_DB must be exactly PGDB ("" for the committed
+# template, the rendered database name for the file that gets installed). A
+# newline smuggled into PGDB shows up as a line outside the set.
+mg_env_problems() {
+  local spec
+  spec=$(
+    mg_line R '' "WILLOW_KEYRING=$3/verifiers.public.json"
+    mg_line R '' "WILLOW_SEAL_RING=$3/verifiers.public.json"
+    mg_line R '' "WILLOW_PG_DB=$4"
+    mg_line R '' "WILLOW_PG_USER=$2"
+    mg_line R '' 'WILLOW_MCP_STRICT_TRUST_ROOT=1'
+  )
+  mg_ini_problems "$1" "$spec"
+}
+
+# mg_render_env SRC PGDB -- the env file as installed: the template with any
+# WILLOW_PGP_FINGERPRINT= line dropped and WILLOW_PG_DB= set to PGDB. Plain
+# `read` and `printf %s` -- no sed, so PGDB (read from the operator-writable
+# $H/env) is never interpreted as a replacement string.
+mg_render_env() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      WILLOW_PGP_FINGERPRINT=*) ;;
+      WILLOW_PG_DB=*) printf 'WILLOW_PG_DB=%s\n' "$2" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$1"
+  return 0
+}
+
+# mg_installed_problems RENDERED INSTALLED OWNER GROUP MODE -- what is really
+# in /etc against what was rendered from the committed HEAD: absent, a symlink,
+# other bytes, other owner or mode.
+mg_installed_problems() {
+  local st
+  [ -e "$2" ] || [ -L "$2" ] || { printf 'absent: %s\n' "$2"; return 0; }
+  [ ! -L "$2" ] || { printf '%s is a symlink\n' "$2"; return 0; }
+  cmp -s "$1" "$2" || printf '%s has other contents than the committed HEAD renders\n' "$2"
+  st=$(stat -c '%U:%G %a' -- "$2" 2>/dev/null || true)
+  [ "$st" = "$3:$4 $5" ] || printf '%s is %s, expected %s:%s %s\n' "$2" "${st:-unreadable}" "$3" "$4" "$5"
+  return 0
+}
+
+# mg_stamp_problems STAMPFILE HEADSHA -- the venv and the units must come from
+# the same commit: the venv's recorded build commit is the HEAD clone's.
+mg_stamp_problems() {
+  local built
+  [ -n "$2" ] || { printf 'the HEAD clone has no commit sha\n'; return 0; }
+  [ -f "$1" ] || { printf '%s is absent: the venv records no build commit\n' "$1"; return 0; }
+  built=$(cat -- "$1" 2>/dev/null || true)
+  [ "$built" = "$2" ] || printf 'the venv was built from %s, the units come from the HEAD clone %s\n' "${built:-<empty>}" "$2"
+  return 0
+}
+
+# mg_emit OK_LABEL FAIL_LABEL PROBLEMS -- a report line; 1 when PROBLEMS is set.
+mg_emit() {
+  if [ -z "$3" ]; then printf '  [ok]   %s\n' "$1"; return 0; fi
+  printf '  [FAIL] %s\n' "$2"
+  printf '%s\n' "$3" | head -8 | sed 's/^/           - /'
+  return 1
+}
+
+# mg_report CLONE PY TRUST_OWNER H GNUPGHOME ETC SYSD STAMP HEADSHA PGDB [ROOT_USER ROOT_GROUP] --
+# one line per check (0 only if all pass): the committed units and env, the
+# env as it will be rendered, the stamp, and the files really in /etc against
+# the render. An installed file that is not there yet is [info], not a failure.
+# ROOT_USER/ROOT_GROUP (default root/root) are the account that must own the
+# installed files; production never passes them (tests do, to run unprivileged).
+mg_report() {
+  local clone=$1 py=$2 to=$3 h=$4 gnupg=$5 etc=$6 sysd=$7 stamp=$8 sha=$9 pgdb=${10}
+  local ru=${11:-root} rg=${12:-root}
+  local src="$clone/$MG_DEPLOY_REL" rc=0 p
+  p=$(mg_stamp_problems "$stamp" "$sha")
+  mg_emit "the venv was built from the commit the units are read from (${sha:0:12})" "the venv and the units come from different commits" "$p" || rc=1
+  p=$(mg_service_problems "$src/$MG_SERVICE" "$py" "$to" "$h" "$gnupg" "$etc")
+  mg_emit "committed $MG_SERVICE carries exactly the expected directives (User/Group $to, ExecStart $py)" "committed $MG_SERVICE is not the expected unit" "$p" || rc=1
+  p=$(mg_timer_problems "$src/$MG_TIMER")
+  mg_emit "committed $MG_TIMER carries only the expected keys" "committed $MG_TIMER is not the expected timer" "$p" || rc=1
+  p=$(mg_env_problems "$src/$MG_ENV" "$to" "$etc" "")
+  mg_emit "committed $MG_ENV carries only the expected keys" "committed $MG_ENV is not the expected env file" "$p" || rc=1
+  p=$(mg_env_problems <(mg_render_env "$src/$MG_ENV" "$pgdb") "$to" "$etc" "$pgdb")
+  mg_emit "$MG_ENV renders to only the expected keys" "$MG_ENV does not render to the expected keys" "$p" || rc=1
+  if [ -e "$sysd/$MG_SERVICE" ] || [ -L "$sysd/$MG_SERVICE" ]; then
+    p=$(mg_installed_problems "$src/$MG_SERVICE" "$sysd/$MG_SERVICE" "$ru" "$rg" 644)
+    mg_emit "installed unit matches committed HEAD" "installed unit differs from committed HEAD ($sysd/$MG_SERVICE)" "$p" || rc=1
+  else
+    printf '  [info] %s is not installed yet; a plain install installs it from the committed HEAD\n' "$sysd/$MG_SERVICE"
+  fi
+  if [ -e "$sysd/$MG_TIMER" ] || [ -L "$sysd/$MG_TIMER" ]; then
+    p=$(mg_installed_problems "$src/$MG_TIMER" "$sysd/$MG_TIMER" "$ru" "$rg" 644)
+    mg_emit "installed timer matches committed HEAD" "installed timer differs from committed HEAD ($sysd/$MG_TIMER)" "$p" || rc=1
+  else
+    printf '  [info] %s is not installed yet\n' "$sysd/$MG_TIMER"
+  fi
+  if [ -e "$etc/$MG_ENV" ] || [ -L "$etc/$MG_ENV" ]; then
+    p=$(mg_installed_problems <(mg_render_env "$src/$MG_ENV" "$pgdb") "$etc/$MG_ENV" "$ru" "$to" 640)
+    mg_emit "installed env matches the render of committed HEAD" "installed env differs from the render of committed HEAD ($etc/$MG_ENV)" "$p" || rc=1
+  else
+    printf '  [info] %s is not installed yet\n' "$etc/$MG_ENV"
+  fi
+  return "$rc"
+}
 # END trust-venv-check
+
+# ensure_head_clone -- the ONE root-owned clone of the checkout's COMMITTED HEAD
+# per run. Everything root installs from the checkout is read from it and from
+# nowhere else: the venv's wheel and hash-pinned requirements
+# (provision_trust_venv) and the unit, timer and env template (step 4, the
+# validation, --check). HEAD_SHA is its commit; the venv's stamp must equal it.
+# An uncommitted edit in the working tree is not in the clone, so it is not
+# installed. Called from the main shell (not a subshell): it sets globals and
+# the EXIT trap that removes the temp dir.
+HEAD_CLONE=""
+HEAD_SHA=""
+TVC_BUILD=""
+ensure_head_clone() {
+  [ -z "$HEAD_CLONE" ] || return 0
+  command -v git >/dev/null 2>&1 || stop "git is required to read willow-mcp's committed HEAD from the checkout"
+  TVC_BUILD=$(mktemp -d)
+  trap 'rm -rf "${TVC_BUILD:-}"' EXIT
+  git -c safe.directory="$CHECKOUT" clone --quiet --no-hardlinks "$CHECKOUT" "$TVC_BUILD/src" \
+    || stop "could not clone $CHECKOUT to read its committed HEAD from"
+  HEAD_SHA=$(git -C "$TVC_BUILD/src" rev-parse HEAD) || stop "could not read the commit of the HEAD clone"
+  [ -n "$HEAD_SHA" ] || stop "the HEAD clone of $CHECKOUT has no commit"
+  HEAD_CLONE="$TVC_BUILD/src"
+}
 
 # provision_trust_venv [force] -- root builds $TRUST_VENV from this checkout.
 # Skipped when the venv already passes every check, unless forced
@@ -484,31 +726,26 @@ tvc_report() {
 # clone, so the build writes nothing into the operator-writable checkout and
 # runs no operator-writable build code beyond the commit being installed).
 provision_trust_venv() {
-  local force=${1:-} problems head_now head_built reqs build_reqs f
+  local force=${1:-} problems head_built reqs build_reqs f
   local -a wheels
+  ensure_head_clone
   # The privileged steps (rotate_resign, sync_constitutional,
   # seed_envelope_ratify, the constitutional seed bundle) now run FROM the
   # venv, so a venv built from an older HEAD would run older steps than the
   # checkout holds: skip only when it passes every check AND was built from the
   # checkout's current HEAD (the stamp is written below, inside the venv).
   if [ -z "$force" ] && tvc_report "$TRUST_VENV" "$PY" 0 / >/dev/null 2>&1; then
-    head_now=$(git -c safe.directory="$CHECKOUT" -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || true)
     head_built=$(cat "$TRUST_VENV/$TVC_STAMP" 2>/dev/null || true)
-    if [ -n "$head_now" ] && [ "$head_now" = "$head_built" ]; then
-      say "== 0a. trust-owner venv $TRUST_VENV already passes every check and was built from HEAD ${head_now:0:12} -- not rebuilt (sudo bash install.sh --provision-venv rebuilds it from this checkout)"
+    if [ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" = "$head_built" ]; then
+      say "== 0a. trust-owner venv $TRUST_VENV already passes every check and was built from HEAD ${HEAD_SHA:0:12} -- not rebuilt (sudo bash install.sh --provision-venv rebuilds it from this checkout)"
       return 0
     fi
-    say "== 0a. trust-owner venv $TRUST_VENV passes its checks but its recorded build commit (${head_built:0:12}) is not the checkout HEAD (${head_now:0:12}) -- rebuilding so the privileged steps match the checkout"
+    say "== 0a. trust-owner venv $TRUST_VENV passes its checks but its recorded build commit (${head_built:0:12}) is not the checkout HEAD (${HEAD_SHA:0:12}) -- rebuilding so the privileged steps and the units match the checkout"
   fi
   say "== 0a. build the trust-owner venv at $TRUST_VENV (root:root, non-editable, from $CHECKOUT)"
   [ -x "$TRUST_PY_BASE" ] || stop "$TRUST_PY_BASE is not executable -- the trust-owner venv is built from the root-owned system python (edit TRUST_PY_BASE in install.sh if this box's system python is another version)"
-  command -v git >/dev/null 2>&1 || stop "git is required to build willow-mcp's version from the checkout"
   problems=$(tvc_chain_problems / "$TRUST_PY_BASE" 0)
   [ -z "$problems" ] || stop "the base interpreter $TRUST_PY_BASE is itself not root-owned and unwritable: $problems"
-  TVC_BUILD=$(mktemp -d)
-  trap 'rm -rf "${TVC_BUILD:-}"' EXIT
-  git -c safe.directory="$CHECKOUT" clone --quiet --no-hardlinks "$CHECKOUT" "$TVC_BUILD/src" \
-    || stop "could not clone $CHECKOUT to build from"
   # Both hash-pinned files come from the committed HEAD in the root-owned clone.
   reqs="$TVC_BUILD/src/$TRUST_REQS_REL"; build_reqs="$TVC_BUILD/src/$TRUST_BUILD_REQS_REL"
   for f in "$reqs" "$build_reqs"; do
@@ -536,7 +773,7 @@ provision_trust_venv() {
     || stop "pip could not install the hash-pinned dependencies from ${reqs#"$TVC_BUILD/src/"} into $TRUST_VENV (a hash mismatch refuses the install)"
   ( umask 022; "$PY" -I -m pip install --quiet --no-deps --no-index "${wheels[0]}" ) \
     || stop "could not install ${wheels[0]##*/} into $TRUST_VENV"
-  git -C "$TVC_BUILD/src" rev-parse HEAD > "$TRUST_VENV/$TVC_STAMP" \
+  printf '%s\n' "$HEAD_SHA" > "$TRUST_VENV/$TVC_STAMP" \
     || stop "could not record the commit the venv was built from"
   chown -R root:root "$TRUST_VENV"
   chmod -R u=rwX,go=rX "$TRUST_VENV"
@@ -547,10 +784,19 @@ provision_trust_venv() {
 # enforce_trust_interpreter -- the preflight: refuse (stop) unless every check passes.
 enforce_trust_interpreter() {
   local up
+  ensure_head_clone
   tvc_report "$TRUST_VENV" "$PY" 0 / \
     || stop "trust-owner python interpreter at $PY failed the preflight (FAIL lines above): it must exist, be executable, sit on a path no non-root uid can write, and be a non-editable install -- Loki audit BFCC5C79 F7, operator rulings Q7=A/Q13. A plain 'sudo bash install.sh' or 'sudo bash install.sh --provision-venv' builds it."
-  up=$(tvc_unit_problems "$HERE/willow-mcp-manifest-grant.service" "$PY")
-  [ -z "$up" ] || stop "$up -- the unit and install.sh must name the same interpreter"
+  # The units and the venv come from one commit, and the committed unit, timer
+  # and env are each exactly the expected directive set (mg_*, above).
+  up=$(mg_stamp_problems "$TRUST_VENV/$TVC_STAMP" "$HEAD_SHA")
+  [ -z "$up" ] || stop "$up -- the units and the venv must come from the same commit; sudo bash install.sh --provision-venv rebuilds the venv from the checkout's committed HEAD"
+  up=$(mg_service_problems "$HEAD_CLONE/$MG_DEPLOY_REL/$MG_SERVICE" "$PY" "$TRUST_OWNER" "$H" "$GNUPGHOME_TO" "$ETC")
+  [ -z "$up" ] || stop "$MG_SERVICE (committed HEAD ${HEAD_SHA:0:12}) is not the expected unit -- it must carry exactly the allowlisted directives and name the same interpreter as install.sh: $up"
+  up=$(mg_timer_problems "$HEAD_CLONE/$MG_DEPLOY_REL/$MG_TIMER")
+  [ -z "$up" ] || stop "$MG_TIMER (committed HEAD ${HEAD_SHA:0:12}) is not the expected timer: $up"
+  up=$(mg_env_problems "$HEAD_CLONE/$MG_DEPLOY_REL/$MG_ENV" "$TRUST_OWNER" "$ETC" "")
+  [ -z "$up" ] || stop "$MG_ENV (committed HEAD ${HEAD_SHA:0:12}) is not the expected env file: $up"
 }
 
 # ------------------------------------------------------- --dry-run-sign
@@ -652,8 +898,11 @@ if [ -n "$PROVISION_VENV" ]; then
 fi
 [ -d "$H" ] || stop "operator box not found at $H"
 id "$TRUST_OWNER" >/dev/null 2>&1 || stop "user $TRUST_OWNER does not exist — trust_root_setup has not run on this box"
-for f in manifest-grant.env willow-mcp-manifest-grant.service willow-mcp-manifest-grant.timer; do
-  [ -f "$HERE/$f" ] || stop "missing $HERE/$f"
+# The units and the env template are read from the committed HEAD (one
+# root-owned clone, ensure_head_clone), never from the working tree.
+ensure_head_clone
+for f in "$MG_ENV" "$MG_SERVICE" "$MG_TIMER"; do
+  [ -f "$HEAD_CLONE/$MG_DEPLOY_REL/$f" ] || stop "$MG_DEPLOY_REL/$f is not in the committed HEAD ${HEAD_SHA:0:12} -- commit it first (an uncommitted file is never installed)"
 done
 [ -f "$ETC/verifiers.public.json" ] || stop "$ETC/verifiers.public.json absent — the net-signer's public ring is a precondition (manifest-grant.env names it)"
 PG_DB=$(grep -E '^WILLOW_PG_DB=' "$H/env" | tail -1 | cut -d= -f2- || true)
@@ -666,14 +915,8 @@ PG_DB=$(grep -E '^WILLOW_PG_DB=' "$H/env" | tail -1 | cut -d= -f2- || true)
 if [ -n "$CHECK_ONLY" ]; then
   say "== trust-owner interpreter $PY"
   tvc_report "$TRUST_VENV" "$PY" 0 / || CHECK_FAILED=1
-  tvc_emit "the unit file beside install.sh runs $PY" "$(tvc_unit_problems "$HERE/willow-mcp-manifest-grant.service" "$PY")" || CHECK_FAILED=1
-  if [ -f /etc/systemd/system/willow-mcp-manifest-grant.service ]; then
-    INSTALLED_EXEC=$(grep -E '^ExecStart=' /etc/systemd/system/willow-mcp-manifest-grant.service | head -1 || true)
-    case "$INSTALLED_EXEC" in
-      "ExecStart=$PY "*) say "  [ok]   the installed unit already runs $PY" ;;
-      *) say "  [info] the installed unit still reads: ${INSTALLED_EXEC:-<no ExecStart>} -- a plain install repoints it" ;;
-    esac
-  fi
+  say "== units and env from the committed HEAD ${HEAD_SHA:0:12}"
+  mg_report "$HEAD_CLONE" "$PY" "$TRUST_OWNER" "$H" "$GNUPGHOME_TO" "$ETC" "$SYSD" "$TRUST_VENV/$TVC_STAMP" "$HEAD_SHA" "$PG_DB" || CHECK_FAILED=1
 else
   [ -n "$ROTATE$CHECK_SIGNATURES" ] || provision_trust_venv
   enforce_trust_interpreter
@@ -1324,19 +1567,30 @@ strip_pgp_pin
 # ---------------------------------------------------------- 4. env file, units
 say "== 4. $ETC and system units"
 install -d -m 755 "$ETC"
-ENV_TMP=$(mktemp)
 # Dispatch 0CB0C85C: WILLOW_PGP_FINGERPRINT is no longer rendered into this
 # file at all — the trust-owner apply unit now reads $TRUST_ENV directly
 # (trust-owner-owned, world-readable; the SAME file everything else reads),
 # so the second copy this file used to carry — the exact drift Loki audit
 # A38D41C2's F8 measured, since uid willow-operator could never read $H/env
 # to check it against the source — is gone, not merely re-synced.
-sed -E -e '/^WILLOW_PGP_FINGERPRINT=/d' \
-       -e "s|^WILLOW_PG_DB=.*|WILLOW_PG_DB=$PG_DB|" "$HERE/manifest-grant.env" > "$ENV_TMP"
-install -o root -g "$TRUST_OWNER" -m 640 "$ENV_TMP" "$ETC/manifest-grant.env"
-rm -f "$ENV_TMP"
-install -o root -g root -m 644 "$HERE/willow-mcp-manifest-grant.service" /etc/systemd/system/
-install -o root -g root -m 644 "$HERE/willow-mcp-manifest-grant.timer"   /etc/systemd/system/
+# Rework 5: the template, the unit and the timer are read from the committed
+# HEAD clone (ensure_head_clone), rendered/validated there, installed from
+# there, and then the files really in /etc are compared to that render.
+MG_SRC="$HEAD_CLONE/$MG_DEPLOY_REL"
+MG_STAGE="$TVC_BUILD/stage"
+install -d -m 700 "$MG_STAGE"
+mg_render_env "$MG_SRC/$MG_ENV" "$PG_DB" > "$MG_STAGE/$MG_ENV"
+p=$(mg_env_problems "$MG_STAGE/$MG_ENV" "$TRUST_OWNER" "$ETC" "$PG_DB")
+[ -z "$p" ] || stop "$MG_ENV rendered from the committed HEAD ${HEAD_SHA:0:12} carries more than the expected keys (is WILLOW_PG_DB in $H/env a single plain line?): $p"
+install -o root -g "$TRUST_OWNER" -m 640 "$MG_STAGE/$MG_ENV" "$ETC/$MG_ENV"
+install -o root -g root -m 644 "$MG_SRC/$MG_SERVICE" "$SYSD/$MG_SERVICE"
+install -o root -g root -m 644 "$MG_SRC/$MG_TIMER"   "$SYSD/$MG_TIMER"
+p=$(
+  mg_installed_problems "$MG_SRC/$MG_SERVICE" "$SYSD/$MG_SERVICE" root root 644
+  mg_installed_problems "$MG_SRC/$MG_TIMER" "$SYSD/$MG_TIMER" root root 644
+  mg_installed_problems "$MG_STAGE/$MG_ENV" "$ETC/$MG_ENV" root "$TRUST_OWNER" 640
+)
+[ -z "$p" ] || stop "what is installed differs from the committed HEAD ${HEAD_SHA:0:12}: $p"
 systemctl daemon-reload
 
 # ------------------------------------------------------- 5. postgres role
