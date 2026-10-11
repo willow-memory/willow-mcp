@@ -707,7 +707,8 @@ def test_render_values_fills_willow_bot_install_placeholders(home, monkeypatch):
     monkeypatch.setenv("WILLOW_VAULT_BOX", str(home))
     vals = uix.render_values("willow-bot-steward.service")
     assert vals["VAULT_BOX"] == str(home)
-    assert vals["VENV_BIN"] == str(home / "venvs" / "willow-bot" / "bin")
+    # neither home has the venv yet: the D2 home, where it belongs
+    assert vals["VENV_BIN"] == str(home / "willow-bot" / "venvs" / "willow-bot" / "bin")
     assert "willow-bot" in vals["WORKDIR"]
     rendered = uix.render_template(
         "Environment=WILLOW_HOME=@VAULT_BOX@\n"
@@ -1611,3 +1612,33 @@ def test_keyboard_guard_helper_is_the_one_all_sites_use(capsys):
     assert uix.keyboard_install_refused(SimpleNamespace(keyboard=True)) is False
     assert uix.keyboard_install_refused(SimpleNamespace()) is True
     assert "unit_install_execute" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("where,expect_warn", [("new", False), ("legacy", True)])
+def test_render_values_venv_bin_follows_the_d2_resolver(home, monkeypatch, caplog, where, expect_warn):
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+    monkeypatch.setenv("WILLOW_VAULT_BOX", str(home))
+    for v in ("WILLOW_BOT_VAULT_BOX", "WILLOW_BOT_VENV_BIN", "WILLOW_BOT_WORKDIR"):
+        monkeypatch.delenv(v, raising=False)
+    root = home / ("willow-bot" / Path("venvs") if where == "new" else Path("venvs"))
+    py = root / "willow-bot" / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("", encoding="utf-8")
+    py.chmod(0o755)
+    if where == "new":  # a legacy venv alongside must lose
+        other = home / "venvs" / "willow-bot" / "bin" / "python"
+        other.parent.mkdir(parents=True)
+        other.write_text("", encoding="utf-8")
+        other.chmod(0o755)
+    with caplog.at_level("WARNING"):
+        vals = uix.render_values("willow-bot-steward.service")
+    assert vals["VENV_BIN"] == str(py.parent)
+    assert bool(caplog.records) is expect_warn
+
+
+def test_render_values_venv_bin_env_override_skips_the_resolver(home, monkeypatch, caplog):
+    monkeypatch.setenv("WILLOW_HOME", str(home))
+    monkeypatch.setenv("WILLOW_BOT_VENV_BIN", "/opt/bot/bin")
+    with caplog.at_level("WARNING"):
+        assert uix.render_values("willow-bot-steward.service")["VENV_BIN"] == "/opt/bot/bin"
+    assert not caplog.records

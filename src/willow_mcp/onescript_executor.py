@@ -17,7 +17,7 @@ Shape, deliberately narrow:
   "written outside the run" and HARD CLOSES on) before the review runs, so the
   box opens headless. Nothing else is removed and the removal is recorded; the
   one-script's own gate is untouched.
-* **Fixed paths.** Interpreters come from ``$WILLOW_HOME/venvs/<venv>/bin``;
+* **Fixed paths.** Interpreters come from ``<venvs>/<venv>/bin`` (D2 home first, legacy ``$WILLOW_HOME/venvs`` with a warning, one root per venv, ``paths.resolve_venv``);
   the willow-bot checkout is resolved the way ``git_pull_execute`` resolves a
   clone (verified by its ``origin``, never a symlink); the box, the served
   file and the proposals file sit under that checkout's ``.flow/onescript``;
@@ -235,13 +235,27 @@ class _Ctx:
     def public_ring(self) -> Path:
         return self.home / "config" / "verifiers.public.json"
 
+    def _venv(self, name: str) -> "paths.VenvResolution":
+        """One resolution per venv name per call (one warning, one root)."""
+        cache = self.__dict__.setdefault("_venv_cache", {})
+        if name not in cache:
+            cache[name] = paths.resolve_venv(name, home=self.home)
+        return cache[name]
+
+    def venv_absent(self, name: str) -> str | None:
+        """Where ``name`` was looked for when neither home has it, else None."""
+        res = self._venv(name)
+        return paths.venv_absent_detail(res) if res.state == "absent" else None
+
     @property
     def bot_python(self) -> Path:
-        return self.home / "venvs" / BOT_VENV / "bin" / "python"
+        res = self._venv(BOT_VENV)
+        return (res.path or res.new) / "bin" / "python"
 
     @property
     def rat(self) -> Path:
-        return self.home / "venvs" / RAT_VENV / "bin" / "ratatosk"
+        res = self._venv(RAT_VENV)
+        return (res.path or res.new) / "bin" / "ratatosk"
 
 
 def _unreachable(reason: str, **extra) -> dict:
@@ -283,7 +297,8 @@ def _require_real_box(ctx: _Ctx) -> Optional[dict]:
 
 def _need_python(ctx: _Ctx) -> Optional[dict]:
     if not ctx.bot_python.is_file():
-        return _unreachable(f"no interpreter at {ctx.bot_python}; the bot venv is not installed")
+        where = ctx.venv_absent(BOT_VENV) or str(ctx.bot_python)
+        return _unreachable(f"no interpreter at {where}; the bot venv is not installed")
     return None
 
 
@@ -532,7 +547,7 @@ def _plan(step: str, args: dict, ctx: _Ctx, lister: Callable) -> dict:
             return {"result": bad}
         if not ctx.rat.is_file():
             return {"result": _unreachable(
-                f"ratatosk is not installed at {ctx.rat}; the onescript model seat cannot run")}
+                f"ratatosk is not installed at {ctx.venv_absent(RAT_VENV) or ctx.rat}; the onescript model seat cannot run")}
         return {"argv": [str(ctx.rat), "--onescript", "--served", str(ctx.served),
                          "--out", str(ctx.proposals), "--model", model, task],
                 "cwd": ctx.home}

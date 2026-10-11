@@ -6,12 +6,16 @@ Import from here — do not scatter path joins across the codebase.
 
 from __future__ import annotations
 
+import logging
 import os
 import stat
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 LAYOUT_VERSION = 1
+
+logger = logging.getLogger(__name__)
 
 
 def trusted_read(path: Path) -> None:
@@ -669,6 +673,99 @@ def log_path_for_date(date_str: str) -> Path:
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str or ""):
         raise ValueError(f"invalid date: {date_str!r}")
     return logs_dir() / f"{date_str}.log"
+
+
+# ── venvs (seal D2: "all the .venv live in the bot") ──────────────────────────
+#
+# docs/design/d2-venvs-move.md. A venv's home moved from
+# ``$WILLOW_HOME/venvs/<name>`` (legacy) to ``$WILLOW_HOME/willow-bot/venvs/<name>``
+# (new). Every caller that used to join ``"venvs"`` by hand resolves through
+# :func:`resolve_venv` / :func:`venv_dir` instead, so there is one rule:
+#
+# * the new home wins when ``<name>/<probe>`` is an executable file there;
+# * otherwise the legacy home is used, with ONE warning naming the new home;
+# * exactly one root per name is ever chosen: never both, never newest-wins;
+# * neither present is ``absent`` (``venv_dir`` returns ``None``) so the caller
+#   keeps reporting unreachable instead of acting on a path that is not there.
+#
+# The trust-owner paths (manifest-grant unit, install.sh, INSTALL.md) do NOT
+# use this fallback: they stay a hard cut after a separate audit.
+
+_VENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+VENV_PROBE = Path("bin") / "python"
+
+
+def venvs_root(home: Path | None = None) -> Path:
+    """``$WILLOW_HOME/willow-bot/venvs`` — the D2 home of the venvs."""
+    return (home if home is not None else willow_home()) / "willow-bot" / "venvs"
+
+
+def legacy_venvs_root(home: Path | None = None) -> Path:
+    """``$WILLOW_HOME/venvs`` — the home before D2; honoured only as a fallback."""
+    return (home if home is not None else willow_home()) / "venvs"
+
+
+@dataclass(frozen=True)
+class VenvResolution:
+    """Which single root a venv name resolved to.
+
+    ``state`` is ``"new"``, ``"legacy"`` or ``"absent"``. ``path`` is the chosen
+    venv directory, ``None`` when absent. ``new`` and ``legacy`` are the two
+    candidates, kept so an absent report can name both places looked."""
+
+    name: str
+    state: str
+    path: Path | None
+    root: Path | None
+    new: Path
+    legacy: Path
+
+
+def _venv_probe_ok(venv: Path, probe: Path) -> bool:
+    target = venv / probe
+    try:
+        return target.is_file() and os.access(target, os.X_OK)
+    except OSError:
+        return False
+
+
+def resolve_venv(
+    name: str,
+    *,
+    home: Path | None = None,
+    roots: tuple[Path, Path] | None = None,
+    probe: Path | str = VENV_PROBE,
+) -> VenvResolution:
+    """Pick the one root ``name`` lives in. ``roots`` is ``(new, legacy)`` and
+    replaces the home-derived pair (a test/operator seam); ``probe`` is the
+    file whose executable presence marks the venv (default ``bin/python``;
+    another venv kind, e.g. a vendored node tree, passes its own)."""
+    if not _VENV_NAME_RE.match(name or "") or name in (".", ".."):
+        raise ValueError(f"invalid venv name: {name!r}")
+    new_root, legacy_root = roots if roots is not None else (venvs_root(home), legacy_venvs_root(home))
+    new, legacy = new_root / name, legacy_root / name
+    probe = Path(probe)
+    if _venv_probe_ok(new, probe):
+        return VenvResolution(name, "new", new, new_root, new, legacy)
+    if _venv_probe_ok(legacy, probe):
+        logger.warning(
+            "venv %r: using the legacy home %s; the D2 home %s has no executable %s. "
+            "Recreate the venv there (willow-bot-steward venvs --plan).",
+            name, legacy, new, probe,
+        )
+        return VenvResolution(name, "legacy", legacy, legacy_root, new, legacy)
+    return VenvResolution(name, "absent", None, None, new, legacy)
+
+
+def venv_dir(name: str, *, home: Path | None = None, probe: Path | str = VENV_PROBE) -> Path | None:
+    """The chosen venv directory for ``name``, or ``None`` when neither home has
+    it. See :func:`resolve_venv`."""
+    return resolve_venv(name, home=home, probe=probe).path
+
+
+def venv_absent_detail(res: VenvResolution) -> str:
+    """Where an absent venv was looked for, for an unreachable report."""
+    return f"{res.new} (D2 home) and {res.legacy} (legacy home)"
 
 
 # ── internal (product runtime; not operator-facing tree docs) ─────────────────

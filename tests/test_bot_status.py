@@ -136,10 +136,61 @@ def test_resolve_binary_env_override(monkeypatch):
     assert bs.resolve_binary() == "/opt/willow-bot-steward"
 
 
-def test_resolve_binary_derives_from_willow_home(monkeypatch):
+def _venv(root, *, name="willow-bot"):
+    py = root / name / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("#!/bin/sh\n", encoding="utf-8")
+    py.chmod(0o755)
+    return root / name
+
+
+def test_resolve_binary_derives_from_willow_home(monkeypatch, tmp_path):
+    """The legacy case of the D2 resolver (kept from the pre-D2 pin)."""
     monkeypatch.delenv(bs.BINARY_ENV, raising=False)
-    monkeypatch.setenv("WILLOW_HOME", "/srv/willow")
-    assert bs.resolve_binary() == "/srv/willow/venvs/willow-bot/bin/willow-bot-steward"
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    _venv(tmp_path / "venvs")
+    assert bs.resolve_binary() == str(tmp_path / "venvs/willow-bot/bin/willow-bot-steward")
+
+
+def test_resolve_binary_new_home_wins(monkeypatch, tmp_path):
+    monkeypatch.delenv(bs.BINARY_ENV, raising=False)
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    _venv(tmp_path / "willow-bot" / "venvs")
+    assert bs.resolve_binary() == str(tmp_path / "willow-bot/venvs/willow-bot/bin/willow-bot-steward")
+
+
+def test_resolve_binary_never_both(monkeypatch, tmp_path, caplog):
+    monkeypatch.delenv(bs.BINARY_ENV, raising=False)
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    _venv(tmp_path / "willow-bot" / "venvs")
+    _venv(tmp_path / "venvs")
+    with caplog.at_level("WARNING"):
+        got = bs.resolve_binary()
+    assert got == str(tmp_path / "willow-bot/venvs/willow-bot/bin/willow-bot-steward")
+    assert not caplog.records  # the new home won: nothing to warn about
+
+
+def test_resolve_binary_legacy_warns_once_naming_new_home(monkeypatch, tmp_path, caplog):
+    monkeypatch.delenv(bs.BINARY_ENV, raising=False)
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+    _venv(tmp_path / "venvs")
+    with caplog.at_level("WARNING"):
+        bs.resolve_binary()
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1 and str(tmp_path / "willow-bot/venvs/willow-bot") in msgs[0]
+
+
+def test_read_status_neither_home_is_unreachable_and_runs_nothing(monkeypatch, tmp_path):
+    monkeypatch.delenv(bs.BINARY_ENV, raising=False)
+    monkeypatch.setenv("WILLOW_HOME", str(tmp_path))
+
+    def boom(*a, **k):
+        raise AssertionError("must not run")
+
+    out = bs.read_status(runner=boom)
+    assert out["state"] == "unreachable" and out["reason"] == "binary_missing"
+    assert str(tmp_path / "willow-bot/venvs/willow-bot") in out["detail"]
+    assert str(tmp_path / "venvs/willow-bot") in out["detail"]
 
 
 # ── no ~/.willow fallback: routed through paths.willow_home() ──────────────

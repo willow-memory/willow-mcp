@@ -67,6 +67,8 @@ class Box:
         self.bot = tmp_path / "willow-bot"
         self.py = _stub(self.home / "venvs" / "willow-bot" / "bin" / "python")
         self.rat = _stub(self.home / "venvs" / "willow-mcp" / "bin" / "ratatosk")
+        # a real venv is chosen by its interpreter (paths.resolve_venv)
+        _stub(self.home / "venvs" / "willow-mcp" / "bin" / "python")
         (self.home / "verifiers.json").write_text(
             json.dumps({"verifiers": [], "note": FAKE_SECRET}), encoding="utf-8")
         (self.bot / "one-script" / "onescript").mkdir(parents=True)
@@ -1024,3 +1026,63 @@ def test_checkin_rejects_an_unknown_arg(box):
     out = box.run("checkin", {"nope": 1})
     assert out["error"] == "EINVAL"
     assert box.calls(box.py) == []
+
+
+# ── D2 venv resolution: new home first, warned legacy fallback, one root ─────
+
+def _venv_with(root: Path, name: str, *entry: str) -> Path:
+    for rel in ("python", *entry):
+        _stub(root / name / "bin" / rel)
+    return root / name
+
+
+def test_d2_new_home_wins_for_bot_python_and_ratatosk(tmp_path, caplog):
+    home = tmp_path / "home"
+    _venv_with(home / "venvs", "willow-bot")
+    _venv_with(home / "venvs", "willow-mcp", "ratatosk")
+    new_bot = _venv_with(home / "willow-bot" / "venvs", "willow-bot")
+    new_mcp = _venv_with(home / "willow-bot" / "venvs", "willow-mcp", "ratatosk")
+    ctx = ox._Ctx(home, None)
+    with caplog.at_level("WARNING"):
+        assert ctx.bot_python == new_bot / "bin" / "python"
+        assert ctx.rat == new_mcp / "bin" / "ratatosk"
+    assert not caplog.records
+
+
+def test_d2_legacy_used_with_one_warning_per_venv(tmp_path, caplog):
+    home = tmp_path / "home"
+    old_bot = _venv_with(home / "venvs", "willow-bot")
+    old_mcp = _venv_with(home / "venvs", "willow-mcp", "ratatosk")
+    ctx = ox._Ctx(home, None)
+    with caplog.at_level("WARNING"):
+        assert ctx.bot_python == old_bot / "bin" / "python"
+        assert ctx.bot_python == old_bot / "bin" / "python"  # cached: no second warning
+        assert ctx.rat == old_mcp / "bin" / "ratatosk"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 2
+    assert str(home / "willow-bot" / "venvs" / "willow-bot") in msgs[0]
+    assert str(home / "willow-bot" / "venvs" / "willow-mcp") in msgs[1]
+
+
+def test_d2_never_both_roots_per_venv(tmp_path):
+    """Bot venv only in the new home, mcp venv only in the legacy one: each
+    name picks its own single root, and a name never mixes interpreter and
+    entrypoint across roots."""
+    home = tmp_path / "home"
+    new_bot = _venv_with(home / "willow-bot" / "venvs", "willow-bot")
+    old_mcp = _venv_with(home / "venvs", "willow-mcp", "ratatosk")
+    # a stray ratatosk in the new mcp home without an interpreter is not a venv
+    _stub(home / "willow-bot" / "venvs" / "willow-mcp" / "bin" / "ratatosk")
+    ctx = ox._Ctx(home, None)
+    assert ctx.bot_python == new_bot / "bin" / "python"
+    assert ctx.rat == old_mcp / "bin" / "ratatosk"
+
+
+def test_d2_neither_home_is_unreachable_naming_both(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    ctx = ox._Ctx(home, None)
+    out = ox._need_python(ctx)
+    assert out["state"] == "unreachable"
+    assert str(home / "willow-bot" / "venvs" / "willow-bot") in out["reason"]
+    assert str(home / "venvs" / "willow-bot") in out["reason"]

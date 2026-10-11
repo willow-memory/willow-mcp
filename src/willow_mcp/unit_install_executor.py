@@ -335,10 +335,13 @@ def render_values(unit: str) -> dict[str, str]:
         or os.environ.get("WILLOW_VAULT_BOX", "").strip()
         or str(willow_home)
     )
-    venv_bin = (
-        os.environ.get("WILLOW_BOT_VENV_BIN", "").strip()
-        or str(Path(vault_box) / "venvs" / "willow-bot" / "bin")
-    )
+    # D2: the bot's venv is resolved like install-service.sh does: the new
+    # home when its interpreter is there, else the legacy home with a warning,
+    # else (nothing yet) the new home, where the venv belongs.
+    venv_bin = os.environ.get("WILLOW_BOT_VENV_BIN", "").strip()
+    if not venv_bin:
+        res = paths.resolve_venv("willow-bot", home=Path(vault_box))
+        venv_bin = str((res.path or res.new) / "bin")
     workdir = (
         os.environ.get("WILLOW_BOT_WORKDIR", "").strip()
         or str(home / "github" / "willow-memory" / "willow-bot")

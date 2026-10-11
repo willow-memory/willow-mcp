@@ -15,6 +15,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from . import paths as _paths
 from .paths import willow_home
 
 _HOME_VAR = "{{HOME}}"
@@ -100,8 +101,11 @@ def resolve_willow_mcp_python() -> str:
     # willow_mcp installed. That fallback writes a .mcp.json whose server cannot
     # start, and nothing reports it. The legacy path stays as a back-compat
     # candidate for installs that have not moved yet.
+    # D2: the new home first, then the legacy home (one root, one warning, from
+    # paths.resolve_venv); the pre-org-folder path stays as a last venv candidate.
+    chosen = _paths.venv_dir("willow-mcp", home=willow_home())
     candidates = [
-        willow_home() / "venvs" / "willow-mcp" / "bin" / "python",
+        chosen / "bin" / "python" if chosen is not None else None,
         Path.home() / "github" / ".willow" / "venvs" / "willow-mcp" / "bin" / "python",
         shutil.which("python3"),
         sys.executable,
