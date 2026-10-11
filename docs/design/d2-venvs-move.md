@@ -1,0 +1,194 @@
+# D2 venvs move: inventory and migration plan
+
+Contents: §1 Scope and rulings · §2 Inventory of every `venvs` reference · §3 Breaks on the D2 bot move · §4 Trust-boundary notes · §5 Open questions for the operator · §6 Proposed PR sequence · §7 Not covered
+
+Status: plan only. Nothing in this document moves, creates, or changes a venv, and
+no code is changed by it. Written 2026-10-11 against `master` at release 2.97.0.
+
+## §1 Scope and rulings
+
+| Item | Statement |
+|---|---|
+| Seal D2 (operator, 2026-10-11) | "all the .venv live in the bot". The bot's venvs live at `$WILLOW_HOME/willow-bot/venvs/<name>`; `$WILLOW_HOME/venvs/` is the legacy home (willow-bot `paths.venvs_dir()` / `paths.legacy_venvs_dir()`). |
+| Ruling since | willow-mcp's own venv `$WILLOW_HOME/venvs/willow-mcp` moves too, to `$WILLOW_HOME/willow-bot/venvs/willow-mcp`. |
+| Not ruled | Whether `venvs/node9` (and any other `venvs/*` child) moves, and whether the legacy home stays honoured during transition. See §5. |
+| Vault rule | `$WILLOW_HOME` is the operator's data-vault box. This plan reads, writes, rotates and adds no vault material and changes no secret handling. Every step that touches the box is an operator act. |
+| Method | Venvs are not relocatable (every `bin/` script names the old interpreter in its shebang). The move is "recreate at the new path, repoint, retire the old", never `mv`. willow-bot's own plan says the same (`willow-bot-steward venvs --plan`). |
+
+Source of the inventory: `git grep -n 'venvs'` over the whole tree, plus
+`git grep -n 'willow-operator-box'`, `BOT_VENV|RAT_VENV|VENV_BIN` and `\bvenv\b` sweeps to
+catch references that build the path from parts. Line numbers are against this commit's parent.
+
+## §2 Inventory of every `venvs` reference
+
+Legend. Boundary column: **TRUST** = a security or trust boundary (allowlist, interpreter
+pinning, sandbox read-only mount, trust-owner execution); **exec** = the path is executed
+or installed into but is not itself a gate; **text** = documentation or comment, no behaviour.
+Venv column: `mcp` = willow-mcp, `bot` = willow-bot, `n9` = node9, `any` = bare name or glob.
+
+### §2.1 Runtime code (`src/`)
+
+| # | file:line | Venv | What it does | Boundary | Proposed change |
+|---|---|---|---|---|---|
+| R1 | `src/willow_mcp/bot_status.py:38,64` (docstring `:57`) | bot | `resolve_binary()` builds `$WILLOW_HOME/venvs/willow-bot/bin/willow-bot-steward` unless `WILLOW_BOT_STEWARD_BIN` is set; the broker executes it for `bot_status` | exec | Resolve through one shared helper (§6 PR 1): new home first, legacy fallback with a warning. |
+| R2 | `src/willow_mcp/onescript_executor.py:20` (doc), `:61` `BOT_VENV`, `:240` `bot_python` | bot | Fixed interpreter `home/venvs/willow-bot/bin/python` for every one-script step | **TRUST** (interpreter pinning: "a fixed step table ... never supplies ... an interpreter") | Same helper; the pin stays fixed, only the root changes. |
+| R3 | `src/willow_mcp/onescript_executor.py:62` `RAT_VENV="willow-mcp"`, `:244` `rat` | mcp | Fixed ratatosk entrypoint `home/venvs/willow-mcp/bin/ratatosk` | **TRUST** (interpreter pinning) | Same helper. |
+| R4 | `src/willow_mcp/pip_sync_executor.py:4` (doc), `:68-69` `_venvs_root()`, `:117-130` `_resolve_venv`, `:244,247,255,312` | any (allowlist names `willow-mcp`, `willow-bot`) | Editable install into `<venvs_root>/<venv>`; bare name only, resolved path must stay under the root, venv must exist (`EVENV`), must be writable by this uid (`EPERM`) | **TRUST** (containment root; the verb exists because sandboxes mount venvs read-only) | Root becomes a resolved pair (new, legacy), exactly one chosen per venv name; containment is checked against the root actually chosen. |
+| R5 | `src/willow_mcp/package_upgrade_executor.py:35`, `:525` (doc), `:348-361` `_resolve_venv`, `:1224,1281` `venvs_root`, `:1153-1159` `_unit_runs_from_venv` | any | Offline tagged install into `<venvs_root>/<venv>`; restarts only units whose `ExecStart` text contains the chosen venv path | **TRUST** (venv containment; the restart set is derived from the path string) | Same resolver as R4. The `ExecStart` substring match must follow the chosen path, so a unit still naming the legacy path is not silently skipped (§3 B6). |
+| R6 | `src/willow_mcp/node9_shadow.py:88,168` `_shadow_root()`, `:203,290,292,299,463` | n9 | Vendored `node`, `node9-ai`, shim, shadow-home and pinned cwd under `venvs/node9`; every execution is by absolute vendored path; `realpath` must stay inside the root; tree is installed read-only (F11) | **TRUST** (interpreter pinning, containment, read-only tree) | Held until §5 Q1 is ruled. If node9 moves: one constant `_shadow_root()`, plus an install-time check that the new root is root-of-trust-owned and read-only. |
+| R7 | `src/willow_mcp/project_wiring.py:104-105` | mcp | Candidate list for the interpreter written into a project's `.mcp.json`: `willow_home()/venvs/willow-mcp/bin/python`, then `~/github/.willow/venvs/willow-mcp/bin/python`, then `which python3` | exec | Insert the new home first; keep both older entries. Order matters: the first existing file wins, so a stale legacy venv beats nothing but must not beat the new one. |
+| R8 | `src/willow_mcp/unit_install_executor.py:340` | bot | Default `VENV_BIN` placeholder (`<vault_box>/venvs/willow-bot/bin`) when re-rendering the steward unit; env overrides `WILLOW_BOT_VENV_BIN` | exec (renders a unit's `ExecStart`) | Mirror willow-bot's `install-service.sh`: new home if its `python` exists, else legacy with a warning. |
+| R9 | `src/willow_mcp/server.py:6194,6197` (`pip_sync_execute` doc), `:6335,6341` (`package_upgrade` doc), `:11383,11388,12430` (node9 install help) | any / n9 | Tool docstrings and CLI help text | text | Reword to "the venvs root" once the helper exists. |
+| R10 | `src/willow_mcp/trust_root_setup.py:493` (comment), `:544` `_chmod_tree` | any | Execute bits are never stripped by the tighten-only sweep; the comment cites venv `bin/` breakage on 2026-09-01 and 2026-09-10 | text (no path literal) | No code change. Needs a check that `willow-bot/` (swept as an enterable subtree) keeps the same carve-out for the new location, which `_EXEC_BITS` already provides. |
+
+### §2.2 Bundled data (shipped in the wheel)
+
+| # | file:line | Venv | What it does | Boundary | Proposed change |
+|---|---|---|---|---|---|
+| D1 | `src/willow_mcp/bundle/constitutional/pip_sync_allowlist.json:5-8` | mcp, bot | Allowlist of `org/repo` to venv name (`willow-mcp` for Jeles, willow-mcp, willow-gate; `willow-bot` for willow-bot) | **TRUST** (allowlist) | No change to names. They stay bare names; the root they resolve under is code (R4/R5). Keeping names rather than paths is what lets one allowlist cover both homes. |
+| D2 | `src/willow_mcp/bundle/constitutional/syscall-table.json:380` (row 25 `bounds.venv`), `:385` (note) | any | Row 25 `package.upgrade` bound text: "the single venv under `${WILLOW_HOME}/venvs` this envelope may write into" | **TRUST** (envelope bound description; row is marked UNSEALED in its own note) | Text-only change, but this file is a constitutional bundle: confirm whether it is signed or vendor-drift checked before editing (see §5 Q6). |
+| D3 | `src/willow_mcp/bundle/node9/shadow-home/README.md:5` | n9 | Says the shadow home lives at `$WILLOW_HOME/venvs/node9/shadow-home/` | text | Follows §5 Q1. |
+
+### §2.3 Hooks and tool configuration
+
+| # | file:line | Venv | What it does | Boundary | Proposed change |
+|---|---|---|---|---|---|
+| H1 | `.claude/settings.json:74` | mcp | `Stop` hook runs `/home/sean-campbell/sean-data-vault/willow-operator-box/venvs/willow-mcp/bin/python3 -m willow_mcp.hook_runner --format claude stop_lint`. The path is hardcoded to the operator box. | **TRUST** in effect: it is the green-claim gate, and if the interpreter is gone the hook fails | Repoint to `.../willow-bot/venvs/willow-mcp/bin/python3` in the same bite that the venv is recreated, not before (§3 B7). |
+| H2 | `tests/test_hook_wiring_sync.py:174` | mcp | Asserts `"venvs/willow-mcp/bin/python3" in first_token` for every dev settings file | **TRUST** (guards the gate from degrading to bare `python3`) | Loosen to accept either home while both are live, then tighten to the new home only after the cut (§6 PR 7). The assertion's purpose (never bare `python3`) stays. |
+
+### §2.4 Units and the trust-owner installer (`deploy/manifest-grant/`)
+
+| # | file:line | Venv | What it does | Boundary | Proposed change |
+|---|---|---|---|---|---|
+| U1 | `deploy/manifest-grant/willow-mcp-manifest-grant.service:70` | mcp | `ExecStart=.../willow-operator-box/venvs/willow-mcp/bin/python -m willow_mcp manifest-grant apply`, run as `User=willow-operator` (the trust owner) | **TRUST** (the trust owner executes this interpreter) | Repoint only after the Loki re-check in §5 Q4. Do not make it a fallback list: a unit has one `ExecStart`. |
+| U2 | `deploy/manifest-grant/install.sh:175` (`PY=`), `:271` (preflight `[ -x "$PY" ]` and its message), `:61` (F7 comment); `PY` is reused at `:466` and later steps | mcp | Root installer uses `$H/venvs/willow-mcp/bin/python` as the trust-owner interpreter from step 1 on, and stops if it is not executable | **TRUST** (Loki audit BFCC5C79 F7) | Choose the new path when it exists and refuse to start if both exist with different contents (§5 Q2). Keep the hard stop. |
+| U3 | `deploy/manifest-grant/INSTALL.md:318` (F7 preflight sentence), `:361` ("NOT reachable ... `venvs/`"), `:96` (`H=` hardcoded box) | mcp | Human-readable account of U2 and of what the trust owner can reach | text, but §4 T1 turns on it | Update after U1/U2, and rewrite the `:361` bullet: the venv moves out of a "not reachable" tree into `willow-bot/`, which that same list calls enterable and listable. |
+| U4 | `src/willow_mcp/deploy/willow-seal-watch.service.template:47-50`, `willow-seat-daemon.service.template:90` (comments) | mcp | "meant to run against the OPERATOR-BOX venv": `{{WILLOW_MCP_PYTHON}}` is supplied at render time | text | Reword; the value comes from `resolve_willow_mcp_python()` (R7), so it follows R7. |
+| U5 | Box-state units (not in this repo): the live serve unit, workers, seal-watch, seat-daemon whose `ExecStart` names `$WILLOW_HOME/venvs/willow-mcp/bin/python` | mcp | Rendered from the templates above at install time | **TRUST** (these are what `package_upgrade` restarts, by `ExecStart` text) | Operator re-renders after the venv exists. Cannot be inventoried from the repo; the operator lists them with `systemctl --user show -p ExecStart` (read-only). |
+
+### §2.5 Scripts
+
+| # | file:line | Venv | What it does | Boundary | Proposed change |
+|---|---|---|---|---|---|
+| S1 | `scripts/bootstrap_cursor_hook_fix.sh:5` | mcp | `VENV="${WILLOW_MCP_VENV:-$HOME/sean-data-vault/willow-operator-box/venvs/willow-mcp}"`, then `pip install -e` and `project sync` into it | exec | Default to the new home when it exists, else the old one with a warning; the env override stays. |
+| S2 | `scripts/venv_dep_sync.py:49` (`DEFAULT_RUNTIME_VENV`), `:52` (`DEFAULT_DEV_VENV` under `~/github/willow-memory/.willow/venvs/`), docstring `:2-4,31,45` | mcp | Read-only comparison of the runtime and dev venv versions; a missing venv is a skip | exec (read-only) | Default runtime venv to the new home when present, else the old. `DEFAULT_DEV_VENV` is a different, pre-D2 location (the `.willow` tree under the org folder) and is not part of D2; leave and note. |
+| S3 | `scripts/operator-onboard.sh:5-7` | mcp | Requires `WILLOW_MCP_PYTHON` to point at the willow-mcp venv python; no path literal | exec | None. Operator passes the new path. |
+
+### §2.6 Documentation
+
+| # | file:line | Venv | Says | Proposed change |
+|---|---|---|---|---|
+| X1 | `docs/OPERATOR-ONBOARD.md:13` | mcp | "venv CLI (`wmc` or `.../venvs/willow-mcp/bin/willow-mcp`)" | Reword to the new path, name the legacy one once. |
+| X2 | `docs/design/onescript-run-verb.md:31,33` | bot, mcp | Interpreter `venvs/willow-bot/bin/python`; ratatosk `venvs/willow-mcp/bin/ratatosk` | Update with R2/R3. |
+| X3 | `docs/design/package-upgrade-verb.md:26,247,282` (and `:35`, generic) | mcp, any | Broker venv path; restore copies into `venvs/...`; sandbox binds `venvs/*` by name | Update with R5; line 282's "binds children BY NAME" is the sandbox fact §3 B8 turns on. |
+| X4 | `docs/design/pip-sync-verb.md:7,8,34,41` | any | Kart mounts `$WILLOW_HOME/venvs/*` read-only (`venvs_are_read_only`); target is `$WILLOW_HOME/venvs/<venv>` only | Update with R4. |
+| X5 | `README.md:77`, `scripts/fleet-standup.sh:98` | mcp | "across two venvs" (the dev `.venv` and the runtime venv); no path | None. |
+
+### §2.7 Tests that pin a path
+
+| # | file:line | Venv | What it pins | Proposed change |
+|---|---|---|---|---|
+| T1 | `tests/test_bot_status.py:142` | bot | `resolve_binary() == "/srv/willow/venvs/willow-bot/bin/willow-bot-steward"` | Add new-home and legacy-fallback cases; keep this one as the legacy case. |
+| T2 | `tests/test_onescript_executor.py:68-69` | bot, mcp | Stubs `home/venvs/willow-bot/bin/python` and `home/venvs/willow-mcp/bin/ratatosk` | Parametrize over both homes; add "both exist, new wins" and "neither exists, unreachable". |
+| T3 | `tests/test_pip_sync_executor.py:100-120,192-196` | mcp | `tmp/venvs/willow-mcp` via the `venvs_root` seam | Seam already exists; add a case for the resolver pair. |
+| T4 | `tests/test_package_upgrade.py:168-169` (fixture) and ~100 uses of `venvs_root` | mcp | `tmp/venvs` via the `venvs_root` seam | No change for the seam; add resolver cases only. |
+| T5 | `tests/test_node9_shadow.py:968,972,987,1002` | n9 | `shim_path() == home/"venvs"/"node9"/"shadow-eval.mjs"`; the vendored Kart template never names `shadow/` or `venvs/node9` | Held with R6. |
+| T6 | `tests/test_node9_shadow_install.py:4,55,62`; `tests/test_node9_shadow_live.py:6` | n9 | Read-only `venvs/node9/` root; live path | Held with R6. |
+| T7 | `tests/test_unit_install.py:710` | bot | `VENV_BIN == home/"venvs"/"willow-bot"/"bin"` | Parametrize with R8. |
+| T8 | `tests/test_mcp_projects.py:349,362,369` | mcp | `resolve_willow_mcp_python()` finds `wh/venvs/willow-mcp/bin/python` | Add the new-home case and an ordering case. |
+| T9 | `tests/test_hook_wiring_sync.py:174` | mcp | See H2 | See H2. |
+| T10 | `tests/test_manifest_grant.py:1871` | mcp | Asserts the operator-facing instruction text `$H/venvs/willow-mcp/bin/python -m willow_mcp envelope ratify ...` | Update with U3. |
+| T11 | `tests/test_trust_root_setup.py:105,110,119` | any | `_chmod_tree` never strips `+x` under `home/venvs/x/bin` | Add a copy of the case under `home/willow-bot/venvs/x/bin`. |
+| T12 | `tests/test_venv_dep_sync.py:1` (docstring), `tests/test_operator_onboard_script.py:4` (comment) | mcp | Text only | Reword with S2. |
+
+### §2.8 Counts
+
+| Category | Rows | Of which trust boundary |
+|---|---|---|
+| Runtime code (R1-R10) | 10 | 5 (R2, R3, R4, R5, R6) |
+| Bundled data (D1-D3) | 3 | 2 (D1, D2) |
+| Hooks and config (H1-H2) | 2 | 2 |
+| Units and installer (U1-U5) | 5 | 4 (U1, U2, U3 by consequence, U5) |
+| Scripts (S1-S3) | 3 | 0 |
+| Docs (X1-X5) | 5 | 0 |
+| Tests (T1-T12) | 12 | 0 (they pin boundaries, they are not ones) |
+| Total | 40 | 13 |
+
+Plus 17 other lines that contain the string `willow-operator-box` without `venvs` (unit
+`RequiresMountsFor`, `WILLOW_HOME`, `ReadWritePaths`, `INSTALL.md:96,609`, `install.sh:131,170`,
+seal-watch and seat-daemon comments, `github_app_credentials.py:31`). They are not part of D2 and
+are not touched.
+
+## §3 Breaks on the D2 bot move
+
+"Bot move" means the willow-bot venv is recreated at `$WILLOW_HOME/willow-bot/venvs/willow-bot`
+and the legacy `$WILLOW_HOME/venvs/willow-bot` is removed or left to rot. willow-bot's side is
+already ready for that: `scripts/install-service.sh:39-50` prefers the new home, and
+`willow_bot/venvs.py` plans the recreation. This repo's side is not. Each line below resolves the
+bot venv in the legacy home only; none looks in the new one.
+
+| # | Breaks | Evidence | Failure mode once the bot venv exists only in the new home |
+|---|---|---|---|
+| B1 | `bot_status` | `bot_status.py:64`: `_willow_home() / "venvs" / "willow-bot" / "bin" / "willow-bot-steward"`; no fallback except `WILLOW_BOT_STEWARD_BIN` | The binary is missing, so the read reports unreachable. If the legacy venv is left in place it reports the stale install's status instead, with no signal that it is stale. |
+| B2 | `onescript_run` (every step) | `onescript_executor.py:240` `bot_python`; stubs in `tests/test_onescript_executor.py:68` | Missing interpreter, so every step is `unreachable`. Same stale-install risk if the old venv stays. |
+| B3 | `pip_sync_execute` for `willow-bot` | `pip_sync_executor.py:69` `paths.willow_home() / "venvs"`; allowlist `pip_sync_allowlist.json:6` maps `willow-memory/willow-bot` to venv `willow-bot` | `EVENV` ("does not exist") if the legacy venv is removed. Worse if it is kept: the install succeeds into the legacy venv, which no unit uses any more, and the receipt says `synced`. willow-bot's `docs/IDEAS.md` item 55 names this exact risk ("the steward's install receipts keep installing into the old venv after the units switch"). |
+| B4 | `package_upgrade` for `willow-bot` | `package_upgrade_executor.py:1281` same root | Same two modes as B3. |
+| B5 | `unit_install_executor` rendering the steward unit | `unit_install_executor.py:340` default `VENV_BIN` is the legacy path; `tests/test_unit_install.py:710` pins it | A verb-17 re-render writes `ExecStart` pointing at the legacy venv, silently undoing what `install-service.sh` just chose. Only `WILLOW_BOT_VENV_BIN` or `WILLOW_BOT_VAULT_BOX` overrides avoid it. |
+| B6 | Restart set of `package_upgrade` | `package_upgrade_executor.py:1159` `str(venv_path) in ExecStart` | A unit still naming the legacy path is skipped when the upgrade targets the new path (and the reverse). The upgrade then reports a clean install while a running process keeps the old code. Applies equally to `willow-mcp` at its own move. |
+| B7 | Stop hook (willow-mcp move, not bot) | `.claude/settings.json:74` hardcoded legacy path | The green-claim gate fails the instant the legacy `willow-mcp` venv is gone. Repoint and recreate together. |
+| B8 | Sandbox read-only guarantee (unverified, needs the other repos) | `docs/design/pip-sync-verb.md:7-8` and `package-upgrade-verb.md:282`: Kart binds `$WILLOW_HOME/venvs/*` read-only BY NAME and an unlisted `$WILLOW_HOME` child is invisible to a task. The template in the grove repo (`deploy/kart-sandbox.template.json:111`) states the rule; the actual bind list lives in the vendored kartikeya default and the box's `kart-sandbox.json`, neither in this repo. | `willow-bot/` is a different child of `$WILLOW_HOME`. It is either unlisted (invisible, so the venv is safe but a task cannot read it) or bound read-write (a task can rewrite the `.pth` that resolves the product package; the exact hole `venvs_are_read_only` closes). Which one holds on the box is not knowable from this repo. |
+
+Already broken today: nothing found. All eight are latent until a venv is recreated in the new
+home. B3 and B5 are the dangerous ones because they fail silently into the wrong venv.
+
+## §4 Trust-boundary notes
+
+| # | Note | Why it matters |
+|---|---|---|
+| T1 | The trust-owner interpreter (U1, U2) currently sits in `venvs/`, which `deploy/manifest-grant/INSTALL.md:361` lists as "NOT reachable" (700/600) for the trust owner's traverse grant. The new home is under `willow-bot/`, which the same list at `:357` puts among the "enterable + listable (755/775) subtrees". | The F7 audit point is that the trust owner executes an interpreter that a less-trusted uid must not be able to rewrite. A venv under a directory the bot uid writes is a regression of that property unless the interpreter tree is trust-owner-owned (or root-owned) and not writable by the bot, wherever it lives. This needs a read-only `stat` on the real box before any repoint. How the trust owner reaches the current path at all, given the 700 note, is also a box fact this repo cannot answer. |
+| T2 | `pip_sync_executor` and `package_upgrade_executor` both refuse unless the broker uid can write the venv (`EPERM`, never escalate). | Moving willow-mcp's venv under `willow-bot/` changes who can write it. If the bot uid owns `willow-bot/`, the broker cannot, and `pip_sync` into `willow-mcp` becomes `EPERM`; if both can, the venv is writable by the less-trusted uid. Either way the ownership of the new venv directories is a ruling, not a default. |
+| T3 | Containment checks (`_resolve_venv`, node9 `realpath` check) are relative to the root they are given. | With two roots, each check must run against the root that was actually chosen, and a name must resolve in exactly one root. Never accept a venv whose resolved path lies in the other root. |
+| T4 | The allowlist (D1) is by bare name, not path. | This is the right shape for the move: no allowlist edit and no re-ratification should be needed, provided resolution stays in code. |
+
+## §5 Open questions for the operator
+
+| # | Question | Recommendation | Confidence |
+|---|---|---|---|
+| Q1 | Does `venvs/node9` (and any other `venvs/*` child) move, or only `willow-mcp`? | Only the two venvs named by D2 (willow-bot and willow-mcp) move. `venvs/node9` is not a Python venv: it is a vendored `node` plus package tree installed read-only by a one-time operator act (R6), with its own containment and read-only guarantees. Moving it widens the change into a different boundary. Rule separately, after the Python venvs are done. | 70% |
+| Q2 | Legacy fallback with a warning, or a hard cut? | Fallback with a warning for the resolver (R1, R2, R3, R4, R5, R7, R8), choosing exactly one root per name (new if its interpreter exists, else legacy); never both, never "newest wins". Hard cut (no fallback, refuse) for the trust-owner paths U1 and U2, where an ambiguous interpreter is exactly what F7 was about. Remove the fallback in a dated, separate PR (§6 PR 8). | 80% |
+| Q3 | Do the sandbox read-only mounts and the allowlist cover both homes during the transition? | Allowlist: yes, it is by name (D1) and needs no change. Sandbox: the operator must confirm on the box, from the live `kart-sandbox.json` and a captured sandbox manifest, that `willow-bot/venvs/*` is bound read-only or absent, and that `venvs/*` stays read-only until the legacy home is retired. Do not recreate the willow-mcp venv in the new home until that is confirmed (§3 B8). The change to the sandbox config is in the grove and kartikeya repos, not here. | 75% |
+| Q4 | Does the move need a Loki re-audit of the manifest-grant trust-owner check? | Yes, a narrow one. The check itself (the interpreter must exist and be executable, `install.sh:271`) is unchanged, but the location it trusts changes from a tree the INSTALL.md calls unreachable to one it calls enterable and listable (§4 T1). Ask Loki the single question: is the interpreter tree, in its new home, owned and writable only by the trust owner or root? Run the audit before PR 6, which repoints U1/U2. | 85% |
+| Q5 | Ordering against the willow-bot side (`WILLOW_BOT_MCP_COMMAND` in `systemd/willow-bot-steward.service.template:26`, `INSTALL.md:29`)? | Bot venv first, willow-mcp venv last. The bot template line 26 hardcodes `@VAULT_BOX@/venvs/willow-mcp/bin/python -m willow_mcp` and its INSTALL.md says to keep willow-mcp's venv at `venvs/willow-mcp` (INSTALL.md:29). So: (1) this repo ships the resolver (§6 PR 1-4) with both homes honoured; (2) the operator recreates the bot venv and re-renders its unit; (3) only then does the willow-bot repo change `WILLOW_BOT_MCP_COMMAND` and INSTALL.md to the new willow-mcp home, and the operator recreates the willow-mcp venv; (4) this repo repoints H1, U1, U2 and S1. Changing the bot's template before the willow-mcp venv exists would start the steward with a missing MCP command. | 80% |
+| Q6 | Is `syscall-table.json` (D2) signed or drift-checked, so that a text-only edit to row 25's bound text has ceremony cost? | Treat the edit as a separate small PR and check `scripts/vendor_drift.py` and the constitutional sync path first. Row 25 is marked UNSEALED in its own note, which lowers the cost, but this repo cannot prove nothing hashes the file. | 60% |
+| Q7 | Who owns the new venv directories, and may the broker uid write them? (§4 T2) | Keep the current ownership model: the venv is writable by the broker uid and not by the bot's task uid; the trust-owner interpreter is the only one that must additionally be non-writable by the broker. If the bot uid owns `willow-bot/`, put a trust-owner-owned `venvs/` directory inside it rather than letting the bot own the venvs it does not run. | 65% |
+| Q8 | Rollback if a recreated venv misbehaves? | Recreate, smoke-import, repoint, keep one legacy generation until the next green restart cycle, delete only on the operator's word. The resolver's "new if interpreter exists, else legacy" rule makes rollback the removal of the new interpreter plus a unit re-render. | 75% |
+
+## §6 Proposed PR sequence
+
+Each bite is independently safe: it adds behaviour that is a no-op while only the legacy home
+exists, so merging it changes nothing on the live box until the operator recreates a venv.
+Every PR carries the usual `Persona:` trailer and a Ratified-by line from the operator.
+
+| PR | Bite | Touches | Safe because | Fixes |
+|---|---|---|---|---|
+| 1 | **Shared venv resolver.** Add `paths.venvs_root()`, `paths.legacy_venvs_root()` and `paths.venv_dir(name)`: new root if `<name>/bin/python` is executable there, else legacy with a one-line warning, never both. Route R1 (`bot_status`), R2 and R3 (`onescript_executor`), R8 (`unit_install_executor`) and R7 (`project_wiring`) through it. Tests T1, T2, T7, T8 gain new-home, legacy, both-present and neither cases. | `paths.py`, `bot_status.py`, `onescript_executor.py`, `unit_install_executor.py`, `project_wiring.py`, five test files | The legacy home keeps working; nothing resolves differently until a new-home interpreter exists. | B1, B2, B5 |
+| 2 | **Installer verbs follow the resolver.** Route R4 (`pip_sync_executor`) and R5 (`package_upgrade_executor`) through `paths.venv_dir`, run containment against the chosen root, and make `_unit_runs_from_venv` match the chosen path. Tests T3, T4. | `pip_sync_executor.py`, `package_upgrade_executor.py`, tests | Same no-op property; the `venvs_root` test seam is kept. | B3, B4, B6 |
+| 3 | **Scripts.** S1 and S2 default to the new home when present, else legacy with a warning. | `bootstrap_cursor_hook_fix.sh`, `venv_dep_sync.py`, their tests | Env overrides unchanged. | none |
+| 4 | **Docs and docstrings.** Update R9, X1-X4 and U4 comments to say "the venvs root". | docs, docstrings | No behaviour. | none |
+| 5 | **Gate and sandbox confirmation, operator side (no code).** Operator confirms Q3 (sandbox) and Q7 (ownership) on the box and asks the Loki question in Q4. | none | Read-only checks. | B8 |
+| 6 | **Trust-owner and hook repoint.** After the willow-mcp venv exists in the new home and Q4 is answered: repoint U1, U2 (`PY`, the preflight and its message), U3, H1, loosen H2/T9 to accept either home, update T10, add T11. `install.sh` picks the new path when it exists and stops if both exist (Q2). | `deploy/manifest-grant/*`, `.claude/settings.json`, tests | Gated on the Loki answer and the operator's recreation; until then the legacy paths stay valid. | B7 |
+| 7 | **node9 (only if Q1 is answered "move").** `_shadow_root()` becomes a resolver; install-time check that the root is read-only; D3, T5, T6. | `node9_shadow.py`, tests | Separate PR so the node9 boundary is audited on its own. | none |
+| 8 | **Retire the legacy fallback.** Dated removal after the operator confirms the legacy venvs are deleted; tighten H2/T9 to the new home only; delete the legacy root helper. | `paths.py`, callers, tests | Operator-triggered; the earlier PRs are complete without it. | none |
+
+PR 1 is the first bite because it is the only one that closes the bot-move breakages (B1, B2, B5)
+without needing any decision beyond Q2. PR 2 follows immediately because B3 and B4 fail silently
+into the wrong venv.
+
+## §7 Not covered
+
+| Item | Reason |
+|---|---|
+| The willow-bot repo (resolver side, `WILLOW_BOT_MCP_COMMAND`, `INSTALL.md`) | Other repo, read only here. |
+| The grove and kartikeya sandbox configs | Other repos; §3 B8 and Q3 need their live contents. |
+| Box state (live units, ownership and ACLs of the new directories, whether the legacy venvs exist) | Operator-only; read-only checks are named in §2.4 U5 and §4 T1. |
+| Vault material | Untouched, per the operator's key. |
