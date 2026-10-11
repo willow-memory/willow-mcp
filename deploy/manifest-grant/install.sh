@@ -19,7 +19,12 @@
 # acted on or reported as a stop.
 #
 #   sudo bash install.sh            # run from the directory holding the units
-#   sudo bash install.sh --check    # detect-only, change nothing
+#   sudo bash install.sh --check    # detect-only, change nothing (reports the
+#                                   # trust-owner interpreter checks too)
+#   sudo bash install.sh --provision-venv
+#                                   # (re)build ONLY the trust-owner venv
+#                                   # (/opt/willow-operator/venv) and check it;
+#                                   # does not touch the unit or the box
 #
 # Idempotent: every step converges; re-running after a stop is the intended
 # recovery. Nothing here reads the broker's env file ($H/env, 0600, provider
@@ -123,6 +128,18 @@
 #   * install.sh and sync_constitutional.py are now mode 0755 in git —
 #     `sudo <path>` (as opposed to `sudo bash <path>`) failed with EACCES on
 #     a tracked 0644 script.
+#
+# Rework 3 (operator rulings Q7=A and Q13, 2026-10-11; Loki audit BFCC5C79 F7
+# lineage): the interpreter the trust owner runs was $H/venvs/willow-mcp/bin/
+# python -- owned and writable by the operator uid (the one the shell, the bot
+# and the agents run as), and an EDITABLE install pointing at the operator's
+# checkout -- so any of them could rewrite code that then ran as the trust
+# owner. The trust owner now has its own venv at /opt/willow-operator/venv:
+# built here as root (step 0a / --provision-venv) from a non-editable wheel,
+# root:root 755/644, and the preflight (tvc_report, below) REFUSES unless the
+# interpreter, every path component to it (symlinks resolved), and everything
+# inside the venv is root-owned and unwritable by any other uid, carries no
+# non-root write ACL, and is not an editable install. See INSTALL.md.
 
 set -euo pipefail
 
@@ -172,12 +189,293 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 CHECKOUT=$(cd "$HERE/../.." && pwd)   # deploy/manifest-grant/ -> checkout root
 BROKER_PUBLIC_KEY_NAME=broker_public_key.pub   # manifest_grant_executor._broker_public_key_path
 BROKER_UNIT_CANDIDATES=(willow-mcp-serve.service willow-mcp.service)  # reloader.DEFAULT_UNIT / unit_reload_executor._BROKER_UNIT_STEMS
-PY="$H/venvs/willow-mcp/bin/python"
+# The trust owner's OWN interpreter (operator rulings Q7=A "split" and Q13,
+# 2026-10-11; Loki audit BFCC5C79 F7 lineage). It used to be
+# $H/venvs/willow-mcp/bin/python -- a tree owned and writable by the operator
+# uid, the same uid the bot, the agents and the operator shell run as, so any
+# of them could rewrite code that then ran as the trust owner. It now lives
+# OUTSIDE every operator-writable tree:
+#   * /opt/willow-operator/venv -- /opt is the FHS home for add-on software;
+#     /etc/willow-mcp is configuration and /var/lib/willow-mcp/manifest-grant
+#     is the trust owner's own WRITABLE state (its gnupg home, a unit
+#     ReadWritePaths) -- an interpreter must be in neither, or the uid that
+#     runs it could rewrite it;
+#   * root:root, 755 dirs / 644 files, a NON-editable install of this
+#     checkout (a built wheel, never `pip install -e`), created below by this
+#     script running as root;
+#   * built from the system python, whose real path the preflight also checks.
+# PY is the one variable every step uses; willow-mcp-manifest-grant.service
+# must name the same path in ExecStart= (the preflight stops if it does not).
+TRUST_VENV=/opt/willow-operator/venv
+TRUST_PY_BASE=/usr/bin/python3.14   # what the operator's box already resolves to (root-owned system python)
+# The least the apply path imports (traced 2026-10-11: `python -m willow_mcp
+# manifest-grant apply` and the trust_owner_verbs / manifest_grant_executor /
+# mcp_federation / envelope_authoring modules it calls need psycopg2 and
+# cryptography only -- not mcp, starlette, kartikeya, jeles, nestor, ratatosk,
+# forge or willow-gate). Same specifiers as pyproject.toml's dependencies;
+# tests/test_trust_venv_preflight.py fails if they drift apart.
+TRUST_VENV_DEPS=("psycopg2-binary>=2.9,<3.0" "cryptography>=42.0,<51.0")
+PY="$TRUST_VENV/bin/python"
 
 say()  { printf '%s\n' "$*"; }
 stop() { printf 'STOP: %s\n' "$*" >&2; exit 2; }
 as_op() { sudo -u "$OPERATOR" XDG_RUNTIME_DIR="/run/user/$OPERATOR_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$OPERATOR_UID/bus" "$@"; }
 as_to() { sudo -u "$TRUST_OWNER" GNUPGHOME="$GNUPGHOME_TO" "$@"; }
+
+# ------------------------------------------- the trust owner's interpreter check
+# Operator rulings Q7=A / Q13 (2026-10-11). The trust owner executes $PY, so
+# nothing a less-trusted uid can write may sit on the way to it or inside it.
+# Every function below prints one problem per line and returns 0 -- an empty
+# result is "clean". They take the uid that counts as "root" and the path the
+# walk starts from as ARGUMENTS (production: 0 and /) so
+# tests/test_trust_venv_preflight.py can run them against a tmp tree as an
+# unprivileged user; nothing here reads either from the environment.
+# BEGIN trust-venv-check
+
+# tvc_components ANCHOR PATH -- ANCHOR, then every prefix of PATH down to it.
+tvc_components() {
+  local anchor=$1 path=$2 cur rest part
+  local -a parts
+  if [ "$anchor" = / ]; then
+    cur=""; rest=${path#/}; printf '/\n'
+  else
+    anchor=${anchor%/}
+    case "$path" in "$anchor"|"$anchor"/*) ;; *) return 1 ;; esac
+    cur=$anchor; rest=${path#"$anchor"}; rest=${rest#/}; printf '%s\n' "$anchor"
+  fi
+  IFS=/ read -ra parts <<<"$rest"
+  for part in ${parts[@]+"${parts[@]}"}; do
+    [ -n "$part" ] || continue
+    cur="$cur/$part"
+    printf '%s\n' "$cur"
+  done
+  return 0
+}
+
+# tvc_chain_paths ANCHOR FILE -- the lexical chain AND the symlink-resolved
+# chain (readlink -f) of FILE; a resolved path outside ANCHOR is walked from /.
+tvc_chain_paths() {
+  local anchor=$1 file=$2 real target a
+  real=$(readlink -f -- "$file" 2>/dev/null || true)
+  for target in "$file" "$real"; do
+    [ -n "$target" ] || continue
+    a=$anchor
+    case "$target" in "$a"|"$a"/*) ;; *) a=/ ;; esac
+    tvc_components "$a" "$target" || true
+  done | awk '!seen[$0]++'
+  return 0
+}
+
+# tvc_chain_problems ANCHOR FILE ROOT_UID -- a component not owned by ROOT_UID,
+# or (non-symlink) writable by group or other.
+tvc_chain_problems() {
+  local anchor=$1 file=$2 ru=$3 c st u rest m ft
+  [ -e "$file" ] || { printf 'no such file: %s\n' "$file"; return 0; }
+  if [ -z "$(readlink -f -- "$file" 2>/dev/null || true)" ]; then
+    printf 'cannot resolve %s with readlink -f\n' "$file"; return 0
+  fi
+  while IFS= read -r c; do
+    st=$(stat -c '%u %a %F' -- "$c" 2>/dev/null) || { printf 'cannot stat %s\n' "$c"; continue; }
+    u=${st%% *}; rest=${st#* }; m=${rest%% *}; ft=${rest#* }
+    if [ "$u" != "$ru" ]; then
+      printf '%s is owned by uid %s, not %s\n' "$c" "$u" "$ru"
+    fi
+    if [ "$ft" != "symbolic link" ] && [ $(( 8#$m & 022 )) -ne 0 ]; then
+      printf '%s is group/other-writable (mode %s)\n' "$c" "$m"
+    fi
+  done < <(tvc_chain_paths "$anchor" "$file")
+  return 0
+}
+
+# tvc_acl_problems ANCHOR FILE VENV -- a non-root ACL entry with write on the
+# chain or anywhere in the venv. Fails closed when getfacl is missing.
+tvc_acl_problems() {
+  local anchor=$1 file=$2 venv=$3 out
+  local -a chain
+  command -v getfacl >/dev/null 2>&1 || {
+    printf 'the ACL check cannot be performed: getfacl is not installed (install the acl package)\n'; return 0; }
+  mapfile -t chain < <(tvc_chain_paths "$anchor" "$file")
+  {
+    out=$(getfacl -p -- ${chain[@]+"${chain[@]}"} 2>&1) || { printf 'getfacl failed on the path chain: %s\n' "${out%%$'\n'*}"; return 0; }
+    printf '%s\n' "$out"
+    out=$(getfacl -R -p -s -- "$venv" 2>&1) || { printf 'getfacl failed on %s: %s\n' "$venv" "${out%%$'\n'*}"; return 0; }
+    printf '%s\n' "$out"
+  } | awk '
+    /^# file: /      { f = substr($0, 9); next }
+    /^getfacl failed|^the ACL check/ { print; next }
+    {
+      line = $0; sub(/^default:/, "", line)
+      n = split(line, a, ":")
+      if ((a[1] == "user" || a[1] == "group") && a[2] != "" && a[2] != "root" && substr(a[3], 2, 1) == "w")
+        printf "%s has a non-root write ACL entry: %s\n", f, $0
+    }' | awk '!seen[$0]++'
+  return 0
+}
+
+# tvc_tree_problems VENV ROOT_UID -- anything inside the venv not owned by
+# ROOT_UID, or (non-symlink) writable by group or other.
+tvc_tree_problems() {
+  local venv=$1 ru=$2 out
+  out=$(find "$venv" \( \( -type l ! -uid "$ru" \) -o \( ! -type l \( ! -uid "$ru" -o -perm /022 \) \) \) -print 2>/dev/null || true)
+  [ -z "$out" ] || printf '%s\n' "$out" | head -8 | sed 's/^/not root-owned or writable by others: /'
+  return 0
+}
+
+# tvc_installed_version VENV -- the willow_mcp version the venv's dist-info names.
+tvc_installed_version() {
+  local d f v
+  for d in "$1"/lib/python*/site-packages "$1"/lib64/python*/site-packages; do
+    for f in "$d"/willow_mcp-*.dist-info; do
+      [ -d "$f" ] || continue
+      v=${f##*/willow_mcp-}; printf '%s\n' "${v%.dist-info}"; return 0
+    done
+  done
+  return 0
+}
+
+# tvc_editable_problems VENV -- willow_mcp absent, or ANY editable install in
+# the venv (not only willow_mcp): an __editable__/_editable_impl_ marker, an
+# .egg-link, easy-install.pth, a direct_url.json with "editable": true, or a
+# .pth line that resolves outside the venv.
+tvc_editable_problems() {
+  local venv=$1 vreal d f line t sp=0
+  for d in "$venv"/lib/python*/site-packages "$venv"/lib64/python*/site-packages; do
+    [ -d "$d" ] && sp=1
+  done
+  vreal=$(readlink -f -- "$venv" 2>/dev/null || printf '%s' "$venv")
+  for d in "$venv"/lib/python*/site-packages "$venv"/lib64/python*/site-packages; do
+    [ -d "$d" ] || continue
+    for f in "$d"/__editable__* "$d"/_editable_impl_* "$d"/*.egg-link "$d"/easy-install.pth; do
+      [ -e "$f" ] && printf 'editable-install marker: %s\n' "$f"
+    done
+    for f in "$d"/*.dist-info/direct_url.json; do
+      [ -f "$f" ] || continue
+      if grep -Eq '"editable"[[:space:]]*:[[:space:]]*true' "$f"; then
+        printf 'editable install (direct_url.json): %s\n' "$f"
+      fi
+    done
+    for f in "$d"/*.pth; do
+      [ -f "$f" ] || continue
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*|import\ *|import$'\t'*) continue ;; esac
+        case "$line" in /*) t=$(readlink -m -- "$line") ;; *) t=$(readlink -m -- "$d/$line") ;; esac
+        case "$t" in "$vreal"|"$vreal"/*) ;; *) printf '%s puts %s on sys.path, outside the venv\n' "$f" "$t" ;; esac
+      done < "$f"
+    done
+  done | awk '!seen[$0]++'
+  [ -n "$(tvc_installed_version "$venv")" ] || printf 'willow_mcp is not installed in %s (no willow_mcp-*.dist-info)\n' "$venv"
+  [ "$sp" = 1 ] || printf 'no site-packages under %s\n' "$venv"
+  return 0
+}
+
+# tvc_import_problems VENV PY -- run only AFTER every check above passed (the
+# interpreter is then root-owned): the apply path imports, from inside the venv.
+tvc_import_problems() {
+  local venv=$1 py=$2 out loc vreal
+  out=$("$py" -I -c 'import psycopg2, cryptography, willow_mcp, willow_mcp.cli_manifest_grant, willow_mcp.trust_owner_verbs, willow_mcp.manifest_grant_executor, willow_mcp.mcp_federation, willow_mcp.envelope_authoring; print(willow_mcp.__file__)' 2>&1) \
+    || { printf 'the apply path does not import: %s\n' "${out##*$'\n'}"; return 0; }
+  loc=$(readlink -f -- "${out##*$'\n'}" 2>/dev/null || true)
+  vreal=$(readlink -f -- "$venv" 2>/dev/null || printf '%s' "$venv")
+  case "$loc" in "$vreal"/*) ;; *) printf 'willow_mcp imports from %s, outside the venv\n' "$loc" ;; esac
+  return 0
+}
+
+# tvc_unit_problems UNIT PY -- the unit file must run PY, exactly.
+tvc_unit_problems() {
+  grep -qxF "ExecStart=$2 -m willow_mcp manifest-grant apply" "$1" 2>/dev/null \
+    || printf 'ExecStart= in %s is not "%s -m willow_mcp manifest-grant apply"\n' "$1" "$2"
+  return 0
+}
+
+# tvc_emit LABEL PROBLEMS -- one report line per check; 1 when PROBLEMS is set.
+tvc_emit() {
+  if [ -z "$2" ]; then printf '  [ok]   %s\n' "$1"; return 0; fi
+  printf '  [FAIL] %s\n' "$1"
+  printf '%s\n' "$2" | head -8 | sed 's/^/           - /'
+  return 1
+}
+
+# tvc_report VENV PY ROOT_UID ANCHOR -- one line per check; 0 only if all pass.
+tvc_report() {
+  local venv=$1 py=$2 ru=$3 anchor=$4 rc=0 p real v
+  real=$(readlink -f -- "$py" 2>/dev/null || true)
+  p=""
+  if [ ! -e "$py" ]; then p="no such file: $py"
+  elif [ -z "$real" ] || [ ! -f "$real" ]; then p="$py does not resolve to a regular file"
+  elif [ ! -x "$py" ]; then p="$py is not executable"
+  fi
+  tvc_emit "interpreter exists and is executable ($py)" "$p" || rc=1
+  if [ -n "$p" ]; then
+    printf '  [skip] path chain, ACLs, venv tree, editable-install and import checks (no interpreter to check)\n'
+    return 1
+  fi
+  p=$(tvc_chain_problems "$anchor" "$py" "$ru")
+  tvc_emit "every path component from $anchor to the interpreter (symlinks resolved) is owned by uid $ru and not group/other-writable" "$p" || rc=1
+  p=$(tvc_acl_problems "$anchor" "$py" "$venv")
+  tvc_emit "no non-root write ACL on the path chain or inside the venv" "$p" || rc=1
+  p=$(tvc_tree_problems "$venv" "$ru")
+  tvc_emit "everything inside $venv is owned by uid $ru and not group/other-writable" "$p" || rc=1
+  p=$(tvc_editable_problems "$venv")
+  v=$(tvc_installed_version "$venv")
+  tvc_emit "willow_mcp ${v:-?} is a regular install; nothing in the venv is editable or puts a path outside it on sys.path" "$p" || rc=1
+  if [ "$rc" = 0 ]; then
+    p=$(tvc_import_problems "$venv" "$py")
+    tvc_emit "the manifest-grant apply path imports from inside the venv" "$p" || rc=1
+  else
+    printf '  [skip] the apply-path import check (not executing an interpreter that failed the checks above)\n'
+  fi
+  return "$rc"
+}
+# END trust-venv-check
+
+# provision_trust_venv [force] -- root builds $TRUST_VENV from this checkout.
+# Skipped when the venv already passes every check, unless forced
+# (--provision-venv). Rebuilds from the checkout's COMMITTED HEAD (a local
+# clone, so the build writes nothing into the operator-writable checkout and
+# runs no operator-writable build code beyond the commit being installed).
+provision_trust_venv() {
+  local force=${1:-} problems
+  local -a wheels
+  if [ -z "$force" ] && tvc_report "$TRUST_VENV" "$PY" 0 / >/dev/null 2>&1; then
+    say "== 0a. trust-owner venv $TRUST_VENV already passes every check -- not rebuilt (sudo bash install.sh --provision-venv rebuilds it from this checkout)"
+    return 0
+  fi
+  say "== 0a. build the trust-owner venv at $TRUST_VENV (root:root, non-editable, from $CHECKOUT)"
+  [ -x "$TRUST_PY_BASE" ] || stop "$TRUST_PY_BASE is not executable -- the trust-owner venv is built from the root-owned system python (edit TRUST_PY_BASE in install.sh if this box's system python is another version)"
+  command -v git >/dev/null 2>&1 || stop "git is required to build willow-mcp's version from the checkout"
+  problems=$(tvc_chain_problems / "$TRUST_PY_BASE" 0)
+  [ -z "$problems" ] || stop "the base interpreter $TRUST_PY_BASE is itself not root-owned and unwritable: $problems"
+  TVC_BUILD=$(mktemp -d)
+  trap 'rm -rf "${TVC_BUILD:-}"' EXIT
+  git -c safe.directory="$CHECKOUT" clone --quiet --no-hardlinks "$CHECKOUT" "$TVC_BUILD/src" \
+    || stop "could not clone $CHECKOUT to build from"
+  rm -rf -- "$TRUST_VENV"
+  install -d -o root -g root -m 755 "$(dirname "$TRUST_VENV")"
+  ( umask 022; "$TRUST_PY_BASE" -m venv "$TRUST_VENV" ) \
+    || stop "could not create the venv with $TRUST_PY_BASE (Debian/Ubuntu: apt install python3-venv)"
+  export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 PYTHONNOUSERSITE=1
+  ( umask 022; "$PY" -m pip install --quiet "${TRUST_VENV_DEPS[@]}" ) \
+    || stop "pip could not install ${TRUST_VENV_DEPS[*]} into $TRUST_VENV"
+  ( umask 022; "$PY" -m pip wheel --quiet --no-deps --wheel-dir "$TVC_BUILD/wheels" "$TVC_BUILD/src" ) \
+    || stop "could not build a willow-mcp wheel from $CHECKOUT"
+  mapfile -t wheels < <(find "$TVC_BUILD/wheels" -maxdepth 1 -name 'willow_mcp-*.whl')
+  [ "${#wheels[@]}" = 1 ] || stop "expected exactly one willow_mcp wheel, found ${#wheels[@]}"
+  ( umask 022; "$PY" -m pip install --quiet --no-deps "${wheels[0]}" ) \
+    || stop "could not install ${wheels[0]##*/} into $TRUST_VENV"
+  chown -R root:root "$TRUST_VENV"
+  chmod -R u=rwX,go=rX "$TRUST_VENV"
+  say "  installed ${wheels[0]##*/} (non-editable) + ${TRUST_VENV_DEPS[*]}"
+  tvc_report "$TRUST_VENV" "$PY" 0 / || stop "the venv just built failed its own preflight -- see the FAIL lines above"
+}
+
+# enforce_trust_interpreter -- the preflight: refuse (stop) unless every check passes.
+enforce_trust_interpreter() {
+  local up
+  tvc_report "$TRUST_VENV" "$PY" 0 / \
+    || stop "trust-owner python interpreter at $PY failed the preflight (FAIL lines above): it must exist, be executable, sit on a path no non-root uid can write, and be a non-editable install -- Loki audit BFCC5C79 F7, operator rulings Q7=A/Q13. A plain 'sudo bash install.sh' or 'sudo bash install.sh --provision-venv' builds it."
+  up=$(tvc_unit_problems "$HERE/willow-mcp-manifest-grant.service" "$PY")
+  [ -z "$up" ] || stop "$up -- the unit and install.sh must name the same interpreter"
+}
 
 # ------------------------------------------------------- --dry-run-sign
 # A real two-uid run of the signing steps cannot be exercised in Kart
@@ -234,16 +532,19 @@ fi
 CHECK_ONLY=""
 ROTATE=""
 CHECK_SIGNATURES=""
+PROVISION_VENV=""
+CHECK_FAILED=""
 RETIRE_FPRS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) CHECK_ONLY="--check"; shift ;;
     --check-signatures) CHECK_SIGNATURES=1; shift ;;
     --rotate) ROTATE=1; shift ;;
+    --provision-venv) PROVISION_VENV=1; shift ;;
     --retire)
       [ $# -ge 2 ] || stop "--retire requires a fingerprint argument"
       RETIRE_FPRS+=("$2"); shift 2 ;;
-    *) stop "unknown argument: $1 (known: --check, --check-signatures, --rotate, --retire FPR, --dry-run-sign)" ;;
+    *) stop "unknown argument: $1 (known: --check, --check-signatures, --provision-venv, --rotate, --retire FPR, --dry-run-sign)" ;;
   esac
 done
 
@@ -260,17 +561,47 @@ if [ -n "$CHECK_ONLY" ] && [ -n "$ROTATE" ]; then
   stop "--check and --rotate are mutually exclusive: --check inspects and changes nothing, --rotate mutates. Use --check-signatures first if you want a read-only pre-check, then --rotate."
 fi
 
+if [ -n "$PROVISION_VENV" ] && [ -n "$CHECK_ONLY$ROTATE$CHECK_SIGNATURES" ]; then
+  stop "--provision-venv builds the trust-owner venv and nothing else; it cannot be combined with --check, --check-signatures or --rotate"
+fi
+
 # ---------------------------------------------------------------- preflight
 [ "$(id -u)" = 0 ] || stop "run as root (sudo bash install.sh)"
+# --provision-venv: build and check the trust-owner venv, touch nothing else, so
+# the venv can be audited BEFORE the unit is repointed at it (the unit and the
+# rest of the box change only on a plain install).
+if [ -n "$PROVISION_VENV" ]; then
+  provision_trust_venv force
+  exit 0
+fi
 [ -d "$H" ] || stop "operator box not found at $H"
 id "$TRUST_OWNER" >/dev/null 2>&1 || stop "user $TRUST_OWNER does not exist — trust_root_setup has not run on this box"
 for f in manifest-grant.env willow-mcp-manifest-grant.service willow-mcp-manifest-grant.timer; do
   [ -f "$HERE/$f" ] || stop "missing $HERE/$f"
 done
 [ -f "$ETC/verifiers.public.json" ] || stop "$ETC/verifiers.public.json absent — the net-signer's public ring is a precondition (manifest-grant.env names it)"
-[ -x "$PY" ] || stop "trust-owner python interpreter not found or not executable at $PY — venvs/willow-mcp must exist before this script does anything"
 PG_DB=$(grep -E '^WILLOW_PG_DB=' "$H/env" | tail -1 | cut -d= -f2- || true)
 [ -n "$PG_DB" ] || stop "WILLOW_PG_DB not set in $H/env"
+# The trust owner's interpreter (F7, Q7=A/Q13): used from step 1 on, so a bad
+# one stops here, before anything is touched. --check reports every line and
+# continues (exit 2 at the end); --rotate / --check-signatures only enforce it
+# (they never build); a plain install builds it first when it is missing or
+# fails a check, then enforces.
+if [ -n "$CHECK_ONLY" ]; then
+  say "== trust-owner interpreter $PY"
+  tvc_report "$TRUST_VENV" "$PY" 0 / || CHECK_FAILED=1
+  tvc_emit "the unit file beside install.sh runs $PY" "$(tvc_unit_problems "$HERE/willow-mcp-manifest-grant.service" "$PY")" || CHECK_FAILED=1
+  if [ -f /etc/systemd/system/willow-mcp-manifest-grant.service ]; then
+    INSTALLED_EXEC=$(grep -E '^ExecStart=' /etc/systemd/system/willow-mcp-manifest-grant.service | head -1 || true)
+    case "$INSTALLED_EXEC" in
+      "ExecStart=$PY "*) say "  [ok]   the installed unit already runs $PY" ;;
+      *) say "  [info] the installed unit still reads: ${INSTALLED_EXEC:-<no ExecStart>} -- a plain install repoints it" ;;
+    esac
+  fi
+else
+  [ -n "$ROTATE$CHECK_SIGNATURES" ] || provision_trust_venv
+  enforce_trust_interpreter
+fi
 
 # governed_files: every file trusted-owner-signed under WILLOW_PGP_FINGERPRINT
 # that --rotate must re-sign and --check-signatures reads — one list, used by
@@ -615,7 +946,14 @@ case "$FSTYPE" in
 esac
 case "$OPTS" in *all_squash*|*idmapped*) stop "mcp_apps mount options ($OPTS) remap ownership — same stop as above." ;; esac
 say "plain $FSTYPE — ownership will stick; continuing"
-[ "$CHECK_ONLY" = "--check" ] && { say "check-only: stopping before any change"; exit 0; }
+if [ "$CHECK_ONLY" = "--check" ]; then
+  if [ -n "$CHECK_FAILED" ]; then
+    say "check-only: stopping before any change -- the trust-owner interpreter checks above FAILED (a plain install, or --provision-venv, builds the venv)"
+    exit 2
+  fi
+  say "check-only: stopping before any change"
+  exit 0
+fi
 
 # --------------------------------------------------------- 1. ownership, ACLs
 say "== 1. ownership and traversal"

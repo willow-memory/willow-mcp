@@ -13,7 +13,12 @@ one root act:
 
     sudo bash install.sh                       # do it
     sudo bash install.sh --check               # detect-only, change nothing — stops
-                                                 # after step 0, before any mutation
+                                                 # after step 0, before any mutation;
+                                                 # prints one [ok]/[FAIL] line per
+                                                 # trust-owner-interpreter check and
+                                                 # exits 2 if any fails
+    sudo bash install.sh --provision-venv       # build (or rebuild) ONLY the trust-owner
+                                                 # venv, check it, touch nothing else
     sudo bash install.sh --check-signatures     # read-only: which fingerprint does
                                                  # each governed file verify under, right now
     sudo bash install.sh --rotate [--retire FPR ...]
@@ -308,17 +313,99 @@ the box already has a `trust.env` — see its own section below. Do not run
 BRAND NEW key unconditionally, which is one key too many for a box that
 has never had one at all.
 
-## Preflight
+## The trust owner's own interpreter (operator rulings Q7=A and Q13, 2026-10-11)
+
+The unit and `install.sh` used to run the trust owner with
+`$H/venvs/willow-mcp/bin/python`. Measured on the operator's box on
+2026-10-11 (read-only `stat`/`getfacl`/`readlink`, `$H` =
+`/home/sean-campbell/sean-data-vault/willow-operator-box`):
+
+| Path | Owner | Mode | ACL |
+|---|---|---|---|
+| `$H` | `sean-campbell:sean-campbell` | 711 | |
+| `$H/willow-bot` | `sean-campbell:sean-campbell` | 775 | none |
+| `$H/venvs` | `sean-campbell:sean-campbell` | 755 | `user:willow-operator:--x`, `other::r-x` |
+| `$H/venvs/willow-mcp` | `sean-campbell:sean-campbell` | 755 | |
+| `$H/venvs/willow-mcp/bin/python` | `sean-campbell:sean-campbell` | 777 | symlink; `readlink -f` = `/usr/bin/python3.14` (root-owned system python) |
+
+and the venv itself holds editable installs: `_editable_impl_willow_mcp.pth`
+and `willow_mcp-2.90.2.dev2+g2f1ac9385.dist-info/direct_url.json` =
+`{"dir_info": {"editable": true}, "url": "file:///home/sean-campbell/github/willow-memory/willow-mcp"}`,
+plus `__editable__.nestor-0.1.0.pth` (and its finder), `_editable_impl_jeles.pth`,
+`_editable_impl_ratatosk_meaning.pth`, `_editable_impl_willow_reconciler.pth`,
+`_ratatosk_checkout.pth` and `a1_coverage.pth`.
+
+So the trust owner executed (a) an interpreter tree owned and writable by
+`sean-campbell` — the uid the operator shell, the bot and the agents run as —
+and (b) willow-mcp straight out of the operator's checkout, which Kart tasks
+hold read-write binds on. Anything that could write either could rewrite code
+that then ran as the trust owner: the trust-owner separation (Loki audit
+BFCC5C79 F7) was not holding. (The same measurement also shows `venvs/` is
+**not** the 700 "NOT reachable" directory this document used to claim; the
+list under step 1 now says what the box shows.)
+
+Ruling Q7 = option A ("split"): the trust owner gets its **own** interpreter
+venv, separate from the broker's willow-mcp venv (which moves into the bot
+tree under D2 — `docs/design/d2-venvs-move.md`). Ruling Q13: this fix goes
+ahead of the D2 sequence as its own change, because the gap is open today.
+
+What `install.sh` now builds and requires:
+
+| Property | Value | Why |
+|---|---|---|
+| Path | `/opt/willow-operator/venv` (`TRUST_VENV`, and `PY=$TRUST_VENV/bin/python`; the unit's `ExecStart=` names the same path and the preflight stops if it does not) | `/opt` is the FHS home for add-on software, outside `$H` and `/home`. `/etc/willow-mcp` is configuration, and `/var/lib/willow-mcp/manifest-grant` is the trust owner's own *writable* state (its gnupg home, a unit `ReadWritePaths=`): an interpreter may sit in neither, or the uid that runs it could rewrite it. Under `ProtectSystem=strict` `/opt` is read-only to the unit as well. |
+| Owner / mode | `root:root`, 755 dirs, 644 files (755 for executables) | No non-root uid can write it, the trust owner included. |
+| Build | `python3.14 -m venv` (`TRUST_PY_BASE=/usr/bin/python3.14`, what the box's current venv already resolves to), then a **non-editable** install of a wheel built from a local clone of this checkout's committed `HEAD` | The build writes nothing into the operator-writable checkout; the installed code is a copy, not a pointer back at the checkout. |
+| Packages | `willow-mcp` (the wheel, `--no-deps`), `psycopg2-binary`, `cryptography` — nothing else | Traced 2026-10-11: `python -m willow_mcp manifest-grant apply` (`__main__` dispatches before `server` loads) and the modules it calls — `manifest_grant_executor`, `trust_owner_verbs`, `mcp_federation`, `envelope_authoring`, `governance_ledger`, `human_session`, `net_signer`, `pgp` — import `psycopg2` (the FRANK ledger, `db`) and `cryptography` (ed25519 verification of the sealed pair) and no other third-party package. `mcp`, `starlette`, `kartikeya`, `jeles`, `nestor`, `ratatosk`, `forge`, `willow-gate`, `requests` and the reconciler are not pulled in. The preflight's last line imports exactly those modules from inside the venv; add a package to `TRUST_VENV_DEPS` only if that import (or a new apply-path module) needs it. |
+
+### Preflight
 
 The script refuses to start unless: it is run as root; `$H` exists; the
 `willow-operator` trust-owner user already exists (`trust_root_setup` has
 run on this box); the three unit/env files sit beside `install.sh`;
 `/etc/willow-mcp/verifiers.public.json` (the net-signer's public ring) is
-already present; **the trust owner's own python interpreter exists and is
-executable at `$H/venvs/willow-mcp/bin/python`** (Loki audit BFCC5C79, F7 —
-this is used from step 1 on, not just the withdrawal step, so a missing
-interpreter now stops before anything is touched rather than partway
-through); and `$H/env` names `WILLOW_PG_DB`.
+already present; `$H/env` names `WILLOW_PG_DB`; and **the trust owner's
+interpreter passes every check below** (Loki audit BFCC5C79, F7 — it is used
+from step 1 on, so a bad one stops before anything is touched). Each check
+prints one `[ok]` or `[FAIL]` line; any `[FAIL]` stops the script (`STOP:`),
+and `--check` prints all of them and exits 2 instead of stopping at the first:
+
+1. the interpreter exists, resolves to a regular file and is executable;
+2. every path component from `/` to it is owned by root and not group- or
+   other-writable — walked twice, once as written and once after
+   `readlink -f`, so a symlink into a writable tree is refused too;
+3. no non-root ACL entry grants write on any of those components or anything
+   inside the venv (`getfacl`; if `getfacl` is missing the check **fails
+   closed** — install the `acl` package, which this script already needs for
+   `setfacl`);
+4. everything inside the venv is owned by root and not group/other-writable;
+5. willow-mcp is installed, and nothing in the venv is editable — no
+   `__editable__*`/`_editable_impl_*` marker, `.egg-link` or
+   `easy-install.pth`, no `direct_url.json` with `"editable": true`, and no
+   `.pth` line that puts a path outside the venv on `sys.path` (for **any**
+   package, not only willow-mcp);
+6. only when 1–5 pass (root never runs an interpreter that failed them): the
+   apply path imports, with `-I`, from inside the venv;
+7. the unit file beside `install.sh` has `ExecStart=$PY -m willow_mcp
+   manifest-grant apply`, exactly.
+
+A plain install builds the venv first when it is missing or fails a check
+(step 0a below); `--rotate` and `--check-signatures` only enforce the checks.
+
+## 0a. Provision the trust-owner venv
+
+    sudo bash install.sh --provision-venv     # rebuild only this, then check it
+    sudo bash install.sh --check              # dry-run: every [ok]/[FAIL] line, changes nothing
+
+Needs, on the box: `python3.14` with `venv` (Debian/Ubuntu: `python3.14-venv`),
+`git`, `acl`, and network access to the package index for the build. The
+rebuild is destructive (`rm -rf /opt/willow-operator/venv`, then recreate):
+while it runs the apply timer fails closed. The unit and the rest of the box
+are untouched until a plain `sudo bash install.sh` repoints the unit — so the
+venv can be audited first. Re-run `--provision-venv` after pulling new
+willow-mcp source; a plain install does not rebuild a venv that already passes
+every check. Not exercised off the real box: root, the network build, the
+real two-uid run (see the legs list under `--rotate`).
 
 ## 0. Find out why mcp_apps reads uid 65534 — before touching ownership
 
@@ -358,8 +445,13 @@ name-reachable once `$H` is traversable:
   `willow-bot/`, `upstream_steward/`, `worker_heartbeat/`, plus the
   intended `mcp_apps/` and `constitutional/`;
 * NOT reachable (700/600, or granted read only where actually needed):
-  `config/`, `store/`, `venvs/`, `mcp_receipt.db`, `vault.db`, `nestor.db`
+  `config/`, `store/`, `mcp_receipt.db`, `vault.db`, `nestor.db`
   itself (never read by the apply half at all now — see the note below).
+  **`venvs/` was listed here and is not:** the box shows it `755`,
+  `sean-campbell:sean-campbell`, with `user:willow-operator:--x` and
+  `other::r-x` (measured 2026-10-11, table above) — enterable and, through
+  `other::r-x`, readable by every uid. That is why the trust owner no longer
+  uses anything under `$H/venvs/`.
 
 `$H/env` carries every provider key and is read by this unit only as root
 (`EnvironmentFile=`), never directly by `willow-operator` — but the SAME

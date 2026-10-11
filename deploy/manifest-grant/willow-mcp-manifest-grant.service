@@ -67,7 +67,7 @@ UMask=0027
 EnvironmentFile=/etc/willow-mcp/manifest-grant.env
 Environment="WILLOW_HOME=/home/sean-campbell/sean-data-vault/willow-operator-box"
 Environment="GNUPGHOME=/var/lib/willow-mcp/manifest-grant/gnupg"
-ExecStart=/home/sean-campbell/sean-data-vault/willow-operator-box/venvs/willow-mcp/bin/python -m willow_mcp manifest-grant apply
+ExecStart=/opt/willow-operator/venv/bin/python -m willow_mcp manifest-grant apply
 # The gpg-agent for GNUPGHOME above is started on demand by gpg itself; the key
 # has no passphrase, so nothing prompts (the template's own warning about a
 # prompt with nowhere to go is what this precondition removes).
