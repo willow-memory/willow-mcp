@@ -89,13 +89,42 @@ def trusted_read(path: Path, *, governance: bool = True) -> None:
         )
 
 
+def provisioned_allowed_uids(marker) -> "set[int]":
+    """The owners a governance input may have on a provisioned box: the
+    marker's trust owner or root. Never the process's own uid."""
+    from . import trust_marker
+
+    return {marker.trust_owner_uid, trust_marker._GOVERNANCE_ROOT_UID}
+
+
+def provisioned_lstat(target: Path, marker, *, want_dir: bool) -> os.stat_result:
+    """``lstat`` ``target`` and enforce the provisioned-box ownership rule
+    (same as :func:`_trusted_read_provisioned`: trust-owner- or root-owned, no
+    group/other write bit) plus: a real directory (``want_dir``) or regular
+    file, never a symlink. Returns the lstat result so a caller can pin the
+    inode it later opens. Raises ``PermissionError`` on any violation."""
+    info = os.lstat(target)
+    kind_ok = stat.S_ISDIR(info.st_mode) if want_dir else stat.S_ISREG(info.st_mode)
+    if not kind_ok:
+        raise PermissionError(
+            f"{target} is not a plain {'directory' if want_dir else 'file'} "
+            "(symlink or special file refused)"
+        )
+    if stat.S_IMODE(info.st_mode) & 0o022 or info.st_uid not in provisioned_allowed_uids(marker):
+        raise PermissionError(
+            f"untrusted ownership or permissions on {target} (uid {info.st_uid}; "
+            f"this host is trust-provisioned, so it must be owned by the trust "
+            f"owner ({marker.trust_owner_uid}) or root and not group/other-writable "
+            "-- Loki D06A0EF3)"
+        )
+    return info
+
+
 def _trusted_read_provisioned(path: Path, marker) -> None:
     """The ``trusted_read`` shape on a provisioned box: trust-owner- or
     root-owned file and parent, no group/other write bit, detached signature
     required on the file. Own-euid ownership is NOT accepted."""
-    from . import trust_marker
-
-    allowed = {marker.trust_owner_uid, trust_marker._GOVERNANCE_ROOT_UID}
+    allowed = provisioned_allowed_uids(marker)
     for target in (path.parent, path):
         if not target.exists():
             raise PermissionError(f"source path missing: {target}")

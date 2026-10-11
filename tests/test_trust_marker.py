@@ -274,8 +274,8 @@ def test_gate_accepts_forged_manifest_without_marker_hole_baseline(box, monkeypa
 
 
 def test_gate_denies_manifest_when_trust_root_raises(box, monkeypatch):
-    write_marker(box, uid=EUID + 1)
-    as_planted(monkeypatch)
+    # a trust-owner-owned manifest tree (D4.5 passes) but no usable trust root
+    write_marker(box)
     (box / "constitutional").mkdir()
     _manifest(box)
     assert gate._load_manifest("seat") is None
