@@ -34,7 +34,7 @@ _BLOCK = re.search(
 ).group(1)
 
 _UID = os.getuid()
-_TOOLS = ("bash", "awk", "find", "stat", "readlink", "sed", "head", "grep", "cat", "dirname", "env", "sh")
+_TOOLS = ("bash", "awk", "find", "stat", "readlink", "sed", "head", "grep", "cat", "dirname", "env", "sh", "sort", "touch")
 
 
 def _tool_dir(tmp_path: Path, *, getfacl: str | None) -> Path:
@@ -54,11 +54,11 @@ def _tool_dir(tmp_path: Path, *, getfacl: str | None) -> Path:
     return d
 
 
-def _run(tmp_path: Path, call: str, *, getfacl: str | None = "exit 0") -> subprocess.CompletedProcess:
+def _run(tmp_path: Path, call: str, *, getfacl: str | None = "exit 0", cwd: Path | None = None) -> subprocess.CompletedProcess:
     script = tmp_path / "_call.sh"
     script.write_text("set -euo pipefail\n" + _BLOCK + "\n" + call + "\n")
     env = {"PATH": str(_tool_dir(tmp_path, getfacl=getfacl)), "LC_ALL": "C"}
-    return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    return subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env, cwd=cwd)
 
 
 def _problems(tmp_path, fn: str, *args: str, getfacl: str | None = "exit 0") -> list[str]:
@@ -70,26 +70,53 @@ def _problems(tmp_path, fn: str, *args: str, getfacl: str | None = "exit 0") -> 
 
 class _Tree:
     """anchor/opt/venv with a fake interpreter, a willow_mcp dist-info and the
-    package directory. Everything is 755/644 and owned by the test user, who
-    stands in for root via the ROOT_UID argument."""
+    package directory, plus the base interpreter it was "made from"
+    (anchor/usr/bin/python3.13), that interpreter's standard library
+    (anchor/usr/lib/python3.13, with Debian's sitecustomize.py symlink into
+    anchor/etc/python3.13/) and the venv's pyvenv.cfg. Everything is 755/644 and
+    owned by the test user, who stands in for root via the ROOT_UID argument."""
 
     def __init__(self, tmp_path: Path):
         self.anchor = tmp_path / "anchor"
         self.venv = self.anchor / "opt" / "venv"
         self.sp = self.venv / "lib" / "python3.13" / "site-packages"
         self.py = self.venv / "bin" / "python"
+        self.base = self.anchor / "usr" / "bin" / "python3.13"
+        self.stdlib = self.anchor / "usr" / "lib" / "python3.13"
+        self.etcpy = self.anchor / "etc" / "python3.13"
+        self.ran = tmp_path / "interpreter-ran"   # a fake interpreter touches this when EXECUTED
         (self.venv / "bin").mkdir(parents=True)
         self.sp.mkdir(parents=True)
         (self.sp / "willow_mcp-1.2.3.dist-info").mkdir()
         (self.sp / "willow_mcp").mkdir()
         (self.sp / "willow_mcp" / "__init__.py").write_text("")
-        self.py.write_text(f"#!/bin/sh\necho {self.sp}/willow_mcp/__init__.py\n")
-        self.py.chmod(0o755)
+        (self.stdlib / "lib-dynload").mkdir(parents=True)
+        (self.stdlib / "os.py").write_text("")
+        (self.stdlib / "lib-dynload" / "_x.so").write_text("")
+        self.etcpy.mkdir(parents=True)
+        (self.etcpy / "sitecustomize.py").write_text("")
+        (self.stdlib / "sitecustomize.py").symlink_to("../../../etc/python3.13/sitecustomize.py")
+        self.base.parent.mkdir(parents=True)
+        self.base.write_text(f"#!/bin/sh\ntouch {self.ran}\n")
+        self.base.chmod(0o755)
+        (self.venv / "pyvenv.cfg").write_text(
+            f"home = {self.base.parent}\ninclude-system-site-packages = false\nversion = 3.13.0\n")
+        self.set_py(self.syspath())
         for d in [self.anchor, *self.anchor.rglob("*")]:
             if d.is_dir() and not d.is_symlink():
                 d.chmod(0o755)
-            elif d.is_file() and d != self.py:
+            elif d.is_file() and d not in (self.py, self.base):
                 d.chmod(0o644)
+
+    def syspath(self) -> list[str]:
+        """What a correct venv python reports for sys.path under -I."""
+        return [f"{self.anchor}/usr/lib/python313.zip", str(self.stdlib), f"{self.stdlib}/lib-dynload", str(self.sp)]
+
+    def set_py(self, syspath: list[str], last: str | None = None) -> None:
+        """The fake venv interpreter: records that it ran, prints sys.path, then willow_mcp.__file__."""
+        lines = "".join(f"echo 'SYSPATH {p}'\n" for p in syspath)
+        self.py.write_text(f"#!/bin/sh\ntouch {self.ran}\n{lines}echo {last or str(self.sp) + '/willow_mcp/__init__.py'}\n")
+        self.py.chmod(0o755)
 
     def chain(self, tmp_path, getfacl="exit 0"):
         return _problems(tmp_path, "tvc_chain_problems", str(self.anchor), str(self.py), str(_UID))
@@ -210,7 +237,7 @@ def test_py_is_one_variable_and_lives_outside_every_operator_writable_tree():
 def test_the_unit_and_install_sh_name_the_same_interpreter():
     venv = _trust_venv_from_install_sh()
     execs = [ln for ln in _UNIT.read_text().splitlines() if ln.startswith("ExecStart=")]
-    assert execs == [f"ExecStart={venv}/bin/python -m willow_mcp manifest-grant apply"]
+    assert execs == [f"ExecStart={venv}/bin/python -I -m willow_mcp manifest-grant apply"]  # F4: isolated mode
     assert _problems_unit(str(_UNIT), f"{venv}/bin/python") == []
 
 
@@ -227,7 +254,7 @@ def _problems_unit(unit: str, py: str) -> list[str]:
 
 def test_the_unit_check_refuses_a_unit_that_runs_another_interpreter(tmp_path):
     u = tmp_path / "u.service"
-    u.write_text("ExecStart=/home/x/venvs/willow-mcp/bin/python -m willow_mcp manifest-grant apply\n")
+    u.write_text("ExecStart=/home/x/venvs/willow-mcp/bin/python -I -m willow_mcp manifest-grant apply\n")
     assert _problems_unit(str(u), "/opt/willow-operator/venv/bin/python")
 
 
@@ -235,7 +262,7 @@ def test_the_preflight_is_called_with_root_uid_0_and_anchor_slash():
     """The test seam must not weaken production: every real call site passes
     uid 0 and `/`, and nothing reads either from the environment."""
     calls = re.findall(r"tvc_report [^\n]*", _INSTALL_SH.split("# END trust-venv-check", 1)[1])
-    assert calls and all(c.startswith('tvc_report "$TRUST_VENV" "$PY" 0 /') for c in calls), calls
+    assert calls and all(c.startswith('tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE"') for c in calls), calls
     assert "ROOT_UID=${" not in _INSTALL_SH and "ANCHOR=${" not in _INSTALL_SH
 
 
@@ -252,7 +279,7 @@ def test_install_sh_wires_check_provision_and_enforce():
     assert "--provision-venv" in body
     assert "enforce_trust_interpreter\n" in body.split("# END trust-venv-check", 1)[1]
     # --check reports instead of stopping, and exits non-zero on a failed line
-    assert 'tvc_report "$TRUST_VENV" "$PY" 0 / || CHECK_FAILED=1' in body
+    assert 'tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE" || CHECK_FAILED=1' in body
     assert "exit 2" in body.split("check-only: stopping before any change --", 1)[1][:400]
     # the original F7 marker text survives
     assert "trust-owner python interpreter" in body
@@ -336,7 +363,6 @@ def test_chain_follows_a_symlink_to_its_writable_target(tree, tmp_path):
 
 def test_chain_accepts_a_symlink_whose_target_is_clean(tree, tmp_path):
     real = tree.anchor / "usr" / "bin" / "python3"
-    real.parent.mkdir(parents=True)
     real.write_text("#!/bin/sh\n")
     real.chmod(0o755)
     for d in (tree.anchor / "usr", tree.anchor / "usr" / "bin"):
@@ -488,7 +514,7 @@ def test_editable_refuses_when_willow_mcp_is_absent(tree, tmp_path):
 # ---- the report (what --check prints) ---------------------------------------------------
 
 def _report(tree, tmp_path, getfacl="exit 0"):
-    r = _run(tmp_path, f"tvc_report '{tree.venv}' '{tree.py}' {_UID} '{tree.anchor}'", getfacl=getfacl)
+    r = _run(tmp_path, f"tvc_report '{tree.venv}' '{tree.py}' {_UID} '{tree.anchor}' '{tree.base}'", getfacl=getfacl)
     return r.returncode, r.stdout
 
 
@@ -496,8 +522,9 @@ def test_report_has_a_line_per_check_and_passes_a_clean_tree(tree, tmp_path):
     rc, out = _report(tree, tmp_path)
     assert rc == 0, out
     lines = out.splitlines()
-    assert len(lines) == 6 and all(ln.startswith("  [ok]") for ln in lines), out
-    for needle in ("executable", "path component", "ACL", "inside", "regular install", "imports from inside"):
+    assert len(lines) == 10 and all(ln.startswith("  [ok]") for ln in lines), out
+    for needle in ("executable", "path component", "ACL", "inside", "regular install", "imports from inside",
+                   "pyvenv.cfg", "standard library", "sitecustomize"):
         assert needle in out
 
 
@@ -841,3 +868,287 @@ def test_plant_install_md_pin_scan_catches_its_violation():
 
 def test_install_md_documents_regenerating_the_pinned_files():
     assert _install_md_pin_gaps((_DEPLOY / "INSTALL.md").read_text(encoding="utf-8")) == []
+
+
+# ---- F3: the standard library and the site hooks the interpreter loads ---------------
+# Loki pre-deploy audit of 4d7ccbf..8963929, F3: the preflight checked the venv and
+# the path to the interpreter but never the standard library, sitecustomize or
+# usercustomize that interpreter imports at start (on the operator's box:
+# /usr/lib/python3.14, /etc/python3.14/sitecustomize.py). All of it is now checked
+# BEFORE any interpreter runs (the fakes here touch `tree.ran` when executed).
+
+def _std(tree, tmp_path, fn: str, *extra: str, getfacl: str = "exit 0", ru: int = _UID) -> list[str]:
+    args = {
+        "tvc_stdlib_problems": [str(tree.anchor), str(tree.base), str(ru)],
+        "tvc_pyvenv_problems": [str(tree.venv), str(tree.base)],
+        "tvc_site_hook_problems": [str(tree.anchor), str(tree.venv), str(tree.base), str(ru)],
+        "tvc_stdlib_acl_problems": [str(tree.anchor), str(tree.venv), str(tree.base)],
+        "tvc_stdlib_dirs": [str(tree.base)],
+    }[fn]
+    return _problems(tmp_path, fn, *args, *extra, getfacl=getfacl)
+
+
+def test_a_clean_stdlib_pyvenv_and_site_hooks_report_nothing(tree, tmp_path):
+    for fn in ("tvc_stdlib_problems", "tvc_pyvenv_problems", "tvc_site_hook_problems", "tvc_stdlib_acl_problems"):
+        assert _std(tree, tmp_path, fn) == [], fn
+    assert _std(tree, tmp_path, "tvc_stdlib_dirs") == [str(tree.stdlib)]
+
+
+def test_the_stdlib_is_derived_from_the_base_name_and_path_without_running_anything(tree, tmp_path):
+    (tree.anchor / "usr" / "lib64" / "python3.13").mkdir(parents=True)
+    assert _std(tree, tmp_path, "tvc_stdlib_dirs") == [str(tree.stdlib), str(tree.anchor / "usr" / "lib64" / "python3.13")]
+    r = _run(tmp_path, f"tvc_stdlib_dirs '{tree.anchor}/usr/bin/python3' || true")   # not pythonX.Y: no guess
+    assert r.returncode == 0 and r.stdout == ""
+    assert not tree.ran.exists() and not (tree.ran.parent / "base-ran").exists()
+
+
+def test_stdlib_refuses_a_group_writable_file_inside_it(tree, tmp_path):
+    f = tree.stdlib / "os.py"
+    f.chmod(0o664)
+    out = _std(tree, tmp_path, "tvc_stdlib_problems")
+    assert out == [f"not root-owned or writable by others: {f}"], out
+
+
+def test_stdlib_refuses_a_world_writable_subdirectory_and_a_new_file_in_lib_dynload(tree, tmp_path):
+    (tree.stdlib / "lib-dynload").chmod(0o777)
+    out = _std(tree, tmp_path, "tvc_stdlib_problems")
+    assert any(str(tree.stdlib / "lib-dynload") in ln for ln in out), out
+
+
+def test_stdlib_refuses_a_writable_directory_on_the_way_to_it(tree, tmp_path):
+    (tree.anchor / "usr" / "lib").chmod(0o775)   # also what would let someone drop a python313.zip
+    out = _std(tree, tmp_path, "tvc_stdlib_problems")
+    assert any(str(tree.anchor / "usr" / "lib") in ln and "group/other-writable" in ln for ln in out), out
+
+
+def test_stdlib_refuses_every_entry_when_the_owner_is_not_the_trusted_uid(tree, tmp_path):
+    out = _std(tree, tmp_path, "tvc_stdlib_problems", ru=_UID + 1)
+    assert any("is owned by uid" in ln for ln in out) and any("not root-owned" in ln for ln in out), out
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="chown to another uid needs root")
+def test_stdlib_names_exactly_the_one_non_root_owned_file(tree, tmp_path):
+    os.chown(tree.stdlib / "os.py", 4242, 4242)
+    out = _std(tree, tmp_path, "tvc_stdlib_problems")
+    assert out == [f"not root-owned or writable by others: {tree.stdlib / 'os.py'}"], out
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="chown to another uid needs root")
+def test_site_hook_target_owned_by_another_uid_is_refused(tree, tmp_path):
+    os.chown(tree.etcpy / "sitecustomize.py", 4242, 4242)
+    out = _std(tree, tmp_path, "tvc_site_hook_problems")
+    assert any(str(tree.etcpy / "sitecustomize.py") in ln and "owned by uid 4242" in ln for ln in out), out
+
+
+def test_stdlib_follows_a_symlink_out_of_the_tree_to_a_writable_target(tree, tmp_path):
+    """Debian: sitecustomize.py is a link into /etc/pythonX.Y/. The link, the
+    directory it lands in and the file must each be unwritable."""
+    tree.etcpy.chmod(0o775)
+    out = _std(tree, tmp_path, "tvc_stdlib_problems")
+    assert any(str(tree.etcpy) in ln and "group/other-writable" in ln for ln in out), out
+    tree.etcpy.chmod(0o755)
+    (tree.etcpy / "sitecustomize.py").chmod(0o666)
+    out = _std(tree, tmp_path, "tvc_stdlib_problems")
+    assert any(str(tree.etcpy / "sitecustomize.py") in ln for ln in out), out
+
+
+def test_stdlib_refuses_a_symlink_to_a_writable_directory_tree(tree, tmp_path):
+    shared = tree.anchor / "shared"
+    (shared / "pkg").mkdir(parents=True)
+    (shared / "pkg" / "m.py").write_text("")
+    (shared / "pkg" / "m.py").chmod(0o666)
+    (tree.stdlib / "pkg").symlink_to(shared / "pkg")
+    out = _std(tree, tmp_path, "tvc_stdlib_problems")
+    assert any("m.py" in ln for ln in out), out
+
+
+def test_stdlib_missing_or_unlocatable_is_a_problem_not_a_pass(tree, tmp_path):
+    shutil.rmtree(tree.stdlib)
+    out = _std(tree, tmp_path, "tvc_stdlib_problems")
+    assert out and "cannot locate the standard library" in out[0], out
+    r = _run(tmp_path, f"tvc_stdlib_problems '{tree.anchor}' '{tree.anchor}/usr/bin/python3' {_UID}")
+    assert "cannot locate the standard library" in r.stdout
+
+
+# -- sitecustomize / usercustomize
+
+def test_site_hook_in_the_venv_site_packages_is_checked(tree, tmp_path):
+    hook = tree.sp / "sitecustomize.py"
+    hook.write_text("import os\n")
+    hook.chmod(0o664)
+    out = _std(tree, tmp_path, "tvc_site_hook_problems")
+    assert any(str(hook) in ln and "group/other-writable" in ln for ln in out), out
+
+
+def test_usercustomize_next_to_the_stdlib_is_checked(tree, tmp_path):
+    hook = tree.stdlib / "usercustomize.py"
+    hook.write_text("")
+    hook.chmod(0o666)
+    out = _std(tree, tmp_path, "tvc_site_hook_problems")
+    assert any(str(hook) in ln for ln in out), out
+
+
+def test_a_sitecustomize_in_lib_dynload_is_found(tree, tmp_path):
+    hook = tree.stdlib / "lib-dynload" / "sitecustomize.cpython-313-x86_64-linux-gnu.so"
+    hook.write_text("")
+    hook.chmod(0o666)
+    assert any(str(hook) in ln for ln in _std(tree, tmp_path, "tvc_site_hook_problems"))
+
+
+def test_a_dangling_site_hook_link_is_judged_by_the_directory_it_would_resolve_into(tree, tmp_path):
+    (tree.etcpy / "sitecustomize.py").unlink()
+    assert _std(tree, tmp_path, "tvc_site_hook_problems") == []          # dangling into a root-owned directory: inert
+    tree.etcpy.chmod(0o777)
+    out = _std(tree, tmp_path, "tvc_site_hook_problems")                 # ... but not into a writable one
+    assert any(str(tree.etcpy) in ln and "group/other-writable" in ln for ln in out), out
+
+
+# -- ACLs on the stdlib and the hooks
+
+def _acl_only_for(path: Path, body: str) -> str:
+    """A getfacl that reports `body` only when asked about `path` (so a check that stops asking is noticed)."""
+    return f'case "$*" in *"{path}"*) printf \'{body}\' ;; esac'
+
+
+def test_acl_on_the_stdlib_is_refused(tree, tmp_path):
+    fake = _acl_only_for(tree.stdlib, f"# file: {tree.stdlib}/os.py\\nuser::rw-\\nuser:mallory:rw-\\ngroup::r--\\nmask::rw-\\nother::r--\\n")
+    out = _std(tree, tmp_path, "tvc_stdlib_acl_problems", getfacl=fake)
+    assert out and "non-root write ACL" in out[0] and "user:mallory:rw-" in out[0], out
+
+
+def test_acl_on_a_site_hook_target_is_refused(tree, tmp_path):
+    fake = _acl_only_for(tree.etcpy, f"# file: {tree.etcpy}/sitecustomize.py\\ngroup:agents:rw-\\n")
+    out = _std(tree, tmp_path, "tvc_stdlib_acl_problems", getfacl=fake)
+    assert out and "group:agents" in out[0], out
+
+
+def test_acl_check_on_the_stdlib_fails_closed_without_getfacl(tree, tmp_path):
+    out = _std(tree, tmp_path, "tvc_stdlib_acl_problems", getfacl=None)
+    assert out and "cannot be performed" in out[0] and len(out) == len(set(out))
+
+
+# -- pyvenv.cfg: include-system-site-packages and friends
+
+def _cfg(tree, text: str) -> None:
+    (tree.venv / "pyvenv.cfg").write_text(text)
+
+
+@pytest.mark.parametrize("text, needle", [
+    ("home = {home}\ninclude-system-site-packages = true\n", "include-system-site-packages = true"),
+    ("home = {home}\ninclude-system-site-packages=TRUE\n", "include-system-site-packages = true"),
+    ("home = {home}\n", "no include-system-site-packages line"),
+    ("home = {home}\ninclude-system-site-packages = false\ninclude-system-site-packages = true\n", "= true"),
+    ("home = {home}\ninclude-system-site-packages = maybe\n", "not false"),
+    ("include-system-site-packages = false\n", "no home line"),
+    ("home = /somewhere/else\ninclude-system-site-packages = false\n", "not the directory of the base interpreter"),
+    ("home = {home}\ninclude-system-site-packages = false\nversion = 3.14.0\n", "version = 3.14.0"),
+])
+def test_pyvenv_cfg_refuses(tree, tmp_path, text, needle):
+    _cfg(tree, text.format(home=tree.base.parent))
+    out = _std(tree, tmp_path, "tvc_pyvenv_problems")
+    assert out and any(needle in ln for ln in out), out
+
+
+@pytest.mark.parametrize("text", [
+    "home = {home}\ninclude-system-site-packages = false\n",
+    "home={home}\ninclude-system-site-packages=False\nversion=3.13.2\n",
+    "home = {home}\ninclude-system-site-packages = true\ninclude-system-site-packages = false\n",   # last one wins, as in site.py
+    "  home  =  {home}  \n  include-system-site-packages  =  false  \nexecutable = /x\n# c\n",
+])
+def test_pyvenv_cfg_accepts(tree, tmp_path, text):
+    _cfg(tree, text.format(home=tree.base.parent))
+    assert _std(tree, tmp_path, "tvc_pyvenv_problems") == []
+
+
+def test_pyvenv_cfg_missing_or_shadowed_is_refused(tree, tmp_path):
+    (tree.venv / "bin" / "pyvenv.cfg").write_text("include-system-site-packages = false\n")
+    assert any("bin/pyvenv.cfg" in ln for ln in _std(tree, tmp_path, "tvc_pyvenv_problems"))
+    (tree.venv / "bin" / "pyvenv.cfg").unlink()
+    (tree.venv / "pyvenv.cfg").unlink()
+    assert any("no pyvenv.cfg" in ln for ln in _std(tree, tmp_path, "tvc_pyvenv_problems"))
+
+
+# -- sys.path as the interpreter really built it (run only after every check passed)
+
+def _import(tree, tmp_path, *allowed: str) -> list[str]:
+    return _problems(tmp_path, "tvc_import_problems", str(tree.venv), str(tree.py), *allowed)
+
+
+def test_import_check_accepts_the_expected_sys_path(tree, tmp_path):
+    assert _import(tree, tmp_path, str(tree.stdlib)) == []
+
+
+@pytest.mark.parametrize("extra", ["/usr/lib/python3/dist-packages", "/usr/local/lib/python3.13/dist-packages",
+                                   "/home/sean-campbell/github/willow-mcp/src", ""])
+def test_import_check_refuses_a_sys_path_entry_outside_the_venv_and_stdlib(tree, tmp_path, extra):
+    tree.set_py([*tree.syspath(), extra])
+    out = _import(tree, tmp_path, str(tree.stdlib))
+    assert out and "sys.path holds" in out[0], out
+
+
+def test_import_check_refuses_an_empty_sys_path_entry_even_when_the_cwd_is_inside_the_venv(tree, tmp_path):
+    """An empty entry means the current directory; judged by what it resolves to it could pass from inside the venv."""
+    tree.set_py([*tree.syspath(), ""])
+    r = _run(tmp_path, f"tvc_import_problems '{tree.venv}' '{tree.py}' '{tree.stdlib}'", cwd=tree.sp)
+    assert r.returncode == 0 and "sys.path holds <the current directory>" in r.stdout, (r.stdout, r.stderr)
+
+
+def test_import_check_without_allowed_dirs_refuses_the_stdlib_entries(tree, tmp_path):
+    assert any("sys.path holds" in ln for ln in _import(tree, tmp_path))
+
+
+def test_import_check_refuses_an_existing_zip_beside_the_stdlib(tree, tmp_path):
+    (tree.anchor / "usr" / "lib" / "python313.zip").write_text("")
+    out = _import(tree, tmp_path, str(tree.stdlib))
+    assert out and "python313.zip" in out[0], out
+
+
+# -- the report: lines, ordering, and not executing anything before they pass
+
+@pytest.mark.parametrize("breaker, needle", [
+    (lambda t: (t.stdlib / "os.py").chmod(0o666), "standard library"),
+    (lambda t: (t.etcpy / "sitecustomize.py").chmod(0o666), "standard library"),
+    (lambda t: (t.sp / "usercustomize.py").write_text("") or (t.sp / "usercustomize.py").chmod(0o666), "inside"),
+    (lambda t: (t.venv / "pyvenv.cfg").write_text(f"home = {t.base.parent}\ninclude-system-site-packages = true\n"), "pyvenv.cfg"),
+    (lambda t: shutil.rmtree(t.stdlib), "standard library"),
+])
+def test_report_refuses_before_executing_any_interpreter(tree, tmp_path, breaker, needle):
+    breaker(tree)
+    rc, out = _report(tree, tmp_path)
+    fail = [ln for ln in out.splitlines() if ln.startswith("  [FAIL]")]
+    assert rc == 1 and any(needle in ln for ln in fail), out
+    assert "[skip] the apply-path import check" in out
+    assert not tree.ran.exists(), "an interpreter was executed although a check failed"
+
+
+def test_report_runs_the_venv_interpreter_only_after_every_check_passed(tree, tmp_path):
+    rc, _ = _report(tree, tmp_path)
+    assert rc == 0 and tree.ran.exists() and tree.ran.read_text() == ""
+
+
+def test_report_never_executes_the_base_interpreter(tree, tmp_path):
+    ran_base = tmp_path / "base-ran"
+    tree.base.write_text(f"#!/bin/sh\ntouch {ran_base}\n")
+    _report(tree, tmp_path)
+    assert not ran_base.exists()
+
+
+def test_report_fails_every_stdlib_line_without_a_base_interpreter(tree, tmp_path):
+    r = _run(tmp_path, f"tvc_report '{tree.venv}' '{tree.py}' {_UID} '{tree.anchor}'")
+    fail = [ln for ln in r.stdout.splitlines() if ln.startswith("  [FAIL]")]
+    assert r.returncode == 1 and len(fail) == 4 and not tree.ran.exists(), r.stdout
+
+
+def test_report_sys_path_surprise_is_a_failed_import_line(tree, tmp_path):
+    tree.set_py([*tree.syspath(), "/usr/lib/python3/dist-packages"])
+    rc, out = _report(tree, tmp_path)
+    assert rc == 1 and "[FAIL] the manifest-grant apply path imports" in out and "dist-packages" in out, out
+
+
+def test_root_checks_the_base_interpreters_stdlib_before_running_it_to_build_a_venv():
+    """provision_trust_venv runs TRUST_PY_BASE as root (`-m venv`): its standard
+    library and site hooks are checked first (F3), and the report passes the base."""
+    body = _INSTALL_SH.split("provision_trust_venv() {", 1)[1].split("\n}\n", 1)[0]
+    assert body.index("tvc_stdlib_problems / ") < body.index("tvc_stdlib_acl_problems / ") < body.index('"$TRUST_PY_BASE" -I -m venv')
+    assert body.index('tvc_chain_problems / "$TRUST_PY_BASE"') < body.index("tvc_stdlib_problems / ")
+    assert 'tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE"' in body

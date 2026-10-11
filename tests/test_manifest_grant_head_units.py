@@ -31,8 +31,9 @@ _INSTALL_SH = (_DEPLOY / "install.sh").read_text(encoding="utf-8")
 _BLOCK = re.search(
     r"^# BEGIN trust-venv-check\n(.*?)^# END trust-venv-check\n", _INSTALL_SH, re.S | re.M
 ).group(1)
-_CLONE_FN = _INSTALL_SH.split("# ensure_head_clone --", 1)[1].split("# provision_trust_venv [force]", 1)[0]
-_CLONE_FN = "# ensure_head_clone --" + _CLONE_FN
+# the pre-reexec section: say/stop, the variable defaults and the function block
+# (mg_git, ensure_head_clone EXPECT, ...), up to the one call that would exec
+_CLONE_FN = "say()  { printf" + _INSTALL_SH.split("say()  { printf", 1)[1].split('if [ "${1:-}" != "--dry-run-sign" ]', 1)[0]
 _ENFORCE_FN = "enforce_trust_interpreter() {" + _INSTALL_SH.split("enforce_trust_interpreter() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
 
 _ME = subprocess.run(["id", "-gn"], capture_output=True, text=True).stdout.strip()
@@ -130,9 +131,9 @@ class _Box:
 say() {{ :; }}
 stop() {{ printf 'STOP: %s\\n' "$*" >&2; exit 2; }}
 tvc_report() {{ return 0; }}
-ensure_head_clone() {{ HEAD_CLONE="{clone}"; HEAD_SHA="{sha or self.sha}"; }}
+HEAD_CLONE="{clone}"; HEAD_SHA="{sha or self.sha}"
 TRUST_VENV="{self.venv}"; PY="{self.py}"; TVC_STAMP=.built-from-head
-TRUST_OWNER="{_ME}"; H="{_H}"; GNUPGHOME_TO="{_GNUPG}"; ETC="{self.etc}"
+TRUST_OWNER="{_ME}"; H="{_H}"; GNUPGHOME_TO="{_GNUPG}"; ETC="{self.etc}"; TRUST_PY_BASE=/usr/bin/python3.14
 {_ENFORCE_FN}
 enforce_trust_interpreter
 echo ENFORCED
@@ -172,7 +173,7 @@ say() {{ :; }}
 stop() {{ printf 'STOP: %s\\n' "$*" >&2; exit 2; }}
 CHECKOUT="{box.checkout}"
 {_CLONE_FN}
-ensure_head_clone
+ensure_head_clone "{box.sha}"
 [ "$HEAD_SHA" = "{box.sha}" ] || {{ echo "sha mismatch $HEAD_SHA" >&2; exit 1; }}
 case "$HEAD_CLONE" in "{box.checkout}"*) echo "clone is inside the checkout" >&2; exit 1 ;; esac
 src="$HEAD_CLONE/{_REL}"
@@ -214,7 +215,7 @@ def test_one_git_read_path_for_the_venv_and_the_units():
     assert len(re.findall(r"\bclone --quiet\b", _INSTALL_SH)) == 1
     assert len(re.findall(r"^ensure_head_clone\(\) \{", _INSTALL_SH, re.M)) == 1
     prov = _INSTALL_SH.split("provision_trust_venv() {", 1)[1].split("\n}\n", 1)[0]
-    assert "ensure_head_clone" in prov and "git " not in re.sub(r"#.*", "", prov).replace("git is required", "")
+    assert "git " not in re.sub(r"#.*", "", prov) and '"$TVC_BUILD/src/' in prov  # the clone the pre-reexec section made
     assert '"$HEAD_CLONE/' in _INSTALL_SH.split("enforce_trust_interpreter() {", 1)[1].split("\n}\n", 1)[0]
 
 
@@ -224,9 +225,9 @@ say() {{ :; }}
 stop() {{ printf 'STOP: %s\\n' "$*" >&2; exit 2; }}
 CHECKOUT="{box.checkout}"
 {_CLONE_FN}
-ensure_head_clone; first="$HEAD_SHA"; dir="$HEAD_CLONE"
-git -c user.email=t@t -c user.name=t -C "{box.checkout}" commit -q --allow-empty -m later
-ensure_head_clone
+ensure_head_clone "{box.sha}"; first="$HEAD_SHA"; dir="$HEAD_CLONE"
+mg_git -c user.email=t@t -c user.name=t -C "{box.checkout}" commit -q --allow-empty -m later
+ensure_head_clone "{box.sha}"
 [ "$HEAD_SHA" = "$first" ] && [ "$HEAD_CLONE" = "$dir" ] && echo SAME
 """
     r = _sh(box.tmp, body)

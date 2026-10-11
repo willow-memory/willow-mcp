@@ -18,13 +18,27 @@
 # question: every judgement left to the operator is detected here and either
 # acted on or reported as a stop.
 #
-#   sudo bash install.sh            # installs from the checkout's COMMITTED HEAD
-#   sudo bash install.sh --check    # detect-only, change nothing (reports the
+#   sudo bash install.sh --expect-head <40-hex sha>
+#                                   # installs from THAT commit (see the pin below)
+#   sudo bash install.sh --check --expect-head <sha>
+#                                   # detect-only, change nothing (reports the
 #                                   # trust-owner interpreter checks too)
-#   sudo bash install.sh --provision-venv
+#   sudo bash install.sh --provision-venv --expect-head <sha>
 #                                   # (re)build ONLY the trust-owner venv
 #                                   # (/opt/willow-operator/venv) and check it;
 #                                   # does not touch the unit or the box
+#   (also --rotate [--retire FPR ...] and --check-signatures, each with
+#   --expect-head <sha>; --dry-run-sign needs neither root nor a pin)
+#
+# Rework 6 (Loki pre-deploy audit of 4d7ccbf..8963929, F1-F4): every mode takes
+# --expect-head, the full 40-hex sha of the commit to install, copied from
+# GitHub -- NOT from the working tree (the checkout's .git is writable by the
+# operator uid and by Kart tasks, so its own HEAD proves nothing). The script
+# clones the checkout, then makes THE CLONE be that commit (a moved ref cannot
+# redirect it) and re-execs the clone's own copy of this file, so every line of
+# privileged shell and every inline python heredoc is read from the pinned
+# commit. See "THE PRE-REEXEC SECTION" below for the (small) part that still
+# runs from the copy you typed.
 #
 # Idempotent: every step converges; re-running after a stop is the intended
 # recovery. Nothing here reads the broker's env file ($H/env, 0600, provider
@@ -152,7 +166,7 @@
 # owner, so willow-mcp-manifest-grant.service, .timer and manifest-grant.env are
 # no longer installed from $HERE (the operator-writable working tree). They come
 # from the same root-owned clone of the committed HEAD the venv is built from
-# (ensure_head_clone, one per run); the clone's commit must equal the venv's
+# (ensure_head_clone, one per run, made by the pre-reexec section); the clone's commit must equal the venv's
 # .built-from-head stamp; the WHOLE unit, timer and env are checked against an
 # allowlist of the directives the committed files carry (mg_*); and after the
 # install the files really in /etc are compared to what was rendered from HEAD
@@ -160,6 +174,233 @@
 # of the three is not installed.
 
 set -euo pipefail
+
+# ==============================================================================
+# THE PRE-REEXEC SECTION -- the only part of this file that runs from the copy
+# you invoked (the working tree: writable by the operator uid, the bot and the
+# agents, and NOT pinned to anything). Loki pre-deploy audit F1: nothing used to
+# say WHICH commit root built, and this script itself, with its inline python
+# heredocs, was read from that tree. Now:
+#
+#   1. mg_pre_reexec (below) requires --expect-head <40-hex sha> in every mode,
+#      checks it is root, clones the checkout with a neutralized git
+#      (mg_git, F2), makes the clone BE that commit (a moved ref, branch, tag or
+#      HEAD in the checkout cannot redirect it), and then
+#   2. `exec`s the CLONE'S OWN copy of this file. That copy re-verifies that it
+#      is the clone's file (root-owned tree, clean, HEAD == the marker ==
+#      --expect-head), does NOT clone again, reinstalls the cleanup trap, and
+#      only then reads on past this section.
+#
+# EXACTLY what runs from the unpinned copy, and nothing else (the residual the
+# operator reviews -- `sha256sum` this file, or read this section):
+#   * this header, `set -euo pipefail`, say/stop, the variable defaults below;
+#   * the DEFINITIONS (no side effects) between `# BEGIN pre-reexec` and
+#     `# END pre-reexec`: mg_git, mg_expect_head, mg_clone_problems,
+#     mg_reexec_problems, ensure_head_clone, mg_pre_reexec;
+#   * the one call `mg_pre_reexec 0 "$@"` at the end of this section: it scans
+#     the arguments for --expect-head, checks `id -u`, takes $0's directory as the
+#     checkout, runs mktemp, mg_git clone / rev-parse / checkout, and `exec`s;
+#   * with PATH pinned to /usr/bin:/bin for all of it (sudo's own PATH is
+#     restored for the pinned copy), so the binaries are bash, env, id, mktemp,
+#     readlink, stat, find, git, rm -- root-owned system tools, assumed;
+#   * `--dry-run-sign` only: it skips the call above and the file is read on, to
+#     the variable assignments (one `id -u "$OPERATOR"`) and a `cat` of
+#     explanatory text, then exits 0. It touches nothing and needs no root.
+# Every other line of this file (functions, steps, heredocs) is parsed ONLY
+# after the exec, from the clone. A syntax error below this section therefore
+# cannot even be reached from the unpinned copy.
+# ==============================================================================
+say()  { printf '%s\n' "$*"; }
+stop() { printf 'STOP: %s\n' "$*" >&2; exit 2; }
+
+HEAD_CLONE=""
+HEAD_SHA=""
+TVC_BUILD=""
+MG_GIT_GLOBAL=/dev/null   # the "global" git config mg_git points at; only ensure_head_clone ever changes it, for one call
+MG_INSTALL_REL=deploy/manifest-grant/install.sh   # the file this is, inside the clone
+
+# BEGIN pre-reexec
+# mg_git ARGS... -- EVERY git command root runs goes through this one function
+# (tests/test_manifest_grant_pinned_head.py scans for a bare `git`). Loki F2:
+# the root clone used to consult operator-writable git configuration. Here:
+#   * `env -i` + PATH=/usr/bin:/bin + HOME=/nonexistent: no inherited GIT_*,
+#     no ~/.gitconfig, no XDG config, no GIT_EXEC_PATH/GIT_SSH/... from sudo;
+#   * GIT_CONFIG_NOSYSTEM=1 + GIT_CONFIG_SYSTEM=/dev/null + GIT_CONFIG_GLOBAL=
+#     $MG_GIT_GLOBAL (/dev/null; a root-written file holding only
+#     safe.directory for the ONE clone call -- see ensure_head_clone): the system
+#     and global config are empty or ours (NOSYSTEM alone does not cover
+#     GIT_CONFIG_SYSTEM on every git; the pair is belt and braces);
+#   * -c core.fsmonitor=false -c core.hooksPath=/dev/null: no fsmonitor program
+#     and no hook directory, whatever a repo's own config says (the root clone's
+#     own config is written by this git, but the SOURCE repo's config is
+#     operator-writable and is read by the upload-pack side of the clone);
+#   * --no-pager (+ no tty under env -i): core.pager is never run;
+#   * -c protocol.allow=never -c protocol.file.allow=always: the only transport
+#     is the local file one (no ssh/http/ext:: helper can be named by a config).
+# `clone --no-local` (ensure_head_clone) is the other half: see there.
+mg_git() {
+  /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$MG_GIT_GLOBAL" GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 \
+    git --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+        -c protocol.allow=never -c protocol.file.allow=always "$@"
+}
+
+# mg_expect_head ARGS... -- scan the command line for --expect-head and print its
+# value, lowercased, when it is a FULL 40-hex sha. Otherwise print why and
+# return 1. Missing, repeated, short/abbreviated (git would resolve an
+# abbreviation to whatever object the writable .git offers), a ref name, or
+# anything non-hex are all refused. `--retire` consumes its value the way the
+# real parser (below) does, so `--retire --expect-head` cannot hide the flag.
+mg_expect_head() {
+  local LC_ALL=C raw="" n=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --expect-head)
+        [ $# -ge 2 ] || { printf '%s\n' "--expect-head needs a value (the full 40-hex sha of the commit to install)"; return 1; }
+        raw=$2; n=$((n + 1)); shift 2 ;;
+      --retire) shift; [ $# -eq 0 ] || shift ;;
+      *) shift ;;
+    esac
+  done
+  [ "$n" -gt 0 ] || { printf '%s\n' "--expect-head <40-hex sha> is required in every mode (no default, and not read from the checkout)"; return 1; }
+  [ "$n" -eq 1 ] || { printf '%s\n' "--expect-head given $n times"; return 1; }
+  case "$raw" in
+    '' | *[!0-9a-fA-F]*) printf '%s\n' "--expect-head must be hexadecimal only, got '${raw:0:60}'"; return 1 ;;
+  esac
+  [ "${#raw}" -eq 40 ] || { printf '%s\n' "--expect-head must be the FULL 40-hex commit sha (an abbreviation or a ref is refused), got ${#raw} characters"; return 1; }
+  printf '%s\n' "${raw,,}"
+}
+
+# mg_clone_problems BUILD ROOT_UID -- the temp dir that holds the clone: owned by
+# ROOT_UID and not group/other-writable, its parent likewise (or sticky, like
+# /tmp), and nothing inside it owned by another uid or group/other-writable.
+# One `find`, not a per-file loop.
+mg_clone_problems() {
+  local build=$1 ru=$2 out st u m
+  [ -d "$build" ] && [ ! -L "$build" ] || { printf '%s is not a plain directory\n' "$build"; return 0; }
+  st=$(stat -c '%u %a' -- "$(dirname -- "$build")" 2>/dev/null) || { printf 'cannot stat the parent of %s\n' "$build"; return 0; }
+  u=${st%% *}; m=${st#* }
+  [ "$u" = "$ru" ] || printf 'the parent of %s is owned by uid %s, not %s\n' "$build" "$u" "$ru"
+  if [ $(( 8#$m & 022 )) -ne 0 ] && [ $(( 8#$m & 01000 )) -eq 0 ]; then
+    printf 'the parent of %s is group/other-writable (mode %s) and not sticky\n' "$build" "$m"
+  fi
+  out=$(find "$build" \( \( -type l ! -uid "$ru" \) -o \( ! -type l \( ! -uid "$ru" -o -perm /022 \) \) \) -print 2>/dev/null | head -8 || true)
+  [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/not owned by the installing uid or writable by others: /'
+  return 0
+}
+
+# mg_reexec_problems ROOT_UID EXPECT SELF -- what the re-exec'd copy checks about
+# itself before it trusts anything: the marker MG_REEXEC equals --expect-head;
+# SELF (this file) is the clone's own deploy/manifest-grant/install.sh by
+# realpath; the clone's directory is root-owned and unwritable; the clone's HEAD
+# is EXPECT; and the clone has no modified, untracked or ignored file (so the
+# file read, and every file built from it, is the committed one).
+mg_reexec_problems() {
+  local ru=$1 expect=$2 self=$3 build=${MG_REEXEC_BUILD:-} p head st
+  if [ "${MG_REEXEC:-}" != "$expect" ]; then
+    printf 're-exec marker %s is not --expect-head %s\n' "${MG_REEXEC:-<none>}" "$expect"; return 0
+  fi
+  [ -n "$build" ] && [ -d "$build/src" ] || { printf 'the re-exec marker names no clone (%s)\n' "${build:-<none>}"; return 0; }
+  if [ "$(readlink -f -- "$self" 2>/dev/null || true)" != "$(readlink -f -- "$build/src/$MG_INSTALL_REL" 2>/dev/null || true)" ]; then
+    printf '%s is not the clone'"'"'s own %s\n' "$self" "$build/src/$MG_INSTALL_REL"; return 0
+  fi
+  p=$(mg_clone_problems "$build" "$ru")
+  [ -z "$p" ] || { printf '%s\n' "$p"; return 0; }
+  head=$(mg_git -C "$build/src" rev-parse --verify --quiet "HEAD^{commit}" 2>/dev/null || true)
+  [ "$head" = "$expect" ] || { printf 'the clone HEAD is %s, not %s\n' "${head:-<unreadable>}" "$expect"; return 0; }
+  st=$(mg_git -C "$build/src" status --porcelain --untracked-files=all --ignored 2>&1 | head -3 || true)
+  [ -z "$st" ] || printf 'the clone is not exactly its commit: %s\n' "${st%%$'\n'*}"
+  return 0
+}
+
+# ensure_head_clone EXPECT -- the ONE root-owned clone, of commit EXPECT only.
+# Called from the main shell (sets globals and the EXIT trap that removes the
+# temp dir), by the PRE-REEXEC copy only; the re-exec'd copy never clones.
+#   * --no-local: git's own pack transport (upload-pack on the source, index-pack
+#     on the clone), not a copy/hardlink of the source's objects/ directory. A
+#     plain local clone takes the object files verbatim -- a loose object whose
+#     bytes do not hash to its name is accepted until something re-hashes it --
+#     whereas index-pack re-hashes every object it receives, so an object forged
+#     under EXPECT's name is simply absent from the clone and the run stops.
+#     (upload-pack does read the source repo's config, in mg_git's neutral
+#     environment; the hooks/programs a config can name are not run by it, and
+#     tests/test_manifest_grant_pinned_head.py plants fsmonitor, pager,
+#     packObjectsHook and a hooksPath in the source and checks none runs.)
+#   * --no-checkout, then `checkout --detach EXPECT`: the clone's HEAD and
+#     branches are whatever the (operator-writable) source advertised, so the
+#     work tree is made from EXPECT explicitly, never from where HEAD points.
+#   * EXPECT must be a COMMIT object present in the clone (`^{commit}` peels a
+#     tag, so a tag's own sha fails the equality), and HEAD is read back.
+#   * no fsck: index-pack's re-hash is the property needed, and
+#     transfer.fsckObjects would refuse legitimate old history.
+ensure_head_clone() {
+  local expect=$1 got real
+  [ -z "$HEAD_CLONE" ] || return 0
+  command -v git >/dev/null 2>&1 || stop "git is required to read willow-mcp's committed HEAD from the checkout"
+  TVC_BUILD=$(mktemp -d /tmp/willow-mg-install.XXXXXXXX)
+  trap 'rm -rf "${TVC_BUILD:-}"' EXIT
+  # upload-pack runs inside the OPERATOR'S repository as root, and git refuses a
+  # repository owned by another uid unless safe.directory names it. `-c
+  # safe.directory=` does not reach that child (git strips GIT_CONFIG_PARAMETERS
+  # for a local connection), so a root-written "global" file names exactly this
+  # one directory (upload-pack opens it as <dir>/.git, so both spellings), for
+  # this one call. Measured: without it, "detected dubious ownership in
+  # repository" stops the clone.
+  real=$(cd "$CHECKOUT" && pwd -P) || stop "cannot enter $CHECKOUT"
+  case "$real" in *[\"\\]* | *$'\n'*) stop "refusing a checkout path with a quote, backslash or newline in it: $real" ;; esac
+  printf '[safe]\n\tdirectory = "%s"\n\tdirectory = "%s/.git"\n' "$real" "$real" > "$TVC_BUILD/safe.gitconfig"
+  MG_GIT_GLOBAL="$TVC_BUILD/safe.gitconfig" mg_git clone --quiet --no-local --no-checkout "$CHECKOUT" "$TVC_BUILD/src" \
+    || stop "could not clone $CHECKOUT to read commit ${expect:0:12} from"
+  got=$(mg_git -C "$TVC_BUILD/src" rev-parse --verify --quiet "$expect^{commit}" || true)
+  [ "$got" = "$expect" ] \
+    || stop "commit $expect (--expect-head) is not a commit in $CHECKOUT's refs: push/fetch it there, or check the sha you copied (a ref moved in the checkout cannot stand in for it)"
+  mg_git -C "$TVC_BUILD/src" checkout --quiet --detach "$expect" \
+    || stop "could not check out $expect in the HEAD clone"
+  HEAD_SHA=$(mg_git -C "$TVC_BUILD/src" rev-parse --verify "HEAD^{commit}") || stop "could not read the commit of the HEAD clone"
+  [ "$HEAD_SHA" = "$expect" ] || stop "the HEAD clone is at $HEAD_SHA, not the --expect-head $expect"
+  HEAD_CLONE="$TVC_BUILD/src"
+}
+
+# mg_pre_reexec ROOT_UID ARGS... -- the whole pre-reexec behaviour. Production
+# calls it with 0 (tests pass their own uid and a fixture; nothing is read from
+# the environment except the re-exec marker the previous copy sets).
+#   not yet re-exec'd: validate, clone, verify, exec the clone's copy (never returns);
+#   re-exec'd (MG_REEXEC / MG_REEXEC_BUILD set): verify THIS file is the clone's
+#   and adopt the clone (globals + cleanup trap), then return so the pinned copy
+#   reads on. A marker that fails verification is a stop: that is the loop guard
+#   (a stale marker in the unpinned copy, a forged one, a second exec all stop).
+mg_pre_reexec() {
+  local ru=$1 orig_path=$PATH out expect
+  local PATH=/usr/bin:/bin
+  shift
+  [ "$(id -u)" = "$ru" ] || stop "run as root (sudo bash install.sh --expect-head <40-hex sha> [mode])"
+  out=$(mg_expect_head "$@") || stop "$out"
+  expect=$out
+  if [ -n "${MG_REEXEC:-}${MG_REEXEC_BUILD:-}" ]; then
+    out=$(mg_reexec_problems "$ru" "$expect" "$0")
+    [ -z "$out" ] || stop "re-exec check failed (not running on): $out"
+    TVC_BUILD=$MG_REEXEC_BUILD
+    HEAD_CLONE="$TVC_BUILD/src"
+    HEAD_SHA=$expect
+    trap 'rm -rf "${TVC_BUILD:-}"' EXIT
+    unset MG_REEXEC MG_REEXEC_BUILD
+    return 0
+  fi
+  HERE=$(cd "$(dirname "$0")" && pwd)
+  CHECKOUT=$(cd "$HERE/../.." && pwd)   # deploy/manifest-grant/ -> checkout root
+  ensure_head_clone "$expect"
+  [ -f "$HEAD_CLONE/$MG_INSTALL_REL" ] \
+    || stop "$MG_INSTALL_REL is not in commit ${expect:0:12}: that commit predates the pinned installer"
+  exec /usr/bin/env PATH="$orig_path" MG_REEXEC="$HEAD_SHA" MG_REEXEC_BUILD="$TVC_BUILD" \
+    "$BASH" "$HEAD_CLONE/$MG_INSTALL_REL" "$@" \
+    || stop "could not exec the clone's install.sh"
+}
+# END pre-reexec
+
+if [ "${1:-}" != "--dry-run-sign" ]; then
+  mg_pre_reexec 0 "$@"
+fi
+
 
 OPERATOR=${SUDO_USER:-sean-campbell}
 OPERATOR_UID=$(id -u "$OPERATOR")
@@ -204,8 +445,6 @@ TRUST_ENV="$H/constitutional/trust.env"
 # retried at the top of every run until it succeeds.
 STALE_KEY_MARKER="$H/constitutional/.stale_trust_key"
 KEY_UID='willow-mcp manifest-grant (trust owner) <manifest-grant@willow-operator-box>'
-HERE=$(cd "$(dirname "$0")" && pwd)
-CHECKOUT=$(cd "$HERE/../.." && pwd)   # deploy/manifest-grant/ -> checkout root
 BROKER_PUBLIC_KEY_NAME=broker_public_key.pub   # manifest_grant_executor._broker_public_key_path
 BROKER_UNIT_CANDIDATES=(willow-mcp-serve.service willow-mcp.service)  # reloader.DEFAULT_UNIT / unit_reload_executor._BROKER_UNIT_STEMS
 # The trust owner's OWN interpreter (operator rulings Q7=A "split" and Q13,
@@ -242,8 +481,6 @@ TRUST_BUILD_REQS_REL=deploy/manifest-grant/trust-venv.build-requirements.txt
 PY="$TRUST_VENV/bin/python"
 TVC_STAMP=.built-from-head   # inside the venv: the commit its wheel was built from
 
-say()  { printf '%s\n' "$*"; }
-stop() { printf 'STOP: %s\n' "$*" >&2; exit 2; }
 as_op() { sudo -u "$OPERATOR" XDG_RUNTIME_DIR="/run/user/$OPERATOR_UID" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$OPERATOR_UID/bus" "$@"; }
 as_to() { sudo -u "$TRUST_OWNER" GNUPGHOME="$GNUPGHOME_TO" "$@"; }
 
@@ -405,14 +642,182 @@ tvc_editable_problems() {
   return 0
 }
 
-# tvc_import_problems VENV PY -- run only AFTER every check above passed (the
-# interpreter is then root-owned): the apply path imports, from inside the venv.
+# ---- the standard library and the site hooks the interpreter loads (Loki F3) ----
+# The venv's python runs with `-I` (no cwd, no PYTHON* variables, no user site)
+# but still imports, at start, from: the standard library of the BASE
+# interpreter the venv was made from, its lib-dynload, any sitecustomize /
+# usercustomize module on that path, and the venv's own site-packages. The
+# checks above cover the venv; the functions below cover the rest, all BEFORE
+# any interpreter is executed (tvc_import_problems runs last).
+
+# tvc_stdlib_dirs BASE -- the directories holding BASE's standard library, from
+# its NAME and resolved path alone; nothing is executed. CPython derives its
+# prefix from where the executable lives (<prefix>/bin/pythonX.Y), and the
+# library is <prefix>/<platlibdir>/pythonX.Y: lib on Debian/Ubuntu, lib64 on
+# Fedora/RHEL, so both are listed when present. Prints nothing (return 1) when
+# BASE is not named pythonX.Y or no such directory exists.
+tvc_stdlib_dirs() {
+  local base=$1 name real prefix d ver found=1
+  name=${base##*/}
+  [[ $name =~ ^python([0-9]+\.[0-9]+)$ ]] || return 1
+  ver=${BASH_REMATCH[1]}
+  real=$(readlink -f -- "$base" 2>/dev/null || true)
+  [ -n "$real" ] || return 1
+  prefix=${real%/*}; prefix=${prefix%/*}
+  for d in "$prefix/lib/python$ver" "$prefix/lib64/python$ver"; do
+    [ -d "$d" ] && { printf '%s\n' "$d"; found=0; }
+  done
+  return "$found"
+}
+
+# tvc_pyvenv_problems VENV BASE -- pyvenv.cfg, read the way site.py reads it.
+# site.py defaults include-system-site-packages to TRUE when the key is absent
+# and lets the last occurrence win, so: the key must be present and its last
+# value `false`; `home` must be the directory BASE lives in; `version` (if
+# given) must be BASE's X.Y; and no bin/pyvenv.cfg may shadow the venv's own
+# (site.py looks beside the executable first). With it false, neither
+# /usr/lib/python3/dist-packages nor /usr/local/lib/pythonX.Y/dist-packages is
+# added to sys.path (tvc_import_problems confirms sys.path once it runs).
+tvc_pyvenv_problems() {
+  local venv=$1 base=$2 cfg line key val inc="" home="" ver="" name bver
+  cfg="$venv/pyvenv.cfg"
+  name=${base##*/}; bver=${name#python}
+  [ ! -e "$venv/bin/pyvenv.cfg" ] && [ ! -L "$venv/bin/pyvenv.cfg" ] || printf '%s exists: it would be read instead of %s\n' "$venv/bin/pyvenv.cfg" "$cfg"
+  [ -f "$cfg" ] || { printf 'no pyvenv.cfg in %s: not a venv, so the system site-packages would be on sys.path\n' "$venv"; return 0; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *=*) ;; *) continue ;; esac
+    key=${line%%=*}; val=${line#*=}
+    key=${key#"${key%%[![:space:]]*}"}; key=${key%"${key##*[![:space:]]}"}
+    val=${val#"${val%%[![:space:]]*}"}; val=${val%"${val##*[![:space:]]}"}
+    case "${key,,}" in
+      include-system-site-packages) inc=${val,,} ;;
+      home) home=$val ;;
+      version) ver=$val ;;
+    esac
+  done < "$cfg"
+  case "$inc" in
+    false) ;;
+    true) printf 'pyvenv.cfg: include-system-site-packages = true (the system site-packages and dist-packages would be on sys.path)\n' ;;
+    '') printf 'pyvenv.cfg has no include-system-site-packages line (site.py then defaults to true)\n' ;;
+    *) printf 'pyvenv.cfg: include-system-site-packages = %s, not false\n' "${inc:0:20}" ;;
+  esac
+  if [ -z "$home" ]; then
+    printf 'pyvenv.cfg has no home line\n'
+  elif [ "$(readlink -f -- "$home" 2>/dev/null || printf '%s' "$home")" != "$(readlink -f -- "$(dirname -- "$base")" 2>/dev/null || true)" ]; then
+    printf 'pyvenv.cfg: home = %s, not the directory of the base interpreter %s\n' "$home" "$base"
+  fi
+  case "$ver" in
+    '') ;;
+    "$bver"|"$bver".*) ;;
+    *) printf 'pyvenv.cfg: version = %s, not the base interpreter'"'"'s %s\n' "$ver" "$bver" ;;
+  esac
+  return 0
+}
+
+# tvc_stdlib_problems ANCHOR BASE ROOT_UID -- the standard library directories:
+# the path chain to each (every component root-owned, none group/other-writable;
+# /usr/lib being among them also means nobody can create a python3XX.zip next to
+# the library, which is on sys.path), and one `find` over the tree for any entry
+# not owned by ROOT_UID or (non-symlink) group/other-writable; plus the
+# resolved target of every symlink that points OUT of the tree (Debian links
+# sitecustomize.py to /etc/pythonX.Y/), each on its own chain.
+tvc_stdlib_problems() {
+  local anchor=$1 base=$2 ru=$3 d t sreal
+  local -a dirs
+  mapfile -t dirs < <(tvc_stdlib_dirs "$base" || true)
+  [ "${#dirs[@]}" -gt 0 ] || { printf 'cannot locate the standard library of %s (expected <prefix>/lib/pythonX.Y beside its bin/)\n' "$base"; return 0; }
+  for d in "${dirs[@]}"; do
+    tvc_chain_problems "$anchor" "$d" "$ru"
+    tvc_tree_problems "$d" "$ru"
+    sreal=$(readlink -f -- "$d")
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      case "$t" in "$sreal"|"$sreal"/*) continue ;; esac
+      tvc_chain_problems "$anchor" "$t" "$ru"
+      [ ! -d "$t" ] || tvc_tree_problems "$t" "$ru"
+    done < <(find "$d" -type l -exec readlink -f -- {} + 2>/dev/null | sort -u || true)
+  done | awk '!seen[$0]++'
+  return 0
+}
+
+# tvc_site_hooks VENV BASE -- every sitecustomize*/usercustomize* the interpreter
+# could import, one path per line: in the standard library, its lib-dynload and
+# the venv's site-packages (the only directories on sys.path in -I mode).
+tvc_site_hooks() {
+  local venv=$1 base=$2 d f n
+  local -a roots
+  mapfile -t roots < <(tvc_stdlib_dirs "$base" || true)
+  for d in ${roots[@]+"${roots[@]}"}; do roots+=("$d/lib-dynload"); done
+  for d in "$venv"/lib/python*/site-packages "$venv"/lib64/python*/site-packages; do roots+=("$d"); done
+  for d in ${roots[@]+"${roots[@]}"}; do
+    for n in sitecustomize usercustomize; do
+      for f in "$d/$n" "$d/$n".*; do
+        if [ -e "$f" ] || [ -L "$f" ]; then printf '%s\n' "$f"; fi
+      done
+    done
+  done | awk '!seen[$0]++'
+  return 0
+}
+
+# tvc_site_hook_problems ANCHOR VENV BASE ROOT_UID -- each hook found, resolved
+# with readlink -m: the file (or, when the link dangles, its directory) must sit
+# on a chain of root-owned, not group/other-writable components.
+tvc_site_hook_problems() {
+  local anchor=$1 venv=$2 base=$3 ru=$4 f t
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    t=$(readlink -m -- "$f" 2>/dev/null || true)
+    if [ -z "$t" ]; then printf 'cannot resolve %s\n' "$f"
+    elif [ -e "$t" ]; then tvc_chain_problems "$anchor" "$t" "$ru"
+    else tvc_chain_problems "$anchor" "$(dirname -- "$t")" "$ru"
+    fi
+  done < <(tvc_site_hooks "$venv" "$base") | awk '!seen[$0]++'
+  return 0
+}
+
+# tvc_stdlib_acl_problems ANCHOR VENV BASE -- tvc_acl_problems over the standard
+# library (chain + recursive) and over every site hook's resolved target.
+tvc_stdlib_acl_problems() {
+  local anchor=$1 venv=$2 base=$3 d f t
+  {
+    while IFS= read -r d; do
+      [ -n "$d" ] || continue
+      tvc_acl_problems "$anchor" "$d" "$d"
+    done < <(tvc_stdlib_dirs "$base" || true)
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      t=$(readlink -m -- "$f" 2>/dev/null || true)
+      if [ -e "$t" ]; then tvc_acl_problems "$anchor" "$t" "$t"; fi
+    done < <(tvc_site_hooks "$venv" "$base")
+  } | awk '!seen[$0]++'
+  return 0
+}
+
+# tvc_import_problems VENV PY [ALLOWED_DIR ...] -- run only AFTER every check above
+# passed (the interpreter is then root-owned): the apply path imports, from
+# inside the venv, and every sys.path entry the interpreter really built lies in
+# the venv or in an ALLOWED_DIR (the checked standard library); a not-yet-existing
+# python3XX.zip beside the library is allowed (its directory was chain-checked).
 tvc_import_problems() {
-  local venv=$1 py=$2 out loc vreal
-  out=$("$py" -I -c 'import psycopg2, cryptography, willow_mcp, willow_mcp.cli_manifest_grant, willow_mcp.trust_owner_verbs, willow_mcp.manifest_grant_executor, willow_mcp.mcp_federation, willow_mcp.envelope_authoring; print(willow_mcp.__file__)' 2>&1) \
+  local venv=$1 py=$2 out line loc vreal r ok d
+  shift 2
+  out=$("$py" -I -c 'import sys, psycopg2, cryptography, willow_mcp, willow_mcp.cli_manifest_grant, willow_mcp.trust_owner_verbs, willow_mcp.manifest_grant_executor, willow_mcp.mcp_federation, willow_mcp.envelope_authoring; [print("SYSPATH " + p) for p in sys.path]; print(willow_mcp.__file__)' 2>&1) \
     || { printf 'the apply path does not import: %s\n' "${out##*$'\n'}"; return 0; }
-  loc=$(readlink -f -- "${out##*$'\n'}" 2>/dev/null || true)
   vreal=$(readlink -f -- "$venv" 2>/dev/null || printf '%s' "$venv")
+  while IFS= read -r line; do
+    case "$line" in SYSPATH\ *) ;; *) continue ;; esac
+    line=${line#SYSPATH }
+    r=$(readlink -m -- "${line:-.}" 2>/dev/null || true)
+    ok=""
+    case "$r" in "$vreal"|"$vreal"/*) ok=1 ;; esac
+    for d in "$@"; do
+      d=$(readlink -f -- "$d" 2>/dev/null || true)
+      case "$r" in "$d"|"$d"/*) ok=1 ;; esac
+      if [ ! -e "$r" ] && [ "${r%/*}" = "${d%/*}" ]; then ok=1; fi
+    done
+    [ -n "$ok" ] && [ -n "$line" ] || printf 'sys.path holds %s, outside the venv and the checked standard library\n' "${line:-<the current directory>}"
+  done <<<"$out"
+  loc=$(readlink -f -- "${out##*$'\n'}" 2>/dev/null || true)
   case "$loc" in "$vreal"/*) ;; *) printf 'willow_mcp imports from %s, outside the venv\n' "$loc" ;; esac
   return 0
 }
@@ -450,9 +855,12 @@ tvc_emit() {
   return 1
 }
 
-# tvc_report VENV PY ROOT_UID ANCHOR -- one line per check; 0 only if all pass.
+# tvc_report VENV PY ROOT_UID ANCHOR BASE -- one line per check; 0 only if all pass.
+# BASE is the system interpreter the venv was built from (TRUST_PY_BASE); the
+# standard-library checks (F3) are derived from it without executing anything.
 tvc_report() {
-  local venv=$1 py=$2 ru=$3 anchor=$4 rc=0 p real v
+  local venv=$1 py=$2 ru=$3 anchor=$4 base=${5:-} rc=0 p real v
+  local -a sdirs
   real=$(readlink -f -- "$py" 2>/dev/null || true)
   p=""
   if [ ! -e "$py" ]; then p="no such file: $py"
@@ -461,7 +869,7 @@ tvc_report() {
   fi
   tvc_emit "interpreter exists and is executable ($py)" "$p" || rc=1
   if [ -n "$p" ]; then
-    printf '  [skip] path chain, ACLs, venv tree, editable-install and import checks (no interpreter to check)\n'
+    printf '  [skip] path chain, ACLs, venv tree, editable-install, standard-library and import checks (no interpreter to check)\n'
     return 1
   fi
   p=$(tvc_chain_problems "$anchor" "$py" "$ru")
@@ -473,9 +881,29 @@ tvc_report() {
   p=$(tvc_editable_problems "$venv")
   v=$(tvc_installed_version "$venv")
   tvc_emit "willow_mcp ${v:-?} is a regular install; nothing in the venv is editable or puts a path outside it on sys.path" "$p" || rc=1
+  # F3: what the interpreter loads that is NOT in the venv. No interpreter runs here.
+  if [ -z "$base" ]; then
+    p="no base interpreter was given, so the standard library cannot be located"
+  else
+    p=$(tvc_pyvenv_problems "$venv" "$base")
+  fi
+  tvc_emit "pyvenv.cfg: include-system-site-packages = false, home and version are the base interpreter's (no system dist-packages on sys.path)" "$p" || rc=1
+  if [ -n "$base" ]; then
+    p=$(tvc_stdlib_problems "$anchor" "$base" "$ru")
+  fi
+  tvc_emit "the standard library of ${base:-?} (path chain, tree, symlink targets) is owned by uid $ru and not group/other-writable" "$p" || rc=1
+  if [ -n "$base" ]; then
+    p=$(tvc_stdlib_acl_problems "$anchor" "$venv" "$base")
+  fi
+  tvc_emit "no non-root write ACL on the standard library, its path chain or the site hooks" "$p" || rc=1
+  if [ -n "$base" ]; then
+    p=$(tvc_site_hook_problems "$anchor" "$venv" "$base" "$ru")
+  fi
+  tvc_emit "sitecustomize / usercustomize (stdlib, lib-dynload, venv site-packages), if any, resolve to root-owned files on unwritable path chains" "$p" || rc=1
   if [ "$rc" = 0 ]; then
-    p=$(tvc_import_problems "$venv" "$py")
-    tvc_emit "the manifest-grant apply path imports from inside the venv" "$p" || rc=1
+    mapfile -t sdirs < <(tvc_stdlib_dirs "$base" || true)
+    p=$(tvc_import_problems "$venv" "$py" ${sdirs[@]+"${sdirs[@]}"})
+    tvc_emit "the manifest-grant apply path imports from inside the venv, and every sys.path entry is in the venv or the checked standard library" "$p" || rc=1
   else
     printf '  [skip] the apply-path import check (not executing an interpreter that failed the checks above)\n'
   fi
@@ -543,7 +971,7 @@ mg_line() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
 
 # mg_service_problems UNIT PY TRUST_OWNER H GNUPGHOME ETC -- the whole service
 # unit: the directive set the committed unit carries, User/Group the trust
-# owner, ExecStart exactly "$PY -m willow_mcp manifest-grant apply", the two
+# owner, ExecStart exactly "$PY -I -m willow_mcp manifest-grant apply", the two
 # Environment= lines and the one EnvironmentFile= expected, every hardening
 # directive present, and NO other line (so no ExecStartPre/Post/Stop*/Reload,
 # no second ExecStart, no drop-in style extras).
@@ -560,7 +988,7 @@ mg_service_problems() {
     mg_line R '[Service]' "EnvironmentFile=$etc/$MG_ENV"
     mg_line R '[Service]' "Environment=\"WILLOW_HOME=$h\""
     mg_line R '[Service]' "Environment=\"GNUPGHOME=$gnupg\""
-    mg_line R '[Service]' "ExecStart=$py -m willow_mcp manifest-grant apply"
+    mg_line R '[Service]' "ExecStart=$py -I -m willow_mcp manifest-grant apply"
     mg_line R '[Service]' 'NoNewPrivileges=true'
     mg_line R '[Service]' 'PrivateTmp=true'
     mg_line R '[Service]' 'ProtectSystem=strict'
@@ -697,29 +1125,6 @@ mg_report() {
 }
 # END trust-venv-check
 
-# ensure_head_clone -- the ONE root-owned clone of the checkout's COMMITTED HEAD
-# per run. Everything root installs from the checkout is read from it and from
-# nowhere else: the venv's wheel and hash-pinned requirements
-# (provision_trust_venv) and the unit, timer and env template (step 4, the
-# validation, --check). HEAD_SHA is its commit; the venv's stamp must equal it.
-# An uncommitted edit in the working tree is not in the clone, so it is not
-# installed. Called from the main shell (not a subshell): it sets globals and
-# the EXIT trap that removes the temp dir.
-HEAD_CLONE=""
-HEAD_SHA=""
-TVC_BUILD=""
-ensure_head_clone() {
-  [ -z "$HEAD_CLONE" ] || return 0
-  command -v git >/dev/null 2>&1 || stop "git is required to read willow-mcp's committed HEAD from the checkout"
-  TVC_BUILD=$(mktemp -d)
-  trap 'rm -rf "${TVC_BUILD:-}"' EXIT
-  git -c safe.directory="$CHECKOUT" clone --quiet --no-hardlinks "$CHECKOUT" "$TVC_BUILD/src" \
-    || stop "could not clone $CHECKOUT to read its committed HEAD from"
-  HEAD_SHA=$(git -C "$TVC_BUILD/src" rev-parse HEAD) || stop "could not read the commit of the HEAD clone"
-  [ -n "$HEAD_SHA" ] || stop "the HEAD clone of $CHECKOUT has no commit"
-  HEAD_CLONE="$TVC_BUILD/src"
-}
-
 # provision_trust_venv [force] -- root builds $TRUST_VENV from this checkout.
 # Skipped when the venv already passes every check, unless forced
 # (--provision-venv). Rebuilds from the checkout's COMMITTED HEAD (a local
@@ -728,24 +1133,28 @@ ensure_head_clone() {
 provision_trust_venv() {
   local force=${1:-} problems head_built reqs build_reqs f
   local -a wheels
-  ensure_head_clone
   # The privileged steps (rotate_resign, sync_constitutional,
   # seed_envelope_ratify, the constitutional seed bundle) now run FROM the
   # venv, so a venv built from an older HEAD would run older steps than the
   # checkout holds: skip only when it passes every check AND was built from the
   # checkout's current HEAD (the stamp is written below, inside the venv).
-  if [ -z "$force" ] && tvc_report "$TRUST_VENV" "$PY" 0 / >/dev/null 2>&1; then
+  if [ -z "$force" ] && tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE" >/dev/null 2>&1; then
     head_built=$(cat "$TRUST_VENV/$TVC_STAMP" 2>/dev/null || true)
     if [ -n "$HEAD_SHA" ] && [ "$HEAD_SHA" = "$head_built" ]; then
-      say "== 0a. trust-owner venv $TRUST_VENV already passes every check and was built from HEAD ${HEAD_SHA:0:12} -- not rebuilt (sudo bash install.sh --provision-venv rebuilds it from this checkout)"
+      say "== 0a. trust-owner venv $TRUST_VENV already passes every check and was built from HEAD ${HEAD_SHA:0:12} -- not rebuilt (sudo bash install.sh --provision-venv --expect-head <sha> rebuilds it from that commit)"
       return 0
     fi
     say "== 0a. trust-owner venv $TRUST_VENV passes its checks but its recorded build commit (${head_built:0:12}) is not the checkout HEAD (${HEAD_SHA:0:12}) -- rebuilding so the privileged steps and the units match the checkout"
   fi
-  say "== 0a. build the trust-owner venv at $TRUST_VENV (root:root, non-editable, from $CHECKOUT)"
+  say "== 0a. build the trust-owner venv at $TRUST_VENV (root:root, non-editable, from the committed HEAD ${HEAD_SHA:0:12})"
   [ -x "$TRUST_PY_BASE" ] || stop "$TRUST_PY_BASE is not executable -- the trust-owner venv is built from the root-owned system python (edit TRUST_PY_BASE in install.sh if this box's system python is another version)"
   problems=$(tvc_chain_problems / "$TRUST_PY_BASE" 0)
   [ -z "$problems" ] || stop "the base interpreter $TRUST_PY_BASE is itself not root-owned and unwritable: $problems"
+  # F3: root runs this interpreter below (the build venv, `-m venv`), so the
+  # standard library and the site hooks it loads are checked first, no
+  # interpreter executed.
+  problems=$(tvc_stdlib_problems / "$TRUST_PY_BASE" 0; tvc_stdlib_acl_problems / "$TRUST_VENV" "$TRUST_PY_BASE")
+  [ -z "$problems" ] || stop "the standard library of the base interpreter $TRUST_PY_BASE is not root-owned and unwritable (or carries a non-root write ACL): $problems"
   # Both hash-pinned files come from the committed HEAD in the root-owned clone.
   reqs="$TVC_BUILD/src/$TRUST_REQS_REL"; build_reqs="$TVC_BUILD/src/$TRUST_BUILD_REQS_REL"
   for f in "$reqs" "$build_reqs"; do
@@ -762,7 +1171,7 @@ provision_trust_venv() {
   ( umask 022; "$TVC_BUILD/buildvenv/bin/python" -I -m pip install --quiet --require-hashes --only-binary=:all: --no-deps -r "$build_reqs" ) \
     || stop "pip could not install the hash-pinned build tools from ${build_reqs#"$TVC_BUILD/src/"} (a hash mismatch refuses the install)"
   ( umask 022; "$TVC_BUILD/buildvenv/bin/python" -I -m pip wheel --quiet --no-deps --no-build-isolation --no-index --wheel-dir "$TVC_BUILD/wheels" "$TVC_BUILD/src" ) \
-    || stop "could not build a willow-mcp wheel from $CHECKOUT"
+    || stop "could not build a willow-mcp wheel from the committed HEAD ${HEAD_SHA:0:12}"
   mapfile -t wheels < <(find "$TVC_BUILD/wheels" -maxdepth 1 -name 'willow_mcp-*.whl')
   [ "${#wheels[@]}" = 1 ] || stop "expected exactly one willow_mcp wheel, found ${#wheels[@]}"
   rm -rf -- "$TRUST_VENV"
@@ -778,19 +1187,18 @@ provision_trust_venv() {
   chown -R root:root "$TRUST_VENV"
   chmod -R u=rwX,go=rX "$TRUST_VENV"
   say "  installed ${wheels[0]##*/} (non-editable) + the hash-pinned dependencies in ${TRUST_REQS_REL##*/}"
-  tvc_report "$TRUST_VENV" "$PY" 0 / || stop "the venv just built failed its own preflight -- see the FAIL lines above"
+  tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE" || stop "the venv just built failed its own preflight -- see the FAIL lines above"
 }
 
 # enforce_trust_interpreter -- the preflight: refuse (stop) unless every check passes.
 enforce_trust_interpreter() {
   local up
-  ensure_head_clone
-  tvc_report "$TRUST_VENV" "$PY" 0 / \
-    || stop "trust-owner python interpreter at $PY failed the preflight (FAIL lines above): it must exist, be executable, sit on a path no non-root uid can write, and be a non-editable install -- Loki audit BFCC5C79 F7, operator rulings Q7=A/Q13. A plain 'sudo bash install.sh' or 'sudo bash install.sh --provision-venv' builds it."
+  tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE" \
+    || stop "trust-owner python interpreter at $PY failed the preflight (FAIL lines above): it must exist, be executable, sit on a path no non-root uid can write, and be a non-editable install -- Loki audit BFCC5C79 F7, operator rulings Q7=A/Q13. A plain 'sudo bash install.sh --expect-head <sha>' or 'sudo bash install.sh --provision-venv --expect-head <sha>' builds it."
   # The units and the venv come from one commit, and the committed unit, timer
   # and env are each exactly the expected directive set (mg_*, above).
   up=$(mg_stamp_problems "$TRUST_VENV/$TVC_STAMP" "$HEAD_SHA")
-  [ -z "$up" ] || stop "$up -- the units and the venv must come from the same commit; sudo bash install.sh --provision-venv rebuilds the venv from the checkout's committed HEAD"
+  [ -z "$up" ] || stop "$up -- the units and the venv must come from the same commit; sudo bash install.sh --provision-venv --expect-head <sha> rebuilds the venv from that commit"
   up=$(mg_service_problems "$HEAD_CLONE/$MG_DEPLOY_REL/$MG_SERVICE" "$PY" "$TRUST_OWNER" "$H" "$GNUPGHOME_TO" "$ETC")
   [ -z "$up" ] || stop "$MG_SERVICE (committed HEAD ${HEAD_SHA:0:12}) is not the expected unit -- it must carry exactly the allowlisted directives and name the same interpreter as install.sh: $up"
   up=$(mg_timer_problems "$HEAD_CLONE/$MG_DEPLOY_REL/$MG_TIMER")
@@ -863,10 +1271,15 @@ while [ $# -gt 0 ]; do
     --check-signatures) CHECK_SIGNATURES=1; shift ;;
     --rotate) ROTATE=1; shift ;;
     --provision-venv) PROVISION_VENV=1; shift ;;
+    --expect-head)
+      # already validated (full 40-hex, exactly once) and equal to the clone's
+      # commit by the pre-reexec section; the value is consumed here.
+      [ $# -ge 2 ] || stop "--expect-head requires the full 40-hex commit sha"
+      shift 2 ;;
     --retire)
       [ $# -ge 2 ] || stop "--retire requires a fingerprint argument"
       RETIRE_FPRS+=("$2"); shift 2 ;;
-    *) stop "unknown argument: $1 (known: --check, --check-signatures, --provision-venv, --rotate, --retire FPR, --dry-run-sign)" ;;
+    *) stop "unknown argument: $1 (known: --expect-head SHA, --check, --check-signatures, --provision-venv, --rotate, --retire FPR, --dry-run-sign)" ;;
   esac
 done
 
@@ -877,7 +1290,7 @@ done
 # because `--check`'s own gate only fired AFTER `--rotate` had already
 # exited. Both are refused up front, before anything is touched.
 if [ "${#RETIRE_FPRS[@]}" -gt 0 ] && [ -z "$ROTATE" ]; then
-  stop "--retire only makes sense with --rotate (there is no key being replaced to retire the old one for). Did you mean: sudo bash install.sh --rotate --retire ${RETIRE_FPRS[0]}?"
+  stop "--retire only makes sense with --rotate (there is no key being replaced to retire the old one for). Did you mean: sudo bash install.sh --rotate --retire ${RETIRE_FPRS[0]} --expect-head <sha>?"
 fi
 if [ -n "$CHECK_ONLY" ] && [ -n "$ROTATE" ]; then
   stop "--check and --rotate are mutually exclusive: --check inspects and changes nothing, --rotate mutates. Use --check-signatures first if you want a read-only pre-check, then --rotate."
@@ -888,7 +1301,8 @@ if [ -n "$PROVISION_VENV" ] && [ -n "$CHECK_ONLY$ROTATE$CHECK_SIGNATURES" ]; the
 fi
 
 # ---------------------------------------------------------------- preflight
-[ "$(id -u)" = 0 ] || stop "run as root (sudo bash install.sh)"
+[ "$(id -u)" = 0 ] || stop "run as root (sudo bash install.sh --expect-head <40-hex sha>)"
+say "== pinned: this is the clone's own install.sh at commit $HEAD_SHA (--expect-head matched); nothing from here on is read from the working tree"
 # --provision-venv: build and check the trust-owner venv, touch nothing else, so
 # the venv can be audited BEFORE the unit is repointed at it (the unit and the
 # rest of the box change only on a plain install).
@@ -898,9 +1312,9 @@ if [ -n "$PROVISION_VENV" ]; then
 fi
 [ -d "$H" ] || stop "operator box not found at $H"
 id "$TRUST_OWNER" >/dev/null 2>&1 || stop "user $TRUST_OWNER does not exist — trust_root_setup has not run on this box"
-# The units and the env template are read from the committed HEAD (one
-# root-owned clone, ensure_head_clone), never from the working tree.
-ensure_head_clone
+# The units and the env template are read from the committed HEAD (the one
+# root-owned clone the pre-reexec section made, pinned by --expect-head), never
+# from the working tree.
 for f in "$MG_ENV" "$MG_SERVICE" "$MG_TIMER"; do
   [ -f "$HEAD_CLONE/$MG_DEPLOY_REL/$f" ] || stop "$MG_DEPLOY_REL/$f is not in the committed HEAD ${HEAD_SHA:0:12} -- commit it first (an uncommitted file is never installed)"
 done
@@ -914,7 +1328,7 @@ PG_DB=$(grep -E '^WILLOW_PG_DB=' "$H/env" | tail -1 | cut -d= -f2- || true)
 # fails a check, then enforces.
 if [ -n "$CHECK_ONLY" ]; then
   say "== trust-owner interpreter $PY"
-  tvc_report "$TRUST_VENV" "$PY" 0 / || CHECK_FAILED=1
+  tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE" || CHECK_FAILED=1
   say "== units and env from the committed HEAD ${HEAD_SHA:0:12}"
   mg_report "$HEAD_CLONE" "$PY" "$TRUST_OWNER" "$H" "$GNUPGHOME_TO" "$ETC" "$SYSD" "$TRUST_VENV/$TVC_STAMP" "$HEAD_SHA" "$PG_DB" || CHECK_FAILED=1
 else
@@ -1574,7 +1988,7 @@ install -d -m 755 "$ETC"
 # A38D41C2's F8 measured, since uid willow-operator could never read $H/env
 # to check it against the source — is gone, not merely re-synced.
 # Rework 5: the template, the unit and the timer are read from the committed
-# HEAD clone (ensure_head_clone), rendered/validated there, installed from
+# HEAD clone (the pre-reexec section's ensure_head_clone), rendered/validated there, installed from
 # there, and then the files really in /etc are compared to that render.
 MG_SRC="$HEAD_CLONE/$MG_DEPLOY_REL"
 MG_STAGE="$TVC_BUILD/stage"

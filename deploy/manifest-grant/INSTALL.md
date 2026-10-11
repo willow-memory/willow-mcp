@@ -11,22 +11,72 @@ this document used to walk through one keyboard line at a time are no longer
 the operator's to type; `install.sh` (beside this file) collapses them into
 one root act:
 
-    sudo bash install.sh                       # do it (from the COMMITTED HEAD: commit
+    sudo bash install.sh --expect-head <sha>     # do it, from THAT commit (commit and push
                                                  # before you install)
-    sudo bash install.sh --check               # detect-only, change nothing — stops
+    sudo bash install.sh --check --expect-head <sha>
+                                                 # detect-only, change nothing — stops
                                                  # after step 0, before any mutation;
                                                  # prints one [ok]/[FAIL] line per
                                                  # trust-owner-interpreter check, one per
                                                  # unit/timer/env check, and any drift of
                                                  # /etc from the committed HEAD; exits 2 if
                                                  # any fails
-    sudo bash install.sh --provision-venv       # build (or rebuild) ONLY the trust-owner
+    sudo bash install.sh --provision-venv --expect-head <sha>
+                                                 # build (or rebuild) ONLY the trust-owner
                                                  # venv, check it, touch nothing else
-    sudo bash install.sh --check-signatures     # read-only: which fingerprint does
+    sudo bash install.sh --check-signatures --expect-head <sha>
+                                                 # read-only: which fingerprint does
                                                  # each governed file verify under, right now
-    sudo bash install.sh --rotate [--retire FPR ...]
+    sudo bash install.sh --rotate [--retire FPR ...] --expect-head <sha>
                                                  # generate a new trust-owner signing key,
                                                  # re-sign everything, THEN retire old key(s)
+
+## Which commit: `--expect-head <40-hex sha>` (Loki pre-deploy audit F1)
+
+**Every mode takes `--expect-head`, with the full 40-hex commit sha, and refuses
+to start without it** — plain install, `--check`, `--provision-venv`,
+`--rotate`, `--check-signatures` (only `--dry-run-sign`, which prints text and
+touches nothing, needs neither root nor a sha). A missing, abbreviated (7 or 39
+characters), non-hex or doubled value, a branch or tag name, `HEAD`, and the
+form `--expect-head=<sha>` are all refused before anything is cloned. Uppercase hex is
+accepted and lowercased.
+
+**Where the sha comes from — not from the checkout.** Take it from GitHub, in a
+normal shell on a machine and account that is not the one being installed from:
+
+    git ls-remote https://github.com/willow-memory/willow-mcp <branch>     # the 40-hex on the line for refs/heads/<branch>
+
+or the branch page / the commit page on GitHub (the full sha, not the 7-character
+form). The checkout's own `git rev-parse HEAD` is **not** a trustworthy source: its
+`.git` is writable by the operator uid (the shell, the bot, the agents) and by
+Kart tasks, so HEAD, branches, `packed-refs` and even the object files can be
+rewritten, and `rev-parse` then faithfully prints the rewritten answer. The sha is
+a check only because it reaches the script from outside the thing it checks. The
+commit must also exist in the checkout (`git fetch` first, as the operator, if it
+does not); nothing is fetched from the network by the script.
+
+**What the script does with it.** It clones the checkout (`git clone --no-local
+--no-checkout`, so every object is re-hashed on receipt and an object forged
+under the expected name is simply absent), checks out exactly that sha detached
+(a moved HEAD, branch or tag in the checkout cannot redirect it; a sha that is not
+a commit in the clone stops the run), and then **`exec`s the clone's own copy of
+`deploy/manifest-grant/install.sh`** before any privileged action. That copy
+re-verifies that it is the clone's file (root-owned unwritable clone, clean
+tree, `HEAD` equal to the sha), does not clone again, and only then reads on:
+every line of shell and every inline python heredoc below the pre-reexec
+section comes from the pinned commit. The unpinned file you typed runs only
+the section marked `THE PRE-REEXEC SECTION` at the top of `install.sh` —
+argument scan, the root check, `mktemp`, `mg_git clone / rev-parse / checkout`,
+`exec` — with git run under a neutral environment (`env -i`, no system, global
+or user config, no hooks, no fsmonitor, no pager, file transport only). That
+section is the residual to review. To check the file you are about to run
+against the commit you are about to install:
+
+    curl -fsSL https://raw.githubusercontent.com/willow-memory/willow-mcp/<sha>/deploy/manifest-grant/install.sh | sha256sum
+    sha256sum deploy/manifest-grant/install.sh                              # the two must match
+
+Every command below therefore carries `--expect-head <sha>`; write the same sha
+on each (re-run `git ls-remote` if the branch moved).
 
 Dispatch `B291C0C7` ("one signing key, one source of truth", amending
 `A9BF01A9`; reworked by `E29CCFC7`/`0CB0C85C`/`38CA74F2` per Loki audits
@@ -133,7 +183,7 @@ step 3 opened. If step 4 stops partway, the box stays down in the same
 fail-closed state — rerunning `install.sh` (idempotent) is the recovery,
 not a rollback.
 
-1. **Read-only check first.** `sudo bash install.sh --check-signatures`.
+1. **Read-only check first.** `sudo bash install.sh --expect-head <sha> --check-signatures`.
    With no `trust.env` yet, this runs in report-only mode (Loki re-audit
    `93D0F057`, N4 — this is exactly the state the check must work from):
    it names which fingerprint currently signs each governed file (today:
@@ -169,7 +219,7 @@ not a rollback.
    yet), but NOT reversible in the sense of "no outage": the moment this
    step's code is live, every process that starts or restarts on it
    refuses to boot.
-4. **`sudo bash install.sh`.** Generates (or reuses) the trust-owner
+4. **`sudo bash install.sh --expect-head <sha>`.** Generates (or reuses) the trust-owner
    signing key; syncs and signs `syscall-table.json` (step 1c) under that
    key explicitly (not through `trust.env`, which does not exist yet —
    see "Ordering" below); seeds the `envelope.ratify` bootstrap envelope
@@ -189,7 +239,7 @@ not a rollback.
    that do not yet verify). See "N1: the syscall-table residual" below
    for the one sub-step (1c) whose signed-but-not-yet-published state
    this description now accounts for honestly.
-5. **Confirm.** `sudo bash install.sh --check-signatures` again — now in
+5. **Confirm.** `sudo bash install.sh --expect-head <sha> --check-signatures` again — now in
    comparison mode (`trust.env` exists): every governed file should read
    `OK`. Also confirms `$H/env` no longer names a leftover fingerprint.
 6. **Reconnect the desk.** Only meaningful after step 2 removed its old
@@ -395,17 +445,47 @@ and `--check` prints all of them and exits 2 instead of stopping at the first:
    `_ratatosk_checkout.pth` = `import ratatosk_path_hook`, a module that did
    `sys.path.insert(0, <ratatosk checkout>)` — a checkout Kart tasks can
    write, ahead of the standard library;
-6. only when 1–5 pass (root never runs an interpreter that failed them): the
-   apply path imports, with `-I`, from inside the venv;
-7. the venv's `.built-from-head` stamp equals the commit of the root-owned
+6. **`pyvenv.cfg`** (Loki F3), read the way `site.py` reads it: the key
+   `include-system-site-packages` must be present and its last value `false`
+   (`site.py` defaults an absent key to **true**, which would put
+   `/usr/lib/python3/dist-packages` on `sys.path`), `home` must be the directory
+   of `TRUST_PY_BASE`, `version` that interpreter's `X.Y`, and no
+   `bin/pyvenv.cfg` may exist (it would be read first);
+7. **the standard library the interpreter loads** (F3). Located without
+   executing anything: `TRUST_PY_BASE` must be named `pythonX.Y`, its
+   `readlink -f` gives `<prefix>/bin/pythonX.Y`, and CPython's library is
+   `<prefix>/lib/pythonX.Y` (and `<prefix>/lib64/pythonX.Y` where that exists) —
+   `/usr/lib/python3.14` on the operator's box (measured: root:root 755, no
+   non-root-owned or group/other-writable entry, no extended ACL). Every path
+   component down to it (so `/usr/lib` — nobody can drop a `python3XX.zip`
+   beside it) is root-owned and not group/other-writable, and **one `find`**
+   over the whole tree rejects any entry not owned by root or (non-symlink)
+   group/other-writable; the resolved target of every symlink that leaves the
+   tree is judged on its own chain and tree (Debian links `sitecustomize.py` to
+   `/etc/python3.14/sitecustomize.py`);
+8. no non-root write ACL on the standard library, its chain or those targets
+   (`getfacl`, fail closed as in 3);
+9. **`sitecustomize` / `usercustomize`** (F3): every such file (or directory,
+   or compiled module) in the standard library, its `lib-dynload` and the
+   venv's `site-packages` — the only places `-I` looks — is resolved with
+   `readlink -m` and must itself sit on a root-owned, unwritable chain (a
+   dangling link is judged by the directory it would land in);
+10. only when 1–9 pass (root never runs an interpreter that failed them): the
+   apply path imports, with `-I`, from inside the venv, **and every
+   `sys.path` entry the interpreter actually built** lies in the venv or in
+   the checked standard library (so a system `dist-packages` that somehow got
+   added is caught by looking, not only by reading `pyvenv.cfg`);
+11. the venv's `.built-from-head` stamp equals the commit of the root-owned
    HEAD clone the units are read from (refused if they differ: the units and
    the venv must come from the same commit);
-8. the committed `willow-mcp-manifest-grant.service` is exactly the
+12. the committed `willow-mcp-manifest-grant.service` is exactly the
    allowlisted directive set, the `.timer` only its expected keys and
    `manifest-grant.env` only its expected keys (next section).
 
 A plain install builds the venv first when it is missing or fails a check
 (step 0a below); `--rotate` and `--check-signatures` only enforce the checks.
+Before the build, root's own use of the base interpreter (`python3.14 -I -m
+venv`) is covered by checks 7–9 run on `TRUST_PY_BASE`.
 
 ### The unit, timer and env come from the committed HEAD
 
@@ -415,15 +495,16 @@ code-equivalent. They used to be copied from the working tree beside
 `install.sh` (writable by the operator uid, the bot and the agents) with only
 `ExecStart=` checked. Now:
 
-- **One root-owned clone of the committed HEAD per run** (`ensure_head_clone`,
-  the clone the venv build already used). The venv's wheel and pinned
+- **One root-owned clone of the pinned commit per run** (`ensure_head_clone`,
+  made by the pre-reexec section from `--expect-head`; the re-exec'd copy of
+  `install.sh` reuses it and never clones again). The venv's wheel and pinned
   requirements, the unit, the timer and the env template are all read from it
   and from nowhere else; `install.sh` reads nothing privileged from `$HERE`.
   **Commit before you install**: an uncommitted edit to any of the three is
   not installed (and not validated as if it were). The clone's commit must
   equal the venv's `.built-from-head` stamp; a mismatch stops a plain
   install, `--rotate` and `--check-signatures` alike (operator ruling
-  2026-10-11: "keep it on all three"). `sudo bash install.sh
+  2026-10-11: "keep it on all three"). `sudo bash install.sh --expect-head <sha>
   --provision-venv` rebuilds the venv from HEAD.
 - **The whole file is validated, not just `ExecStart=`** (`mg_service_problems`,
   `mg_timer_problems`, `mg_env_problems`, in the `trust-venv-check` block of
@@ -435,7 +516,9 @@ code-equivalent. They used to be copied from the working tree beside
     `RequiresMountsFor=$H`. `[Service]`: `Type=oneshot`, `User=` and `Group=`
     the trust owner, `UMask=0027`, `EnvironmentFile=/etc/willow-mcp/manifest-grant.env`,
     `Environment="WILLOW_HOME=$H"`, `Environment="GNUPGHOME=/var/lib/willow-mcp/manifest-grant/gnupg"`,
-    `ExecStart=$PY -m willow_mcp manifest-grant apply`, `NoNewPrivileges=true`,
+    `ExecStart=$PY -I -m willow_mcp manifest-grant apply` (`-I`: isolated mode —
+    no current directory on `sys.path`, `PYTHON*` variables and the user site
+    ignored; Loki pre-deploy audit F4), `NoNewPrivileges=true`,
     `PrivateTmp=true`, `ProtectSystem=strict`, `ProtectHome=read-only`, four
     `ReadWritePaths=` (`$H/manifest_grants`, `$H/mcp_apps`, `$H/constitutional`,
     `/var/lib/willow-mcp/manifest-grant`), `ProtectKernelTunables=true`,
@@ -518,14 +601,14 @@ or the bundle is not used. (The steps' docstrings still name their old
 `deploy/manifest-grant/` paths; the files are byte-identical to before the
 move.)
 
-    sudo bash install.sh --provision-venv     # rebuild only this, then check it
-    sudo bash install.sh --check              # dry-run: every [ok]/[FAIL] line, changes nothing
+    sudo bash install.sh --expect-head <sha> --provision-venv     # rebuild only this, then check it
+    sudo bash install.sh --expect-head <sha> --check              # dry-run: every [ok]/[FAIL] line, changes nothing
 
 Needs, on the box: `python3.14` with `venv` (Debian/Ubuntu: `python3.14-venv`),
 `git`, `acl`, and network access to the package index for the build. The
 rebuild is destructive (`rm -rf /opt/willow-operator/venv`, then recreate):
 while it runs the apply timer fails closed. The unit and the rest of the box
-are untouched until a plain `sudo bash install.sh` repoints the unit — so the
+are untouched until a plain `sudo bash install.sh --expect-head <sha>` repoints the unit — so the
 venv can be audited first. Re-run `--provision-venv` after pulling new
 willow-mcp source (a plain install also rebuilds it when its recorded build
 commit is not the checkout's `HEAD`). Not exercised off the real box: root, the network build, the
@@ -726,7 +809,7 @@ sequence the plain install's own step 6 calls — Loki re-audit `93D0F057`,
 N1: one code path for "change what is trusted", not two that can disagree
 about the order), and the order is the whole point:
 
-    sudo bash install.sh --rotate [--retire FPR ...]
+    sudo bash install.sh --expect-head <sha> --rotate [--retire FPR ...]
 
 1. **Generate a new key, always** — never reuse whatever the trust owner's
    GNUPGHOME already holds, even if a key of the same name-prefix is already
