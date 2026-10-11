@@ -306,5 +306,5 @@ Not decided here and left to the operator: whether D2-style relocation is ever r
 | Q-D1-4 | Yes: the public `trust_fingerprint` pin goes in the record |
 | Q-D1-5 | Agreed: `i_generation` best-effort, no birth time in v1 |
 | Q-D1-6 | Yes: on a recorded box a missing recorded directory is refused, not re-created |
-| Q-D1-8 | Not yet ruled (the recommendation stands: an `install.sh` mode) |
+| Q-D1-8 | `install.sh` mode: re-record is `--re-record-trust-identity`, inheriting `--expect-head` and the `env -i` re-exec |
 | Q-D1-10 | Answered: `findmnt -nT "$H"` = `/  /dev/mapper/ubuntu--vg-ubuntu--lv ext4 rw,relatime`. `$H` is on the root filesystem (LVM), not its own mount |
