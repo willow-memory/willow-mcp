@@ -205,3 +205,62 @@ def test_tool_is_gated_on_own_name():
     assert "pip_sync_execute" in gate.PERMISSION_GROUPS["steward_sweep"]
     assert "pip_sync_execute" in gate.PERMISSION_GROUPS["full_access"]
     assert "pip_sync_execute" not in gate.PERMISSION_GROUPS["envelope_apply"]
+
+
+# ── D2: the venv root is resolved by paths.resolve_venv, one root only ──────
+
+def _mk_venv(root, name="willow-mcp"):
+    py = root / name / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("#!/bin/sh\n", encoding="utf-8")
+    py.chmod(0o755)
+    return root / name
+
+
+def _d2_sync(layout, runner, new, old, **kw):
+    return _sync(layout, runner, venvs_root=None, venv_roots=(new, old), **kw)
+
+
+def test_d2_new_home_wins_and_installs_there(layout, tmp_path, caplog):
+    new, old = tmp_path / "willow-bot" / "venvs", tmp_path / "venvs-old"
+    chosen = _mk_venv(new)
+    _mk_venv(old)
+    runner = _FakeRunner(version_after="1.2.3")
+    with caplog.at_level("WARNING"):
+        out = _d2_sync(layout, runner, new, old)
+    assert out["ok"], out
+    installs = [c for c in runner.calls if "pip" in c and "install" in c]
+    assert installs and installs[0][0] == str(chosen / "bin" / "python")
+    assert not caplog.records
+
+
+def test_d2_legacy_used_with_one_warning(layout, tmp_path, caplog):
+    new, old = tmp_path / "willow-bot" / "venvs", tmp_path / "venvs-old"
+    chosen = _mk_venv(old)
+    runner = _FakeRunner(version_after="1.2.3")
+    with caplog.at_level("WARNING"):
+        out = _d2_sync(layout, runner, new, old)
+    assert out["ok"], out
+    installs = [c for c in runner.calls if "pip" in c and "install" in c]
+    assert installs[0][0] == str(chosen / "bin" / "python")
+    assert len(caplog.records) == 1 and str(new / "willow-mcp") in caplog.records[0].getMessage()
+
+
+def test_d2_neither_home_is_evenv_naming_both(layout, tmp_path):
+    new, old = tmp_path / "n", tmp_path / "o"
+    new.mkdir()
+    old.mkdir()
+    out = _d2_sync(layout, _FakeRunner(), new, old)
+    assert out["error"] == "EVENV"
+    assert str(new / "willow-mcp") in out["reason"] and str(old / "willow-mcp") in out["reason"]
+
+
+def test_d2_new_home_symlink_into_legacy_is_refused_never_both(layout, tmp_path):
+    """Containment runs against the chosen root: a new-home name that is a
+    symlink into the legacy root resolves outside it and is refused."""
+    new, old = tmp_path / "willow-bot" / "venvs", tmp_path / "venvs-old"
+    target = _mk_venv(old)
+    new.mkdir(parents=True)
+    (new / "willow-mcp").symlink_to(target)
+    out = _d2_sync(layout, _FakeRunner(), new, old)
+    assert out["error"] == "EVENV" and "outside" in out["reason"]

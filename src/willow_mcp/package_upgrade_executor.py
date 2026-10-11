@@ -345,24 +345,54 @@ def refuse_symlinks_in_tree(clone: Path, sha: str, *, runner) -> dict | None:
     return None
 
 
-def _resolve_venv(venv: str, *, venvs_root: Path) -> dict:
+def _resolve_venv(
+    venv: str,
+    *,
+    venvs_root: Path | None = None,
+    venv_roots: tuple[Path, Path] | None = None,
+) -> dict:
+    """The one venv ``venv`` names, under exactly one root.
+
+    D2: ``paths.resolve_venv`` picks the root (``$WILLOW_HOME/willow-bot/venvs``
+    first, the legacy ``$WILLOW_HOME/venvs`` with a warning), and containment is
+    checked against THAT root only: a venv whose resolved path lies in the
+    other root (or anywhere else) is refused. ``venv_roots`` is a
+    ``(new, legacy)`` seam; ``venvs_root`` is the older single-root seam and
+    skips resolution."""
     name = (venv or "").strip()
-    if not name or "/" in name or not _VENV_NAME_RE.match(name):
-        return _refuse("EVENV", f"venv {venv!r} must be a bare name under {venvs_root}")
-    path = (venvs_root / name)
+    shown = venvs_root if venvs_root is not None else "the venvs roots"
+    if not name or "/" in name or "\\" in name or not _VENV_NAME_RE.match(name):
+        return _refuse("EVENV", f"venv {venv!r} must be a bare name under {shown}")
+    state = "explicit"
+    other: Path | None = None
+    if venvs_root is not None:
+        root, path = venvs_root, venvs_root / name
+        where = str(venvs_root)
+    else:
+        res = paths.resolve_venv(name, roots=venv_roots)
+        state = res.state
+        if res.path is None:
+            where = paths.venv_absent_detail(res)
+            for cand in (res.new, res.legacy):
+                if cand.is_dir():
+                    return _refuse("EVENV", f"venv {venv!r} has no executable bin/python in {cand} — not a real venv")
+            return _refuse("EVENV", f"venv {venv!r} does not exist under {where}")
+        root, path = res.root, res.path
+        where = str(root)
+        other = res.new if res.state == "legacy" else res.legacy
     try:
         resolved = path.resolve()
-        inside = resolved.is_relative_to(venvs_root.resolve())
+        inside = resolved.is_relative_to(root.resolve())
     except OSError as exc:
         return _refuse("EVENV", f"could not resolve {path}: {exc}")
     if not inside:
-        return _refuse("EVENV", f"venv {venv!r} resolves outside {venvs_root}")
+        return _refuse("EVENV", f"venv {venv!r} resolves outside {where}")
     if not path.is_dir():
-        return _refuse("EVENV", f"venv {venv!r} does not exist under {venvs_root}")
+        return _refuse("EVENV", f"venv {venv!r} does not exist under {where}")
     python = path / "bin" / "python"
     if not python.is_file():
         return _refuse("EVENV", f"venv {venv!r} has no bin/python — not a real venv")
-    return {"ok": True, "path": path, "python": python}
+    return {"ok": True, "path": path, "python": python, "root_state": state, "other_path": other}
 
 
 def _check_writable(venv_path: Path) -> dict | None:
@@ -1156,7 +1186,9 @@ def _unit_runs_from_venv(unit: str, venv_path: Path, *, runner) -> bool:
                 runner=runner, timeout=_SYSTEMCTL_TIMEOUT_S)
     if proc.returncode != 0:
         return False
-    return str(venv_path) in (proc.stdout or "")
+    # The CHOSEN path, on a path boundary: `.../willow-mcp` must not match a
+    # unit running `.../willow-mcp2`, nor a unit still naming the other D2 root.
+    return re.search(re.escape(str(venv_path)) + r"(?![\w.-])", proc.stdout or "") is not None
 
 
 def _lane_for_unit(unit: str) -> str | None:
@@ -1222,6 +1254,7 @@ def execute_package_upgrade(
     sleeper: Callable[[float], None] | None = None,
     github_root: Path | None = None,
     venvs_root: Path | None = None,
+    venv_roots: tuple[Path, Path] | None = None,
     work_dir: Path | None = None,
     private_root: Path | None = None,
     force_restart: bool = False,
@@ -1278,8 +1311,9 @@ def execute_package_upgrade(
     if symlink_refusal is not None:
         return symlink_refusal
 
-    root = Path(venvs_root) if venvs_root is not None else (paths.willow_home() / "venvs")
-    venv_info = _resolve_venv(venv, venvs_root=root)
+    venv_info = _resolve_venv(
+        venv, venvs_root=Path(venvs_root) if venvs_root is not None else None, venv_roots=venv_roots,
+    )
     if not venv_info.get("ok"):
         return venv_info
     venv_path, python = venv_info["path"], venv_info["python"]
@@ -1329,6 +1363,14 @@ def execute_package_upgrade(
     skipped_units = [
         u for u in importers.get("worker_units", ())
         if not is_broker_unit(u) and u not in worker_units
+    ]
+    # D2: a unit whose ExecStart names the venv in the OTHER root runs code
+    # this install does not touch. It is not restarted (a restart would not
+    # load the new code); it is named, so the miss is never silent (B6).
+    other_path = venv_info.get("other_path")
+    other_root_units = [
+        u for u in skipped_units
+        if other_path is not None and _unit_runs_from_venv(u, other_path, runner=runner)
     ]
     if not force_restart:
         for unit in worker_units:
@@ -1611,6 +1653,7 @@ def execute_package_upgrade(
         "tag_sha": sha, "wheel": str(private_wheel_path), "wheel_sha256": wheel_digest,
         "build_task_id": build_task_id,
         "restarted": restarted, "skipped_units": skipped_units,
+        "other_root_units": other_root_units, "venv_path": str(venv_path),
         "serve_reload_required": serve_imports,
         "serve_reload_reason": importers.get("serve_reason", "") if serve_imports else "",
         "envelope_id": matches[0], "citation_id": citation_id,
