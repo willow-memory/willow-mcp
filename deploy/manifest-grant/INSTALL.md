@@ -421,8 +421,10 @@ code-equivalent. They used to be copied from the working tree beside
   and from nowhere else; `install.sh` reads nothing privileged from `$HERE`.
   **Commit before you install**: an uncommitted edit to any of the three is
   not installed (and not validated as if it were). The clone's commit must
-  equal the venv's `.built-from-head` stamp; a mismatch stops the install
-  (`sudo bash install.sh --provision-venv` rebuilds the venv from HEAD).
+  equal the venv's `.built-from-head` stamp; a mismatch stops a plain
+  install, `--rotate` and `--check-signatures` alike (operator ruling
+  2026-10-11: "keep it on all three"). `sudo bash install.sh
+  --provision-venv` rebuilds the venv from HEAD.
 - **The whole file is validated, not just `ExecStart=`** (`mg_service_problems`,
   `mg_timer_problems`, `mg_env_problems`, in the `trust-venv-check` block of
   `install.sh`). Exact-line allowlists, each line once, per section; a
