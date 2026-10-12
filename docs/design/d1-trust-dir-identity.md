@@ -270,6 +270,7 @@ Status (updated as bites land):
 | Bite | Status |
 |---|---|
 | 1 | landed in the commit `feat(trust): D1 bite 1 — trust-identity record reader and fd-walk helper (no callers)`: `src/willow_mcp/trust_identity.py` + `tests/test_trust_identity.py`, no callers (a test guards that until bite 3) |
+| 2 | `install.sh` writes and checks the record, no runtime reader: `src/willow_mcp/install_steps/trust_identity_record.py` (`precheck`, `audit`, `check`, `diff`, `write --mode first, rewrite or rerecord`), `install.sh` (`identity_precheck` before step 1 and before `--rotate`'s re-sign, the first-write gate `--record-trust-identity` after a clean read-only audit, `write_trust_identity` right after `write_trust_marker` in step 6 and `--rotate`, `--check` lines, `--re-record-trust-identity` with a diff, the audit and a typed `rr-` token or `--confirm`), the `trust_root_setup` mkdir guard (Q-D1-6), `INSTALL.md` section "D1", `tests/test_trust_identity_install.py` |
 
 Recommended order: 1, 2, run `--check` on the box and read the report, 3, 4, 5, 7; 6 on request. Bites 3 and 4 are the first that can refuse a live read, so the operator should have a valid record and a passing `--check` before them. The hole doc status line is owned by another agent's edit in flight, so this document does not edit it.
 

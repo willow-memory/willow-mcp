@@ -30,6 +30,13 @@ one root act:
     sudo bash install.sh --rotate [--retire FPR ...] --expect-head <sha>
                                                  # generate a new trust-owner signing key,
                                                  # re-sign everything, THEN retire old key(s)
+    sudo bash install.sh --record-trust-identity --expect-head <sha>
+                                                 # D1: a plain install that ALSO writes the
+                                                 # FIRST trust-identity record, only after a
+                                                 # clean read-only audit (see "D1" below)
+    sudo bash install.sh --re-record-trust-identity [--confirm TOKEN] --expect-head <sha>
+                                                 # D1: accept a changed trust-directory
+                                                 # identity (diff, audit, typed token)
 
 ## Which commit: `--expect-head <40-hex sha>` (Loki pre-deploy audit F1)
 
@@ -1055,7 +1062,7 @@ remove it to "fix" an outage; repair the cause.
 
 What it does not close: rollback to an older genuine trust-owner copy,
 renaming `$H` or an ancestor, and the outage itself (next step: D1, fd reads
-plus a root-owned `(dev, ino)` record). `manifest_grants/` stays in `$H`.
+plus a root-owned `(fsid, ino)` record; see the D1 section below). `manifest_grants/` stays in `$H`.
 
 Outage recovery (accepted, operator ruling Q38): if something renames
 `constitutional/` away, every PGP reader refuses with an error naming
@@ -1064,6 +1071,155 @@ the genuine trust-owner-owned `constitutional/` back (or restore it), then
 `sudo deploy/manifest-grant/install.sh --check`, and restart the broker.
 If only `trust.env` is gone, re-run the install (step 6 rewrites it, then
 the marker). Do not edit the marker by hand; install.sh rewrites it.
+
+## D1: the trust-identity record (rename-away hole, option D1, bite 2)
+
+`docs/design/d1-trust-dir-identity.md` is the design. D4 (above) makes a missing
+or foreign-owned `constitutional/` a refusal, but it cannot tell WHICH
+valid-looking directory it is looking at: a uid-1000 process that owns `$H` can
+rename `mcp_apps/` aside and plant a tree carrying copied, genuinely signed
+manifests. D1 pins the identity of the containers in a second root-owned file.
+
+**Bite 2 (this section) makes the record exist and keeps it honest. Nothing at
+runtime reads it yet** (bites 3 to 5), so a record changes no behaviour of the
+broker, the gate or the apply half. What it does change is `install.sh`: three
+guards below.
+
+### What the record is
+
+`/etc/willow-mcp/trust-identity`, `root:root 0644`, in the same root-owned
+directory chain as the marker, written atomically (temp file beside it, `0644`,
+`root:root`, validated by re-parsing, `mv`) by `willow_mcp.install_steps.
+trust_identity_record` from the pinned trust-owner venv, so its bytes are exactly
+`trust_identity.render_record`'s. Seven `key=value` lines:
+
+    version=1
+    willow_home=<realpath of $H>
+    home=fsid:<hex> ino:<n> uid:<n> mode:<octal>[ igen:<n>]
+    dir.constitutional=fsid:... ino:... uid:... mode:...
+    dir.mcp_apps=fsid:... ino:... uid:... mode:...
+    dir.manifest_grants=fsid:... ino:... uid:... mode:...
+    trust_fingerprint=<the 40-hex trust.env carries>
+
+It is written only AFTER the marker (a record without a valid marker is invalid),
+in step 6 of a plain install and after `--rotate`. `mode` of `manifest_grants/`
+includes the group bits of the trust owner's `rwx` ACL mask, as `stat` shows
+them. It holds directory identities and a public fingerprint, no vault material;
+`$H/env`, `vault.db`, `broker_signing_key` and keys are never opened by any of it.
+
+### The first record: audit, then an explicit flag (operator ruling Q-D1-1)
+
+A plain install on a box that has a valid marker and NO record does not write
+one. Before step 1 (so before `chown -R` can make a planted tree look genuine) it
+prints a **read-only audit** of the box as found, and says so. The first record
+is written only when you rerun with `--record-trust-identity` AND that run's
+audit is all `[ok]`; if it is not, install.sh stops before step 1 with nothing
+written. The audit checks:
+
+| Line | What it checks |
+|---|---|
+| D4 marker | valid, binds this `$H` and the trust owner's uid |
+| `$H` | a plain directory (not a symlink), owned by the operator, not group/other-writable |
+| `constitutional/`, `mcp_apps/` | plain directories owned by the trust owner, not group/other-writable |
+| `manifest_grants/` and `pending/ done/ failed/` | plain directories owned by the operator, not other-writable (the group bits carry the ACL mask, so they are not flagged) |
+| `constitutional/` tree | no symlink or special file; the governed files (`trust.env`, `pre-approved.json`, `syscall-table.json`, `frank_head_anchor.json` and their `.sig`) owned by the trust owner or root, not group/other-writable. Other files there (`review_queue.json`, ...) are listed `[info]`, not failed |
+| `mcp_apps/` tree | no symlink or special file anywhere (the seats, `_federation`, `_net_leases`, `_identity_bindings`, `_retired`), every entry trust-owner or root owned and not group/other-writable (the D4.5 gate shape and the F1 lease/binding shape) |
+| seats | every `manifest.json` has its `.sig`, parses, and does not declare another seat's `app_id` (D4.5). A manifest with no `app_id` is noted, allowed (Q47) |
+| `trust.env` | a regular file naming one 40-hex fingerprint |
+| signatures | every governed file verifies under that fingerprint (the `--check-signatures` read, run as the operator) |
+| identity found | the `(fsid, inode, uid, mode[, igen])` the record would pin, printed for you to read |
+
+Why a flag and not a typed confirmation for the first record: the first record
+protects against a box that is already hijacked when it is recorded, and the
+control for that is the audit, which the run enforces itself; the flag is the
+operator's consent, per invocation, and works from a non-interactive `sudo`
+(a typed prompt would make the plain install interactive). The audit's identity
+digest is carried to step 6, which writes only if the inode of `$H` and of each
+recorded directory is still what the audit saw. The flag is only for a plain
+install; it is refused with `--check`, `--rotate`, `--provision-venv`,
+`--check-signatures` and `--re-record-trust-identity`, and on a box with no
+valid marker (there is nothing yet to audit before step 1 changes it).
+
+First-write procedure, exactly:
+
+    sudo bash install.sh --expect-head <sha>                          # deploys this commit's venv and installer;
+                                                                      # prints the audit and the suggestion; writes no record
+    sudo bash install.sh --check --expect-head <sha>                  # prints "[info] trust-identity record absent" and the audit again
+    # read the audit. Every line [ok]? Then:
+    sudo bash install.sh --record-trust-identity --expect-head <sha>  # audit again, stop if not clean, else the install and the first record
+    sudo bash install.sh --check --expect-head <sha>                  # [ok]   trust-identity record valid and matches live
+
+If the audit is not clean, fix what it names (a plain install without the flag
+repairs ownership of `mcp_apps/` and `constitutional/` in step 1) and read it
+again. A box that failed the audit on something you do not understand is the
+case the audit exists for: investigate before recording.
+
+### The pre-check (every plain install and `--rotate` on a recorded box)
+
+With a record present, install.sh compares the live `$H`, `constitutional/`,
+`mcp_apps/` and `manifest_grants/` to it BEFORE step 1 (before any `chown -R`,
+`setfacl` or `install -d`) and, for `--rotate`, before any key is generated or
+anything is re-signed. A difference in `(fsid, inode)`, uid, mode or the
+fingerprint, a recorded directory that is gone (never re-created: Q-D1-6), or an
+invalid record stops with the diff and the recovery text, nothing changed.
+Matching: the run goes on and, at step 6, keeps the record current (an
+unchanged box writes nothing; `--rotate` may move only `trust_fingerprint`; a
+plain install may move nothing). The `trust_root_setup` hardening sweep
+(`apply_trust_root_hardening`, `repair_runtime_permissions`) likewise refuses to
+`mkdir` a recorded directory (or a missing parent of one) on a recorded box.
+
+### `--check`
+
+    [ok]   trust-identity record valid and matches live
+    [FAIL] trust-identity record differs from the live trust directories      (+ one "- dir: field old -> new" line each)
+    [FAIL] trust-identity record is invalid (a recorded box refuses on an invalid record, ...)   (+ the reason)
+    [info] trust-identity record absent (run with --record-trust-identity after the audit)
+
+`absent` on a box with a valid marker is followed by the audit (a FAIL there
+fails `--check`). `--check` exits 2 on any `[FAIL]`, like the other checks.
+
+### Accepting a changed identity: `--re-record-trust-identity`
+
+The only way. Root, `--expect-head`, the `env -i` re-exec, like every mode; it
+never builds the venv. In order, it: (1) shows the live identity and the old
+record against it (every changed field), or says the old record is invalid;
+(2) runs the same read-only audit (a restored tree must verify under the trust
+fingerprint) and stops if it is not clean; (3) asks for a confirmation and, only
+on an exact match, writes atomically.
+
+The confirmation is a token, `rr-` and 12 hex of the digest of the exact record
+about to be written, so it commits to the diff you were shown and changes with
+the inodes. On a terminal you type it at a `/dev/tty` prompt. Without one the
+run prints it and exits 3, writing nothing; rerun the same command with
+`--confirm <token>`. The token is recomputed from the live tree on that second
+run, so a tree that changed in between does not match. This does not stop a
+script from running twice; it stops the one-line blind re-record (a pasted
+command, a recovery loop) from accepting a state nobody looked at.
+
+    sudo bash install.sh --check-signatures --expect-head <sha>       # first: do the signatures verify?
+    sudo bash install.sh --re-record-trust-identity --expect-head <sha>
+    # read the diff and the audit; type the token, or rerun with --confirm <token>
+    sudo bash install.sh --check --expect-head <sha>
+
+### Recovering from a mismatch outage
+
+A record that stops a plain install or `--rotate` is the design working. Do not
+run a plain install to "fix" it, and **never delete `/etc/willow-mcp/
+trust-identity`** (that only removes the check; a recorded box with a damaged
+or missing record is investigated, not reset).
+
+1. Find out what changed (`--check` prints the diff).
+2. A rename-away and plant: as root `mv` the planted directory aside and the
+   genuine one back. The same inode matches the record again; no re-record.
+3. A restore from backup, an `rsync`/`cp -a`, a moved `$H`, filesystem repair, or
+   a damaged record file: verify the tree (`--check-signatures`), then
+   `--re-record-trust-identity` above.
+4. Do not delete the old directory before re-recording (inode reuse, design
+   section 1.1 row 7).
+
+What the guards cannot do: exercise real root, real `/etc` or the real gpg keyring
+in the test suite. The commit report records a root run in a sandbox with a fake
+trust-owner user and a temporary `$H`.
 
 ## 6b. Withdraw every request minted before this install
 

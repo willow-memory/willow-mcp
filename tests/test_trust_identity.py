@@ -878,28 +878,41 @@ def test_diff_records_names_what_changed(box):
 
 # ── no callers (bite 1) ────────────────────────────────────────────────────
 
-_IMPORT_RE = re.compile(r"(?m)^\s*(?:from\s+(?:willow_mcp)?\.?\s*import\s+[^\n]*\btrust_identity\b"
-                        r"|from\s+(?:willow_mcp)?\.trust_identity\s+import|import\s+willow_mcp\.trust_identity)")
+_IMPORT_RE = re.compile(r"(?m)^\s*(?:from\s+(?:willow_mcp)?\.*\s*import\s+[^\n]*\btrust_identity\b"
+                        r"|from\s+(?:willow_mcp)?\.*trust_identity\s+import|import\s+willow_mcp\.trust_identity)")
 
 
 def _modules_importing_trust_identity(roots):
     hits = []
     for root in roots:
         for f in sorted(root.rglob("*.py")):
-            if f.name in ("trust_identity.py", "test_trust_identity.py", "conftest.py"):  # conftest: the autouse isolation fixture
+            # conftest: the autouse isolation fixture; test_trust_identity*: the tests of the module
+            if f.name in ("trust_identity.py", "conftest.py") or f.name.startswith("test_trust_identity"):
                 continue
             if _IMPORT_RE.search(f.read_text(encoding="utf-8")):
                 hits.append(str(f.relative_to(root)))
     return hits
 
 
-def test_no_module_outside_the_helper_imports_it_yet(tmp_path):
-    """Bite 1 ships the helper with NO callers. Bite 3 removes this guard on
-    purpose when the first reader is switched over."""
-    assert _modules_importing_trust_identity([SRC, TESTS]) == []
+#: The only importers until bite 3 switches the readers: the installer's step
+#: (bite 2: writes and checks the record) and trust_root_setup (Q-D1-6: its
+#: mkdir sweep refuses to re-create a recorded directory). No READER of the
+#: record (paths, pgp, gate, envelopes, constitutional, ...) may import it yet.
+_BITE2_IMPORTERS = {"install_steps/trust_identity_record.py", "trust_root_setup.py"}
+
+
+def test_no_reader_imports_it_yet(tmp_path):
+    """Bite 2 adds exactly two importers (the installer step, and the
+    trust_root_setup mkdir guard). Bite 3 removes this guard on purpose when
+    the first reader is switched over."""
+    assert set(_modules_importing_trust_identity([SRC, TESTS])) - {"conftest.py"} <= _BITE2_IMPORTERS
+    assert _BITE2_IMPORTERS <= set(_modules_importing_trust_identity([SRC]))
     install = (SRC.parent.parent / "deploy" / "manifest-grant" / "install.sh")
     if install.exists():
-        assert "trust_identity" not in install.read_text()
+        # install.sh reaches the module only through its installer step, run from the pinned venv
+        code = "\n".join(ln for ln in install.read_text().splitlines() if not ln.lstrip().startswith("#"))
+        assert not re.search(r"willow_mcp\.trust_identity\b", code)  # only the step module ...
+        assert "install_steps.trust_identity_record" in code  # ... which is the one entry
 
 
 def test_the_import_guard_fires_on_a_planted_importer(tmp_path):
@@ -912,7 +925,9 @@ def test_the_import_guard_fires_on_a_planted_importer(tmp_path):
         "from willow_mcp.trust_identity import read_record\n",
         "import willow_mcp.trust_identity\n",
         "    from . import trust_identity\n",
+        "from .. import trust_identity as ti\n",
+        "    from ..trust_identity import read_record\n",
     )):
         (tmp_path / f"m{i}.py").write_text(line)
     (tmp_path / "ok.py").write_text("from . import trust_marker\n# trust_identity in a comment\n")
-    assert len(_modules_importing_trust_identity([tmp_path])) == 7
+    assert len(_modules_importing_trust_identity([tmp_path])) == 9

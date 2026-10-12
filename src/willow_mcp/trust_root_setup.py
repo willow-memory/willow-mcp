@@ -634,6 +634,38 @@ def _chown_target(target: Path, owner: str, *, dry_run: bool) -> list[str]:
     return actions
 
 
+def _refuse_recreating_recorded_dir(target: Path) -> None:
+    """D1 (operator ruling Q-D1-6): on a box carrying a trust-identity record a
+    missing recorded directory (``$WILLOW_HOME``, ``constitutional/``,
+    ``mcp_apps/``, ``manifest_grants/``) is an incident, not a setup step, so a
+    ``mkdir`` that would create one -- directly, or as a missing parent of
+    ``target`` -- is refused. Absent record: today's behaviour. An invalid
+    record refuses too (it is never read as absent). Existing directories are
+    untouched by this guard."""
+    from . import trust_identity
+
+    try:
+        rec = trust_identity.read_record()
+    except trust_identity.TrustIdentityError as exc:
+        raise trust_identity.TrustIdentityError(
+            f"refusing to create {target}: {exc}"
+        ) from exc
+    if rec is None:
+        return
+    recorded = [Path(rec.willow_home)] + [Path(rec.willow_home) / n for n in trust_identity.RECORDED_DIRS]
+    probe = Path(os.path.abspath(target))
+    real = Path(os.path.realpath(target))
+    for d in recorded:
+        for cand in (probe, real):
+            if (cand == d or d in cand.parents) and not os.path.lexists(d):
+                raise trust_identity.TrustIdentityMissing(
+                    f"refusing to create {target}: {d} is a recorded trust directory "
+                    "(/etc/willow-mcp/trust-identity) and is missing. A missing recorded "
+                    "directory is an incident, not a setup step: restore it, or have a "
+                    "root operator investigate and run install.sh --re-record-trust-identity."
+                )
+
+
 def apply_trust_root_hardening(owner: str, *, dry_run: bool = False) -> dict[str, Any]:
     """chown policy roots to ``owner`` with world-readable modes."""
     trust_owner = resolve_trust_owner(owner)
@@ -641,6 +673,7 @@ def apply_trust_root_hardening(owner: str, *, dry_run: bool = False) -> dict[str
     for root in trust_root_directories():
         root = root.expanduser()
         if not root.exists() and not dry_run:
+            _refuse_recreating_recorded_dir(root)
             root.mkdir(parents=True, exist_ok=True)
         actions.extend(_chown_target(root, trust_owner, dry_run=dry_run))
         if root.exists():
@@ -724,6 +757,7 @@ def repair_runtime_permissions(runtime_user: str = "", *, dry_run: bool = False)
     store_key = str(paths.store_root().resolve(strict=False))
     for target in targets:
         if not target.exists() and not dry_run:
+            _refuse_recreating_recorded_dir(target)
             if target.suffix:
                 target.parent.mkdir(parents=True, exist_ok=True)
             else:

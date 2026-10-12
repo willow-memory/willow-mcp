@@ -27,6 +27,13 @@
 #                                   # (re)build ONLY the trust-owner venv
 #                                   # (/opt/willow-operator/venv) and check it;
 #                                   # does not touch the unit or the box
+#   sudo bash install.sh --record-trust-identity --expect-head <sha>
+#                                   # a plain install that ALSO writes the first
+#                                   # D1 trust-identity record, only after a clean
+#                                   # read-only audit (see INSTALL.md, D1)
+#   sudo bash install.sh --re-record-trust-identity [--confirm TOKEN] --expect-head <sha>
+#                                   # accept a changed trust-directory identity
+#                                   # (diff + audit + a typed or --confirm token)
 #   (also --rotate [--retire FPR ...] and --check-signatures, each with
 #   --expect-head <sha>; --dry-run-sign needs neither root nor a pin)
 #
@@ -1487,6 +1494,9 @@ CHECK_ONLY=""
 ROTATE=""
 CHECK_SIGNATURES=""
 PROVISION_VENV=""
+RECORD_FIRST=""              # --record-trust-identity (D1: the first record)
+RERECORD=""                  # --re-record-trust-identity (D1)
+RERECORD_CONFIRM=""          # --confirm TOKEN
 CHECK_FAILED=""
 RETIRE_FPRS=()
 while [ $# -gt 0 ]; do
@@ -1495,6 +1505,12 @@ while [ $# -gt 0 ]; do
     --check-signatures) CHECK_SIGNATURES=1; shift ;;
     --rotate) ROTATE=1; shift ;;
     --provision-venv) PROVISION_VENV=1; shift ;;
+    --record-trust-identity) RECORD_FIRST=1; shift ;;
+    --re-record-trust-identity) RERECORD=1; shift ;;
+    --confirm)
+      [ $# -ge 2 ] || stop "--confirm requires the token --re-record-trust-identity printed"
+      case "$2" in -*|'') stop "--confirm requires the token --re-record-trust-identity printed (got '${2:0:40}')" ;; esac
+      RERECORD_CONFIRM=$2; shift 2 ;;
     --expect-head)
       # already validated (full 40-hex, exactly once) and equal to the clone's
       # commit by the pre-reexec section; the value is consumed here.
@@ -1503,7 +1519,7 @@ while [ $# -gt 0 ]; do
     --retire)
       [ $# -ge 2 ] || stop "--retire requires a fingerprint argument"
       RETIRE_FPRS+=("$2"); shift 2 ;;
-    *) stop "unknown argument: $1 (known: --expect-head SHA, --check, --check-signatures, --provision-venv, --rotate, --retire FPR, --dry-run-sign)" ;;
+    *) stop "unknown argument: $1 (known: --expect-head SHA, --check, --check-signatures, --provision-venv, --rotate, --retire FPR, --record-trust-identity, --re-record-trust-identity, --confirm TOKEN, --dry-run-sign)" ;;
   esac
 done
 
@@ -1522,6 +1538,16 @@ fi
 
 if [ -n "$PROVISION_VENV" ] && [ -n "$CHECK_ONLY$ROTATE$CHECK_SIGNATURES" ]; then
   stop "--provision-venv builds the trust-owner venv and nothing else; it cannot be combined with --check, --check-signatures or --rotate"
+fi
+# D1 (bite 2): the first record is a plain install's act; a re-record is its own mode.
+if [ -n "$RECORD_FIRST" ] && [ -n "$CHECK_ONLY$ROTATE$CHECK_SIGNATURES$PROVISION_VENV$RERECORD" ]; then
+  stop "--record-trust-identity is a flag of the plain install (audit, then step 1-7, then the first record); it cannot be combined with --check, --check-signatures, --rotate, --provision-venv or --re-record-trust-identity"
+fi
+if [ -n "$RERECORD" ] && [ -n "$CHECK_ONLY$ROTATE$CHECK_SIGNATURES$PROVISION_VENV" ]; then
+  stop "--re-record-trust-identity is its own mode; it cannot be combined with --check, --check-signatures, --rotate or --provision-venv"
+fi
+if [ -n "$RERECORD_CONFIRM" ] && [ -z "$RERECORD" ]; then
+  stop "--confirm only goes with --re-record-trust-identity"
 fi
 
 # ---------------------------------------------------------------- preflight
@@ -1549,14 +1575,14 @@ PG_DB=$(grep -E '^WILLOW_PG_DB=' "$H/env" | tail -1 | cut -d= -f2- || true)
 # one stops here, before anything is touched. --check reports every line and
 # continues (exit 2 at the end); --rotate / --check-signatures only enforce it
 # (they never build); a plain install builds it first when it is missing or
-# fails a check, then enforces.
+# fails a check, then enforces. (--re-record-trust-identity only enforces too.)
 if [ -n "$CHECK_ONLY" ]; then
   say "== trust-owner interpreter $PY"
   tvc_report "$TRUST_VENV" "$PY" 0 / "$TRUST_PY_BASE" || CHECK_FAILED=1
   say "== units and env from the committed HEAD ${HEAD_SHA:0:12}"
   mg_report "$HEAD_CLONE" "$PY" "$TRUST_OWNER" "$H" "$GNUPGHOME_TO" "$ETC" "$SYSD" "$TRUST_VENV/$TVC_STAMP" "$HEAD_SHA" "$PG_DB" || CHECK_FAILED=1
 else
-  [ -n "$ROTATE$CHECK_SIGNATURES" ] || provision_trust_venv
+  [ -n "$ROTATE$CHECK_SIGNATURES$RERECORD" ] || provision_trust_venv
   enforce_trust_interpreter
 fi
 
@@ -1742,12 +1768,194 @@ retire_stale_key_if_marked() {
 # fingerprint on a marked box is refused by the reader, so the marker would
 # lock the box out). Never touches vault material: it writes one file in $ETC.
 write_trust_marker() {
-  grep -Eq '^(export )?WILLOW_PGP_FINGERPRINT=[0-9A-Fa-f]{40}$' "$TRUST_ENV" \
+  mg_trust_env_fpr "$TRUST_ENV" >/dev/null \
     || stop "$TRUST_ENV carries no 40-hex WILLOW_PGP_FINGERPRINT after publishing: refusing to write the trust-provisioned marker (a marked box with no fingerprint refuses every PGP read)"
   mg_write_marker "$ETC/$MG_MARKER" "$H" "$TRUST_OWNER" root root \
     || stop "could not write a valid $ETC/$MG_MARKER"
   say "  wrote $ETC/$MG_MARKER (root:root 0644): rename-away protection ON for $(readlink -f "$H")"
 }
+
+# ------------------------------------------------ D1: the trust-identity record
+# docs/design/d1-trust-dir-identity.md, bite 2. /etc/willow-mcp/trust-identity pins
+# the (fsid, inode) of $H, constitutional/, mcp_apps/ and manifest_grants/ plus
+# the public trust fingerprint; root writes it, nothing at runtime reads it yet
+# (bites 3-5), so a record changes no behaviour except the three guards here:
+#   * identity_precheck -- BEFORE step 1's `chown -R` and before --rotate's
+#     re-sign: a recorded box whose live trust directories differ from the record
+#     (or whose record is invalid, or a recorded directory is gone) stops, so root
+#     cannot launder a planted tree into trust-owner ownership;
+#   * the FIRST record is never written silently (Q-D1-1): a read-only audit runs
+#     before step 1 and must be all-clean, and --record-trust-identity must be
+#     given (see write_trust_identity);
+#   * --re-record-trust-identity is the only way to accept a changed identity.
+# The bytes of the record come from willow_mcp.trust_identity.render_record, run
+# from the pinned trust-owner venv ($PY -I -m ...), not re-implemented here.
+# BEGIN trust-identity
+MG_IDENTITY=trust-identity   # $ETC/trust-identity
+MG_ROOT_USER=root            # who must own the marker: a plain assignment, tests override it
+MG_ROOT_GROUP=root
+TI_STEP=willow_mcp.install_steps.trust_identity_record
+# (RECORD_FIRST, RERECORD and RERECORD_CONFIRM are the argument defaults, above.)
+TI_STATE=""                  # absent | valid, set by identity_precheck
+TI_AUDIT_RC=""               # 0 clean, 1 not, set by identity_audit
+TI_SNAPSHOT=""               # the identity digest the audit saw
+
+# mg_trust_env_fpr FILE -- the 40-hex WILLOW_PGP_FINGERPRINT FILE carries (the one
+# write_trust_marker requires); returns 1 when it carries none.
+mg_trust_env_fpr() {
+  local line
+  line=$(grep -E '^(export )?WILLOW_PGP_FINGERPRINT=[0-9A-Fa-f]{40}$' -- "$1" 2>/dev/null | tail -1) || return 1
+  [ -n "$line" ] || return 1
+  printf '%s\n' "${line##*=}"
+}
+
+# ti_run ARGS... -- the pinned venv's identity step (root, -I).
+ti_run() { "$PY" -I -m "$TI_STEP" "$@"; }
+
+# identity_hint -- what to do about a mismatch; never "delete the record".
+identity_hint() {
+  printf '%s\n' \
+    "If this change is NOT expected (a rename-away and plant): do not run a plain install; as root move the planted directory aside and the genuine one back (same inode: the record matches again)." \
+    "If it IS legitimate (a restore, an rsync, a moved \$H, filesystem repair): verify the tree first (sudo bash install.sh --check-signatures --expect-head <sha>), then accept it with: sudo bash install.sh --re-record-trust-identity --expect-head <sha>." \
+    "Never delete $ETC/$MG_IDENTITY to make this go away."
+}
+
+# identity_audit -- the read-only audit (owners, modes, kinds, the D4.5/F1 shapes,
+# and every governed file verifying under the trust fingerprint). Prints it; sets
+# TI_AUDIT_RC (0 only if every line is [ok]) and TI_SNAPSHOT. Changes nothing.
+identity_audit() {
+  local fpr out rc=0 sigout src=0 bad
+  local -a gfiles
+  TI_AUDIT_RC=0; TI_SNAPSHOT=""
+  fpr=$(mg_trust_env_fpr "$TRUST_ENV" 2>/dev/null || true)
+  out=$(ti_run audit --home "$H" --trust-owner-uid "$(id -u "$TRUST_OWNER")" --operator-uid "$OPERATOR_UID" --fingerprint "$fpr") || rc=$?
+  printf '%s\n' "$out" | grep -v '^snapshot=' || true
+  TI_SNAPSHOT=$(printf '%s\n' "$out" | sed -n 's/^snapshot=//p' | tail -1)
+  [ "$rc" -eq 0 ] || TI_AUDIT_RC=1
+  if [ -z "$fpr" ]; then
+    say "  [FAIL] no governed-file signature check: $TRUST_ENV carries no 40-hex fingerprint"
+    TI_AUDIT_RC=1
+    return 0
+  fi
+  mapfile -t gfiles < <(governed_files)
+  sigout=$(as_op "$PY" -I -m willow_mcp.install_steps.rotate_resign --check --fingerprint "$fpr" "${gfiles[@]}" 2>&1) || src=$?
+  bad=$(printf '%s\n' "$sigout" | grep -E '^  /' | grep -vE ': (OK — verifies|absent)' || true)
+  if [ "$src" -eq 0 ] && [ -z "$bad" ]; then
+    say "  [ok]   every governed file verifies under the trust fingerprint $fpr (the --check-signatures read)"
+  else
+    say "  [FAIL] governed files that do not verify under the trust fingerprint $fpr (--check-signatures)"
+    printf '%s\n' "${bad:-rotate_resign exited $src: ${sigout##*$'\n'}}" | head -8 | sed 's/^ */           - /'
+    TI_AUDIT_RC=1
+  fi
+  return 0
+}
+
+# identity_precheck -- BEFORE step 1 (plain) or the re-sign (--rotate). Sets
+# TI_STATE. Record absent: fine (a first record needs the flag, below). Record
+# valid and matching the live tree: fine. Anything else: stop with the diff.
+identity_precheck() {
+  local fpr out rc=0
+  fpr=$(mg_trust_env_fpr "$TRUST_ENV" 2>/dev/null || true)
+  out=$(ti_run precheck --home "$H" --fingerprint "$fpr") || rc=$?
+  case "$rc" in
+    0)
+      case "${out%%$'\n'*}" in
+        ABSENT) TI_STATE=absent ;;
+        MATCH)  TI_STATE=valid; say "  trust-identity record valid and matches the live trust directories" ;;
+        *) stop "unexpected output from the trust-identity pre-check: ${out:0:200}" ;;
+      esac ;;
+    10)
+      stop "the live trust directories differ from $ETC/$MG_IDENTITY -- nothing was changed (no chown, no mkdir, no re-sign):
+$(printf '%s\n' "$out" | tail -n +2 | sed 's/^/    /')
+$(identity_hint)" ;;
+    11)
+      stop "$ETC/$MG_IDENTITY is invalid -- nothing was changed: ${out#INVALID: }
+$(identity_hint)" ;;
+    *) stop "the trust-identity pre-check failed to run (exit $rc): ${out:0:300}" ;;
+  esac
+  return 0
+}
+
+# identity_gate_first -- plain install, before step 1, when no record exists. Always
+# prints the audit; with --record-trust-identity it must be clean and the marker
+# must already be valid (an already-provisioned box), else stop with nothing written.
+identity_gate_first() {
+  [ "$TI_STATE" = absent ] || return 0
+  local mp
+  mp=$(mg_marker_problems "$ETC/$MG_MARKER" "$H" "$TRUST_OWNER" "$MG_ROOT_USER" "$MG_ROOT_GROUP" 2>&1 || true)
+  if [ -n "$mp" ] || [ ! -e "$ETC/$MG_MARKER" ]; then
+    [ -z "$RECORD_FIRST" ] || stop "--record-trust-identity needs an already-provisioned box (a valid $ETC/$MG_MARKER from an earlier install) so there is something to audit before step 1 changes it; run a plain install first, then --check, then this${mp:+ ($(printf '%s' "$mp" | head -1))}"
+    say "  no trust-identity record, and no valid marker yet: the first record needs a provisioned box (plain install, then --record-trust-identity)"
+    return 0
+  fi
+  say "== trust-identity: no record yet -- read-only audit of the live box (nothing is changed by it)"
+  identity_audit
+  if [ -z "$RECORD_FIRST" ]; then
+    say "  no record will be written by this run. Read the audit above; when it is all [ok] run: sudo bash install.sh --record-trust-identity --expect-head <sha>"
+    TI_AUDIT_RC=1   # never let a later step treat an un-flagged audit as consent
+    return 0
+  fi
+  [ "$TI_AUDIT_RC" = 0 ] && [ -n "$TI_SNAPSHOT" ] \
+    || stop "the audit above is not all [ok]: the first trust-identity record is NOT written and step 1 did not run. Fix what it names (a plain install without the flag repairs ownership), then rerun with --record-trust-identity"
+  say "  audit clean -- the first record will be written at step 6, after the marker, if the identity is unchanged"
+}
+
+# write_trust_identity [rotate] -- right AFTER write_trust_marker (the reader needs
+# a valid marker): keep a valid record current, or write the first one when the
+# gate allowed it. Never writes a first record without --record-trust-identity and
+# a clean audit; never absorbs a changed directory identity (only --re-record does).
+write_trust_identity() {
+  local fpr
+  [ -n "$TI_STATE" ] || stop "internal: the trust-identity pre-check did not run before the trust marker was written"
+  fpr=$(mg_trust_env_fpr "$TRUST_ENV") || stop "$TRUST_ENV carries no 40-hex fingerprint: not writing the trust-identity record"
+  case "$TI_STATE" in
+    valid)
+      ti_run write --mode rewrite --home "$H" --fingerprint "$fpr" ${1:+--allow-fingerprint-change} \
+        || stop "could not keep $ETC/$MG_IDENTITY current (see above); the marker is written, the old record stands"
+      ;;
+    absent)
+      if [ -n "$RECORD_FIRST" ] && [ "$TI_AUDIT_RC" = 0 ]; then
+        ti_run write --mode first --home "$H" --fingerprint "$fpr" --expect-snapshot "$TI_SNAPSHOT" \
+          || stop "the first trust-identity record was not written (see above); nothing else about the box depends on it yet"
+      else
+        say "  [info] no trust-identity record (D1): after reading the audit, run: sudo bash install.sh --record-trust-identity --expect-head <sha>"
+      fi ;;
+    *) stop "internal: unknown trust-identity state '$TI_STATE'" ;;
+  esac
+}
+
+# identity_no_recreate -- step 1 `install -d`s these; with a valid record they must
+# already exist (the pre-check proved it a moment ago; this closes the window).
+identity_no_recreate() {
+  local d
+  [ "$TI_STATE" = valid ] || return 0
+  for d in constitutional mcp_apps manifest_grants; do
+    { [ -d "$H/$d" ] && [ ! -L "$H/$d" ]; } \
+      || stop "$H/$d is a recorded trust directory and is gone: refusing to re-create it (Q-D1-6) -- an incident, not a setup step; nothing changed"
+  done
+}
+
+# identity_check_report -- the --check lines; returns 1 on a FAIL.
+identity_check_report() {
+  local fpr out rc=0 mp
+  say "== trust-identity record (D1)"
+  fpr=$(mg_trust_env_fpr "$TRUST_ENV" 2>/dev/null || true)
+  out=$(ti_run check --home "$H" --fingerprint "$fpr") || rc=$?
+  printf '%s\n' "$out"
+  case "$rc" in
+    0) return 0 ;;
+    4)
+      mp=$(mg_marker_problems "$ETC/$MG_MARKER" "$H" "$TRUST_OWNER" "$MG_ROOT_USER" "$MG_ROOT_GROUP" 2>&1 || true)
+      if [ -z "$mp" ] && [ -e "$ETC/$MG_MARKER" ]; then
+        say "== read-only audit before the first record"
+        identity_audit
+        [ "$TI_AUDIT_RC" = 0 ] || return 1
+      fi
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# END trust-identity
 
 # sign_and_publish_trust: the ONE code path for "change what is trusted" --
 # Loki re-audit 93D0F057, N1: the plain install used to publish trust.env at
@@ -1783,7 +1991,10 @@ sign_and_publish_trust() {
   if [ -n "$old_fpr" ] && [ "$old_fpr" != "$new_fpr" ]; then
     if as_to gpg --batch --yes --delete-secret-and-public-key "$old_fpr"; then
       say "  retired previous trust-owner key $old_fpr from $GNUPGHOME_TO"
-      [ -f "$STALE_KEY_MARKER" ] && rm -f "$STALE_KEY_MARKER"
+      # (not `[ -f ... ] && rm`: with no marker that list ends the function with
+      # status 1 and `set -e` killed --rotate here, before the trust marker, the
+      # D1 record and the broker restart -- seen in the first root run of D1)
+      rm -f -- "$STALE_KEY_MARKER"
     else
       # F-B (Loki audit 23DE8AA9): a bare warning here used to be the ONLY
       # record of this failure -- forgotten the instant the script exited,
@@ -1839,6 +2050,40 @@ if [ -n "$CHECK_SIGNATURES" ]; then
   exit $?
 fi
 
+# ------------------------------------------------ --re-record-trust-identity
+# D1 (docs/design/d1-trust-dir-identity.md section 4.1, Q-D1-8): the ONLY way to
+# accept a changed identity of $H, constitutional/, mcp_apps/ or manifest_grants/
+# (a restore from backup, an rsync, a moved $H, filesystem repair, or a damaged
+# record). Root, --expect-head and the env -i re-exec like every mode. It writes
+# nothing until: (1) the old record (or its invalidity) is shown against the live
+# tree, (2) the same read-only audit as the first record is all [ok] (a restored
+# tree must verify under the trust fingerprint), and (3) the operator types the
+# token of the exact record about to be written -- "rr-" and 12 hex of its digest,
+# so it commits to the diff shown and changes with the inodes. On a terminal the
+# token is typed at a /dev/tty prompt; without one the run prints it and exits 3,
+# and `--confirm <token>` repeats the run (the token is recomputed from the live
+# tree, so a tree that changed between the two runs does not match). Without a
+# match: no write.
+if [ -n "$RERECORD" ]; then
+  say "== --re-record-trust-identity: accept the live trust-directory identity (D1)"
+  RR_FPR=$(mg_trust_env_fpr "$TRUST_ENV") || stop "$TRUST_ENV carries no 40-hex fingerprint: not re-recording"
+  p=$(mg_marker_problems "$ETC/$MG_MARKER" "$H" "$TRUST_OWNER" "$MG_ROOT_USER" "$MG_ROOT_GROUP" 2>&1 || true)
+  { [ -z "$p" ] && [ -e "$ETC/$MG_MARKER" ]; } || stop "$ETC/$MG_MARKER is not valid, so no record can stand beside it; repair the marker first (a plain install): ${p%%$'\n'*}"
+  say "== 1. the old record against the live tree"
+  ti_run diff --home "$H" --fingerprint "$RR_FPR" || stop "cannot read the live trust directories (a recorded directory missing or a symlink?) -- restore the tree first; nothing written"
+  say "== 2. read-only audit of the live box"
+  identity_audit
+  [ "$TI_AUDIT_RC" = 0 ] || stop "the audit above is not all [ok]: nothing written. Fix what it names, then rerun"
+  say "== 3. confirm"
+  RR_RC=0
+  ti_run write --mode rerecord --home "$H" --fingerprint "$RR_FPR" ${RERECORD_CONFIRM:+--confirm "$RERECORD_CONFIRM"} || RR_RC=$?
+  case "$RR_RC" in
+    0) say "done. $ETC/$MG_IDENTITY re-recorded; sudo bash install.sh --check --expect-head <sha> should now report it valid and matching." ; exit 0 ;;
+    3) say "nothing written: confirmation required (see the token above)"; exit 3 ;;
+    *) stop "the trust-identity record was not written (see above)" ;;
+  esac
+fi
+
 # -------------------------------------------------------------------- --rotate
 # Dispatch B291C0C7 ("one signing key, one source of truth"), amending
 # A9BF01A9. Operator ruling (verbatim): "I kinda wanna delete both these keys
@@ -1848,6 +2093,9 @@ fi
 # old key is retired ONLY after every file verifies under the new one.
 if [ -n "$ROTATE" ]; then
   say "== --rotate: generate a new trust-owner signing key, re-sign everything, THEN switch trust, THEN retire"
+  # D1: compare the live trust directories to the record BEFORE any re-sign (a
+  # re-sign over a planted tree would launder it). Stops with the diff.
+  identity_precheck
 
   # 1. a NEW key, always — the whole point of --rotate is a fresh key, never
   # reusing whatever the trust owner's GNUPGHOME already holds. The OLD key
@@ -1882,6 +2130,7 @@ if [ -n "$ROTATE" ]; then
   # 2026-09-23 incident, verbatim).
   sign_and_publish_trust "$NEW_FPR" "$OLD_FPR"
   write_trust_marker
+  write_trust_identity rotate
 
   for fpr in "${RETIRE_FPRS[@]}"; do
     if sudo -u "$OPERATOR" gpg --batch --yes --delete-key "$fpr"; then
@@ -1920,6 +2169,7 @@ esac
 case "$OPTS" in *all_squash*|*idmapped*) stop "mcp_apps mount options ($OPTS) remap ownership — same stop as above." ;; esac
 say "plain $FSTYPE — ownership will stick; continuing"
 if [ "$CHECK_ONLY" = "--check" ]; then
+  identity_check_report || CHECK_FAILED=1
   if [ -n "$CHECK_FAILED" ]; then
     say "check-only: stopping before any change -- a check above reported [FAIL] (an interpreter [FAIL]: --provision-venv rebuilds the venv; an installed unit/timer/env [FAIL]: a plain install replaces them from the committed HEAD)"
     exit 2
@@ -1928,8 +2178,21 @@ if [ "$CHECK_ONLY" = "--check" ]; then
   exit 0
 fi
 
+# ------------------------------------------- D1 pre-check, BEFORE anything changes
+# Step 1 below runs `chown -R` over whatever sits at $H/mcp_apps and `install -d`
+# over the other recorded paths. With a trust-identity record present that is
+# only safe on the tree that was recorded: a planted directory (rename-away) would
+# be laundered into trust-owner ownership. Compare first; a difference, an invalid
+# record or a vanished recorded directory stops here with nothing changed. With no
+# record: print the read-only audit (it must be clean, and --record-trust-identity
+# given, for step 6 to write the first one).
+say "== trust-identity pre-check (D1)"
+identity_precheck
+identity_gate_first
+
 # --------------------------------------------------------- 1. ownership, ACLs
 say "== 1. ownership and traversal"
+identity_no_recreate
 # Rework (Loki audit B00BD43E, F3, 2026-09-22): the traverse ACL on $H lets
 # the trust owner open BY NAME anything world-readable beneath it, not just
 # mcp_apps/manifest_grants/constitutional/ — nestor.db.ledger.jsonl (664),
@@ -2278,6 +2541,7 @@ sudo -u "$TRUST_OWNER" psql -d "$PG_DB" -qtc 'select 1' >/dev/null || stop "peer
 say "== 6. re-sign everything under $FPR, then publish $TRUST_ENV"
 sign_and_publish_trust "$FPR" "$OLD_TRUST_FPR"
 write_trust_marker
+write_trust_identity
 
 # ------------------ 6b. guard: no request minted before this install may apply
 # Sealed 33654f35 (2026-09-22): d23a3726's pending request "is withdrawn, not
