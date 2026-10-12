@@ -345,6 +345,7 @@ def test_resolve_willow_mcp_python_keeps_the_venv_symlink(tmp_path, monkeypatch)
     real = tmp_path / "usr" / "bin" / "python3.12"
     real.parent.mkdir(parents=True)
     real.write_text("#!/bin/sh\n", encoding="utf-8")
+    real.chmod(0o755)
 
     venv_bin = wh / "venvs" / "willow-mcp" / "bin"
     venv_bin.mkdir(parents=True)
@@ -369,6 +370,7 @@ def test_resolve_willow_mcp_python_follows_willow_home(tmp_path, monkeypatch):
     venv_bin = wh / "venvs" / "willow-mcp" / "bin"
     venv_bin.mkdir(parents=True)
     (venv_bin / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+    (venv_bin / "python").chmod(0o755)
 
     assert resolve_willow_mcp_python() == str(venv_bin / "python")
 
@@ -440,3 +442,42 @@ def test_sync_dry_run_does_not_seed(tmp_path, monkeypatch):
     with pytest.raises(RegistryMissing):
         sync_all(dry_run=True)
     assert not (wh / "mcp" / "projects.json").exists()
+
+
+def _mcp_venv(root, *, exe=True):
+    venv_bin = root / "willow-mcp" / "bin"
+    venv_bin.mkdir(parents=True)
+    py = venv_bin / "python"
+    py.write_text("#!/bin/sh\n", encoding="utf-8")
+    py.chmod(0o755 if exe else 0o644)
+    return py
+
+
+def test_resolve_willow_mcp_python_new_d2_home_wins(tmp_path, monkeypatch):
+    wh = tmp_path / ".willow"
+    monkeypatch.setenv("WILLOW_HOME", str(wh))
+    monkeypatch.delenv("WILLOW_MCP_PYTHON", raising=False)
+    _mcp_venv(wh / "venvs")
+    new = _mcp_venv(wh / "willow-bot" / "venvs")
+    assert resolve_willow_mcp_python() == str(new)
+
+
+def test_resolve_willow_mcp_python_legacy_warns(tmp_path, monkeypatch, caplog):
+    wh = tmp_path / ".willow"
+    monkeypatch.setenv("WILLOW_HOME", str(wh))
+    monkeypatch.delenv("WILLOW_MCP_PYTHON", raising=False)
+    old = _mcp_venv(wh / "venvs")
+    with caplog.at_level("WARNING"):
+        assert resolve_willow_mcp_python() == str(old)
+    assert len(caplog.records) == 1
+    assert str(wh / "willow-bot" / "venvs" / "willow-mcp") in caplog.records[0].getMessage()
+
+
+def test_resolve_willow_mcp_python_neither_home_never_names_a_missing_venv(tmp_path, monkeypatch):
+    wh = tmp_path / ".willow"
+    wh.mkdir()
+    monkeypatch.setenv("WILLOW_HOME", str(wh))
+    monkeypatch.setenv("HOME", str(tmp_path / "nohome"))
+    monkeypatch.delenv("WILLOW_MCP_PYTHON", raising=False)
+    got = resolve_willow_mcp_python()
+    assert str(wh) not in got

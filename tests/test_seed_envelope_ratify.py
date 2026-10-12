@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 _MODULE_PATH = (
-    Path(__file__).resolve().parents[1] / "deploy" / "manifest-grant" / "seed_envelope_ratify.py"
+    Path(__file__).resolve().parents[1] / "src" / "willow_mcp" / "install_steps" / "seed_envelope_ratify.py"
 )
 _spec = _importlib_util.spec_from_file_location("seed_envelope_ratify", _MODULE_PATH)
 seed_envelope_ratify = _importlib_util.module_from_spec(_spec)

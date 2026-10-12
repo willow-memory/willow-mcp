@@ -31,8 +31,11 @@ _APP_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]{1,64}$")
 
 
 def _apps_root() -> Path:
+    from . import trust_marker
+
     home = Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
-    return Path(os.environ.get("WILLOW_MCP_APPS_ROOT", home / "mcp_apps"))
+    override = trust_marker.trust_input_env("WILLOW_MCP_APPS_ROOT")
+    return Path(override) if override else home / "mcp_apps"
 
 
 def _validate_app_id(app_id: str) -> str:
@@ -742,6 +745,54 @@ MANIFEST_OK = "ok"
 MANIFEST_ABSENT = "absent"
 MANIFEST_UNPARSEABLE = "unparseable"
 MANIFEST_UNSIGNED = "unsigned"
+#: D4.5 (Loki D06A0EF3): on a trust-provisioned box the apps root, seat dir,
+#: manifest or .sig is not trust-owner/root-owned, is group/other-writable, or
+#: is a symlink -- a planted tree can carry genuine signed copies.
+MANIFEST_UNTRUSTED_OWNER = "untrusted_owner"
+#: The manifest's own ``app_id`` names a different seat than its directory
+#: (cross-seat replay of a genuinely signed manifest).
+MANIFEST_APP_ID_MISMATCH = "app_id_mismatch"
+
+
+def _read_pinned(path: Path, info: os.stat_result) -> bytes:
+    """The shared D4.5 pinned read (``paths.read_pinned``): an O_NOFOLLOW fd
+    that must be the very inode ``info`` described."""
+    from . import paths
+
+    return paths.read_pinned(path, info)
+
+
+def _read_provisioned_manifest(root: Path, app_id: str, marker) -> tuple[bytes, Optional[bytes]]:
+    """`(manifest_bytes, sig_bytes_or_None)` (None: no .sig file -- an unsigned
+    manifest, reported as such, not as an ownership fault) from a tree that passed the D4.5 ownership
+    rule: apps root, seat dir, manifest and .sig each trust-owner/root-owned,
+    plain, not g/o-writable. Raises PermissionError otherwise."""
+    from . import paths
+
+    seat = root / app_id
+    manifest = seat / "manifest.json"
+    sig = pgp.detached_sig_path(manifest)
+    paths.provisioned_lstat(root, marker, want_dir=True)
+    paths.provisioned_lstat(seat, marker, want_dir=True)
+    m_info = paths.provisioned_lstat(manifest, marker, want_dir=False)
+    try:
+        s_info = paths.provisioned_lstat(sig, marker, want_dir=False)
+    except FileNotFoundError:
+        return _read_pinned(manifest, m_info), None
+    return _read_pinned(manifest, m_info), _read_pinned(sig, s_info)
+
+
+def _verify_snapshot(manifest_bytes: bytes, sig_bytes: bytes) -> tuple[bool, str]:
+    """Verify the exact bytes that were ownership-checked (and will be parsed)
+    from a private scratch copy, so the check cannot be raced."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="willow-manifest-verify-") as d:
+        os.chmod(d, 0o700)
+        f = Path(d) / "manifest.json"
+        f.write_bytes(manifest_bytes)
+        pgp.detached_sig_path(f).write_bytes(sig_bytes)
+        return pgp.verify_detached(f)
 
 
 def _read_manifest(app_id: str) -> tuple[Optional[dict], str, str]:
@@ -751,10 +802,28 @@ def _read_manifest(app_id: str) -> tuple[Optional[dict], str, str]:
     `manifest_diagnosis` is the operator-facing one. Both go through here so the
     reported reason can never drift from the reason the gate actually acted on.
     """
-    root = _apps_root()
+    from . import trust_marker
+
+    try:
+        root = _apps_root()
+    except trust_marker.TrustMarkerError as e:
+        logger.error("gate: trust marker unusable for %s: %s — denied (D06A0EF3)", app_id, e)
+        return None, MANIFEST_UNSIGNED, f"the trust-provisioned marker is not usable: {str(e)[:300]}"
     manifest_path = root / app_id / "manifest.json"
     if not manifest_path.exists():
         return None, MANIFEST_ABSENT, f"no manifest at {manifest_path}"
+    # D4.5 (Loki D06A0EF3): D4 made the trust root unforgeable, but a manifest
+    # tree the broker can rename aside and re-plant with GENUINE signed copies
+    # (cross-seat replay, rollback) still verifies. Under a valid marker the
+    # whole chain must be trust-owner/root-owned.
+    try:
+        marker = trust_marker.active_marker()
+    except trust_marker.TrustMarkerError as e:
+        logger.error("gate: trust marker unusable for %s: %s — denied (D06A0EF3)", app_id, e)
+        return None, MANIFEST_UNSIGNED, (
+            f"{manifest_path} exists, but the trust-provisioned marker is not "
+            f"usable: {str(e)[:300]}"
+        )
     # The manifest and detached signature are one authority artifact.  A
     # publisher needs two renames to replace them, so readers share-lock the
     # app directory while reading and verifying; the permission CLI takes the
@@ -763,8 +832,25 @@ def _read_manifest(app_id: str) -> tuple[Optional[dict], str, str]:
     with pgp.signed_pair_lock(manifest_path, exclusive=False):
         if not manifest_path.exists():
             return None, MANIFEST_ABSENT, f"no manifest at {manifest_path}"
+        raw = b""
+        raw_sig: Optional[bytes] = None
+        if marker is not None:
+            try:
+                raw, raw_sig = _read_provisioned_manifest(root, app_id, marker)
+            except OSError as e:  # PermissionError is an OSError
+                logger.error(
+                    "gate: manifest tree for %s is not trust-owned: %s — denied (D06A0EF3)",
+                    app_id, e,
+                )
+                return None, MANIFEST_UNTRUSTED_OWNER, (
+                    f"{manifest_path}: {str(e)[:300]}"
+                )
         try:
-            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if marker is not None:
+                text = raw.decode("utf-8")
+            else:
+                text = manifest_path.read_text(encoding="utf-8")
+            data = json.loads(text)
         except Exception as e:
             logger.error("gate: manifest unreadable for %s: %s", app_id, e)
             return None, MANIFEST_UNPARSEABLE, (
@@ -773,8 +859,25 @@ def _read_manifest(app_id: str) -> tuple[Optional[dict], str, str]:
         # #183: opt-in PGP enforcement. Every caller of _load_manifest already
         # treats None as "deny" (fail-closed) -- checking here, once, means an
         # unsigned or tampered manifest is denied everywhere a manifest is read.
-        if pgp.pgp_enabled():
-            ok, detail = pgp.verify_detached(manifest_path)
+        try:
+            enforced = pgp.pgp_enabled()
+        except (pgp.PgpSourceUnreadable, pgp.PgpFingerprintConflict) as e:
+            # D4 (Loki D06A0EF3): on a trust-provisioned box pgp_enabled()
+            # raises rather than report "off". The gate treats it as a denial,
+            # never as "no enforcement, accept the manifest".
+            logger.error("gate: trust root unusable for %s: %s — denied", app_id, e)
+            return None, MANIFEST_UNSIGNED, (
+                f"{manifest_path} exists and parses, but the PGP trust root "
+                f"could not be established: {str(e)[:300]}"
+            )
+        if enforced:
+            if marker is not None:
+                if raw_sig is None:
+                    ok, detail = False, f"no signature file: {manifest_path.name}.sig"
+                else:
+                    ok, detail = _verify_snapshot(raw, raw_sig)
+            else:
+                ok, detail = pgp.verify_detached(manifest_path)
             if not ok:
                 logger.error(
                     "gate: manifest signature invalid for %s: %s — denied (PGP enforced)",
@@ -785,6 +888,20 @@ def _read_manifest(app_id: str) -> tuple[Optional[dict], str, str]:
                     f"(WILLOW_PGP_FINGERPRINT is set) and its signature did not verify: "
                     f"{detail}. Sign it with `willow-mcp sign-manifest {app_id}`."
                 )
+    # D4.5: a manifest names its own seat. compile_manifests / registry always
+    # write ``app_id``; a hand-written one may omit it, and that is allowed
+    # (nothing to contradict -- and under a marker the ownership chain above
+    # already bars a planted copy). A PRESENT value that is not exactly the
+    # directory name is a replayed manifest.
+    if isinstance(data, dict) and "app_id" in data and data["app_id"] != app_id:
+        logger.error(
+            "gate: manifest in %s/ claims app_id %r — denied (cross-seat replay, D06A0EF3)",
+            app_id, str(data["app_id"])[:64],
+        )
+        return None, MANIFEST_APP_ID_MISMATCH, (
+            f"{manifest_path} declares app_id {str(data['app_id'])[:64]!r} but lives "
+            f"in the directory for {app_id!r}"
+        )
     return data, MANIFEST_OK, "manifest loaded"
 
 

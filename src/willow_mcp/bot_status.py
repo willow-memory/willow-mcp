@@ -35,7 +35,7 @@ from typing import Callable, Optional
 from . import paths
 
 #: Env override for tests and non-default installs — checked before the
-#: derived `$WILLOW_HOME/venvs/willow-bot/bin/willow-bot-steward` path, the
+#: derived `<venvs>/willow-bot/bin/willow-bot-steward` path, the
 #: same override-then-derive shape `pull_executor._github_root` uses.
 BINARY_ENV = "WILLOW_BOT_STEWARD_BIN"
 
@@ -54,14 +54,25 @@ def _willow_home() -> Path:
 
 def resolve_binary() -> str:
     """The steward CLI to run: ``$WILLOW_BOT_STEWARD_BIN`` if set, else the
-    installed entrypoint under the bot's own venv beneath ``$WILLOW_HOME``.
+    installed entrypoint under the bot's own venv, resolved by
+    :func:`paths.resolve_venv` (D2 home first, legacy ``$WILLOW_HOME/venvs``
+    with a warning, one root only).
     Never hardcodes an operator home — ``_willow_home`` is the one place
     that falls back to ``~/.willow`` (via ``paths.willow_home``), matching
     ``pull_executor.trigger_dir``. May raise ``paths.RetiredHomeError``."""
+    return _resolve()[0]
+
+
+def _resolve() -> tuple[str, "paths.VenvResolution | None"]:
+    """``(binary, resolution)``; ``resolution`` is None for the env override.
+    An absent venv resolves to the D2 home's path: the miss then names where
+    the venv belongs, and `read_status` reports it as `binary_missing`
+    without running anything."""
     override = (os.environ.get(BINARY_ENV) or "").strip()
     if override:
-        return override
-    return str(_willow_home() / "venvs" / "willow-bot" / "bin" / "willow-bot-steward")
+        return override, None
+    res = paths.resolve_venv("willow-bot", home=_willow_home())
+    return str((res.path or res.new) / "bin" / "willow-bot-steward"), res
 
 
 def _tail(text: str, n: int = 200) -> str:
@@ -86,13 +97,23 @@ def read_status(
     it must raise ``FileNotFoundError`` / ``subprocess.TimeoutExpired`` the
     way the real one does, since those are exactly the states this function
     tells apart."""
+    res = None
     try:
-        resolved = binary or resolve_binary()
+        resolved = binary
+        if not resolved:
+            resolved, res = _resolve()
     except paths.RetiredHomeError as exc:
         return {
             "state": "unreachable",
             "reason": "retired_home",
             "detail": str(exc),
+        }
+    if res is not None and res.state == "absent":
+        return {
+            "state": "unreachable",
+            "reason": "binary_missing",
+            "binary": resolved,
+            "detail": f"no willow-bot venv in {paths.venv_absent_detail(res)}",
         }
     run = runner or subprocess.run
     try:

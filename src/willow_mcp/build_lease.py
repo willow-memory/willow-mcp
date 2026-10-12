@@ -70,9 +70,11 @@ def _now() -> datetime:
 def _leases_root(create: bool = False) -> Path:
     """The build-lease directory. `create` only for the one caller that issues
     leases. Readers must never mkdir here — a read path that mutates the trust
-    root has the failure mode backwards."""
-    home = Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
-    root = Path(os.environ.get("WILLOW_MCP_APPS_ROOT", home / "mcp_apps")) / "_build_leases"
+    root has the failure mode backwards. Under a valid trust-provisioned marker
+    the `WILLOW_MCP_APPS_ROOT` lever is ignored (Q37, F1), as in `lease.py`."""
+    from . import paths
+
+    root = paths.reader_apps_root() / "_build_leases"
     if create:
         root.mkdir(parents=True, exist_ok=True)
     return root
@@ -131,6 +133,9 @@ def read_lease(tool: str) -> dict:
       `expired`    well-formed and matching, but its deadline has passed
       `malformed`  unreadable, unparseable, or claiming more than MAX_TTL_SECONDS
       `mismatch`   the record names a different tool than the file it lives in
+      `untrusted`  a valid trust marker binds this host and the tree the lease
+                   sits in is not trust-owner/root-owned, or is a symlink or
+                   swapped under the read, or the marker is unusable
     Only `active` authorizes anything.
     """
     check: dict = {"tool": tool, "status": "none", "path": None,
@@ -142,15 +147,30 @@ def read_lease(tool: str) -> dict:
         return {**check, "status": "malformed", "error": str(e)}
 
     check["path"] = str(path)
-    try:
-        if not path.is_file():
-            return check
-    except OSError as e:
-        logger.error("build_lease: cannot stat %s (%s) — denying build", path, e)
-        return {**check, "status": "malformed", "error": f"unreadable: {e}"}
+    # F1 (Loki, audit of b725667): same rule as `lease.read_lease` — under a
+    # valid trust marker the lease must sit in a trust-owner/root-owned tree.
+    # An absent `_build_leases/` is simply no lease.
+    from . import paths
+
+    state, pinned, detail = paths.marker_gated_read([path.parent.parent, path.parent], path)
+    if state == paths.READ_UNTRUSTED:
+        logger.error("build_lease: %s is not under a trust-owned tree: %s — denying build (D06A0EF3)", path, detail)
+        return {**check, "status": "untrusted", "reason": "untrusted_owner", "error": detail}
+    if state == paths.READ_ABSENT:
+        return check
+    if state == paths.READ_UNREADABLE:
+        logger.error("build_lease: cannot read %s (%s) — denying build", path, detail)
+        return {**check, "status": "malformed", "error": f"unreadable: {detail}"}
+    if state == paths.READ_UNMARKED:
+        try:
+            if not path.is_file():
+                return check
+        except OSError as e:
+            logger.error("build_lease: cannot stat %s (%s) — denying build", path, e)
+            return {**check, "status": "malformed", "error": f"unreadable: {e}"}
 
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(pinned.decode("utf-8") if pinned is not None else path.read_text(encoding="utf-8"))
     except Exception as e:
         logger.error("build_lease: %s is unparseable (%s) — denying build", path, e)
         return {**check, "status": "malformed", "error": f"unparseable: {str(e)[:120]}"}

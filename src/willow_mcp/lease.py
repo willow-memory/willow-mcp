@@ -93,9 +93,15 @@ def _leases_root(create: bool = False) -> Path:
     that tries to create the directory raises `OSError(EROFS)` instead of simply
     denying. A read path that mutates the trust root, and dies when it cannot, has
     the failure mode exactly backwards.
+
+    F1 (Loki, audit of b725667): on a host carrying a valid trust-provisioned
+    marker the `WILLOW_MCP_APPS_ROOT` lever is IGNORED here (Q37,
+    `paths.reader_apps_root`), for the reader and the issuer alike, so a lease is
+    written where it is read.
     """
-    home = Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
-    root = Path(os.environ.get("WILLOW_MCP_APPS_ROOT", home / "mcp_apps")) / "_net_leases"
+    from . import paths
+
+    root = paths.reader_apps_root() / "_net_leases"
     if create:
         root.mkdir(parents=True, exist_ok=True)
     return root
@@ -259,6 +265,11 @@ def read_lease(app_id: str) -> dict:
                   the fix is chmod/chown, never a re-grant
       `malformed` unparseable, or claiming more than MAX_TTL_SECONDS
       `mismatch`  the record names a different app_id than the file it lives in
+      `untrusted` a valid trust marker binds this host and the apps root, lease
+                  directory or file is not trust-owner/root-owned, is
+                  group/other-writable or a symlink, or was swapped under the
+                  read (`reason` is `untrusted_owner`); or the marker itself is
+                  unusable. Treated as no lease.
     Only `active` authorizes anything.
     """
     check: dict = {"app_id": app_id, "status": "none", "path": None,
@@ -273,18 +284,34 @@ def read_lease(app_id: str) -> dict:
         return {**check, "status": "malformed", "error": str(e)}
 
     check["path"] = str(path)
-    try:
-        if not path.is_file():
-            return check
-    except PermissionError as e:
-        logger.error("lease: cannot stat %s (%s) — denying egress", path, e)
-        return {**check, "status": "unreadable", "error": f"permission denied: {e}"}
-    except OSError as e:  # unreadable directory, etc. — not a lease
-        logger.error("lease: cannot stat %s (%s) — denying egress", path, e)
-        return {**check, "status": "malformed", "error": f"unreadable: {e}"}
+    # F1 (Loki, audit of b725667): a lease is a grant, so under a valid trust
+    # marker it must come from a trust-owner/root-owned, non-symlinked tree
+    # (apps root, lease dir, file), read through a pinned fd (D4.5). Anything
+    # else is no lease, loudly, with a reason of its own.
+    from . import paths
+
+    state, pinned, detail = paths.marker_gated_read([path.parent.parent, path.parent], path)
+    if state == paths.READ_UNTRUSTED:
+        logger.error("lease: %s is not under a trust-owned tree: %s — denying egress (D06A0EF3)", path, detail)
+        return {**check, "status": "untrusted", "reason": "untrusted_owner", "error": detail}
+    if state == paths.READ_ABSENT:
+        return check
+    if state == paths.READ_UNREADABLE:
+        logger.error("lease: cannot read %s (%s) — denying egress", path, detail)
+        return {**check, "status": "unreadable", "error": detail}
+    if state == paths.READ_UNMARKED:
+        try:
+            if not path.is_file():
+                return check
+        except PermissionError as e:
+            logger.error("lease: cannot stat %s (%s) — denying egress", path, e)
+            return {**check, "status": "unreadable", "error": f"permission denied: {e}"}
+        except OSError as e:  # unreadable directory, etc. — not a lease
+            logger.error("lease: cannot stat %s (%s) — denying egress", path, e)
+            return {**check, "status": "malformed", "error": f"unreadable: {e}"}
 
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(pinned.decode("utf-8") if pinned is not None else path.read_text(encoding="utf-8"))
     except PermissionError as e:
         # The lease is there and correct for all we know; THIS process may not
         # open it. Reporting that as "malformed" sent the operator to re-issue
@@ -406,9 +433,9 @@ def self_writable_trust_paths(app_id: str = "") -> list[dict]:
         found.append({"key": "lease_root", "path": str(lease_root)})
 
     if app_id:
-        home = Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
-        root = Path(os.environ.get("WILLOW_MCP_APPS_ROOT", home / "mcp_apps"))
-        manifest = root / app_id / "manifest.json"
+        from . import paths
+
+        manifest = paths.reader_apps_root() / app_id / "manifest.json"
         # A manifest that does not exist grants nothing, so it is not a key that
         # could be forged into one — the gate denies an unmanifested app outright.
         if manifest.exists() and path_is_directly_writable_for_trust(manifest):

@@ -1,4 +1,5 @@
 import json
+import pytest
 from datetime import datetime, timezone
 
 from willow_mcp import consent, consent_admin, envelopes, fleet_roster
@@ -676,3 +677,54 @@ def test_one_citation_per_act_and_second_act_needs_second_citation(monkeypatch, 
     )
     assert second["ok"] is False and second["errno"] == "EDQUOT"
     assert len(ledger.events) == 2                    # a distinct citation, not a replay
+
+
+_GOOD_ROW = {"role": "engineer", "trust": "worker"}
+
+
+def _roster(monkeypatch, tmp_path, doc):
+    tmp_path.chmod(0o700)
+    roster = tmp_path / "fleet.json"
+    roster.write_text(json.dumps(doc))
+    roster.chmod(0o600)
+    monkeypatch.setenv("WILLOW_FLEET_ROSTER", str(roster))
+
+
+def test_roster_real_shape_still_loads(monkeypatch, tmp_path):
+    _roster(monkeypatch, tmp_path, {"agents": {"hanuman": _GOOD_ROW}})
+    assert fleet_roster.load_roster() == {"agents": {"hanuman": _GOOD_ROW}}
+
+
+def test_roster_live_box_top_level_metadata_still_loads(monkeypatch, tmp_path):
+    # The operator box's fleet.json top level (2026-10-11): metadata no consumer
+    # reads. "soil_manifest" matches the authority pattern by name only.
+    doc = {
+        "schema": "fleet/v1", "description": "x", "updated": "2026-10-11",
+        "constitutional_ref": "CONST-III-2", "soil_manifest": "soil/manifest.json",
+        "soil_store": "soil/store.db", "agents": {"hanuman": _GOOD_ROW},
+    }
+    _roster(monkeypatch, tmp_path, doc)
+    assert fleet_roster.load_roster() == {"agents": {"hanuman": _GOOD_ROW}}
+
+
+def test_roster_strips_unlisted_benign_keys(monkeypatch, tmp_path):
+    _roster(monkeypatch, tmp_path, {"note": "x", "agents": {"hanuman": {**_GOOD_ROW, "emoji": "x"}}})
+    assert fleet_roster.load_roster() == {"agents": {"hanuman": _GOOD_ROW}}
+
+
+@pytest.mark.parametrize("key", [
+    "capabilities", "permissions", "grants", "manifest", "trust_level", "fingerprint",
+    "syscall_table", "envelope", "allowed_tools", "Capability",
+])
+@pytest.mark.parametrize("where", ["top", "row", "nested"])
+def test_roster_refuses_authority_bearing_fields(monkeypatch, tmp_path, key, where):
+    doc = {"agents": {"hanuman": dict(_GOOD_ROW)}}
+    if where == "top":
+        doc[key] = ["*"]
+    elif where == "row":
+        doc["agents"]["hanuman"][key] = ["*"]
+    else:
+        doc["agents"]["hanuman"]["meta"] = {key: 1}
+    _roster(monkeypatch, tmp_path, doc)
+    with pytest.raises(ValueError, match="authority-bearing"):
+        fleet_roster.load_roster()

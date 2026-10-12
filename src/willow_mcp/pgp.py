@@ -229,6 +229,65 @@ def _trust_config_dir_already_provisioned(dir_path: Path) -> bool:
         return False
 
 
+def _provisioned_marker():
+    """The valid root-owned trust-provisioned marker bound to this
+    ``$WILLOW_HOME`` (:mod:`trust_marker`, D4), or ``None`` when no marker
+    exists (bootstrap behaviour unchanged). A marker that is invalid, binds a
+    different home, or disagrees with the resolved trust owner raises
+    :class:`PgpSourceUnreadable` -- never "absent"."""
+    from . import trust_marker
+
+    try:
+        return trust_marker.active_marker()
+    except trust_marker.TrustMarkerError as exc:
+        raise PgpSourceUnreadable(
+            f"{exc} (Loki D06A0EF3 rename-away protection: refusing to "
+            "decide whether PGP is enforced)"
+        ) from exc
+
+
+def _require_provisioned_shape(path: Path, marker) -> None:
+    """With a valid marker the trust-config directory and file MUST exist in
+    the trust root's shape. Raises :class:`PgpSourceUnreadable` naming
+    D06A0EF3 and the marker -- the rename-away case (a broker-planted
+    ``constitutional/``) lands here instead of reading as bootstrap."""
+    from . import trust_marker
+
+    where = (
+        f"the root-owned marker {trust_marker.marker_path()} says this "
+        "$WILLOW_HOME was provisioned for trust (Loki D06A0EF3, rename-away)"
+    )
+    try:
+        dinfo = os.lstat(path.parent)
+    except OSError as exc:
+        raise PgpSourceUnreadable(
+            f"{path.parent} cannot be stat'ed ({exc}) but {where}: "
+            "constitutional/ was removed or renamed away. Refusing to treat "
+            "that as 'enforcement off'. A root operator must restore it or "
+            "re-run install.sh."
+        ) from exc
+    if not stat.S_ISDIR(dinfo.st_mode) or dinfo.st_uid != marker.trust_owner_uid:
+        raise PgpSourceUnreadable(
+            f"{path.parent} is not a plain directory owned by the trust "
+            f"owner (uid {marker.trust_owner_uid}; found uid {dinfo.st_uid}) "
+            f"but {where}: it was renamed away and replaced. Refusing to "
+            "treat that as 'enforcement off'. Move the planted directory "
+            "aside as root, restore the genuine constitutional/ and retry."
+        )
+    try:
+        finfo = os.lstat(path)
+    except OSError as exc:
+        raise PgpSourceUnreadable(
+            f"{path} is missing or unreadable ({exc}) but {where}. Refusing "
+            "to treat that as 'enforcement off'. Run install.sh as root to "
+            "restore it."
+        ) from exc
+    if not stat.S_ISREG(finfo.st_mode):
+        raise PgpSourceUnreadable(
+            f"{path} is not a regular file but {where}. Refusing."
+        )
+
+
 def _read_trust_config_fingerprint() -> str:
     """``WILLOW_PGP_FINGERPRINT=`` from the trust-config file. Three
     states, never collapsed (Loki A38D41C2 F4; tightened by Loki 93D0F057
@@ -248,6 +307,11 @@ def _read_trust_config_fingerprint() -> str:
       either install stopped between those two steps, or something
       removed it after — raises :class:`PgpSourceUnreadable` rather than
       silently disabling enforcement.
+
+      D4 UPDATE: on a box with a valid root-owned trust-provisioned marker
+      (:mod:`trust_marker`) the bootstrap reading below no longer applies:
+      a missing trust.env or a non-trust-owner ``constitutional/`` RAISES.
+      The residual gap that follows still holds on a box WITHOUT the marker.
 
       RESIDUAL GAP, named plainly rather than hidden — the broker owns
       ``$WILLOW_HOME`` itself (mode 700), so it can rename ``constitutional/``
@@ -286,6 +350,9 @@ def _read_trust_config_fingerprint() -> str:
     """
     global _trust_config_cache
     path = _trust_config_path()
+    marker = _provisioned_marker()
+    if marker is not None:
+        _require_provisioned_shape(path, marker)
     if not path.exists():
         with _trust_config_cache_lock:
             _trust_config_cache = None
@@ -312,7 +379,7 @@ def _read_trust_config_fingerprint() -> str:
     key = (str(path), st.st_ino, st.st_mtime_ns, st.st_size)
     with _trust_config_cache_lock:
         cached = _trust_config_cache
-        if cached is not None and cached[:4] == key:
+        if cached is not None and cached[:4] == key and (cached[4] or marker is None):
             return cached[4]
     try:
         text = path.read_text(encoding="utf-8")
@@ -324,6 +391,14 @@ def _read_trust_config_fingerprint() -> str:
             "file's permissions and retry."
         ) from exc
     value = _parse_trust_config_text(text, path=path)
+    if marker is not None and not value:
+        raise PgpSourceUnreadable(
+            f"{path} carries no WILLOW_PGP_FINGERPRINT but the root-owned "
+            f"marker {_trust_marker_path()} says this $WILLOW_HOME was "
+            "provisioned for trust (Loki D06A0EF3): on a provisioned box an "
+            "empty fingerprint is never 'enforcement off'. Refusing. A root "
+            "operator must restore the genuine trust.env."
+        )
     with _trust_config_cache_lock:
         _trust_config_cache = (*key, value)
     return value
@@ -387,9 +462,25 @@ def expected_fingerprint() -> str:
     return env_value or file_value
 
 
+def _trust_marker_path() -> Path:
+    from . import trust_marker
+
+    return trust_marker.marker_path()
+
+
 def pgp_enabled() -> bool:
+    """True when PGP enforcement is on. On a box with a valid root-owned
+    trust-provisioned marker (D4) this is True or it RAISES
+    (:class:`PgpSourceUnreadable`) -- it never returns False."""
     fp = expected_fingerprint()
-    return bool(fp and _FP_RE.match(fp))
+    enabled = bool(fp and _FP_RE.match(fp))
+    if not enabled and _provisioned_marker() is not None:
+        raise PgpSourceUnreadable(
+            "no usable fingerprint although the root-owned marker "
+            f"{_trust_marker_path()} says trust is provisioned (Loki "
+            "D06A0EF3) -- refusing to report enforcement off."
+        )
+    return enabled
 
 
 def signing_blocked() -> tuple[bool, str]:

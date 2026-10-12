@@ -11,14 +11,89 @@ this document used to walk through one keyboard line at a time are no longer
 the operator's to type; `install.sh` (beside this file) collapses them into
 one root act:
 
-    sudo bash install.sh                       # do it
-    sudo bash install.sh --check               # detect-only, change nothing — stops
-                                                 # after step 0, before any mutation
-    sudo bash install.sh --check-signatures     # read-only: which fingerprint does
+    sudo bash install.sh --expect-head <sha>     # do it, from THAT commit (commit and push
+                                                 # before you install)
+    sudo bash install.sh --check --expect-head <sha>
+                                                 # detect-only, change nothing — stops
+                                                 # after step 0, before any mutation;
+                                                 # prints one [ok]/[FAIL] line per
+                                                 # trust-owner-interpreter check, one per
+                                                 # unit/timer/env check, and any drift of
+                                                 # /etc from the committed HEAD; exits 2 if
+                                                 # any fails
+    sudo bash install.sh --provision-venv --expect-head <sha>
+                                                 # build (or rebuild) ONLY the trust-owner
+                                                 # venv, check it, touch nothing else
+    sudo bash install.sh --check-signatures --expect-head <sha>
+                                                 # read-only: which fingerprint does
                                                  # each governed file verify under, right now
-    sudo bash install.sh --rotate [--retire FPR ...]
+    sudo bash install.sh --rotate [--retire FPR ...] --expect-head <sha>
                                                  # generate a new trust-owner signing key,
                                                  # re-sign everything, THEN retire old key(s)
+    sudo bash install.sh --record-trust-identity --expect-head <sha>
+                                                 # D1: a plain install that ALSO writes the
+                                                 # FIRST trust-identity record, only after a
+                                                 # clean read-only audit (see "D1" below)
+    sudo bash install.sh --re-record-trust-identity [--confirm TOKEN] --expect-head <sha>
+                                                 # D1: accept a changed trust-directory
+                                                 # identity (diff, audit, typed token)
+
+## Which commit: `--expect-head <40-hex sha>` (Loki pre-deploy audit F1)
+
+**Every mode takes `--expect-head`, with the full 40-hex commit sha, and refuses
+to start without it** — plain install, `--check`, `--provision-venv`,
+`--rotate`, `--check-signatures` (only `--dry-run-sign`, which prints text and
+touches nothing, needs neither root nor a sha). A missing, abbreviated (7 or 39
+characters), non-hex or doubled value, a branch or tag name, `HEAD`, and the
+form `--expect-head=<sha>` are all refused before anything is cloned. Uppercase hex is
+accepted and lowercased.
+
+**Where the sha comes from — not from the checkout.** Take it from GitHub, in a
+normal shell on a machine and account that is not the one being installed from:
+
+    git ls-remote https://github.com/willow-memory/willow-mcp <branch>     # the 40-hex on the line for refs/heads/<branch>
+
+or the branch page / the commit page on GitHub (the full sha, not the 7-character
+form). The checkout's own `git rev-parse HEAD` is **not** a trustworthy source: its
+`.git` is writable by the operator uid (the shell, the bot, the agents) and by
+Kart tasks, so HEAD, branches, `packed-refs` and even the object files can be
+rewritten, and `rev-parse` then faithfully prints the rewritten answer. The sha is
+a check only because it reaches the script from outside the thing it checks. The
+commit must also exist in the checkout (`git fetch` first, as the operator, if it
+does not); nothing is fetched from the network by the script.
+
+**What the script does with it.** It clones the checkout (`git clone --no-local
+--no-checkout`, so every object is re-hashed on receipt and an object forged
+under the expected name is simply absent), checks out exactly that sha detached
+(a moved HEAD, branch or tag in the checkout cannot redirect it; a sha that is not
+a commit in the clone stops the run), and then **`exec`s the clone's own copy of
+`deploy/manifest-grant/install.sh`** before any privileged action. That copy
+re-verifies that it is the clone's file (root-owned unwritable clone, clean
+tree, `HEAD` equal to the sha), does not clone again, and only then reads on:
+every line of shell and every inline python heredoc below the pre-reexec
+section comes from the pinned commit. The unpinned file you typed runs only
+the section marked `THE PRE-REEXEC SECTION` at the top of `install.sh` —
+argument scan, the root check, `mktemp`, `mg_git clone / rev-parse / checkout`,
+`exec` — with git run under a neutral environment (`env -i`, no system, global
+or user config, no hooks, no fsmonitor, no pager, file transport only). That
+section is the residual to review. To check the file you are about to run
+against the commit you are about to install:
+
+    curl -fsSL https://raw.githubusercontent.com/willow-memory/willow-mcp/<sha>/deploy/manifest-grant/install.sh | sha256sum
+    sha256sum deploy/manifest-grant/install.sh                              # the two must match
+
+The initial `sudo` invocation of `install.sh` itself starts before any of this can help: it
+relies on sudo's own startup (`env_reset` and sudo's hardcoded
+`BASH_ENV`/`ENV`/`SHELLOPTS`/`BASHOPTS` blacklist). To run it as root without
+sudo, use `env -i PATH=/usr/bin:/bin bash install.sh --expect-head <sha> ...` so
+no startup variable reaches bash. The re-exec into the pinned copy no longer
+depends on sudo: it runs under `/usr/bin/env -i` with a fixed allowlist
+(`SUDO_USER`, plus `PATH` and the two `MG_REEXEC*` markers) and
+`--noprofile --norc`, so `LD_PRELOAD`, `LD_LIBRARY_PATH`, `IFS`, `PYTHON*`,
+`GIT_*` and every startup variable are dropped before it runs.
+
+Every command below therefore carries `--expect-head <sha>`; write the same sha
+on each (re-run `git ls-remote` if the branch moved).
 
 Dispatch `B291C0C7` ("one signing key, one source of truth", amending
 `A9BF01A9`; reworked by `E29CCFC7`/`0CB0C85C`/`38CA74F2` per Loki audits
@@ -56,7 +131,9 @@ indirection at all). See `paths.trust_config_path()`'s own docstring for
 the full argument.
 
 **The rename-away hole (Loki audit `D06A0EF3`) is UNCHANGED by either
-rework and still open on this box.** `$H` is owned by the broker's own
+rework and still open on this box until step 6 has written the D4 marker
+(see "D4: the trust-provisioned marker" after step 6), which closes its
+fail-open half.** `$H` is owned by the broker's own
 uid, mode `700`, so the broker can rename `$H/constitutional` away
 entirely and put an empty, self-owned directory of the same name back —
 `constitutional/` then reads as "never provisioned," trust.env as
@@ -125,7 +202,7 @@ step 3 opened. If step 4 stops partway, the box stays down in the same
 fail-closed state — rerunning `install.sh` (idempotent) is the recovery,
 not a rollback.
 
-1. **Read-only check first.** `sudo bash install.sh --check-signatures`.
+1. **Read-only check first.** `sudo bash install.sh --expect-head <sha> --check-signatures`.
    With no `trust.env` yet, this runs in report-only mode (Loki re-audit
    `93D0F057`, N4 — this is exactly the state the check must work from):
    it names which fingerprint currently signs each governed file (today:
@@ -161,7 +238,7 @@ not a rollback.
    yet), but NOT reversible in the sense of "no outage": the moment this
    step's code is live, every process that starts or restarts on it
    refuses to boot.
-4. **`sudo bash install.sh`.** Generates (or reuses) the trust-owner
+4. **`sudo bash install.sh --expect-head <sha>`.** Generates (or reuses) the trust-owner
    signing key; syncs and signs `syscall-table.json` (step 1c) under that
    key explicitly (not through `trust.env`, which does not exist yet —
    see "Ordering" below); seeds the `envelope.ratify` bootstrap envelope
@@ -181,7 +258,7 @@ not a rollback.
    that do not yet verify). See "N1: the syscall-table residual" below
    for the one sub-step (1c) whose signed-but-not-yet-published state
    this description now accounts for honestly.
-5. **Confirm.** `sudo bash install.sh --check-signatures` again — now in
+5. **Confirm.** `sudo bash install.sh --expect-head <sha> --check-signatures` again — now in
    comparison mode (`trust.env` exists): every governed file should read
    `OK`. Also confirms `$H/env` no longer names a leftover fingerprint.
 6. **Reconnect the desk.** Only meaningful after step 2 removed its old
@@ -308,17 +385,260 @@ the box already has a `trust.env` — see its own section below. Do not run
 BRAND NEW key unconditionally, which is one key too many for a box that
 has never had one at all.
 
-## Preflight
+## The trust owner's own interpreter (operator rulings Q7=A and Q13, 2026-10-11)
+
+The unit and `install.sh` used to run the trust owner with
+`$H/venvs/willow-mcp/bin/python`. Measured on the operator's box on
+2026-10-11 (read-only `stat`/`getfacl`/`readlink`, `$H` =
+`/home/sean-campbell/sean-data-vault/willow-operator-box`):
+
+| Path | Owner | Mode | ACL |
+|---|---|---|---|
+| `$H` | `sean-campbell:sean-campbell` | 711 | |
+| `$H/willow-bot` | `sean-campbell:sean-campbell` | 775 | none |
+| `$H/venvs` | `sean-campbell:sean-campbell` | 755 | `user:willow-operator:--x`, `other::r-x` |
+| `$H/venvs/willow-mcp` | `sean-campbell:sean-campbell` | 755 | |
+| `$H/venvs/willow-mcp/bin/python` | `sean-campbell:sean-campbell` | 777 | symlink; `readlink -f` = `/usr/bin/python3.14` (root-owned system python) |
+
+and the venv itself holds editable installs: `_editable_impl_willow_mcp.pth`
+and `willow_mcp-2.90.2.dev2+g2f1ac9385.dist-info/direct_url.json` =
+`{"dir_info": {"editable": true}, "url": "file:///home/sean-campbell/github/willow-memory/willow-mcp"}`,
+plus `__editable__.nestor-0.1.0.pth` (and its finder), `_editable_impl_jeles.pth`,
+`_editable_impl_ratatosk_meaning.pth`, `_editable_impl_willow_reconciler.pth`,
+`_ratatosk_checkout.pth` and `a1_coverage.pth`.
+
+So the trust owner executed (a) an interpreter tree owned and writable by
+`sean-campbell` — the uid the operator shell, the bot and the agents run as —
+and (b) willow-mcp straight out of the operator's checkout, which Kart tasks
+hold read-write binds on. Anything that could write either could rewrite code
+that then ran as the trust owner: the trust-owner separation (Loki audit
+BFCC5C79 F7) was not holding. (The same measurement also shows `venvs/` is
+**not** the 700 "NOT reachable" directory this document used to claim; the
+list under step 1 now says what the box shows.)
+
+Ruling Q7 = option A ("split"): the trust owner gets its **own** interpreter
+venv, separate from the broker's willow-mcp venv (which moves into the bot
+tree under D2 — `docs/design/d2-venvs-move.md`). Ruling Q13: this fix goes
+ahead of the D2 sequence as its own change, because the gap is open today.
+
+What `install.sh` now builds and requires:
+
+| Property | Value | Why |
+|---|---|---|
+| Path | `/opt/willow-operator/venv` (`TRUST_VENV`, and `PY=$TRUST_VENV/bin/python`; the unit's `ExecStart=` names the same path and the preflight stops if it does not) | `/opt` is the FHS home for add-on software, outside `$H` and `/home`. `/etc/willow-mcp` is configuration, and `/var/lib/willow-mcp/manifest-grant` is the trust owner's own *writable* state (its gnupg home, a unit `ReadWritePaths=`): an interpreter may sit in neither, or the uid that runs it could rewrite it. Under `ProtectSystem=strict` `/opt` is read-only to the unit as well. |
+| Owner / mode | `root:root`, 755 dirs, 644 files (755 for executables) | No non-root uid can write it, the trust owner included. |
+| Build | `python3.14 -m venv` (`TRUST_PY_BASE=/usr/bin/python3.14`, what the box's current venv already resolves to), then a **non-editable** install of a wheel built from a local clone of this checkout's committed `HEAD`. The wheel is built in a throwaway root-owned build venv whose backend (hatchling, hatch-vcs and their dependencies) is installed from `trust-venv.build-requirements.txt`, then `pip wheel --no-build-isolation --no-index`; the dependencies go into the trust venv from `trust-venv.requirements.txt` with `pip install --require-hashes --only-binary=:all: --no-deps -r`; the wheel is installed by file with `--no-deps --no-index`. Both requirements files are read from the committed `HEAD` in the root-owned clone, and refused unless every line is a `name==version` pin or a `--hash=sha256:` entry (no `--index-url`, `-r`, URL or range). | The build writes nothing into the operator-writable checkout; the installed code is a copy, not a pointer back at the checkout. |
+| Packages | `willow-mcp` (the wheel, `--no-deps`), `psycopg2-binary`, `cryptography` and their transitive dependencies `cffi` and `pycparser`, each pinned by sha256 — nothing else | Traced 2026-10-11: `python -m willow_mcp manifest-grant apply` (`__main__` dispatches before `server` loads) and the modules it calls — `manifest_grant_executor`, `trust_owner_verbs`, `mcp_federation`, `envelope_authoring`, `governance_ledger`, `human_session`, `net_signer`, `pgp` — import `psycopg2` (the FRANK ledger, `db`) and `cryptography` (ed25519 verification of the sealed pair) and no other third-party package. `mcp`, `starlette`, `kartikeya`, `jeles`, `nestor`, `ratatosk`, `forge`, `willow-gate`, `requests` and the reconciler are not pulled in. The preflight's last line imports exactly those modules from inside the venv; add a package to `trust-venv.requirements.in` (and regenerate) only if that import (or a new apply-path module) needs it. |
+
+### Preflight
 
 The script refuses to start unless: it is run as root; `$H` exists; the
 `willow-operator` trust-owner user already exists (`trust_root_setup` has
-run on this box); the three unit/env files sit beside `install.sh`;
+run on this box); the three unit/env files are in the checkout's **committed
+HEAD** (see "The unit, timer and env come from the committed HEAD" below);
 `/etc/willow-mcp/verifiers.public.json` (the net-signer's public ring) is
-already present; **the trust owner's own python interpreter exists and is
-executable at `$H/venvs/willow-mcp/bin/python`** (Loki audit BFCC5C79, F7 —
-this is used from step 1 on, not just the withdrawal step, so a missing
-interpreter now stops before anything is touched rather than partway
-through); and `$H/env` names `WILLOW_PG_DB`.
+already present; `$H/env` names `WILLOW_PG_DB`; and **the trust owner's
+interpreter passes every check below** (Loki audit BFCC5C79, F7 — it is used
+from step 1 on, so a bad one stops before anything is touched). Each check
+prints one `[ok]` or `[FAIL]` line; any `[FAIL]` stops the script (`STOP:`),
+and `--check` prints all of them and exits 2 instead of stopping at the first:
+
+1. the interpreter exists, resolves to a regular file and is executable;
+2. every path component from `/` to it is owned by root and not group- or
+   other-writable — walked twice, once as written and once after
+   `readlink -f`, so a symlink into a writable tree is refused too;
+3. no non-root ACL entry grants write on any of those components or anything
+   inside the venv (`getfacl`; if `getfacl` is missing the check **fails
+   closed** — install the `acl` package, which this script already needs for
+   `setfacl`);
+4. everything inside the venv is owned by root and not group/other-writable;
+5. willow-mcp is installed, and nothing in the venv is editable — no
+   `__editable__*`/`_editable_impl_*` marker, `.egg-link` or
+   `easy-install.pth`, no `direct_url.json` with `"editable": true`, and no
+   `.pth` line that puts a path outside the venv on `sys.path`, and no
+   *executable* `.pth` line (one starting `import ` or `import<TAB>`, which
+   `site.py` runs at every interpreter start) — for **any** package, not
+   only willow-mcp. There is no allowlist: a clean build of this venv has no
+   `.pth` file at all (setuptools' `distutils-precedence.pth` is refused too;
+   the venv never installs setuptools). Live finding on the old venv:
+   `_ratatosk_checkout.pth` = `import ratatosk_path_hook`, a module that did
+   `sys.path.insert(0, <ratatosk checkout>)` — a checkout Kart tasks can
+   write, ahead of the standard library;
+6. **`pyvenv.cfg`** (Loki F3), read the way `site.py` reads it: the key
+   `include-system-site-packages` must be present and its last value `false`
+   (`site.py` defaults an absent key to **true**, which would put
+   `/usr/lib/python3/dist-packages` on `sys.path`), `home` must be the directory
+   of `TRUST_PY_BASE`, `version` that interpreter's `X.Y`, and no
+   `bin/pyvenv.cfg` may exist (it would be read first);
+7. **the standard library the interpreter loads** (F3). Located without
+   executing anything: `TRUST_PY_BASE` must be named `pythonX.Y`, its
+   `readlink -f` gives `<prefix>/bin/pythonX.Y`, and CPython's library is
+   `<prefix>/lib/pythonX.Y` (and `<prefix>/lib64/pythonX.Y` where that exists) —
+   `/usr/lib/python3.14` on the operator's box (measured: root:root 755, no
+   non-root-owned or group/other-writable entry, no extended ACL). Every path
+   component down to it (so `/usr/lib` — nobody can drop a `python3XX.zip`
+   beside it) is root-owned and not group/other-writable, and **one `find`**
+   over the whole tree rejects any entry not owned by root or (non-symlink)
+   group/other-writable; the resolved target of every symlink that leaves the
+   tree is judged on its own chain and tree (Debian links `sitecustomize.py` to
+   `/etc/python3.14/sitecustomize.py`);
+8. no non-root write ACL on the standard library, its chain or those targets
+   (`getfacl`, fail closed as in 3);
+9. **`sitecustomize` / `usercustomize`** (F3): every such file (or directory,
+   or compiled module) in the standard library, its `lib-dynload` and the
+   venv's `site-packages` — the only places `-I` looks — is resolved with
+   `readlink -m` and must itself sit on a root-owned, unwritable chain (a
+   dangling link is judged by the directory it would land in);
+10. only when 1–9 pass (root never runs an interpreter that failed them): the
+   apply path imports, with `-I`, from inside the venv, **and every
+   `sys.path` entry the interpreter actually built** lies in the venv or in
+   the checked standard library (so a system `dist-packages` that somehow got
+   added is caught by looking, not only by reading `pyvenv.cfg`);
+11. the venv's `.built-from-head` stamp equals the commit of the root-owned
+   HEAD clone the units are read from (refused if they differ: the units and
+   the venv must come from the same commit);
+12. the committed `willow-mcp-manifest-grant.service` is exactly the
+   allowlisted directive set, the `.timer` only its expected keys and
+   `manifest-grant.env` only its expected keys (next section).
+
+A plain install builds the venv first when it is missing or fails a check
+(step 0a below); `--rotate` and `--check-signatures` only enforce the checks.
+Before the build, root's own use of the base interpreter (`python3.14 -I -m
+venv`) is covered by checks 7–9 run on `TRUST_PY_BASE`.
+
+### The unit, timer and env come from the committed HEAD
+
+The service runs as the trust owner and root installs it, so
+`willow-mcp-manifest-grant.service`, `.timer` and `manifest-grant.env` are
+code-equivalent. They used to be copied from the working tree beside
+`install.sh` (writable by the operator uid, the bot and the agents) with only
+`ExecStart=` checked. Now:
+
+- **One root-owned clone of the pinned commit per run** (`ensure_head_clone`,
+  made by the pre-reexec section from `--expect-head`; the re-exec'd copy of
+  `install.sh` reuses it and never clones again). The venv's wheel and pinned
+  requirements, the unit, the timer and the env template are all read from it
+  and from nowhere else; `install.sh` reads nothing privileged from `$HERE`.
+  **Commit before you install**: an uncommitted edit to any of the three is
+  not installed (and not validated as if it were). The clone's commit must
+  equal the venv's `.built-from-head` stamp; a mismatch stops a plain
+  install, `--rotate` and `--check-signatures` alike (operator ruling
+  2026-10-11: "keep it on all three"). `sudo bash install.sh --expect-head <sha>
+  --provision-venv` rebuilds the venv from HEAD.
+- **The whole file is validated, not just `ExecStart=`** (`mg_service_problems`,
+  `mg_timer_problems`, `mg_env_problems`, in the `trust-venv-check` block of
+  `install.sh`). Exact-line allowlists, each line once, per section; a
+  comment or blank line is skipped, anything else (including an indented
+  directive, a trailing-backslash continuation, a duplicate, a missing line or
+  a directive in the wrong section) stops the install.
+  - service `[Unit]`: `Description=`, `After=network.target postgresql.service`,
+    `RequiresMountsFor=$H`. `[Service]`: `Type=oneshot`, `User=` and `Group=`
+    the trust owner, `UMask=0027`, `EnvironmentFile=/etc/willow-mcp/manifest-grant.env`,
+    `Environment="WILLOW_HOME=$H"`, `Environment="GNUPGHOME=/var/lib/willow-mcp/manifest-grant/gnupg"`,
+    `ExecStart=$PY -I -m willow_mcp manifest-grant apply` (`-I`: isolated mode —
+    no current directory on `sys.path`, `PYTHON*` variables and the user site
+    ignored; Loki pre-deploy audit F4), `NoNewPrivileges=true`,
+    `PrivateTmp=true`, `ProtectSystem=strict`, `ProtectHome=read-only`, four
+    `ReadWritePaths=` (`$H/manifest_grants`, `$H/mcp_apps`, `$H/constitutional`,
+    `/var/lib/willow-mcp/manifest-grant`), `ProtectKernelTunables=true`,
+    `ProtectControlGroups=true`, `RestrictSUIDSGID=true`, `LockPersonality=true`.
+    So no `ExecStartPre`/`ExecStartPost`/`ExecStop*`/`ExecReload`/`ExecCondition`,
+    no second `ExecStart`, no other `Environment`/`EnvironmentFile`.
+  - timer: `[Unit]` `Description=`; `[Timer]` `OnBootSec=2min`,
+    `OnUnitActiveSec=60s`, optionally `Unit=willow-mcp-manifest-grant.service`
+    (and nothing else); `[Install]` `WantedBy=timers.target`.
+  - env (committed, and again as rendered): `WILLOW_KEYRING=` and
+    `WILLOW_SEAL_RING=` `/etc/willow-mcp/verifiers.public.json`,
+    `WILLOW_PG_DB=` (empty in the template, the database name once rendered),
+    `WILLOW_PG_USER=` the trust owner, `WILLOW_MCP_STRICT_TRUST_ROOT=1`. No
+    other key. The render is plain shell (`mg_render_env`: drop any
+    `WILLOW_PGP_FINGERPRINT=` line, set `WILLOW_PG_DB=`), no `sed`, so the
+    value read from `$H/env` is never a replacement string; a newline in it
+    would render a second line and the allowlist stops it.
+  - Because the unit names `$H` (`WILLOW_HOME`, `RequiresMountsFor=`,
+    `ReadWritePaths=`) literally, it only validates on a box whose operator is
+    the one `install.sh` derives (`SUDO_USER`, default `sean-campbell`); on
+    another operator the install stops here instead of installing a unit that
+    points at someone else's box.
+- **Drift is checked after the install and by `--check`.** Step 4 compares
+  what is really in `/etc/systemd/system` and `/etc/willow-mcp` (bytes, owner,
+  mode, not a symlink) with what was rendered from HEAD and stops on any
+  difference. `--check` prints `[ok] installed unit matches committed HEAD`
+  or `[FAIL] installed unit differs from committed HEAD` (and the same for the
+  timer and the env), `[info]` for a file not installed yet, and exits 2 on a
+  FAIL. A systemd drop-in directory for the unit (`*.service.d/`) is not
+  inspected.
+
+## 0a. Provision the trust-owner venv
+
+### Regenerating the hash-pinned files
+
+`trust-venv.requirements.txt` (runtime) and `trust-venv.build-requirements.txt`
+(build backend) are generated from the `.in` files beside them, which hold the
+same ranges as `pyproject.toml` (`psycopg2-binary`, `cryptography`; and
+`[build-system] requires`). Regenerate them on any machine with network
+access, from this directory, with [uv](https://docs.astral.sh/uv/):
+
+    cd deploy/manifest-grant
+    uv pip compile --generate-hashes --python-version 3.14 \
+        --python-platform x86_64-manylinux_2_28 \
+        -o trust-venv.requirements.txt trust-venv.requirements.in
+    uv pip compile --generate-hashes --python-version 3.14 \
+        --python-platform x86_64-manylinux_2_28 \
+        -o trust-venv.build-requirements.txt trust-venv.build-requirements.in
+
+(`pip-compile --generate-hashes --allow-unsafe` from pip-tools works the
+same.) Regenerating is a **reviewed change**: a hash here is what root and
+the trust owner will run, so the diff goes through a pull request like code.
+Read it for new packages (the runtime set must stay `psycopg2-binary`,
+`cryptography`, `cffi`, `pycparser`), version jumps, and any line that is not
+a `name==version` pin or a `--hash=sha256:` entry. The tests fail if a pin
+drifts out of the `pyproject.toml` range, a line lacks a hash, or `install.sh`
+installs anything not hash-pinned. The files list every release artifact's
+hash for the pinned version (wheels for all platforms and the sdist);
+`--only-binary=:all:` makes pip refuse the sdist, so nothing is built from
+source on the box. Only `pip` itself, which `python -m venv` seeds from the
+root-owned system python, is outside the pinned set.
+
+### Privileged steps run only from this venv
+
+`rotate_resign`, `sync_constitutional` and `seed_envelope_ratify` used to be
+scripts beside `install.sh`, run with the trust-owner interpreter from the
+operator-writable checkout: whoever could edit them got code run as root or
+as the trust owner. They now ship in the willow-mcp wheel as
+`willow_mcp.install_steps.<name>` and `install.sh` runs them as
+`"$PY" -I -m willow_mcp.install_steps.<name>`, so they live in
+`/opt/willow-operator/venv` and are covered by the same tree, ACL and
+editable checks. The constitutional seed bundle step 1c syncs is read from
+the installed package too, not from the checkout. Every interpreter call in
+`install.sh` carries `-I` (no current directory, `PYTHON*` variables or user
+site on `sys.path`). The venv records the commit it was built from
+(`.built-from-head`); a plain install rebuilds it when that is not the
+checkout's `HEAD`, so these steps and the bundle always match the commit you
+are installing. Commit before you install: an uncommitted edit to the steps
+or the bundle is not used. (The steps' docstrings still name their old
+`deploy/manifest-grant/` paths; the files are byte-identical to before the
+move.)
+
+    sudo bash install.sh --expect-head <sha> --provision-venv     # rebuild only this, then check it
+    sudo bash install.sh --expect-head <sha> --check              # dry-run: every [ok]/[FAIL] line, changes nothing
+
+Needs, on the box: `python3.14` with `venv` (Debian/Ubuntu: `python3.14-venv`),
+`git`, `acl`, and network access to the package index for the build. The
+rebuild is atomic: the new venv is built in a sibling release directory
+(`/opt/willow-operator/venv.rel.<random>`, root:root 755, at the path it will
+keep), checked in full there, and `/opt/willow-operator/venv` then becomes a
+root-owned symlink to it, swapped with a single `renameat2(2)` (the first run on
+a box where `venv` is still a real directory exchanges the two in one step).
+The unit's `ExecStart=/opt/willow-operator/venv/bin/python` line is unchanged
+and the apply timer never sees a missing interpreter; the old venv is deleted
+only after the swap and a second check at the live path, and a failed build or
+check leaves the live venv untouched. The unit and the rest of the box
+are untouched until a plain `sudo bash install.sh --expect-head <sha>` repoints the unit — so the
+venv can be audited first. Re-run `--provision-venv` after pulling new
+willow-mcp source (a plain install also rebuilds it when its recorded build
+commit is not the checkout's `HEAD`). Not exercised off the real box: root, the network build, the
+real two-uid run (see the legs list under `--rotate`).
 
 ## 0. Find out why mcp_apps reads uid 65534 — before touching ownership
 
@@ -358,8 +678,13 @@ name-reachable once `$H` is traversable:
   `willow-bot/`, `upstream_steward/`, `worker_heartbeat/`, plus the
   intended `mcp_apps/` and `constitutional/`;
 * NOT reachable (700/600, or granted read only where actually needed):
-  `config/`, `store/`, `venvs/`, `mcp_receipt.db`, `vault.db`, `nestor.db`
+  `config/`, `store/`, `mcp_receipt.db`, `vault.db`, `nestor.db`
   itself (never read by the apply half at all now — see the note below).
+  **`venvs/` was listed here and is not:** the box shows it `755`,
+  `sean-campbell:sean-campbell`, with `user:willow-operator:--x` and
+  `other::r-x` (measured 2026-10-11, table above) — enterable and, through
+  `other::r-x`, readable by every uid. That is why the trust owner no longer
+  uses anything under `$H/venvs/`.
 
 `$H/env` carries every provider key and is read by this unit only as root
 (`EnvironmentFile=`), never directly by `willow-operator` — but the SAME
@@ -431,7 +756,7 @@ box. Measured 2026-09-22: the box's table was 22 rows, stale by one row
 froze every envelope ratification behind it, because the verb could never
 be governed at all (`UnknownVerbError`).
 
-    deploy/manifest-grant/sync_constitutional.py <checkout>/src/willow_mcp/bundle/constitutional $H/constitutional
+    /opt/willow-operator/venv/bin/python -I -m willow_mcp.install_steps.sync_constitutional <venv site-packages>/willow_mcp/bundle/constitutional $H/constitutional
 
 `constitutional/` holds POLICY (`syscall-table.json`) and LIVE STATE
 (`pre-approved.json`, the active envelope register; `review_queue.json`;
@@ -510,7 +835,7 @@ sequence the plain install's own step 6 calls — Loki re-audit `93D0F057`,
 N1: one code path for "change what is trusted", not two that can disagree
 about the order), and the order is the whole point:
 
-    sudo bash install.sh --rotate [--retire FPR ...]
+    sudo bash install.sh --expect-head <sha> --rotate [--retire FPR ...]
 
 1. **Generate a new key, always** — never reuse whatever the trust owner's
    GNUPGHOME already holds, even if a key of the same name-prefix is already
@@ -648,13 +973,17 @@ reads `trust.env` directly as the one source of truth.
 ## 4. Env file, units
 
     install -d -m 755 /etc/willow-mcp
-    # manifest-grant.env, with WILLOW_PG_DB filled in. WILLOW_PGP_FINGERPRINT
+    # Rendered from, and installed from, the root-owned clone of the committed
+    # HEAD (never the working tree); validated whole first; compared with /etc
+    # afterwards. manifest-grant.env, with WILLOW_PG_DB filled in. WILLOW_PGP_FINGERPRINT
     # is NOT rendered here (dispatch 0CB0C85C, dissolving Loki A38D41C2's F8):
     # the trust-owner apply unit reads trust.env directly -- the same file
     # everything else reads -- so there is no second copy of the fingerprint
     # to keep in sync, or to drift, here at all.
-    install -o root -g willow-operator -m 640 manifest-grant.env /etc/willow-mcp/manifest-grant.env
-    install -o root -g root -m 644 willow-mcp-manifest-grant.{service,timer} /etc/systemd/system/
+    install -o root -g willow-operator -m 640 <rendered manifest-grant.env> /etc/willow-mcp/manifest-grant.env
+    install -o root -g root -m 644 <HEAD>/deploy/manifest-grant/willow-mcp-manifest-grant.{service,timer} /etc/systemd/system/
+    # then: installed files == the render of HEAD (bytes, root:root 644 /
+    # root:willow-operator 640), else STOP
     systemctl daemon-reload
 
 ## 5. Postgres role for the apply half
@@ -693,6 +1022,204 @@ fingerprint change reads "no ratified servers" and silently drops every
 other entry. `trust_owner_verbs._apply_federation_ratify` also carries a
 defensive check refusing `EACCES` before ever reaching
 `mcp_federation.ratify()` if the registry does not verify, as a backstop.
+
+## D4: the trust-provisioned marker (rename-away hole, Loki `D06A0EF3`)
+
+Step 6 (and `--rotate`) ends by writing `/etc/willow-mcp/trust-provisioned`,
+`root:root 0644`, atomically (temp file beside it, chmod, chown, `mv`), and
+only after `trust.env` carries a real 40-hex fingerprint. Two lines:
+
+    willow_home=<realpath of $H>
+    trust_owner_uid=<uid of the trust owner>
+
+What it does. Its mere presence tells every reader this `$WILLOW_HOME` has
+been provisioned for trust, a fact the broker's uid cannot erase (it is
+root-owned, in a root-owned directory chain). With it present and valid:
+
+* `pgp.pgp_enabled()` is True or it RAISES. A missing, unreadable or empty
+  `trust.env`, or a `constitutional/` that is not a plain directory owned by
+  the trust owner (a rename-away and plant), refuses instead of reading as
+  "enforcement off". The gate denies the seat's manifest; the broker refuses
+  to start (`refusing to start`, exit 1).
+* `paths.trusted_read` drops the own-euid branch for governance inputs: the
+  envelope register, the syscall table, the FRANK head anchor and anything
+  else read through it must be owned (file and parent) by the trust owner or
+  root, and the file must carry a verifying signature. The fleet roster
+  (`$H/fleet.json`, broker-owned) keeps the old shape.
+* `WILLOW_MCP_APPS_ROOT`, `WILLOW_CHARTER_REPO`, `WILLOW_ENVELOPE_REGISTRY`
+  and `WILLOW_SYSCALL_TABLE` are ignored for trust inputs (the default path
+  under `$H` is used) with one loud `ERROR` log line per variable per process.
+* A process whose `$WILLOW_HOME` realpath differs from the marker's refuses
+  trust-sensitive reads, rather than running unenforced.
+
+An invalid marker (symlink, not root-owned, group/other-writable, bad parent,
+malformed) is refused, never read as absent. `--check` prints `[ok]` for a
+valid marker, `[FAIL]` for an invalid one, and `[info]` when absent.
+
+Removing the marker re-opens the bootstrap fail-open (an absent `trust.env` in
+a non-trust-owner `constitutional/` reads as "never provisioned"). Do not
+remove it to "fix" an outage; repair the cause.
+
+What it does not close: rollback to an older genuine trust-owner copy,
+renaming `$H` or an ancestor, and the outage itself (next step: D1, fd reads
+plus a root-owned `(fsid, ino)` record; see the D1 section below). `manifest_grants/` stays in `$H`.
+
+Outage recovery (accepted, operator ruling Q38): if something renames
+`constitutional/` away, every PGP reader refuses with an error naming
+`D06A0EF3` and the marker. As root: move the planted directory aside, move
+the genuine trust-owner-owned `constitutional/` back (or restore it), then
+`sudo deploy/manifest-grant/install.sh --check`, and restart the broker.
+If only `trust.env` is gone, re-run the install (step 6 rewrites it, then
+the marker). Do not edit the marker by hand; install.sh rewrites it.
+
+## D1: the trust-identity record (rename-away hole, option D1, bite 2)
+
+`docs/design/d1-trust-dir-identity.md` is the design. D4 (above) makes a missing
+or foreign-owned `constitutional/` a refusal, but it cannot tell WHICH
+valid-looking directory it is looking at: a uid-1000 process that owns `$H` can
+rename `mcp_apps/` aside and plant a tree carrying copied, genuinely signed
+manifests. D1 pins the identity of the containers in a second root-owned file.
+
+**Bite 2 (this section) makes the record exist and keeps it honest. Nothing at
+runtime reads it yet** (bites 3 to 5), so a record changes no behaviour of the
+broker, the gate or the apply half. What it does change is `install.sh`: three
+guards below.
+
+### What the record is
+
+`/etc/willow-mcp/trust-identity`, `root:root 0644`, in the same root-owned
+directory chain as the marker, written atomically (temp file beside it, `0644`,
+`root:root`, validated by re-parsing, `mv`) by `willow_mcp.install_steps.
+trust_identity_record` from the pinned trust-owner venv, so its bytes are exactly
+`trust_identity.render_record`'s. Seven `key=value` lines:
+
+    version=1
+    willow_home=<realpath of $H>
+    home=fsid:<hex> ino:<n> uid:<n> mode:<octal>[ igen:<n>]
+    dir.constitutional=fsid:... ino:... uid:... mode:...
+    dir.mcp_apps=fsid:... ino:... uid:... mode:...
+    dir.manifest_grants=fsid:... ino:... uid:... mode:...
+    trust_fingerprint=<the 40-hex trust.env carries>
+
+It is written only AFTER the marker (a record without a valid marker is invalid),
+in step 6 of a plain install and after `--rotate`. `mode` of `manifest_grants/`
+includes the group bits of the trust owner's `rwx` ACL mask, as `stat` shows
+them. It holds directory identities and a public fingerprint, no vault material;
+`$H/env`, `vault.db`, `broker_signing_key` and keys are never opened by any of it.
+
+### The first record: audit, then an explicit flag (operator ruling Q-D1-1)
+
+A plain install on a box that has a valid marker and NO record does not write
+one. Before step 1 (so before `chown -R` can make a planted tree look genuine) it
+prints a **read-only audit** of the box as found, and says so. The first record
+is written only when you rerun with `--record-trust-identity` AND that run's
+audit is all `[ok]`; if it is not, install.sh stops before step 1 with nothing
+written. The audit checks:
+
+| Line | What it checks |
+|---|---|
+| D4 marker | valid, binds this `$H` and the trust owner's uid |
+| `$H` | a plain directory (not a symlink), owned by the operator, not group/other-writable |
+| `constitutional/`, `mcp_apps/` | plain directories owned by the trust owner, not group/other-writable |
+| `manifest_grants/` and `pending/ done/ failed/` | plain directories owned by the operator, not other-writable (the group bits carry the ACL mask, so they are not flagged) |
+| `constitutional/` tree | no symlink or special file; the governed files (`trust.env`, `pre-approved.json`, `syscall-table.json`, `frank_head_anchor.json` and their `.sig`) owned by the trust owner or root, not group/other-writable. Other files there (`review_queue.json`, ...) are listed `[info]`, not failed |
+| `mcp_apps/` tree | no symlink or special file anywhere (the seats, `_federation`, `_net_leases`, `_identity_bindings`, `_retired`), every entry trust-owner or root owned and not group/other-writable (the D4.5 gate shape and the F1 lease/binding shape) |
+| seats | every `manifest.json` has its `.sig`, parses, and does not declare another seat's `app_id` (D4.5). A manifest with no `app_id` is noted, allowed (Q47) |
+| `trust.env` | a regular file naming one 40-hex fingerprint |
+| signatures | every governed file verifies under that fingerprint (the `--check-signatures` read, run as the operator) |
+| identity found | the `(fsid, inode, uid, mode[, igen])` the record would pin, printed for you to read |
+
+Why a flag and not a typed confirmation for the first record: the first record
+protects against a box that is already hijacked when it is recorded, and the
+control for that is the audit, which the run enforces itself; the flag is the
+operator's consent, per invocation, and works from a non-interactive `sudo`
+(a typed prompt would make the plain install interactive). The audit's identity
+digest is carried to step 6, which writes only if the inode of `$H` and of each
+recorded directory is still what the audit saw. The flag is only for a plain
+install; it is refused with `--check`, `--rotate`, `--provision-venv`,
+`--check-signatures` and `--re-record-trust-identity`, and on a box with no
+valid marker (there is nothing yet to audit before step 1 changes it).
+
+First-write procedure, exactly:
+
+    sudo bash install.sh --expect-head <sha>                          # deploys this commit's venv and installer;
+                                                                      # prints the audit and the suggestion; writes no record
+    sudo bash install.sh --check --expect-head <sha>                  # prints "[info] trust-identity record absent" and the audit again
+    # read the audit. Every line [ok]? Then:
+    sudo bash install.sh --record-trust-identity --expect-head <sha>  # audit again, stop if not clean, else the install and the first record
+    sudo bash install.sh --check --expect-head <sha>                  # [ok]   trust-identity record valid and matches live
+
+If the audit is not clean, fix what it names (a plain install without the flag
+repairs ownership of `mcp_apps/` and `constitutional/` in step 1) and read it
+again. A box that failed the audit on something you do not understand is the
+case the audit exists for: investigate before recording.
+
+### The pre-check (every plain install and `--rotate` on a recorded box)
+
+With a record present, install.sh compares the live `$H`, `constitutional/`,
+`mcp_apps/` and `manifest_grants/` to it BEFORE step 1 (before any `chown -R`,
+`setfacl` or `install -d`) and, for `--rotate`, before any key is generated or
+anything is re-signed. A difference in `(fsid, inode)`, uid, mode or the
+fingerprint, a recorded directory that is gone (never re-created: Q-D1-6), or an
+invalid record stops with the diff and the recovery text, nothing changed.
+Matching: the run goes on and, at step 6, keeps the record current (an
+unchanged box writes nothing; `--rotate` may move only `trust_fingerprint`; a
+plain install may move nothing). The `trust_root_setup` hardening sweep
+(`apply_trust_root_hardening`, `repair_runtime_permissions`) likewise refuses to
+`mkdir` a recorded directory (or a missing parent of one) on a recorded box.
+
+### `--check`
+
+    [ok]   trust-identity record valid and matches live
+    [FAIL] trust-identity record differs from the live trust directories      (+ one "- dir: field old -> new" line each)
+    [FAIL] trust-identity record is invalid (a recorded box refuses on an invalid record, ...)   (+ the reason)
+    [info] trust-identity record absent (run with --record-trust-identity after the audit)
+
+`absent` on a box with a valid marker is followed by the audit (a FAIL there
+fails `--check`). `--check` exits 2 on any `[FAIL]`, like the other checks.
+
+### Accepting a changed identity: `--re-record-trust-identity`
+
+The only way. Root, `--expect-head`, the `env -i` re-exec, like every mode; it
+never builds the venv. In order, it: (1) shows the live identity and the old
+record against it (every changed field), or says the old record is invalid;
+(2) runs the same read-only audit (a restored tree must verify under the trust
+fingerprint) and stops if it is not clean; (3) asks for a confirmation and, only
+on an exact match, writes atomically.
+
+The confirmation is a token, `rr-` and 12 hex of the digest of the exact record
+about to be written, so it commits to the diff you were shown and changes with
+the inodes. On a terminal you type it at a `/dev/tty` prompt. Without one the
+run prints it and exits 3, writing nothing; rerun the same command with
+`--confirm <token>`. The token is recomputed from the live tree on that second
+run, so a tree that changed in between does not match. This does not stop a
+script from running twice; it stops the one-line blind re-record (a pasted
+command, a recovery loop) from accepting a state nobody looked at.
+
+    sudo bash install.sh --check-signatures --expect-head <sha>       # first: do the signatures verify?
+    sudo bash install.sh --re-record-trust-identity --expect-head <sha>
+    # read the diff and the audit; type the token, or rerun with --confirm <token>
+    sudo bash install.sh --check --expect-head <sha>
+
+### Recovering from a mismatch outage
+
+A record that stops a plain install or `--rotate` is the design working. Do not
+run a plain install to "fix" it, and **never delete `/etc/willow-mcp/
+trust-identity`** (that only removes the check; a recorded box with a damaged
+or missing record is investigated, not reset).
+
+1. Find out what changed (`--check` prints the diff).
+2. A rename-away and plant: as root `mv` the planted directory aside and the
+   genuine one back. The same inode matches the record again; no re-record.
+3. A restore from backup, an `rsync`/`cp -a`, a moved `$H`, filesystem repair, or
+   a damaged record file: verify the tree (`--check-signatures`), then
+   `--re-record-trust-identity` above.
+4. Do not delete the old directory before re-recording (inode reuse, design
+   section 1.1 row 7).
+
+What the guards cannot do: exercise real root, real `/etc` or the real gpg keyring
+in the test suite. The commit report records a root run in a sandbox with a fake
+trust-owner user and a temporary `$H`.
 
 ## 6b. Withdraw every request minted before this install
 

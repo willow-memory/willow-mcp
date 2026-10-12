@@ -3,7 +3,70 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
+
+# Schema guard (Loki R1, audit of 456849a..2ef4419). The roster is read on the
+# own-euid shape (governance=False: broker-writable, unsigned), so it must never
+# carry anything that confers trust or capability. The allowlist is exactly what
+# the consumers read: status()/sync() use data["agents"], and per row only
+# "role" and "trust" (the agents-table columns; "trust" is a display label, not
+# an authority). Everything else is dropped; keys that look like authority are
+# refused outright. If the roster ever needs such a field, flip the read below to
+# governance=True (trust-owner-owned + signed) instead of widening this list.
+_TOP_KEYS = frozenset({"agents"})
+# Known top-level metadata in the live fleet.json (operator box, 2026-10-11),
+# read by no consumer: excluded from the authority scan and then dropped like
+# any other unlisted key. "soil_manifest" would otherwise trip the pattern.
+_INERT_TOP_KEYS = frozenset(
+    {"schema", "description", "updated", "constitutional_ref", "soil_manifest", "soil_store"}
+)
+_ROW_KEYS = frozenset({"role", "trust"})
+_FORBIDDEN_KEY = re.compile(
+    r"capabilit|permission|grant|manifest|trust|fingerprint|fpr|syscall|envelope"
+    r"|privilege|authori|allow|scope|signature|\bsudo\b|\badmin\b",
+    re.IGNORECASE,
+)
+
+
+def _forbidden_keys(node: object, path: str = "") -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            here = f"{path}/{key}"
+            if _FORBIDDEN_KEY.search(str(key)):
+                found.append(here)
+            found.extend(_forbidden_keys(value, here))
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            found.extend(_forbidden_keys(value, f"{path}[{i}]"))
+    return found
+
+
+def _guard_schema(data: dict) -> dict:
+    """Refuse authority-bearing keys; strip every other key outside the allowlist."""
+    agents = data.get("agents")
+    # The one allowed trust-ish key per row ("trust" under agents/<name>) is
+    # removed from the scan; anything else matching the pattern is a refusal.
+    scan = {k: v for k, v in data.items() if k != "agents" and k not in _INERT_TOP_KEYS}
+    if isinstance(agents, dict):
+        scan["agents"] = {
+            name: ({k: v for k, v in row.items() if k not in _ROW_KEYS} if isinstance(row, dict) else row)
+            for name, row in agents.items()
+        }
+    bad = _forbidden_keys(scan)
+    if bad:
+        raise ValueError(
+            "fleet.json carries authority-bearing field(s) the roster may not hold: "
+            + ", ".join(sorted(bad))
+        )
+    clean = {k: v for k, v in data.items() if k in _TOP_KEYS}
+    if isinstance(agents, dict):
+        clean["agents"] = {
+            name: ({k: v for k, v in row.items() if k in _ROW_KEYS} if isinstance(row, dict) else row)
+            for name, row in agents.items()
+        }
+    return clean
 
 
 def roster_path() -> Path:
@@ -16,8 +79,14 @@ def load_roster() -> dict:
     # Authenticate the roster's trust root before reconciling from it (§4.6).
     from .paths import trusted_read
 
-    trusted_read(roster_path())
+    # Not a governance input in the D4 sense: the roster lives at
+    # $WILLOW_HOME/fleet.json, broker-owned. Kept on the own-euid shape; if the
+    # roster ever needs a trust/capability field, flip this to governance=True.
+    trusted_read(roster_path(), governance=False)
     data = json.loads(roster_path().read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("fleet.json must be an object")
+    data = _guard_schema(data)
     agents = data.get("agents")
     if not isinstance(agents, dict):
         raise ValueError("fleet.json agents must be an object")

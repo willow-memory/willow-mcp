@@ -10,7 +10,7 @@ federation.ratify — syscall-table rows 20-23, renumbered from an original
 19-22 draft per Loki audit BFCC5C79 finding F4) beyond
 mcp_apps/manifest_grants.
 
-Divergence note (this PR's own finding, not a bug): `src/willow_mcp/bundle/
+Divergence note (this PR's own finding; the template has since been deleted, Loki R2): `src/willow_mcp/bundle/
 deploy/willow-mcp-manifest-grant.service.template` is the OLD `--user`
 BROKER-owned unit design this install retires outright (INSTALL.md step 2 —
 `systemctl --user disable --now willow-mcp-manifest-grant.timer`); it is a
@@ -35,10 +35,11 @@ from pathlib import Path
 import pytest
 
 _DEPLOY = Path(__file__).resolve().parents[1] / "deploy" / "manifest-grant"
+_STEPS = Path(__file__).resolve().parents[1] / "src" / "willow_mcp" / "install_steps"
 _BUNDLE_TEMPLATE = (
     Path(__file__).resolve().parents[1] / "src" / "willow_mcp" / "bundle" / "deploy"
     / "willow-mcp-manifest-grant.service.template"
-)
+)  # DELETED (Loki R2); kept only so a test can assert it stays gone
 
 _SEALED_PAIRS = ("1fdfbdf3", "1bd6fd29")
 
@@ -158,7 +159,7 @@ def _install_sh_gpg_writes_to_a_path_offenders(install_sh_text: str) -> list[str
 
 
 _ONE_ACT_SYNC_SIGN_MARKERS = (
-    "sync_and_sign", "--sign-as", "seed_envelope_ratify.py",
+    "sync_and_sign", "--sign-as", "install_steps.seed_envelope_ratify",
 )
 
 
@@ -195,7 +196,7 @@ def _old_template_has_a_fixed_user_line(text: str) -> bool:
 
 _ROTATE_REQUIRED_MARKERS = (
     "--rotate", "--check-signatures", "--retire", "governed_files",
-    "rotate_resign.py", "frank_head_anchor.json",
+    "install_steps.rotate_resign", "frank_head_anchor.json",
 )
 
 
@@ -210,8 +211,13 @@ def _install_sh_retires_before_verify(install_sh_text: str) -> bool:
     must survive until every governed file is confirmed to verify under
     the new one."""
     body = _script_body(install_sh_text)
+    # Scope to sign_and_publish_trust (the one rotation path); an earlier
+    # stale-marker retire elsewhere is a different act. No function: whole body.
+    start = body.find("sign_and_publish_trust() {")
+    if start != -1:
+        body = body[start:body.find("\n}\n", start)]
     idx_delete = body.find("delete-secret-and-public-key")
-    idx_verify = body.find('rotate_resign.py" --check --fingerprint "$NEW_FPR"')
+    idx_verify = body.find('install_steps.rotate_resign --check --fingerprint "$new_fpr"')
     if idx_delete == -1 or idx_verify == -1:
         return False
     return idx_delete < idx_verify
@@ -316,7 +322,7 @@ def test_plant_every_deploy_scan_helper_catches_its_violation():
         _ONE_ACT_SYNC_SIGN_MARKERS
     )
     assert _install_sh_missing_one_act_markers(
-        "set -euo pipefail\nsync_and_sign --sign-as x seed_envelope_ratify.py"
+        "set -euo pipefail\nsync_and_sign --sign-as x install_steps.seed_envelope_ratify"
     ) == []
 
     assert _install_sh_syscall_table_double_signed(
@@ -334,10 +340,10 @@ def test_plant_every_deploy_scan_helper_catches_its_violation():
     ) == []
 
     assert _install_sh_retires_before_verify(
-        'set -euo pipefail\ndelete-secret-and-public-key\nrotate_resign.py" --check --fingerprint "$NEW_FPR"\n'
+        'set -euo pipefail\ndelete-secret-and-public-key\ninstall_steps.rotate_resign --check --fingerprint "$new_fpr"\n'
     ) is True
     assert _install_sh_retires_before_verify(
-        'set -euo pipefail\nrotate_resign.py" --check --fingerprint "$NEW_FPR"\ndelete-secret-and-public-key\n'
+        'set -euo pipefail\ninstall_steps.rotate_resign --check --fingerprint "$new_fpr"\ndelete-secret-and-public-key\n'
     ) is False
     assert _install_sh_retires_before_verify("neither marker present") is False
 
@@ -768,11 +774,11 @@ def test_install_sh_step_6_calls_the_shared_sign_and_publish_function():
 
 def _extract_strip_pgp_pin_heredoc(install_sh_text: str) -> str:
     """The Python tokenizer embedded in `strip_pgp_pin()`'s
-    `"$PY" - "$dropin" <<'PYEOF' ... PYEOF` heredoc, extracted so it can
+    `"$PY" -I - "$dropin" <<'PYEOF' ... PYEOF` heredoc, extracted so it can
     be executed directly against synthetic drop-in files — the only way
     to prove the REAL logic handles a given Environment= shape, rather
     than eyeballing the regex."""
-    marker_start = '"$PY" - "$dropin" <<\'PYEOF\'\n'
+    marker_start = '"$PY" -I - "$dropin" <<\'PYEOF\'\n'
     start = install_sh_text.index(marker_start) + len(marker_start)
     end = install_sh_text.index("\nPYEOF", start)
     return install_sh_text[start:end]
@@ -831,9 +837,9 @@ def test_strip_pgp_pin_heredoc_preserves_an_unrelated_token_on_the_same_line(tmp
 
 _TRACKED_SHEBANG_SCRIPTS = (
     _DEPLOY / "install.sh",
-    _DEPLOY / "sync_constitutional.py",
-    _DEPLOY / "seed_envelope_ratify.py",
-    _DEPLOY / "rotate_resign.py",
+    _STEPS / "sync_constitutional.py",
+    _STEPS / "seed_envelope_ratify.py",
+    _STEPS / "rotate_resign.py",
 )
 
 
@@ -887,15 +893,12 @@ def test_install_sh_strips_the_serve_units_own_pgp_pin():
     assert _install_sh_missing_pgp_dropin_strip(text) is False
 
 
-def test_bundle_manifest_grant_template_is_the_retired_user_unit_design():
-    """No existing template covers the NEW system-unit shape this PR adds
-    (the assignment's own "if there is none, say so in the handoff" clause);
-    the OLD one is the --user design this install RETIRES (INSTALL.md step
-    2), and is not expected to match it — a different deployment model."""
-    if not _BUNDLE_TEMPLATE.is_file():
-        pytest.skip("no bundle template for the --user manifest-grant unit exists at all")
-    old_text = _BUNDLE_TEMPLATE.read_text(encoding="utf-8")
+def test_bundle_manifest_grant_template_stays_deleted():
+    """Loki R2: the bundled `--user` template (`@PYTHON@ -m ...`, no `-I`) was
+    the design this install retires (INSTALL.md step 2) and nothing rendered
+    it; it is deleted. The only manifest-grant service unit is the committed
+    system unit, which must stay `-I`."""
+    assert not _BUNDLE_TEMPLATE.exists()
     new_text = (_DEPLOY / "willow-mcp-manifest-grant.service").read_text(encoding="utf-8")
-    assert _old_template_has_a_fixed_user_line(old_text) is False
     assert _service_unit_missing(new_text) == []
-    assert old_text != new_text
+    assert "python -I -m willow_mcp manifest-grant apply" in new_text

@@ -1628,3 +1628,70 @@ def test_build_task_script_executes_against_a_real_fixture_package(tmp_path):
     built = list(wheel_dir.glob("*.whl"))
     assert built, (proc.stdout, proc.stderr)
     assert built[0].name.startswith(fixture_pkg)
+
+
+# ── D2: venv root resolved by paths.resolve_venv; ExecStart match follows it ─
+
+def _d2_venv(root: Path, name: str = VENV) -> Path:
+    py = root / name / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
+    return root / name
+
+
+def test_d2_resolve_new_home_wins_silently(tmp_path, caplog):
+    new, old = tmp_path / "new", tmp_path / "old"
+    chosen = _d2_venv(new)
+    _d2_venv(old)
+    with caplog.at_level("WARNING"):
+        info = pux._resolve_venv(VENV, venv_roots=(new, old))
+    assert info["ok"] and info["path"] == chosen and info["other_path"] == old / VENV
+    assert not caplog.records
+
+
+def test_d2_resolve_legacy_warns_once(tmp_path, caplog):
+    new, old = tmp_path / "new", tmp_path / "old"
+    chosen = _d2_venv(old)
+    with caplog.at_level("WARNING"):
+        info = pux._resolve_venv(VENV, venv_roots=(new, old))
+    assert info["ok"] and info["path"] == chosen and info["root_state"] == "legacy"
+    assert len(caplog.records) == 1 and str(new / VENV) in caplog.records[0].getMessage()
+
+
+def test_d2_resolve_neither_is_evenv_naming_both(tmp_path):
+    new, old = tmp_path / "new", tmp_path / "old"
+    info = pux._resolve_venv(VENV, venv_roots=(new, old))
+    assert info["error"] == "EVENV"
+    assert str(new / VENV) in info["reason"] and str(old / VENV) in info["reason"]
+
+
+def test_d2_resolve_never_accepts_a_venv_in_the_other_root(tmp_path):
+    new, old = tmp_path / "new", tmp_path / "old"
+    target = _d2_venv(old)
+    new.mkdir()
+    (new / VENV).symlink_to(target)
+    info = pux._resolve_venv(VENV, venv_roots=(new, old))
+    assert info["error"] == "EVENV" and "outside" in info["reason"]
+
+
+def _show(execstart: str):
+    def runner(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, execstart, "")
+    return runner
+
+
+def test_d2_restart_match_follows_the_chosen_path(tmp_path):
+    new, old = tmp_path / "new" / VENV, tmp_path / "old" / VENV
+    on_new = f"{{ path={new}/bin/python ; argv[]={new}/bin/python -m x }}"
+    on_old = f"{{ path={old}/bin/python ; argv[]={old}/bin/python -m x }}"
+    assert pux._unit_runs_from_venv("u", new, runner=_show(on_new))
+    assert not pux._unit_runs_from_venv("u", new, runner=_show(on_old))
+    assert pux._unit_runs_from_venv("u", old, runner=_show(on_old))
+    assert not pux._unit_runs_from_venv("u", old, runner=_show(on_new))
+
+
+def test_d2_restart_match_is_on_a_path_boundary(tmp_path):
+    venv = tmp_path / VENV
+    sibling = f"{{ path={venv}2/bin/python }}"
+    assert not pux._unit_runs_from_venv("u", venv, runner=_show(sibling))

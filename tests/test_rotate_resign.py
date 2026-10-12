@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 _MODULE_PATH = (
-    Path(__file__).resolve().parents[1] / "deploy" / "manifest-grant" / "rotate_resign.py"
+    Path(__file__).resolve().parents[1] / "src" / "willow_mcp" / "install_steps" / "rotate_resign.py"
 )
 _spec = importlib.util.spec_from_file_location("rotate_resign", _MODULE_PATH)
 rotate_resign = importlib.util.module_from_spec(_spec)

@@ -1,0 +1,9 @@
+# Inputs to trust-venv.requirements.txt: the trust-owner venv's third-party
+# runtime dependencies, as RANGES, identical to pyproject.toml's entries for the
+# same packages (tests/test_trust_venv_preflight.py fails if they drift or if
+# the pinned versions stop satisfying them). Transitive dependencies (cffi,
+# pycparser) are resolved into the .txt. Do not edit the .txt by hand:
+# regenerate it (INSTALL.md, "Regenerating the hash-pinned files") and review
+# the diff -- a hash is what root and the trust owner will run.
+psycopg2-binary>=2.9,<3.0
+cryptography>=42.0,<51.0

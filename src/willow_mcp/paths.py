@@ -6,15 +6,21 @@ Import from here — do not scatter path joins across the codebase.
 
 from __future__ import annotations
 
+import errno
+import logging
 import os
 import stat
 import re
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 LAYOUT_VERSION = 1
 
+logger = logging.getLogger(__name__)
 
-def trusted_read(path: Path) -> None:
+
+def trusted_read(path: Path, *, governance: bool = True) -> None:
     """Fail-closed authentication of a policy/source file before it is trusted.
 
     Loki B5FB7E2B §4.6: an envelope registry, syscall table, or fleet roster the
@@ -42,11 +48,30 @@ def trusted_read(path: Path) -> None:
     fallback chain that gets more permissive on failure: a missing or
     non-verifying signature on a trust-owner-owned file is a refusal, full
     stop — it never falls through to being trusted on ownership alone.
+
+    D4 (rename-away hole, Loki D06A0EF3): when a valid root-owned
+    ``trust-provisioned`` marker binds this ``$WILLOW_HOME`` and ``governance``
+    is true (the default), the own-euid branch is dropped. The file and its
+    parent must be owned by the trust owner or root (a broker process no
+    longer believes a broker-planted register/syscall table), and the FILE
+    must carry a verifying signature either way. ``governance=False`` keeps
+    the old shape for a broker-owned input that is not a governance input
+    (the fleet roster). An invalid marker refuses (``PermissionError``).
     """
     if path.is_symlink() or path.parent.is_symlink():
         raise PermissionError(f"symlinked source path refused: {path}")
     euid = os.geteuid()
     trust_owner_uid = _trust_owner_uid()
+    if governance:
+        from . import trust_marker
+
+        try:
+            marker = trust_marker.active_marker()
+        except trust_marker.TrustMarkerError as exc:
+            raise PermissionError(f"{path}: {exc}") from exc
+        if marker is not None:
+            _trusted_read_provisioned(path, marker)
+            return
     for target in (path.parent, path):
         if not target.exists():
             raise PermissionError(f"source path missing: {target}")
@@ -64,6 +89,157 @@ def trusted_read(path: Path) -> None:
         raise PermissionError(
             f"untrusted ownership or permissions on source path: {target}"
         )
+
+
+def provisioned_allowed_uids(marker) -> "set[int]":
+    """The owners a governance input may have on a provisioned box: the
+    marker's trust owner or root. Never the process's own uid."""
+    from . import trust_marker
+
+    return {marker.trust_owner_uid, trust_marker._GOVERNANCE_ROOT_UID}
+
+
+def provisioned_lstat(target: Path, marker, *, want_dir: bool) -> os.stat_result:
+    """``lstat`` ``target`` and enforce the provisioned-box ownership rule
+    (same as :func:`_trusted_read_provisioned`: trust-owner- or root-owned, no
+    group/other write bit) plus: a real directory (``want_dir``) or regular
+    file, never a symlink. Returns the lstat result so a caller can pin the
+    inode it later opens. Raises ``PermissionError`` on any violation."""
+    info = os.lstat(target)
+    kind_ok = stat.S_ISDIR(info.st_mode) if want_dir else stat.S_ISREG(info.st_mode)
+    if not kind_ok:
+        raise ProvisionedViolation(
+            f"{target} is not a plain {'directory' if want_dir else 'file'} "
+            "(symlink or special file refused)"
+        )
+    if stat.S_IMODE(info.st_mode) & 0o022 or info.st_uid not in provisioned_allowed_uids(marker):
+        raise ProvisionedViolation(
+            f"untrusted ownership or permissions on {target} (uid {info.st_uid}; "
+            f"this host is trust-provisioned, so it must be owned by the trust "
+            f"owner ({marker.trust_owner_uid}) or root and not group/other-writable "
+            "-- Loki D06A0EF3)"
+        )
+    return info
+
+
+class ProvisionedViolation(PermissionError):
+    """A D4.5 ownership/kind/identity rule was broken (as opposed to the OS
+    refusing this process access, which is a plain ``PermissionError`` with an
+    errno). Subclasses ``PermissionError`` so existing callers still catch it."""
+
+
+def read_pinned(path: Path, info: os.stat_result) -> bytes:
+    """Read ``path`` through an O_NOFOLLOW fd and require it to be the very
+    inode ``info`` (an lstat taken after the ownership checks) described.
+    A symlink at ``path`` or a different inode raises
+    :class:`ProvisionedViolation`."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ProvisionedViolation(f"{path} is a symlink (refused)") from exc
+        raise
+    try:
+        now = os.fstat(fd)
+        if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
+            raise ProvisionedViolation(f"{path} changed between check and open")
+        chunks = []
+        while True:
+            b = os.read(fd, 1 << 20)
+            if not b:
+                break
+            chunks.append(b)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def provisioned_read(marker, dirs: Sequence[Path], file: Path) -> bytes:
+    """The D4.5 read: each of ``dirs`` (outermost first) must be a real
+    directory and ``file`` a regular file, all trust-owner- or root-owned and
+    not group/other-writable (:func:`provisioned_lstat`), then ``file`` is read
+    through the pinned O_NOFOLLOW + (dev, ino) read. Raises
+    ``FileNotFoundError`` when something on the way is absent,
+    :class:`ProvisionedViolation` on a rule break."""
+    for d in dirs:
+        provisioned_lstat(d, marker, want_dir=True)
+    info = provisioned_lstat(file, marker, want_dir=False)
+    return read_pinned(file, info)
+
+
+def reader_apps_root() -> Path:
+    """The ``mcp_apps`` root a lease/binding READER uses: ``$WILLOW_HOME/mcp_apps``,
+    with the ``WILLOW_MCP_APPS_ROOT`` lever honoured only when no valid trust
+    marker binds this host (Q37, ``trust_marker.trust_input_env``). Never
+    raises: a marker that cannot be trusted drops the lever here, and the
+    read itself (:func:`marker_gated_read`) reports the marker error."""
+    from . import trust_marker
+
+    home = Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
+    try:
+        override = trust_marker.trust_input_env("WILLOW_MCP_APPS_ROOT")
+    except trust_marker.TrustMarkerError:
+        override = ""
+    return Path(override) if override else home / "mcp_apps"
+
+
+#: ``marker_gated_read`` states. ``unmarked``: no marker on this host, the
+#: caller reads exactly as it always did. ``absent``: the file (or a directory
+#: above it) does not exist. ``ok``: bytes read from a trust-owned tree.
+#: ``untrusted``: an ownership/kind/identity rule broke or the marker is
+#: unusable -- the caller treats it as no record and says so. ``unreadable``:
+#: the OS refused this process (a mode problem, not an ownership one).
+READ_UNMARKED = "unmarked"
+READ_ABSENT = "absent"
+READ_OK = "ok"
+READ_UNTRUSTED = "untrusted"
+READ_UNREADABLE = "unreadable"
+
+
+def marker_gated_read(dirs: Sequence[Path], file: Path) -> "tuple[str, bytes | None, str]":
+    """``(state, data, detail)`` for a lease/binding record: when a valid trust
+    marker binds this host, ``file`` is read only through
+    :func:`provisioned_read`; otherwise the state is ``unmarked`` and nothing is
+    read. Never raises for the cases above; a ``TrustMarkerError`` is
+    ``untrusted`` (fail closed)."""
+    from . import trust_marker
+
+    try:
+        marker = trust_marker.active_marker()
+    except trust_marker.TrustMarkerError as exc:
+        return READ_UNTRUSTED, None, f"the trust-provisioned marker is not usable: {str(exc)[:300]}"
+    if marker is None:
+        return READ_UNMARKED, None, ""
+    try:
+        return READ_OK, provisioned_read(marker, dirs, file), ""
+    except FileNotFoundError:
+        return READ_ABSENT, None, ""
+    except ProvisionedViolation as exc:
+        return READ_UNTRUSTED, None, str(exc)[:300]
+    except PermissionError as exc:
+        return READ_UNREADABLE, None, f"permission denied: {str(exc)[:200]}"
+    except OSError as exc:
+        return READ_UNTRUSTED, None, f"cannot read it safely: {str(exc)[:200]}"
+
+
+def _trusted_read_provisioned(path: Path, marker) -> None:
+    """The ``trusted_read`` shape on a provisioned box: trust-owner- or
+    root-owned file and parent, no group/other write bit, detached signature
+    required on the file. Own-euid ownership is NOT accepted."""
+    allowed = provisioned_allowed_uids(marker)
+    for target in (path.parent, path):
+        if not target.exists():
+            raise PermissionError(f"source path missing: {target}")
+        info = target.stat()
+        if stat.S_IMODE(info.st_mode) & 0o022 or info.st_uid not in allowed:
+            raise PermissionError(
+                f"untrusted ownership or permissions on source path: {target} "
+                f"(uid {info.st_uid}; this host is trust-provisioned, so a "
+                f"governance input must be owned by the trust owner "
+                f"({marker.trust_owner_uid}) or root, never by this "
+                "process's own uid — Loki D06A0EF3)"
+            )
+    _require_trust_owner_signature(path)
 
 
 def _trust_owner_uid() -> "int | None":
@@ -263,7 +439,9 @@ def trust_config_path() -> Path:
 
 def charter_repo() -> Path | None:
     """Grove charter repository (``WILLOW_CHARTER_REPO``)."""
-    raw = os.environ.get("WILLOW_CHARTER_REPO", "").strip()
+    from . import trust_marker
+
+    raw = trust_marker.trust_input_env("WILLOW_CHARTER_REPO")
     return Path(raw).expanduser() if raw else None
 
 
@@ -535,7 +713,9 @@ def package_dir(package_name: str) -> Path:
 # ── mcp_apps / store ──────────────────────────────────────────────────────────
 
 def mcp_apps_root() -> Path:
-    override = os.environ.get("WILLOW_MCP_APPS_ROOT", "").strip()
+    from . import trust_marker
+
+    override = trust_marker.trust_input_env("WILLOW_MCP_APPS_ROOT")
     if override:
         return Path(override)
     return willow_home() / "mcp_apps"
@@ -669,6 +849,99 @@ def log_path_for_date(date_str: str) -> Path:
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str or ""):
         raise ValueError(f"invalid date: {date_str!r}")
     return logs_dir() / f"{date_str}.log"
+
+
+# ── venvs (seal D2: "all the .venv live in the bot") ──────────────────────────
+#
+# docs/design/d2-venvs-move.md. A venv's home moved from
+# ``$WILLOW_HOME/venvs/<name>`` (legacy) to ``$WILLOW_HOME/willow-bot/venvs/<name>``
+# (new). Every caller that used to join ``"venvs"`` by hand resolves through
+# :func:`resolve_venv` / :func:`venv_dir` instead, so there is one rule:
+#
+# * the new home wins when ``<name>/<probe>`` is an executable file there;
+# * otherwise the legacy home is used, with ONE warning naming the new home;
+# * exactly one root per name is ever chosen: never both, never newest-wins;
+# * neither present is ``absent`` (``venv_dir`` returns ``None``) so the caller
+#   keeps reporting unreachable instead of acting on a path that is not there.
+#
+# The trust-owner paths (manifest-grant unit, install.sh, INSTALL.md) do NOT
+# use this fallback: they stay a hard cut after a separate audit.
+
+_VENV_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+VENV_PROBE = Path("bin") / "python"
+
+
+def venvs_root(home: Path | None = None) -> Path:
+    """``$WILLOW_HOME/willow-bot/venvs`` — the D2 home of the venvs."""
+    return (home if home is not None else willow_home()) / "willow-bot" / "venvs"
+
+
+def legacy_venvs_root(home: Path | None = None) -> Path:
+    """``$WILLOW_HOME/venvs`` — the home before D2; honoured only as a fallback."""
+    return (home if home is not None else willow_home()) / "venvs"
+
+
+@dataclass(frozen=True)
+class VenvResolution:
+    """Which single root a venv name resolved to.
+
+    ``state`` is ``"new"``, ``"legacy"`` or ``"absent"``. ``path`` is the chosen
+    venv directory, ``None`` when absent. ``new`` and ``legacy`` are the two
+    candidates, kept so an absent report can name both places looked."""
+
+    name: str
+    state: str
+    path: Path | None
+    root: Path | None
+    new: Path
+    legacy: Path
+
+
+def _venv_probe_ok(venv: Path, probe: Path) -> bool:
+    target = venv / probe
+    try:
+        return target.is_file() and os.access(target, os.X_OK)
+    except OSError:
+        return False
+
+
+def resolve_venv(
+    name: str,
+    *,
+    home: Path | None = None,
+    roots: tuple[Path, Path] | None = None,
+    probe: Path | str = VENV_PROBE,
+) -> VenvResolution:
+    """Pick the one root ``name`` lives in. ``roots`` is ``(new, legacy)`` and
+    replaces the home-derived pair (a test/operator seam); ``probe`` is the
+    file whose executable presence marks the venv (default ``bin/python``;
+    another venv kind, e.g. a vendored node tree, passes its own)."""
+    if not _VENV_NAME_RE.match(name or "") or name in (".", ".."):
+        raise ValueError(f"invalid venv name: {name!r}")
+    new_root, legacy_root = roots if roots is not None else (venvs_root(home), legacy_venvs_root(home))
+    new, legacy = new_root / name, legacy_root / name
+    probe = Path(probe)
+    if _venv_probe_ok(new, probe):
+        return VenvResolution(name, "new", new, new_root, new, legacy)
+    if _venv_probe_ok(legacy, probe):
+        logger.warning(
+            "venv %r: using the legacy home %s; the D2 home %s has no executable %s. "
+            "Recreate the venv there (willow-bot-steward venvs --plan).",
+            name, legacy, new, probe,
+        )
+        return VenvResolution(name, "legacy", legacy, legacy_root, new, legacy)
+    return VenvResolution(name, "absent", None, None, new, legacy)
+
+
+def venv_dir(name: str, *, home: Path | None = None, probe: Path | str = VENV_PROBE) -> Path | None:
+    """The chosen venv directory for ``name``, or ``None`` when neither home has
+    it. See :func:`resolve_venv`."""
+    return resolve_venv(name, home=home, probe=probe).path
+
+
+def venv_absent_detail(res: VenvResolution) -> str:
+    """Where an absent venv was looked for, for an unreachable report."""
+    return f"{res.new} (D2 home) and {res.legacy} (legacy home)"
 
 
 # ── internal (product runtime; not operator-facing tree docs) ─────────────────

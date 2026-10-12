@@ -14,11 +14,14 @@ via the local `willow-mcp confirm-binding` CLI subcommand (stdio-only, run by
 the operator on the host that owns $WILLOW_HOME).
 """
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("willow_mcp.identity_binding")
 
 
 def _write_json_atomic(path: Path, record: dict) -> None:
@@ -37,9 +40,18 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9_.\-:]{1,256}$")
 
 
 def _bindings_root() -> Path:
-    home = Path(os.environ.get("WILLOW_HOME", Path.home() / ".willow"))
-    root = Path(os.environ.get("WILLOW_MCP_APPS_ROOT", home / "mcp_apps")) / "_identity_bindings"
-    root.mkdir(parents=True, exist_ok=True)
+    """The binding directory. F1 (Loki, audit of b725667): under a valid
+    trust-provisioned marker the `WILLOW_MCP_APPS_ROOT` lever is ignored
+    (Q37, `paths.reader_apps_root`); without a marker it is honoured as ever."""
+    from . import paths
+
+    root = paths.reader_apps_root() / "_identity_bindings"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # A trust-owned directory the caller cannot create into is the hardened
+        # shape, not an error for a reader; a write fails on its own below.
+        pass
     return root
 
 
@@ -66,19 +78,46 @@ def binding_path(idp: str, subject_id: str) -> Path:
     return _bindings_root() / f"{idp}__{subject_id}.json"
 
 
-def load_binding(idp: str, subject_id: str) -> Optional[dict]:
-    """Read a binding. A pre-rename record is normalised to the `idp` key here,
-    once, so nothing downstream has to know two shapes existed."""
+def _read_binding(idp: str, subject_id: str) -> "tuple[Optional[dict], str]":
+    """`(record_or_None, untrusted_detail)`. `untrusted_detail` is non-empty only
+    when a valid trust marker binds this host and the binding's tree (apps
+    root, `_identity_bindings/`, the file) is not trust-owner/root-owned, is a
+    symlink or was swapped under the read, or the marker is unusable (F1,
+    Loki D06A0EF3): the record is then absent, never read."""
+    from . import paths
+
     path = binding_path(idp, subject_id)
-    if not path.exists():
-        return None
+    state, pinned, detail = paths.marker_gated_read([path.parent.parent, path.parent], path)
+    if state == paths.READ_UNTRUSTED:
+        logger.error("identity_binding: %s is not under a trust-owned tree: %s — binding treated as absent (D06A0EF3)",
+                     path, detail)
+        return None, detail
+    if state in (paths.READ_ABSENT, paths.READ_UNREADABLE):
+        return None, ""
+    if state == paths.READ_OK:
+        text = pinned.decode("utf-8", errors="replace")
+    else:
+        if not path.exists():
+            return None, ""
+        try:
+            text = path.read_text()
+        except Exception:
+            return None, ""
     try:
-        record = json.loads(path.read_text())
+        record = json.loads(text)
     except Exception:
-        return None
+        return None, ""
     if isinstance(record, dict) and "idp" not in record and "issuer" in record:
         record["idp"] = record.pop("issuer")
-    return record
+    return record, ""
+
+
+def load_binding(idp: str, subject_id: str) -> Optional[dict]:
+    """Read a binding. A pre-rename record is normalised to the `idp` key here,
+    once, so nothing downstream has to know two shapes existed. Under a valid
+    trust marker a binding outside a trust-owned tree is absent (see
+    `_read_binding`)."""
+    return _read_binding(idp, subject_id)[0]
 
 
 def compute_email_basis(idp: str, email: Optional[str]) -> str:
@@ -124,10 +163,16 @@ def propose_binding(idp: str, subject_id: str, email: Optional[str]) -> dict:
     email-drift flag (§6.3 step 4) if the incoming email differs from what
     was stored — that's an audit note, not a decision change.
     """
-    existing = load_binding(idp, subject_id)
+    existing, untrusted = _read_binding(idp, subject_id)
     if existing is not None:
         _note_email_drift(existing, email)
         return existing
+    if untrusted:
+        # An untrusted store holds no decisions: do not write into it, and do
+        # not clobber what is there. The caller gets an unconfirmed stub, which
+        # the gate treats as unbound.
+        return {"idp": idp, "subject_id": subject_id, "email": email, "app_id": None,
+                "confirmed": False, "untrusted": untrusted}
     now = datetime.now(timezone.utc).isoformat()
     record = {
         "idp": idp,
@@ -148,7 +193,11 @@ def confirm_binding(idp: str, subject_id: str, app_id: str) -> dict:
 
     Not reachable from any MCP tool — call only from the local CLI.
     """
-    record = load_binding(idp, subject_id)
+    record, untrusted = _read_binding(idp, subject_id)
+    if record is None and untrusted:
+        raise ValueError(
+            f"binding for ({idp}, {subject_id}) is not in a trust-owned tree: {untrusted}"
+        )
     if record is None:
         raise ValueError(
             f"no proposed binding for ({idp}, {subject_id}) — "

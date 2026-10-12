@@ -8820,6 +8820,17 @@ def _derive_problems(store: dict, postgres: dict, manifest: dict, mode: str,
                 "fix": (f"from an operator terminal: sudo chmod 644 {lease_state.get('path')} "
                         f"— do not re-issue; a fresh grant-net from the same root shell "
                         f"writes the same unreadable file")})
+        elif status == "untrusted":
+            problems.append({
+                "severity": "warn", "check": "net_lease",
+                "detail": (f"egress lease at {lease_state.get('path')} is not in a trust-owned tree"
+                           + (f": {lease_state['error']}" if lease_state.get("error") else "")
+                           + " — this host carries a trust-provisioned marker, so a lease must sit"
+                             " in an apps root / lease directory / file owned by the trust owner or"
+                             " root and writable by neither group nor other (Loki D06A0EF3);"
+                             " allow_net is denied."),
+                "fix": "have the trust owner (or root) re-issue it: `willow-mcp grant-net <app_id> --ttl 30m` "
+                       "run as that uid, after repairing the ownership of the lease directory"})
         elif status in ("malformed", "mismatch"):
             problems.append({
                 "severity": "warn", "check": "net_lease",
@@ -12504,6 +12515,56 @@ def _boot_manifest_verify_sweep_or_exit() -> list[dict[str, str]]:
         raise SystemExit(1)
 
 
+def _boot_syscall_sync():
+    """Boot convenience syscall-table sync; returns (sync_result, ledger). Never raises."""
+    from .pgp import PgpSourceUnreadable as _PgpSourceUnreadable
+    from .trust_marker import TrustMarkerError as _TrustMarkerError
+
+    _sync_result = None
+    _sync_ledger = None
+    try:
+        from . import constitutional as _constitutional
+        from .governance_ledger import GovernanceLedger as _GovernanceLedger
+        _pg_for_sync = get_pg()
+        _sync_ledger = _GovernanceLedger(_pg_for_sync) if _pg_for_sync else None
+        _sync_result = _constitutional.sync_syscall_table_at_boot(ledger=_sync_ledger)
+        if _sync_result.get("queued", {}).get("ok"):
+            print(
+                f"willow-mcp: syscall table sync queued for trust-owner apply "
+                f"(pair_id={_sync_result['queued'].get('pair_id')})",
+                file=sys.stderr,
+            )
+        elif _sync_result.get("added"):
+            print(
+                f"willow-mcp: synced syscall table verb id(s) "
+                f"{_sync_result['added']} ({', '.join(_sync_result.get('verbs') or [])}) "
+                f"from the bundle — seals: {_sync_result.get('seals') or {}}",
+                file=sys.stderr,
+            )
+        elif not _sync_result.get("ok"):
+            print(
+                f"willow-mcp: syscall table sync refused: {_sync_result.get('reason')}",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001 — never block startup on this convenience sync
+        _sync_result = None
+        _sync_ledger = None
+        if isinstance(exc, (PermissionError, _TrustMarkerError, _PgpSourceUnreadable)):
+            # Not a plain sync hiccup: a trust-marker / trust-source refusal (rename-away
+            # hole, Loki D06A0EF3). Boot still goes on (the decision-time trusted_read
+            # enforces regardless; worst case here is a stale table), but say so loudly.
+            print(
+                f"willow-mcp: ERROR: syscall table sync hit a TRUST-MARKER refusal "
+                f"({type(exc).__name__}: {exc}) -- /etc/willow-mcp/trust-provisioned or its "
+                f"trust source is unreadable or untrusted (Loki D06A0EF3). Continuing "
+                f"without the sync; the live table may be stale.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"willow-mcp: syscall table sync failed: {exc}", file=sys.stderr)
+    return _sync_result, _sync_ledger
+
+
 def _main():
     args, _ = _build_parser().parse_known_args()
 
@@ -12549,34 +12610,7 @@ def _main():
     # this is a convenience sync, not a security gate, so a refusal or read
     # error is logged and the server still starts on whatever table it
     # already had.
-    try:
-        from . import constitutional as _constitutional
-        from .governance_ledger import GovernanceLedger as _GovernanceLedger
-        _pg_for_sync = get_pg()
-        _sync_ledger = _GovernanceLedger(_pg_for_sync) if _pg_for_sync else None
-        _sync_result = _constitutional.sync_syscall_table_at_boot(ledger=_sync_ledger)
-        if _sync_result.get("queued", {}).get("ok"):
-            print(
-                f"willow-mcp: syscall table sync queued for trust-owner apply "
-                f"(pair_id={_sync_result['queued'].get('pair_id')})",
-                file=sys.stderr,
-            )
-        elif _sync_result.get("added"):
-            print(
-                f"willow-mcp: synced syscall table verb id(s) "
-                f"{_sync_result['added']} ({', '.join(_sync_result.get('verbs') or [])}) "
-                f"from the bundle — seals: {_sync_result.get('seals') or {}}",
-                file=sys.stderr,
-            )
-        elif not _sync_result.get("ok"):
-            print(
-                f"willow-mcp: syscall table sync refused: {_sync_result.get('reason')}",
-                file=sys.stderr,
-            )
-    except Exception as exc:  # noqa: BLE001 — never block startup on this convenience sync
-        _sync_result = None
-        _sync_ledger = None
-        print(f"willow-mcp: syscall table sync failed: {exc}", file=sys.stderr)
+    _sync_result, _sync_ledger = _boot_syscall_sync()
 
     # Decision ab9b55dd: ink what changed the tool surface before any client
     # could be told — rows the sync just added, and an advertise mode that

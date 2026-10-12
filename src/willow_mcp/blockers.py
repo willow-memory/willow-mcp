@@ -156,6 +156,8 @@ def _check_lease(app_id: str) -> dict | None:
                        f"cannot read it ({row.get('error') or 'permission denied'})"),
         "malformed": row.get("error") or "malformed",
         "mismatch": row.get("error") or "names a different app_id",
+        "untrusted": (f"a lease at {row.get('path')} is not in a trust-owned tree, so it "
+                      f"is not honoured: {row.get('error') or 'untrusted'} (Loki D06A0EF3)"),
     }.get(status, str(status))
     effect = (
         "open-web and integration egress, net-bearing jeles-corpus federated "

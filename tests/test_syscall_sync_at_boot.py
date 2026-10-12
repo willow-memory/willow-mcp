@@ -116,3 +116,36 @@ def test_tables_already_agree_queues_nothing_even_when_unwritable(tables, tmp_pa
     assert "deferred" not in out and "queued" not in out
     assert live.read_bytes() == before
     assert _pending(grants_root) == []
+
+
+@pytest.mark.parametrize("exc", [
+    PermissionError("untrusted source"),
+    __import__("willow_mcp.trust_marker", fromlist=["x"]).TrustMarkerError("marker not root"),
+    __import__("willow_mcp.pgp", fromlist=["x"]).PgpSourceUnreadable("trust.env unreadable"),
+])
+def test_boot_sync_marker_error_is_logged_distinctly_and_boot_continues(monkeypatch, capsys, exc):
+    from willow_mcp import server
+
+    def boom(**_kw):
+        raise exc
+
+    monkeypatch.setattr(server, "get_pg", lambda: None)
+    monkeypatch.setattr(constitutional, "sync_syscall_table_at_boot", boom)
+    assert server._boot_syscall_sync() == (None, None)      # no raise: boot goes on
+    err = capsys.readouterr().err
+    assert "ERROR" in err and "TRUST-MARKER refusal" in err
+    assert "trust-provisioned" in err and "D06A0EF3" in err and type(exc).__name__ in err
+    assert "syscall table sync failed" not in err
+
+
+def test_boot_sync_other_errors_keep_the_plain_log_line(monkeypatch, capsys):
+    from willow_mcp import server
+
+    def boom(**_kw):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(server, "get_pg", lambda: None)
+    monkeypatch.setattr(constitutional, "sync_syscall_table_at_boot", boom)
+    assert server._boot_syscall_sync() == (None, None)
+    err = capsys.readouterr().err
+    assert "syscall table sync failed: disk on fire" in err and "TRUST-MARKER" not in err

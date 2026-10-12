@@ -65,10 +65,6 @@ def _github_root() -> Path:
     return Path.home() / "github"
 
 
-def _venvs_root() -> Path:
-    return paths.willow_home() / "venvs"
-
-
 def load_allowlist(*, path: Optional[Path] = None) -> dict:
     """Box override first, then the bundled default beside this package."""
     if path is not None:
@@ -114,24 +110,52 @@ def lookup_pair(slug: str, allowlist: dict) -> Optional[dict]:
     return dict(hit) if hit else None
 
 
-def _resolve_venv(venv: str, *, venvs_root: Path) -> dict:
+def _resolve_venv(
+    venv: str,
+    *,
+    venvs_root: Path | None = None,
+    venv_roots: tuple[Path, Path] | None = None,
+) -> dict:
+    """The one venv ``venv`` names, under exactly one root.
+
+    D2: ``paths.resolve_venv`` picks the root (``$WILLOW_HOME/willow-bot/venvs``
+    first, the legacy ``$WILLOW_HOME/venvs`` with a warning), and containment is
+    checked against THAT root only: a venv whose resolved path lies in the
+    other root (or anywhere else) is refused. ``venv_roots`` is a
+    ``(new, legacy)`` seam; ``venvs_root`` is the older single-root seam and
+    skips resolution."""
     name = (venv or "").strip()
+    shown = venvs_root if venvs_root is not None else "the venvs roots"
     if not name or "/" in name or "\\" in name or not _VENV_NAME_RE.match(name):
-        return _refuse("EVENV", f"venv {venv!r} must be a bare name under {venvs_root}")
-    path = venvs_root / name
+        return _refuse("EVENV", f"venv {venv!r} must be a bare name under {shown}")
+    state = "explicit"
+    if venvs_root is not None:
+        root, path = venvs_root, venvs_root / name
+        where = str(venvs_root)
+    else:
+        res = paths.resolve_venv(name, roots=venv_roots)
+        state = res.state
+        if res.path is None:
+            where = paths.venv_absent_detail(res)
+            for cand in (res.new, res.legacy):
+                if cand.is_dir():
+                    return _refuse("EVENV", f"venv {venv!r} has no executable bin/python in {cand} — not a real venv")
+            return _refuse("EVENV", f"venv {venv!r} does not exist under {where}")
+        root, path = res.root, res.path
+        where = str(root)
     try:
         resolved = path.resolve()
-        inside = resolved.is_relative_to(venvs_root.resolve())
+        inside = resolved.is_relative_to(root.resolve())
     except OSError as exc:
         return _refuse("EVENV", f"could not resolve {path}: {exc}")
     if not inside:
-        return _refuse("EVENV", f"venv {venv!r} resolves outside {venvs_root}")
+        return _refuse("EVENV", f"venv {venv!r} resolves outside {where}")
     if not path.is_dir():
-        return _refuse("EVENV", f"venv {venv!r} does not exist under {venvs_root}")
+        return _refuse("EVENV", f"venv {venv!r} does not exist under {where}")
     python = path / "bin" / "python"
     if not python.is_file():
         return _refuse("EVENV", f"venv {venv!r} has no bin/python — not a real venv")
-    return {"ok": True, "path": path, "python": python, "name": name}
+    return {"ok": True, "path": path, "python": python, "root_state": state, "name": name}
 
 
 def _check_writable(venv_path: Path) -> dict | None:
@@ -242,9 +266,12 @@ def execute_pip_sync(
     runner: Optional[Callable] = None,
     allowlist: Optional[dict] = None,
     venvs_root: Optional[Path] = None,
+    venv_roots: Optional[tuple[Path, Path]] = None,
     github_root: Optional[Path] = None,
 ) -> dict:
-    """Install ``checkout`` editable into ``$WILLOW_HOME/venvs/<venv>``.
+    """Install ``checkout`` editable into the venv ``<venv>`` (D2: under
+    ``$WILLOW_HOME/willow-bot/venvs``, else the legacy ``$WILLOW_HOME/venvs``
+    with a warning; exactly one root, see ``paths.resolve_venv``).
 
     ``venv`` may be omitted when the checkout's ``origin`` maps to a pair in
     the allowlist. ``extras`` tokens must be allowlisted; when omitted, the
@@ -252,7 +279,6 @@ def execute_pip_sync(
     """
     path = Path(checkout).expanduser()
     allow = allowlist if allowlist is not None else load_allowlist()
-    roots = venvs_root or _venvs_root()
     ghub = github_root or _github_root()
     allowed_extras = set(allow.get("extras") or ())
 
@@ -309,7 +335,7 @@ def execute_pip_sync(
             branch=branch, default_branch=default,
         )
 
-    venv_info = _resolve_venv(venv_name, venvs_root=roots)
+    venv_info = _resolve_venv(venv_name, venvs_root=venvs_root, venv_roots=venv_roots)
     if not venv_info.get("ok"):
         return venv_info
     venv_path: Path = venv_info["path"]
