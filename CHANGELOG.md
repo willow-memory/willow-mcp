@@ -31,6 +31,39 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.98.0](https://github.com/willow-memory/willow-mcp/compare/v2.97.0...v2.98.0) (2026-10-12)
+
+
+### Added
+
+* **paths:** one venv resolver, new D2 home first with a warned legacy fallback (D2 bite 1) ([d9396d5](https://github.com/willow-memory/willow-mcp/commit/d9396d5d2d58202552fe0544f431cbf0d4167382))
+* **pip-sync,package-upgrade:** installer verbs follow the venv resolver (D2 bite 2) ([91e0f99](https://github.com/willow-memory/willow-mcp/commit/91e0f998b10d8a6a8a96355738d0e3595b2235db))
+* **trust:** D1 bite 1 — trust-identity record reader and fd-walk helper (no callers) ([0fae697](https://github.com/willow-memory/willow-mcp/commit/0fae69731047c1c041c7b48547326ad5e1904c78))
+* **trust:** D1 bite 2 — install.sh writes and checks the trust-identity record (no runtime reader) ([cead372](https://github.com/willow-memory/willow-mcp/commit/cead3724247b33688011965e47742033df000e9e))
+* **trust:** root-owned trust-provisioned marker closes the rename-away fail-open (D4) ([09cff31](https://github.com/willow-memory/willow-mcp/commit/09cff315677f0bb9e2308684aa0a03e71140f695))
+
+
+### Fixed
+
+* **deploy:** --provision-venv swaps the trust-owner venv atomically (Q50) ([6925f8b](https://github.com/willow-memory/willow-mcp/commit/6925f8bcef91c18df6109882a8a10d982a201359))
+* **deps:** willow-ratatosk floor 1.13.0 for rat_turn's --onescript ([1f503d5](https://github.com/willow-memory/willow-mcp/commit/1f503d5d98ce732cb52c041ff32f6b7398a3f665))
+* **gate:** under the trust marker a manifest must be trust-owner-owned and name its own seat (D4.5) ([b725667](https://github.com/willow-memory/willow-mcp/commit/b725667bec1b8dc33cb601a84388f76eced13ea2))
+* **manifest-grant:** --check names what failed instead of blaming the interpreter ([8963929](https://github.com/willow-memory/willow-mcp/commit/896392914c7285777a2be5b939f19b7fbbf8352f))
+* **manifest-grant:** a root-owned parent of the clone dir is trusted ([2a917b4](https://github.com/willow-memory/willow-mcp/commit/2a917b45daad89b0890c4adfb5f9d5f579c26252))
+* **manifest-grant:** group A && B before || C so shellcheck is clean at every severity ([5ca3375](https://github.com/willow-memory/willow-mcp/commit/5ca3375628ad47dc50a2431baafcd82b8ba93e93))
+* **manifest-grant:** pin the installed commit, re-exec the clone's own install.sh, neutral git, stdlib checks, python -I ([fd9bbad](https://github.com/willow-memory/willow-mcp/commit/fd9bbad1c51efa1a6ad95c5f68bcdb7e0f72ced5))
+* **manifest-grant:** privileged steps run only code from the root-owned venv ([754f185](https://github.com/willow-memory/willow-mcp/commit/754f185fb864e304d37a785a012ce94deb9ca8bf))
+* **manifest-grant:** scrub shell startup env on the re-exec; drop the retired unit template (Loki R1, R2) ([88e736b](https://github.com/willow-memory/willow-mcp/commit/88e736b067f33d31d7eb6d36c16c0d8ddc9b376d))
+* **manifest-grant:** the re-exec runs under env -i with a fixed allowlist (Loki R1a, R1b) ([2ef4419](https://github.com/willow-memory/willow-mcp/commit/2ef44195403d150deedc5213111e71493d023cdd))
+* **manifest-grant:** the trust owner runs its own root-owned, non-editable venv ([7f4fbb8](https://github.com/willow-memory/willow-mcp/commit/7f4fbb81532ed2674626ace7115627c5f69f5f2a))
+* **manifest-grant:** the trust venv installs only hash-pinned dependencies and build tools ([ae7e8aa](https://github.com/willow-memory/willow-mcp/commit/ae7e8aaa6736ed9647c4689bf2b2b46d0f6c66c5))
+* **manifest-grant:** units and env install only from the committed HEAD, validated whole ([e1cf291](https://github.com/willow-memory/willow-mcp/commit/e1cf29187f468895edf59be7db917dca535cfaf4))
+* **roster:** the live fleet.json metadata keys are inert, not refused ([3e1581c](https://github.com/willow-memory/willow-mcp/commit/3e1581c548a2fcb9df64d31148df219c43dd6cd4))
+* **trust:** lease and binding readers enforce ownership under the marker (F1, Q49) ([b6df086](https://github.com/willow-memory/willow-mcp/commit/b6df0864f3033fd5baf48c792df793f17482d4c8))
+* **trust:** roster schema guard, operator sanity check, distinct boot-sync marker log (Loki R1–R3) ([9d620ce](https://github.com/willow-memory/willow-mcp/commit/9d620ce0177e9e7c5fc135ecd3ff54d6b8205c75))
+* **unit-ops:** an idle tick exits 0 instead of crashing ([172a59f](https://github.com/willow-memory/willow-mcp/commit/172a59fcb69148fbaef1f0e0c97872d3df709d87))
+* **unit-ops:** an idle tick exits 0 instead of crashing ([c84f477](https://github.com/willow-memory/willow-mcp/commit/c84f477d20cdade39bb38ee6649b3bd2a3d758fb))
+
 ## [2.97.0](https://github.com/willow-memory/willow-mcp/compare/v2.96.0...v2.97.0) (2026-10-09)
 
 
