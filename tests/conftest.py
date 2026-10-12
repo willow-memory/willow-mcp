@@ -107,6 +107,21 @@ def _no_host_trust_marker(tmp_path_factory, monkeypatch):
     trust_marker._logged_levers.clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_host_trust_identity(tmp_path_factory, monkeypatch):
+    """D1: the real /etc/willow-mcp/trust-identity record must never leak into
+    a test on a provisioned host. Same shape as ``_no_host_trust_marker``:
+    point the compiled-in constant at a path that does not exist (record
+    ABSENT); tests of the record monkeypatch ``_RECORD_PATH`` again."""
+    from willow_mcp import trust_identity
+
+    monkeypatch.setattr(
+        trust_identity, "_RECORD_PATH",
+        tmp_path_factory.mktemp("noidentity") / "etc" / "willow-mcp" / "trust-identity",
+    )
+    trust_identity.reset_openat2_probe()
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """Per-test isolated $WILLOW_HOME + aligned mcp_apps/store roots."""
