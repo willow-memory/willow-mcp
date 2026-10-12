@@ -398,11 +398,15 @@ def test_the_reexecd_copy_refuses_to_trust_anything_else(clone, what):
 
 
 def test_the_clone_dirs_parent_must_be_root_owned_and_unwritable_or_sticky(tmp_path):
-    def probe(mode: int, uid: int | None = None) -> list[str]:
-        par = tmp_path / f"par{mode:o}{uid}"
+    def probe(mode: int, uid: int | None = None, owner: int | None = None) -> list[str]:
+        par = tmp_path / f"par{mode:o}{uid}{owner}"
         build = par / "b"
         build.mkdir(parents=True)
         par.chmod(mode)
+        if owner is not None:
+            os.chown(par, owner, -1)
+            if uid is not None:
+                os.chown(build, uid, -1)    # the build dir itself belongs to ROOT_UID
         body = f'{_SECTION}\nmg_clone_problems "{build}" "{uid if uid is not None else os.getuid()}"\n'
         r = subprocess.run(["bash", "-c", "set -euo pipefail\n" + body], capture_output=True, text=True, env=_ID)
         assert r.returncode == 0, r.stderr
@@ -411,7 +415,13 @@ def test_the_clone_dirs_parent_must_be_root_owned_and_unwritable_or_sticky(tmp_p
     assert probe(0o1777) == []                                   # /tmp
     assert any("group/other-writable" in ln for ln in probe(0o777))
     assert any("group/other-writable" in ln for ln in probe(0o775))
-    assert any("is owned by uid" in ln for ln in probe(0o755, uid=os.getuid() + 1))
+    # a parent owned by neither ROOT_UID nor root is refused; as root the parent
+    # is handed to a third uid, as non-root it stays the runner's own
+    stranger = 4242 if os.getuid() == 0 else None
+    assert any("is owned by uid" in ln for ln in probe(0o755, uid=os.getuid() + 1, owner=stranger))
+    if os.getuid() == 0:
+        # root's own parent is trusted even when ROOT_UID differs (a non-root CI runner's /tmp)
+        assert probe(0o755, uid=4243, owner=0) == []
 
 
 # ---- the pre-reexec section is small, and nothing privileged precedes the call ---------------
