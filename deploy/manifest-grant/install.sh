@@ -279,15 +279,17 @@ mg_expect_head() {
 }
 
 # mg_clone_problems BUILD ROOT_UID -- the temp dir that holds the clone: owned by
-# ROOT_UID and not group/other-writable, its parent likewise (or sticky, like
-# /tmp), and nothing inside it owned by another uid or group/other-writable.
+# ROOT_UID and not group/other-writable, its parent owned by ROOT_UID or root
+# and not group/other-writable (or sticky, like /tmp), and nothing inside it owned by another uid or group/other-writable.
 # One `find`, not a per-file loop.
 mg_clone_problems() {
   local build=$1 ru=$2 out st u m
   [ -d "$build" ] && [ ! -L "$build" ] || { printf '%s is not a plain directory\n' "$build"; return 0; }
   st=$(stat -c '%u %a' -- "$(dirname -- "$build")" 2>/dev/null) || { printf 'cannot stat the parent of %s\n' "$build"; return 0; }
   u=${st%% *}; m=${st#* }
-  [ "$u" = "$ru" ] || printf 'the parent of %s is owned by uid %s, not %s\n' "$build" "$u" "$ru"
+  # Root's own parent (e.g. /tmp) is trusted too: equal to ROOT_UID in
+  # production, and the only owner a non-root test runner's mktemp sees.
+  [ "$u" = "$ru" ] || [ "$u" = 0 ] || printf 'the parent of %s is owned by uid %s, not %s\n' "$build" "$u" "$ru"
   if [ $(( 8#$m & 022 )) -ne 0 ] && [ $(( 8#$m & 01000 )) -eq 0 ]; then
     printf 'the parent of %s is group/other-writable (mode %s) and not sticky\n' "$build" "$m"
   fi
