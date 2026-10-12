@@ -284,7 +284,7 @@ mg_expect_head() {
 # One `find`, not a per-file loop.
 mg_clone_problems() {
   local build=$1 ru=$2 out st u m
-  [ -d "$build" ] && [ ! -L "$build" ] || { printf '%s is not a plain directory\n' "$build"; return 0; }
+  { [ -d "$build" ] && [ ! -L "$build" ]; } || { printf '%s is not a plain directory\n' "$build"; return 0; }
   st=$(stat -c '%u %a' -- "$(dirname -- "$build")" 2>/dev/null) || { printf 'cannot stat the parent of %s\n' "$build"; return 0; }
   u=${st%% *}; m=${st#* }
   # Root's own parent (e.g. /tmp) is trusted too: equal to ROOT_UID in
@@ -309,7 +309,7 @@ mg_reexec_problems() {
   if [ "${MG_REEXEC:-}" != "$expect" ]; then
     printf 're-exec marker %s is not --expect-head %s\n' "${MG_REEXEC:-<none>}" "$expect"; return 0
   fi
-  [ -n "$build" ] && [ -d "$build/src" ] || { printf 'the re-exec marker names no clone (%s)\n' "${build:-<none>}"; return 0; }
+  { [ -n "$build" ] && [ -d "$build/src" ]; } || { printf 'the re-exec marker names no clone (%s)\n' "${build:-<none>}"; return 0; }
   if [ "$(readlink -f -- "$self" 2>/dev/null || true)" != "$(readlink -f -- "$build/src/$MG_INSTALL_REL" 2>/dev/null || true)" ]; then
     printf '%s is not the clone'"'"'s own %s\n' "$self" "$build/src/$MG_INSTALL_REL"; return 0
   fi
@@ -1160,7 +1160,7 @@ mg_marker_problems() {
   done
   want_home=$(readlink -f -- "$h" 2>/dev/null || true)
   want_uid=$(id -u "$to" 2>/dev/null || true)
-  [ -n "$want_home" ] && [ -n "$want_uid" ] || { printf 'cannot resolve %s or trust owner %s\n' "$h" "$to"; return 0; }
+  { [ -n "$want_home" ] && [ -n "$want_uid" ]; } || { printf 'cannot resolve %s or trust owner %s\n' "$h" "$to"; return 0; }
   lines=$(cat -- "$m" 2>/dev/null || true)
   [ "$lines" = "willow_home=$want_home
 trust_owner_uid=$want_uid" ] || printf '%s does not read exactly willow_home=%s and trust_owner_uid=%s\n' "$m" "$want_home" "$want_uid"
@@ -1174,10 +1174,10 @@ mg_write_marker() {
   local m=$1 h=$2 to=$3 ru=${4:-root} rg=${5:-root} tmp p home uid
   home=$(readlink -f -- "$h" 2>/dev/null || true)
   uid=$(id -u "$to" 2>/dev/null || true)
-  [ -n "$home" ] && [ -n "$uid" ] || { printf 'cannot resolve %s or trust owner %s\n' "$h" "$to" >&2; return 1; }
+  { [ -n "$home" ] && [ -n "$uid" ]; } || { printf 'cannot resolve %s or trust owner %s\n' "$h" "$to" >&2; return 1; }
   tmp=$(mktemp -- "$(dirname -- "$m")/.trust-provisioned.XXXXXX") || return 1
   printf 'willow_home=%s\ntrust_owner_uid=%s\n' "$home" "$uid" > "$tmp" || { rm -f -- "$tmp"; return 1; }
-  chmod 0644 -- "$tmp" && chown "$ru:$rg" -- "$tmp" || { rm -f -- "$tmp"; return 1; }
+  { chmod 0644 -- "$tmp" && chown "$ru:$rg" -- "$tmp"; } || { rm -f -- "$tmp"; return 1; }
   # validate the temp file BEFORE it replaces anything: a bad write must not
   # clobber an existing valid marker
   p=$(mg_marker_problems "$tmp" "$h" "$to" "$ru" "$rg")
@@ -1307,7 +1307,7 @@ if libc.renameat2(-100, os.fsencode(src), -100, os.fsencode(dst), flags) != 0:
 # the wheel, built at STAGE's own permanent path. $TRUST_VENV is not touched.
 tvc_build_stage() {
   local stage=$1 reqs=$2 wheel=$3
-  chown "$TVC_OWNER" "$stage" && chmod 755 "$stage" || tvc_stop "could not set the release directory $stage root:root 755"
+  { chown "$TVC_OWNER" "$stage" && chmod 755 "$stage"; } || tvc_stop "could not set the release directory $stage root:root 755"
   ( umask 022; "$TRUST_PY_BASE" -I -m venv "$stage" ) \
     || tvc_stop "could not create the venv with $TRUST_PY_BASE (Debian/Ubuntu: apt install python3-venv)"
   ( umask 022; "$stage/bin/python" -I -m pip install --quiet --require-hashes --only-binary=:all: --no-deps -r "$reqs" ) \
@@ -1316,7 +1316,7 @@ tvc_build_stage() {
     || tvc_stop "could not install ${wheel##*/} into $stage; $TRUST_VENV is unchanged"
   printf '%s\n' "$HEAD_SHA" > "$stage/$TVC_STAMP" \
     || tvc_stop "could not record the commit the venv was built from"
-  chown -R "$TVC_OWNER" "$stage" && chmod -R u=rwX,go=rX "$stage" || tvc_stop "could not set $stage root:root, go-w"
+  { chown -R "$TVC_OWNER" "$stage" && chmod -R u=rwX,go=rX "$stage"; } || tvc_stop "could not set $stage root:root, go-w"
 }
 
 # tvc_publish STAGE ROOT_UID ANCHOR -- check STAGE with the FULL preflight at its
@@ -1897,7 +1897,7 @@ identity_gate_first() {
     TI_AUDIT_RC=1   # never let a later step treat an un-flagged audit as consent
     return 0
   fi
-  [ "$TI_AUDIT_RC" = 0 ] && [ -n "$TI_SNAPSHOT" ] \
+  { [ "$TI_AUDIT_RC" = 0 ] && [ -n "$TI_SNAPSHOT" ]; } \
     || stop "the audit above is not all [ok]: the first trust-identity record is NOT written and step 1 did not run. Fix what it names (a plain install without the flag repairs ownership), then rerun with --record-trust-identity"
   say "  audit clean -- the first record will be written at step 6, after the marker, if the identity is unchanged"
 }
