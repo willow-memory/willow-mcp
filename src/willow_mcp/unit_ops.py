@@ -305,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     ledger = GovernanceLedger(pg)
     out = tick(ledger=ledger)
     print(json.dumps(out, indent=2, default=str))
-    ok = out.get("ok") and all(r.get("ok") for r in out.get("results") or [True])
+    ok = out.get("ok") and all(r.get("ok") for r in out.get("results") or [])
     return 0 if ok else 1
 
 
