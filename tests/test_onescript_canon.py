@@ -84,6 +84,7 @@ def test_trust_owner_modules_keep_their_own_code_and_match_their_family():
         net_signer,
         receipts,
         session_binder,
+        session_signing,
         training_corpus,
         trust_owner_verbs,
     )
@@ -115,6 +116,9 @@ def test_trust_owner_modules_keep_their_own_code_and_match_their_family():
     assert net_signer.seal_message("s é", "t ☃", "v") == e.bytes(["s é", "t ☃", "v"])
     h = hashlib.sha256(e.bytes(["p", "ts", "a", "t", "o", "dé"])).hexdigest()
     assert receipts._entry_hash("p", "ts", "a", "t", "o", "dé") == h
+    # session_signing is in the trust closure (human_session imports it), so it
+    # keeps its own json.dumps; held to the same family here.
+    assert session_signing._message("ä", "s☃", "v", "2026") == e.bytes(["ä", "s☃", "v", "2026"])
     assert session_binder.call_sig(b"k", "s☃", "a", "t", "n") == __import__("hmac").new(
         b"k", _fam("compact_ascii").bytes(["call", "s☃", "a", "t", "n"]), hashlib.sha256
     ).hexdigest()
