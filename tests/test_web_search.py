@@ -526,3 +526,12 @@ def test_the_search_module_makes_no_unguarded_network_call():
         and node.func.value.id in ("requests", "urllib", "http", "socket")
     ]
     assert calls == [], f"unguarded transport calls in web_search: {calls}"
+
+
+def test_ddg_links_are_dropped_by_host_not_by_substring():
+    """A result whose query names duckduckgo.com is still a result; only
+    DuckDuckGo's own hosts are skipped (CodeQL: incomplete URL substring check)."""
+    assert web_search._is_ddg_host("https://duckduckgo.com/settings")
+    assert web_search._is_ddg_host("https://html.duckduckgo.com/html/?q=x")
+    assert not web_search._is_ddg_host("https://example.com/?ref=duckduckgo.com")
+    assert not web_search._is_ddg_host("https://notduckduckgo.com/")
