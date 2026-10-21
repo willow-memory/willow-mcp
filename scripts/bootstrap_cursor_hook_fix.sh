@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="${WILLOW_MCP_VENV:-$HOME/sean-data-vault/willow-operator-box/venvs/willow-mcp}"
 export WILLOW_HOME="${WILLOW_HOME:-$HOME/sean-data-vault/willow-operator-box}"
 
-cp "$ROOT/src/willow_mcp/bundle/hooks/pre_tool_use.py" "$ROOT/hooks/pre_tool_use.py"
+"$ROOT/scripts/sync_repo_hooks.sh"
 "$VENV/bin/pip" install -q -e "$ROOT"
 "$VENV/bin/willow-mcp" project sync willow-mcp
 
