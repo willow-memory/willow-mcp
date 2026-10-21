@@ -18,6 +18,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
+from .onescript_canon import family
+
 FORMAT_VERSION = "willow-bound-receipt/1"
 DEFAULT_TTL_SECONDS = 300
 
@@ -143,41 +145,34 @@ def load_json_schema() -> dict:
 
 def agent_identity_ref(agent_id: str, trust_level: int, session_id: str) -> str:
     """Digest of the bound session_bind identity (capped trust + session id)."""
-    msg = json.dumps(
-        ["session_bind", agent_id, int(trust_level), session_id],
-        separators=(",", ":"),
-        ensure_ascii=False,
+    msg = family("compact_utf8").bytes(
+        ["session_bind", agent_id, int(trust_level), session_id]
     )
-    return hashlib.sha256(msg.encode("utf-8")).hexdigest()
+    return hashlib.sha256(msg).hexdigest()
 
 
 def manifest_acl_digest(manifest: dict) -> str:
     """Capability plane: sorted manifest permission groups / tool names."""
     app_id = manifest.get("app_id")
     perms = sorted({p for p in (manifest.get("permissions") or []) if isinstance(p, str)})
-    msg = json.dumps(["manifest-acl", app_id, perms], separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(msg.encode("utf-8")).hexdigest()
+    msg = family("compact_utf8").bytes(["manifest-acl", app_id, perms])
+    return hashlib.sha256(msg).hexdigest()
 
 
 def manifest_policy_digest(manifest: dict) -> str:
     """Policy plane: canonical manifest document bytes (sorted keys at top level)."""
-    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(family("sorted_compact_utf8").bytes(manifest)).hexdigest()
 
 
 def tool_call_digest(session_id: str, app_id: str, tool: str, call_nonce: str) -> str:
     """Same message shape as session_binder.call_sig (without the HMAC)."""
-    msg = json.dumps(
-        ["call", session_id, app_id, tool, call_nonce],
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(msg.encode("utf-8")).hexdigest()
+    msg = family("compact_utf8").bytes(["call", session_id, app_id, tool, call_nonce])
+    return hashlib.sha256(msg).hexdigest()
 
 
 def effect_ref(outcome: str, detail: Optional[str] = None) -> str:
-    msg = json.dumps(["effect", outcome, detail], separators=(",", ":"), ensure_ascii=False)
-    return f"effect:{hashlib.sha256(msg.encode('utf-8')).hexdigest()}"
+    msg = family("compact_utf8").bytes(["effect", outcome, detail])
+    return f"effect:{hashlib.sha256(msg).hexdigest()}"
 
 
 def denial_code(code: str) -> str:
@@ -196,12 +191,8 @@ def ledger_entry_hash(
     detail: Optional[str],
 ) -> str:
     """Matches willow_mcp.receipts._entry_hash for cross-linking."""
-    payload = json.dumps(
-        [prev_hash, ts, app_id, tool, outcome, detail],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    payload = family("compact_utf8").bytes([prev_hash, ts, app_id, tool, outcome, detail])
+    return hashlib.sha256(payload).hexdigest()
 
 
 # ── Canonical signing bytes ───────────────────────────────────────────────────
@@ -221,7 +212,7 @@ def canonical_signed_bytes(payload: BoundReceiptPayload | dict[str, str]) -> byt
         p["issued_at"],
         p["expires_at"],
     ]
-    return json.dumps(array, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return family("compact_utf8").bytes(array)
 
 
 # ── Structural validation (stage 1) ───────────────────────────────────────────

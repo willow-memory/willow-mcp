@@ -36,10 +36,10 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 from typing import Optional
 
 from . import keyring as keyring_mod
+from .onescript_canon import family
 
 
 class InvalidSessionSignatureError(Exception):
@@ -80,11 +80,7 @@ def _message(
     a refactor. ``tests/test_client_signed_sessions.py`` pins the exact
     output for a known input.
     """
-    return json.dumps(
-        [app_id, session_id, verifier, attested_at],
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
+    return family("compact_utf8").bytes([app_id, session_id, verifier, attested_at])
 
 
 def _sign_ed25519(private_key: bytes, message: bytes) -> str:

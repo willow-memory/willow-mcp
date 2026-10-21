@@ -30,6 +30,8 @@ import json
 from pathlib import Path
 from typing import Optional, Union
 
+from .onescript_canon import family
+
 
 class LedgerError(Exception):
     """The ledger is unusable (unreadable, malformed, chain broken)."""
@@ -99,7 +101,7 @@ def append(
         "sig_digest": sig_digest,
         "prev": prev,
     }
-    line = json.dumps(entry, separators=(",", ":"), ensure_ascii=False)
+    line = family("compact_utf8")(entry)
     with open(p, "a", encoding="utf-8") as fh:
         fh.write(line + "\n")
     return hashlib.sha256(line.encode("utf-8")).hexdigest()
