@@ -50,7 +50,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from .scrub_reach import get
+from . import scrub_local
 
 VERB = "git.push"
 
@@ -142,13 +142,11 @@ _REQUEST_ID_RE = re.compile(r"x-github-request-id:\s*([0-9A-Fa-f:]+)", re.IGNORE
 def _redact(text: str) -> str:
     """The Authorization header and ``gh?_`` tokens out of a git trace, then
     any credential shape. The rules are the one script's (flatten-2 F12:
-    ``scrub.py`` sets ``git_trace`` and ``credentials``); the marks this
-    printed before (``<redacted>``, ``gh?_<redacted>``) are unchanged. With the
-    one script out of reach the trace is withheld, with why."""
-    mod, why = get()
-    if mod is None:
-        return f"<redacted: unreachable: {why}>"
-    return mod.apply(text or "", ("git_trace", "credentials"))
+    ``scrub.py`` sets ``git_trace`` and ``credentials``, carried as
+    ``scrub_local``: this module is on the trust-owner path, which never
+    reaches the one script); the marks this printed before (``<redacted>``,
+    ``gh?_<redacted>``) are unchanged."""
+    return scrub_local.apply(text or "", ("git_trace", "credentials"))
 
 
 def _split_trace(stderr: str) -> tuple[str, list[str]]:

@@ -18,16 +18,15 @@ Design:
     a structured token) — not a generic high-entropy heuristic, which would
     redact legitimate ids and hashes. Precision over recall: a backstop that
     cried wolf would be turned off.
-  * One rule, one home (flatten-2 F12). The patterns are the one script's
-    ``onescript/scrub.py`` (the operator: "Using the onescript at every
-    path."): the set ``credentials`` for this funnel, ``credentials`` plus
-    ``journal_kv`` for a journal tail. This module keeps the funnel's shape (the
-    walk, the opaque scan, the audit kinds) and names which sets it uses. With
-    the one script out of reach it refuses: ``redact_egress`` raises
-    ``ScrubUnreachable`` (``server._guarded`` turns that into
-    ``egress_scan_failed``), ``scan_opaque`` reports ``unreachable`` (a refusal),
-    ``redact_journal_tail`` withholds the whole tail. Never a copy of the old
-    patterns.
+  * One rule, held to the one script's (flatten-2 F12). The patterns are
+    ``onescript/scrub.py``'s, carried here as ``scrub_local`` (a byte copy;
+    ``tests/test_scrub_parity.py`` holds them equal): the set ``credentials``
+    for this funnel, ``credentials`` plus ``journal_kv`` for a journal tail.
+    This module sits in the trust-owner closure (keyring -> ... ->
+    unit_status), and trust-owner code never reaches the one script (operator
+    ruling 2026-10-21, "1 yes"), so it imports no ``onescript_*`` module and
+    has no unreachable case. It keeps the funnel's shape (the walk, the opaque
+    scan, the audit kinds) and names which sets it uses.
   * Payload-free reporting. The caller-facing value is the redacted structure;
     the audit trail records only WHICH KINDS were redacted, never the value —
     so the backstop cannot itself become the leak (a stack trace / receipt with
@@ -38,7 +37,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .scrub_reach import ScrubUnreachable, get, need
+from . import scrub_local
 
 _PLACEHOLDER = "[REDACTED:{kind}]"
 
@@ -57,12 +56,12 @@ _MAX_DEPTH = 40
 
 
 def _redact_str(s: str, found: set, sets=EGRESS_SETS) -> str:
-    return need().apply(s, sets, marker=_PLACEHOLDER, found=found)
+    return scrub_local.apply(s, sets, marker=_PLACEHOLDER, found=found)
 
 
 def _walk(obj: Any, found: set, depth: int, sets=EGRESS_SETS) -> Any:
     # Values only: keys are structural field names, not payload.
-    return need().walk_strings(
+    return scrub_local.walk_strings(
         obj, lambda s: _redact_str(s, found, sets), _MAX_DEPTH, depth
     )
 
@@ -101,10 +100,7 @@ def scan_opaque(obj: Any) -> list[str]:
         except Exception:
             return ["unserializable"]
     found: set = set()
-    try:
-        _redact_str(text, found)
-    except ScrubUnreachable:
-        return ["unreachable"]
+    _redact_str(text, found)
     return sorted(found)
 
 
@@ -141,9 +137,6 @@ def redact_journal_tail(text: str) -> tuple[str, list[str]]:
     tool-response funnel (:func:`redact_egress`), which the label/kv rules
     would over-redact (Loki 0DFFEFA6 B3). With the one script out of reach the
     whole tail is withheld, with the reason."""
-    mod, why = get()
-    if mod is None:
-        return _PLACEHOLDER.format(kind=f"unreachable: {why}"), ["unreachable"]
     found: set = set()
-    redacted = mod.apply(text, JOURNAL_SETS, marker=_PLACEHOLDER, found=found)
+    redacted = scrub_local.apply(text, JOURNAL_SETS, marker=_PLACEHOLDER, found=found)
     return redacted, sorted(found)

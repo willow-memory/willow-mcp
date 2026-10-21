@@ -38,16 +38,15 @@ caught by substring/finditer search regardless of anchor.
 Flatten-2 F12: the shapes, their unanchored form and the ``api_key = value``
 rule now live in the one script's ``onescript/scrub.py`` (sets ``credentials``
 and ``assigned_credential``; the operator: "Using the onescript at every
-path."), which keeps every fix above (it is where the \\b-free form is held for
-every caller). This module keeps the Nest's names for the kinds, its
-fingerprint, and its fail-closed answer when the one script is out of reach:
-``find_secrets`` reports ``[("unreachable", why)]`` (so the intake hook HOLDS the
-file) and ``redact_text`` withholds the whole text.
+path."), which keeps every fix above. willow-mcp carries them as ``scrub_local`` (a
+parity-tested byte copy, so an installed server works with no checkout beside
+it; operator: "2 carry copies"). This module keeps the Nest's names for the
+kinds and its fingerprint.
 """
 
 from __future__ import annotations
 
-from ..scrub_reach import get
+from .. import scrub_local
 
 _SETS = ("credentials_bounded", "assigned_credential")
 
@@ -71,17 +70,11 @@ def find_secrets(text: str) -> list[tuple[str, str]]:
     `if found:` holds the item rather than reading "could not look" as clean."""
     if not text:
         return []
-    mod, why = get()
-    if mod is None:
-        return [("unreachable", why)]
-    return [(_KIND.get(k, k), v) for k, v in mod.find(text, _SETS)]
+    return [(_KIND.get(k, k), v) for k, v in scrub_local.find(text, _SETS)]
 
 
 def redact_text(text: str) -> str:
     """Replace every detected secret with a typed placeholder."""
     if not text:
         return text
-    mod, why = get()
-    if mod is None:
-        return f"[REDACTED:unreachable: {why}]"
-    return mod.replace_found(text, mod.find(text, _SETS), kind_of=lambda k: _KIND.get(k, k))
+    return scrub_local.replace_found(text, scrub_local.find(text, _SETS), kind_of=lambda k: _KIND.get(k, k))

@@ -32,7 +32,7 @@ import os
 import re
 from typing import Any
 
-from .scrub_reach import get
+from . import scrub_local
 
 # --- Deny-by-default allow-lists -------------------------------------------
 
@@ -50,25 +50,19 @@ _ALLOWED_FRAME_KEYS = frozenset({
 # What counts as sensitive is the one script's (flatten-2 F12,
 # ``onescript/scrub.py``: ``sensitive_key`` for key names, the ``secret_path``
 # set for the paths that must never leave the box, ``credentials`` for a
-# credential shape in a string; the operator: "Using the onescript at every
-# path."). Out of reach, nothing is let through: a key reads as sensitive and a
-# string as redacted, because an event that cannot be checked is not sent whole.
+# credential shape in a string), carried as the parity-tested ``scrub_local``.
 _REDACTED = "[redacted-by-willow-membrane]"
 _STRING_SETS = ("secret_path", "credentials")
 
 
 def _sensitive_key(key: Any) -> bool:
-    mod, _why = get()
-    return True if mod is None else mod.sensitive_key(key)
+    return scrub_local.sensitive_key(key)
 
 
 def _redact_str(value: str) -> str:
     """Redact a string if it exposes a secret path (the whole value) or
     carries a credential shape (that part); otherwise return as-is."""
-    mod, _why = get()
-    if mod is None:
-        return _REDACTED
-    return mod.apply(value, _STRING_SETS, marker=_REDACTED)
+    return scrub_local.apply(value, _STRING_SETS, marker=_REDACTED)
 
 
 def _scrub_mapping(data: dict[str, Any]) -> dict[str, Any]:

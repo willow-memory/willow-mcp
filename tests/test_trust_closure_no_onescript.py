@@ -18,8 +18,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-import pytest
-
 PKG = "willow_mcp"
 SRC = Path(__file__).resolve().parents[1] / "src" / PKG
 
@@ -128,17 +126,6 @@ def test_the_closure_is_not_trivially_small():
     assert len(_closure()) >= len(SEEDS)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "OPEN, for the operator: F12 put scrub_reach (-> onescript_reach) into "
-        "push_executor and secret_scan, and both sit in the lazy closure "
-        "keyring -> net_signer -> unit_install_executor -> pull_executor -> "
-        "push_executor, and -> unit_status -> secret_scan. Cut those edges or "
-        "give the trust path a local scrub held by a parity test; strict, so "
-        "the fix flips this to a pass and the marker must then be removed."
-    ),
-)
 def test_no_trust_closure_module_imports_the_one_script():
     bad: dict[str, list[str]] = {}
     for mod, names in _closure().items():
