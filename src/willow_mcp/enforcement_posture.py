@@ -12,16 +12,20 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+from . import onescript_clock
 
 MARKER_NAME = "remote_posture.json"
 SCHEMA_VERSION = 1
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    """In the one script's ``seconds_z`` format, from its one clock (flatten-2 F8:
+    "Using the onescript at every path."). ``$ONESCRIPT_NOW`` pins it. With no one
+    script reachable this falls back to the carried ``clock_local`` and says so (``onescript_clock.SOURCE``)."""
+    return onescript_clock.clock().seconds_z()
 
 
 def marker_path(*, willow_home: str | Path) -> Path:

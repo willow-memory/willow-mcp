@@ -70,6 +70,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import paths
+from .states_local import EMPTY, POPULATED, UNREACHABLE
 
 _SYSTEMCTL_TIMEOUT_S = 15
 
@@ -140,7 +141,7 @@ def _fingerprint_pairs(pairs: list[tuple[str, str]]) -> dict:
         whole.update(b"=")
         whole.update(v.encode("utf-8"))
         whole.update(b"\n")
-    return {"state": "populated", "keys": keys, "digest": whole.hexdigest()}
+    return {"state": POPULATED, "keys": keys, "digest": whole.hexdigest()}
 
 
 def compute_fingerprint(path: Path) -> dict:
@@ -154,10 +155,10 @@ def compute_fingerprint(path: Path) -> dict:
     """
     try:
         if not path.is_file():
-            return {"state": "empty"}
+            return {"state": EMPTY}
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}"}
+        return {"state": UNREACHABLE, "cause": f"{type(exc).__name__}: {exc}"}
     return _fingerprint_pairs(_parse_env_lines(text))
 
 
@@ -172,7 +173,7 @@ def compute_fingerprint_from_pairs(pairs: list[tuple[str, str]]) -> dict:
 def summary(fp: dict) -> str:
     """A one-line stand-in for a fingerprint in a refusal reason or a
     receipt field — the digest when populated, else the bare state."""
-    if fp.get("state") == "populated":
+    if fp.get("state") == POPULATED:
         return fp.get("digest", "")
     return f"<{fp.get('state', 'unknown')}>"
 
@@ -211,7 +212,7 @@ def fingerprints_equal(a: dict, b: dict) -> bool:
     as equal: the cause is diagnostic text, not part of the fingerprint."""
     if a.get("state") != b.get("state"):
         return False
-    if a.get("state") != "populated":
+    if a.get("state") != POPULATED:
         return True
     return a.get("digest") == b.get("digest")
 
@@ -343,11 +344,11 @@ def env_names_for_unit(unit: str, *, runner: Optional[Callable] = None) -> dict:
         try:
             text = path.read_text(encoding="utf-8")
         except OSError as e:
-            out.update(state="unreachable", reason=f"{path}: {type(e).__name__}", names=[])
+            out.update(state=UNREACHABLE, reason=f"{path}: {type(e).__name__}", names=[])
             return out
         names |= {n for n, _ in _parse_env_lines(text)}
     out["names"] = sorted(names)
-    out["state"] = "populated" if names else "empty"
+    out["state"] = POPULATED if names else EMPTY
     return out
 
 
@@ -383,13 +384,13 @@ def read_state() -> dict:
     p = state_path()
     try:
         if not p.is_file():
-            return {"state": "empty"}
+            return {"state": EMPTY}
         data = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}"}
+        return {"state": UNREACHABLE, "cause": f"{type(exc).__name__}: {exc}"}
     if not isinstance(data, dict) or not isinstance(data.get("env_fingerprint"), dict):
-        return {"state": "unreachable", "cause": "malformed env-fingerprint state file"}
-    return {"state": "populated", "env_fingerprint": data["env_fingerprint"],
+        return {"state": UNREACHABLE, "cause": "malformed env-fingerprint state file"}
+    return {"state": POPULATED, "env_fingerprint": data["env_fingerprint"],
             "env_loaded_at": data.get("env_loaded_at")}
 
 

@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import paths
+from .states_local import EMPTY, POPULATED, UNREACHABLE
 
 #: Env override for tests and non-default installs — checked before the
 #: derived `<venvs>/willow-bot/bin/willow-bot-steward` path, the
@@ -83,7 +84,7 @@ def _has_populated_field(report: dict) -> bool:
     """True if any top-level field of the bot's report names itself
     ``populated`` — the report's own three-state contract, read here rather
     than re-derived, so a field this module has never heard of still counts."""
-    return any(isinstance(value, dict) and value.get("status") == "populated" for value in report.values())
+    return any(isinstance(value, dict) and value.get("status") == POPULATED for value in report.values())
 
 
 def read_status(
@@ -104,13 +105,13 @@ def read_status(
             resolved, res = _resolve()
     except paths.RetiredHomeError as exc:
         return {
-            "state": "unreachable",
+            "state": UNREACHABLE,
             "reason": "retired_home",
             "detail": str(exc),
         }
     if res is not None and res.state == "absent":
         return {
-            "state": "unreachable",
+            "state": UNREACHABLE,
             "reason": "binary_missing",
             "binary": resolved,
             "detail": f"no willow-bot venv in {paths.venv_absent_detail(res)}",
@@ -126,13 +127,13 @@ def read_status(
         )
     except FileNotFoundError:
         return {
-            "state": "unreachable",
+            "state": UNREACHABLE,
             "reason": "binary_missing",
             "binary": resolved,
         }
     except subprocess.TimeoutExpired:
         return {
-            "state": "unreachable",
+            "state": UNREACHABLE,
             "reason": "timeout",
             "binary": resolved,
             "timeout_s": timeout,
@@ -140,7 +141,7 @@ def read_status(
 
     if proc.returncode != 0:
         return {
-            "state": "unreachable",
+            "state": UNREACHABLE,
             "reason": "nonzero_exit",
             "binary": resolved,
             "returncode": proc.returncode,
@@ -151,23 +152,23 @@ def read_status(
         parsed = json.loads(proc.stdout)
     except (json.JSONDecodeError, TypeError):
         return {
-            "state": "unreachable",
+            "state": UNREACHABLE,
             "reason": "unparseable",
             "binary": resolved,
             "detail": _tail(proc.stdout),
         }
     if not isinstance(parsed, dict):
         return {
-            "state": "unreachable",
+            "state": UNREACHABLE,
             "reason": "unparseable",
             "binary": resolved,
             "detail": "top-level JSON is not an object",
         }
 
     if _has_populated_field(parsed):
-        return {"state": "populated", "binary": resolved, "report": parsed}
+        return {"state": POPULATED, "binary": resolved, "report": parsed}
     return {
-        "state": "empty",
+        "state": EMPTY,
         "reason": "no populated field in the bot's report",
         "binary": resolved,
         "report": parsed,

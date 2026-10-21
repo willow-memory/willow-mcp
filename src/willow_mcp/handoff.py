@@ -7,17 +7,20 @@ import os
 import re
 import threading
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from . import handoff_validation as hv
+from . import onescript_clock
 from .dispatch import dispatch_read, dispatch_set_status, packet_lock, packet_symlink_refused
 from .paths import dispatch_dir
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    """In the one script's ``seconds_z`` format, from its one clock (flatten-2 F8:
+    "Using the onescript at every path."). ``$ONESCRIPT_NOW`` pins it. With no one
+    script reachable this falls back to the carried ``clock_local`` and says so (``onescript_clock.SOURCE``)."""
+    return onescript_clock.clock().seconds_z()
 
 
 def _write_json(path: Path, data: dict) -> None:

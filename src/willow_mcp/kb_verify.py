@@ -16,10 +16,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
 
 from . import kb_curate as kbc
+from . import onescript_clock
 from . import schema_profile as sp
 from ._kb_sql import KNOWLEDGE_FIELDS, build_select, row_to_dict
 from .training_corpus import (
@@ -225,7 +225,10 @@ CHECK_KINDS = ("verify_sources", "check_health")
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """In the one script's ``isoformat_utc`` format, from its one clock (flatten-2
+    F8: "Using the onescript at every path."). ``$ONESCRIPT_NOW`` pins it. With no
+    one script reachable this falls back to the carried ``clock_local`` and says so (``onescript_clock.SOURCE``)."""
+    return onescript_clock.clock().isoformat_utc()
 
 
 def record_verification(store, *, record_id: str, outcome: str, check_kind: str,

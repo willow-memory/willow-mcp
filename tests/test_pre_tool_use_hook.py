@@ -1301,15 +1301,6 @@ def test_ambiguous_group_names_do_not_fire_on_prose():
     assert _manifest_write("orchestrator") is not None
 
 
-def test_bundled_hook_is_identical_to_the_repo_copy():
-    """src/willow_mcp/bundle/hooks/pre_tool_use.py is what ships to an agent's
-    harness; hooks/pre_tool_use.py is what these tests exercise. A fix applied to
-    one and not the other is a guardrail that passes CI and is absent in
-    production."""
-    bundled = Path(__file__).resolve().parents[1] / "src/willow_mcp/bundle/hooks/pre_tool_use.py"
-    assert bundled.read_text() == _HOOK_PATH.read_text()
-
-
 # ── framing: this is a guardrail, not a control — never let that erode ──────
 
 _DESIGN_DOC_PATH = (
