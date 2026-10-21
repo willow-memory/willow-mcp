@@ -31,6 +31,14 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.99.1](https://github.com/willow-memory/willow-mcp/compare/v2.99.0...v2.99.1) (2026-10-21)
+
+
+### Fixed
+
+* **onescript:** exit 42 ran to a verdict, never unreachable ([2fe526c](https://github.com/willow-memory/willow-mcp/commit/2fe526c606730f392be749b61b93a4af0068befc))
+* **onescript:** exit 42 ran to a verdict, never unreachable ([a817646](https://github.com/willow-memory/willow-mcp/commit/a8176468bf8d4e49aefabdd2f28a416be7f29301))
+
 ## [2.99.0](https://github.com/willow-memory/willow-mcp/compare/v2.98.0...v2.99.0) (2026-10-21)
 
 
