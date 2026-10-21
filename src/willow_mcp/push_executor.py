@@ -50,6 +50,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from .scrub_reach import get
+
 VERB = "git.push"
 
 #: Errnos for which an ask is worth filing: the verb is real and the actor is
@@ -137,13 +139,16 @@ _sleep = time.sleep  # tests replace this
 
 _TRACE_LINE_RE = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d+\s")
 _REQUEST_ID_RE = re.compile(r"x-github-request-id:\s*([0-9A-Fa-f:]+)", re.IGNORECASE)
-_AUTH_RE = re.compile(r"(?i)(authorization:\s*)(basic|bearer|token)?\s*\S+")
-_TOKEN_RE = re.compile(r"\bgh[sopu]_[A-Za-z0-9]+")
-
-
 def _redact(text: str) -> str:
-    text = _AUTH_RE.sub(r"\1<redacted>", text or "")
-    return _TOKEN_RE.sub("gh?_<redacted>", text)
+    """The Authorization header and ``gh?_`` tokens out of a git trace, then
+    any credential shape. The rules are the one script's (flatten-2 F12:
+    ``scrub.py`` sets ``git_trace`` and ``credentials``); the marks this
+    printed before (``<redacted>``, ``gh?_<redacted>``) are unchanged. With the
+    one script out of reach the trace is withheld, with why."""
+    mod, why = get()
+    if mod is None:
+        return f"<redacted: unreachable: {why}>"
+    return mod.apply(text or "", ("git_trace", "credentials"))
 
 
 def _split_trace(stderr: str) -> tuple[str, list[str]]:
