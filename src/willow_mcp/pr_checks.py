@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Callable, Optional
+from .states_local import EMPTY, POPULATED, UNREACHABLE
 
 _API = "https://api.github.com"
 
@@ -649,11 +650,11 @@ def _fetch_annotations(api: Callable, *, repo: str, run_id, bearer: str) -> dict
     resp = api("GET", url, bearer=bearer)
     if not resp.get("ok"):
         cause, reason = _classify_http_failure(resp)
-        return {"state": "unreachable", "reason": cause, "detail": reason}
+        return {"state": UNREACHABLE, "reason": cause, "detail": reason}
     body = resp.get("body")
     items = body if isinstance(body, list) else []
     items = items[:_MAX_ANNOTATIONS]
-    return {"state": "populated" if items else "empty", "annotations": items}
+    return {"state": POPULATED if items else EMPTY, "annotations": items}
 
 
 def _run_summary(run: dict) -> dict:
@@ -721,7 +722,7 @@ def read_pr_checks(
 
     auth = gac.mint_installation_token(repo)
     if not (auth.get("ok") and auth.get("mode") == "app"):
-        return {"state": "unreachable", "reason": "token",
+        return {"state": UNREACHABLE, "reason": "token",
                 "detail": auth.get("reason") or "could not mint a willows-bot installation token"}
     bearer = auth["token"]
     permissions = auth.get("permissions")
@@ -732,7 +733,7 @@ def read_pr_checks(
         resp = call("GET", f"{_API}/repos/{repo}/pulls/{pr}", bearer=bearer)
         if not resp.get("ok"):
             cause, reason = _classify_http_failure(resp)
-            return {"state": "unreachable", "reason": cause, "detail": reason}
+            return {"state": UNREACHABLE, "reason": cause, "detail": reason}
         body = resp.get("body") or {}
         sha = (body.get("head") or {}).get("sha") or ""
         head = {
@@ -743,13 +744,13 @@ def read_pr_checks(
             "pr_state": body.get("state"),
         }
         if not sha:
-            return {"state": "unreachable", "reason": "not_found",
+            return {"state": UNREACHABLE, "reason": "not_found",
                     "detail": f"pull request {pr} carries no head sha"}
     else:
         head = {"sha": sha}
 
     if not checks_perm_present(permissions):
-        out = {"state": "unreachable", "reason": "permission_absent", "permission": "checks",
+        out = {"state": UNREACHABLE, "reason": "permission_absent", "permission": "checks",
                "head": head}
         _file_ask(out, store=store, app_id=app_id, repo=repo, permission="checks",
                   current=(permissions or {}).get("checks"))
@@ -758,10 +759,10 @@ def read_pr_checks(
     runs, failed = _fetch_check_runs(call, repo=repo, sha=sha, bearer=bearer)
     if failed is not None:
         cause, reason = _classify_http_failure(failed)
-        return {"state": "unreachable", "reason": cause, "detail": reason, "head": head}
+        return {"state": UNREACHABLE, "reason": cause, "detail": reason, "head": head}
 
     if not runs:
-        return {"state": "empty", "head": head,
+        return {"state": EMPTY, "head": head,
                 "reason": f"no checks reported for {sha} yet"}
 
     actions_ok = actions_perm_present(permissions)
@@ -783,7 +784,7 @@ def read_pr_checks(
         if conclusion in _FAILING_CONCLUSIONS:
             if not actions_ok:
                 summary["log_tail"] = {
-                    "state": "unreachable", "reason": "permission_absent",
+                    "state": UNREACHABLE, "reason": "permission_absent",
                     "permission": "actions",
                 }
                 first_error = "(log unreachable: permission_absent: actions)"
@@ -797,7 +798,7 @@ def read_pr_checks(
                     _job_id_from_url(summary.get("html_url") or "")
                 if not job_id:
                     summary["log_tail"] = {
-                        "state": "unreachable", "reason": "no_job_id",
+                        "state": UNREACHABLE, "reason": "no_job_id",
                         "detail": "could not derive an Actions job id from details_url/html_url",
                     }
                     first_error = "(log unreachable: no_job_id)"
@@ -806,7 +807,7 @@ def read_pr_checks(
                     log_resp = fetch_log(log_url, bearer=bearer)
                     if not log_resp.get("ok"):
                         cause, reason = _classify_http_failure(log_resp)
-                        summary["log_tail"] = {"state": "unreachable", "reason": cause, "detail": reason}
+                        summary["log_tail"] = {"state": UNREACHABLE, "reason": cause, "detail": reason}
                         first_error = f"(log unreachable: {cause})"
                     else:
                         full_text = log_resp.get("text") or ""
@@ -815,7 +816,7 @@ def read_pr_checks(
                         log_range_fallback = bool(log_resp.get("range_fallback"))
                         tail_lines, total_lines = _log_tail_lines(full_text, cap)
                         summary["log_tail"] = {
-                            "state": "populated" if tail_lines else "empty",
+                            "state": POPULATED if tail_lines else EMPTY,
                             "lines": tail_lines,
                             "log_lines_total": total_lines,
                             "truncated": total_lines > len(tail_lines),
@@ -846,7 +847,7 @@ def read_pr_checks(
         out_runs.append(summary)
 
     result = {
-        "state": "populated",
+        "state": POPULATED,
         "repo": repo,
         "head": head,
         "check_runs": out_runs,

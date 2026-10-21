@@ -78,6 +78,7 @@ from typing import Optional
 
 from . import net_authority, paths, seal_handler
 from .db import Store
+from .states_local import POPULATED
 
 #: The ``seal <id>`` convention row 15's own ``note`` field established —
 #: read back here so a sync's FRANK event can name which governance
@@ -394,11 +395,11 @@ def _confirm_amendment(rec: dict, *, live_row: dict, bundle_row: dict,
             return False, (
                 f"row {row_id} ({verb}): request carries no sealed row for pair "
                 f"{pair_id!r} — refusing")
-        pair = {**carried, "state": "populated"}
+        pair = {**carried, "state": POPULATED}
     else:
         db_path = nestor_db_path if nestor_db_path is not None else seal_handler._nestor_db_path()
         pair = net_authority.read_sealed_pair(pair_id, db_path)
-    if pair.get("state") != "populated":
+    if pair.get("state") != POPULATED:
         return False, (
             f"row {row_id} ({verb}): sealed pair {pair_id!r} is not confirmed sealed "
             f"in the Nestor ledger (state={pair.get('state')!r}: "

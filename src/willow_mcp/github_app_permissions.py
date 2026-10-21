@@ -31,6 +31,7 @@ why).
 from __future__ import annotations
 
 from typing import Any, Optional
+from .states_local import UNREACHABLE
 
 #: GitHub App settings → Permissions & events → <section> → <permission>. The
 #: section is where the operator's click lands; naming it saves the search.
@@ -91,13 +92,13 @@ def file_permission_ask(
     permission = (permission or "").strip()
     level = (level or "read").strip()
     if not permission:
-        return {"state": "unreachable", "reason": "no permission named"}
+        return {"state": UNREACHABLE, "reason": "no permission named"}
     if store is None:
-        return {"state": "unreachable", "reason": "no store bound — nowhere to file the ask"}
+        return {"state": UNREACHABLE, "reason": "no store bound — nowhere to file the ask"}
     try:
         existing = _open_item_for(store, permission, level)
     except Exception as exc:  # noqa: BLE001 — a queue that cannot be read is reported, not raised
-        return {"state": "unreachable", "reason": f"queue unreadable: {type(exc).__name__}: {exc}"}
+        return {"state": UNREACHABLE, "reason": f"queue unreadable: {type(exc).__name__}: {exc}"}
     title = title_for(permission, level)
     if existing:
         return {"state": "already", "human_required_id": existing.get("id"), "title": title}
@@ -117,5 +118,5 @@ def file_permission_ask(
             source_agent=app_id or "", source_ref=f"{verb}:{repo}:{permission}",
         )
     except Exception as exc:  # noqa: BLE001
-        return {"state": "unreachable", "reason": f"queue unwritable: {type(exc).__name__}: {exc}"}
+        return {"state": UNREACHABLE, "reason": f"queue unwritable: {type(exc).__name__}: {exc}"}
     return {"state": "filed", "human_required_id": row.get("id"), "title": title}

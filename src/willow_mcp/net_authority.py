@@ -63,6 +63,7 @@ from typing import Callable, Optional
 
 from . import egress_authorization as ea
 from . import seal_handler
+from .states_local import EMPTY, POPULATED, REPORT_UNREACHABLE, UNREACHABLE
 
 logger = logging.getLogger(__name__)
 
@@ -519,31 +520,31 @@ def read_sealed_pair(pair_id: str, db_path: Path) -> dict:
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error as exc:
-        return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
+        return {"state": UNREACHABLE, "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
     try:
         row = conn.execute(
             "SELECT source_norm, target_text, verifier, seal_sig, status, superseded_by, "
             "created_at, source_lang FROM tm_pairs WHERE id = ?", (pair_id,)).fetchone()
     except sqlite3.Error as exc:
-        return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
+        return {"state": UNREACHABLE, "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
     finally:
         conn.close()
     if row is None:
-        return {"state": "empty", "why": "pair_absent"}
+        return {"state": EMPTY, "why": "pair_absent"}
     source_norm, target_text, verifier, seal_sig, status, superseded_by, created_at, source_lang = row
     if superseded_by:
-        return {"state": "empty", "why": "superseded"}
+        return {"state": EMPTY, "why": "superseded"}
     if status != "sealed":
-        return {"state": "empty", "why": f"status={status}"}
+        return {"state": EMPTY, "why": f"status={status}"}
     if not seal_sig:
-        return {"state": "empty", "why": "unsigned"}
+        return {"state": EMPTY, "why": "unsigned"}
     # source_lang folded in here (Loki F0C19708, "single query for
     # source_lang"): a caller that needs to know a pair's TYPE (e.g.
     # reloader._ruling_sealed wanting source_lang="decision") no longer
     # needs a second connection/query to learn it -- this is a
     # database-level field, not part of the signed bytes verify_seal checks
     # (seal_message covers only source_norm/target_text/verifier).
-    return {"state": "populated", "source_norm": source_norm, "target_text": target_text,
+    return {"state": POPULATED, "source_norm": source_norm, "target_text": target_text,
             "verifier": verifier, "seal_sig": seal_sig, "created_at": created_at,
             "source_lang": source_lang}
 
@@ -581,13 +582,13 @@ def signer_call(request: dict, *, path: Optional[Path] = None, timeout: float = 
                     break
                 buf += chunk
     except (OSError, socket.timeout) as exc:
-        return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}", "socket": str(sock_path)}
+        return {"state": UNREACHABLE, "cause": f"{type(exc).__name__}: {exc}", "socket": str(sock_path)}
     try:
         reply = json.loads(buf.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        return {"state": "unreachable", "cause": "malformed reply", "socket": str(sock_path)}
+        return {"state": UNREACHABLE, "cause": "malformed reply", "socket": str(sock_path)}
     if not isinstance(reply, dict) or "state" not in reply:
-        return {"state": "unreachable", "cause": "reply carries no state", "socket": str(sock_path)}
+        return {"state": UNREACHABLE, "cause": "reply carries no state", "socket": str(sock_path)}
     return reply
 
 
@@ -676,22 +677,22 @@ def drain(
     receipt: dict = {"event": "net_authority_tick", "at": (now or _now()).isoformat()}
     for needed in ("task_id", "status", "network_authorization"):
         if not cols.get(needed):
-            receipt.update(state="unreachable", reason=f"tasks mapping has no {needed} column")
+            receipt.update(state=UNREACHABLE, reason=f"tasks mapping has no {needed} column")
             return receipt
     try:
         held = _held_rows(pg, cols)
     except Exception as exc:  # noqa: BLE001 — queue outage is reported, never raised into the tick
-        receipt.update(state="unreachable", reason="queue_unavailable",
+        receipt.update(state=UNREACHABLE, reason="queue_unavailable",
                        error=f"{type(exc).__name__}: {exc}")
         return receipt
     if not held:
-        receipt.update(state="empty", held=0)
+        receipt.update(state=EMPTY, held=0)
         return receipt
 
     st = store if store is not None else Store()
     nestor_db = db_path if db_path is not None else seal_handler._nestor_db_path()
     rows_out: list[dict] = []
-    counts = {"waiting": 0, "minted": 0, "refused": 0, "unreachable": 0}
+    counts = {"waiting": 0, "minted": 0, "refused": 0, REPORT_UNREACHABLE: 0}
     truncated = len(held) > max_rows
     current = now or _now()
     for row in held[:max_rows]:
@@ -721,12 +722,12 @@ def drain(
             continue
 
         sealed = read_sealed_pair(pair_id, nestor_db)
-        if sealed["state"] == "unreachable":
-            out.update(state="unreachable", cause=sealed.get("cause"))
-            counts["unreachable"] += 1
+        if sealed["state"] == UNREACHABLE:
+            out.update(state=UNREACHABLE, cause=sealed.get("cause"))
+            counts[REPORT_UNREACHABLE] += 1
             rows_out.append(out)
             continue
-        if sealed["state"] == "empty" and sealed.get("why") == REJECTED_WHY:
+        if sealed["state"] == EMPTY and sealed.get("why") == REJECTED_WHY:
             # Gap 7ca0f5c6cd22: a rejected ask is a refusal now, not a
             # standing offer that quietly times out. Fails the row
             # immediately, named, and inked — same shape the age cap uses.
@@ -751,7 +752,7 @@ def drain(
             st.update(seal_handler.GOVERNANCE_COLLECTION, record_id_for_task(task_id), updated)
             rows_out.append(out)
             continue
-        if sealed["state"] == "empty":
+        if sealed["state"] == EMPTY:
             out.update(state="waiting", why=sealed.get("why"))
             counts["waiting"] += 1
             rows_out.append(out)
@@ -777,9 +778,9 @@ def drain(
             "bound": bound_view,
         })
         state = reply.get("state")
-        if state == "unreachable":
-            out.update(state="unreachable", cause=reply.get("cause"), socket=reply.get("socket"))
-            counts["unreachable"] += 1
+        if state == UNREACHABLE:
+            out.update(state=UNREACHABLE, cause=reply.get("cause"), socket=reply.get("socket"))
+            counts[REPORT_UNREACHABLE] += 1
         elif state == "refused":
             out.update(state="refused", reason=reply.get("reason"), field=reply.get("field"))
             counts["refused"] += 1
@@ -820,11 +821,11 @@ def drain(
                     "seal_digest": payload.get("seal_pair_id"), "decision": "c8572a92",
                 })
         else:
-            out.update(state="unreachable", cause=f"signer reply not understood: {state!r}")
-            counts["unreachable"] += 1
+            out.update(state=UNREACHABLE, cause=f"signer reply not understood: {state!r}")
+            counts[REPORT_UNREACHABLE] += 1
         rows_out.append(out)
 
-    receipt.update(state="populated", held=len(held), rows=rows_out, counts=counts,
+    receipt.update(state=POPULATED, held=len(held), rows=rows_out, counts=counts,
                    truncated=truncated, inked=ledger is not None)
     return receipt
 
@@ -877,7 +878,7 @@ def drain_leases(
     pending = [r for r in st.all(seal_handler.GOVERNANCE_COLLECTION)
                if r.get("kind") == "net-lease-request" and r.get("status") == "proposed"]
     if not pending:
-        receipt.update(state="empty", requests=0)
+        receipt.update(state=EMPTY, requests=0)
         return receipt
     rows_out = []
     for gov in pending:
@@ -889,7 +890,7 @@ def drain_leases(
             rows_out.append(out)
             continue
         sealed = read_sealed_pair(pair_id, nestor_db)
-        if sealed["state"] == "empty" and sealed.get("why") == REJECTED_WHY:
+        if sealed["state"] == EMPTY and sealed.get("why") == REJECTED_WHY:
             # Same fix as drain(): a rejected lease ask is a refusal now, not
             # a standing offer — flip the record so it drops out of `pending`
             # on the next tick instead of being re-checked forever.
@@ -900,8 +901,8 @@ def drain_leases(
                        reason="the operator rejected this lease request in Nestor")
             rows_out.append(out)
             continue
-        if sealed["state"] != "populated":
-            out.update(state="unreachable" if sealed["state"] == "unreachable" else "waiting",
+        if sealed["state"] != POPULATED:
+            out.update(state=UNREACHABLE if sealed["state"] == UNREACHABLE else "waiting",
                        why=sealed.get("why") or sealed.get("cause"))
             rows_out.append(out)
             continue
@@ -927,9 +928,9 @@ def drain_leases(
         elif state == "refused":
             out.update(state="refused", reason=reply.get("reason"), field=reply.get("field"))
         else:
-            out.update(state="unreachable", cause=reply.get("cause"))
+            out.update(state=UNREACHABLE, cause=reply.get("cause"))
         rows_out.append(out)
-    receipt.update(state="populated", requests=len(pending), rows=rows_out)
+    receipt.update(state=POPULATED, requests=len(pending), rows=rows_out)
     return receipt
 
 
@@ -944,12 +945,12 @@ def combined_state(tasks: dict, leases: dict) -> tuple[str, Optional[str]]:
     a tick that could not tell); else ``empty``. Returns ``(state, reason)``,
     ``reason`` naming the blind half's cause when there is one."""
     states = {tasks.get("state"), leases.get("state")}
-    if "populated" in states:
-        return "populated", None
-    if "unreachable" in states:
-        blind = tasks if tasks.get("state") == "unreachable" else leases
-        return "unreachable", blind.get("reason") or blind.get("cause")
-    return "empty", None
+    if POPULATED in states:
+        return POPULATED, None
+    if UNREACHABLE in states:
+        blind = tasks if tasks.get("state") == UNREACHABLE else leases
+        return UNREACHABLE, blind.get("reason") or blind.get("cause")
+    return EMPTY, None
 
 
 def tick(*, app_id: str = "", ledger=None, call: Callable[[dict], dict] = signer_call,
@@ -973,18 +974,18 @@ def tick(*, app_id: str = "", ledger=None, call: Callable[[dict], dict] = signer
 
         pg = get_pg()
     if pg is None:
-        receipt.update(state="unreachable", reason="postgres_unavailable", tasks=None, leases=None)
+        receipt.update(state=UNREACHABLE, reason="postgres_unavailable", tasks=None, leases=None)
         return receipt
     from . import schema_profile as sp
 
     who = (app_id or os.environ.get("WILLOW_APP_ID", "willow")).strip() or "willow"
     mapping = sp.resolve(pg, who, "tasks", TICK_FIELDS)
     if "error" in mapping:
-        receipt.update(state="unreachable", reason="tasks_mapping_unresolved",
+        receipt.update(state=UNREACHABLE, reason="tasks_mapping_unresolved",
                        error=mapping["error"], tasks=None, leases=None)
         return receipt
     if not mapping.get("confirmed"):
-        receipt.update(state="unreachable", reason="tasks_mapping_unconfirmed", tasks=None, leases=None)
+        receipt.update(state=UNREACHABLE, reason="tasks_mapping_unconfirmed", tasks=None, leases=None)
         return receipt
     full_cols = {k: v.get("column") for k, v in mapping["fields"].items()}
     if ledger is None:
@@ -999,7 +1000,7 @@ def tick(*, app_id: str = "", ledger=None, call: Callable[[dict], dict] = signer
         try:
             store = Store()
         except Exception as exc:  # noqa: BLE001 — a store outage is the receipt's to report
-            receipt.update(state="unreachable", reason="store_unavailable",
+            receipt.update(state=UNREACHABLE, reason="store_unavailable",
                            error=f"{type(exc).__name__}: {exc}", tasks=None, leases=None)
             return receipt
     kwargs = {}

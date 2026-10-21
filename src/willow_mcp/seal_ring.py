@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Optional
+from .states_local import UNREACHABLE
 
 SEAL_RING_ENV = "WILLOW_SEAL_RING"
 DEFAULT_SEAL_RING = Path("/etc/willow-mcp/verifiers.public.json")
@@ -53,18 +54,18 @@ def load_seal_ring() -> tuple[Optional[dict], Optional[dict]]:
     try:
         data = path.read_bytes()
     except OSError as exc:
-        return None, {"state": "unreachable",
+        return None, {"state": UNREACHABLE,
                       "cause": f"seal ring {str(path)!r} could not be read "
                                f"({type(exc).__name__}: {exc}) — a seal cannot be verified "
                                "without a ring to verify it against"}
     try:
         ring = net_signer.load_public_ring_bytes(data, path)
     except Exception as exc:  # noqa: BLE001 -- a bad ring is "no ring", never a raise
-        return None, {"state": "unreachable",
+        return None, {"state": UNREACHABLE,
                       "cause": f"seal ring {str(path)!r} is not a usable public-only ring "
                                f"({exc}) — a seal cannot be verified against it"}
     if not ring:
-        return None, {"state": "unreachable",
+        return None, {"state": UNREACHABLE,
                       "cause": f"seal ring {str(path)!r} holds no verifier — a seal cannot "
                                "be verified against an empty ring"}
     return ring, None

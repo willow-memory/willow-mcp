@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import paths
+from .states_local import UNREACHABLE
 
 EVENT = "git_pull"
 
@@ -426,7 +427,7 @@ def sweep_triggers(app_id: str, *, project: str, session: str = "", ledger=None,
         try:
             tdir = trigger_dir()
         except paths.RetiredHomeError as exc:
-            return {"ok": False, "state": "unreachable", "reason": "retired_home",
+            return {"ok": False, "state": UNREACHABLE, "reason": "retired_home",
                     "detail": str(exc), "swept": []}
     if not tdir.is_dir():
         return {"ok": True, "triggers_dir": str(tdir), "present": False, "swept": []}
