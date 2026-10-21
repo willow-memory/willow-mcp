@@ -36,7 +36,8 @@ def test_beside_the_one_script_answers_and_says_so(monkeypatch):
 
 
 def test_absent_the_carried_copy_answers_and_says_so_with_why(tmp_path, monkeypatch):
-    """"2 carry copies": an installed willow-mcp keeps working, and never silently."""
+    """"2 carry copies": an installed willow-mcp keeps working, and never silently:
+    the one script unreachable is said (``WHY`` names the reach), not hidden."""
     from willow_mcp import canon_local
 
     monkeypatch.setenv("ONESCRIPT_HOME", str(tmp_path / "nowhere"))

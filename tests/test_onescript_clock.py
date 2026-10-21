@@ -82,7 +82,8 @@ def test_bound_receipt_clock_and_stamp_format():
 @pytest.mark.parametrize("mod,name", SECONDS_Z_HELPERS + ISO_UTC_HELPERS)
 def test_no_one_script_the_carried_clock_answers_and_says_so(mod, name, monkeypatch, tmp_path):
     """"2 carry copies": the same pinned instant, from ``clock_local``, with
-    ``onescript_clock.SOURCE`` saying ``carried`` and ``WHY`` naming the reach."""
+    ``onescript_clock.SOURCE`` saying ``carried`` and ``WHY`` naming the reach
+    (the one script unreachable is said, never silent)."""
     from willow_mcp import onescript_clock
 
     monkeypatch.setenv("ONESCRIPT_HOME", str(tmp_path / "nowhere"))

@@ -30,6 +30,8 @@ print(json.dumps({"sig": sig, "ok": ok, "source": onescript_sign.SOURCE, "why": 
 
 
 def test_the_sign_reach_signs_with_the_carried_copy_and_says_so(tmp_path):
+    """The one script unreachable is said with why (``WHY``), and signing goes on
+    with the carried copy, never another way."""
     env = {
         "PATH": "/usr/bin:/bin",
         "PYTHONPATH": SRC,
