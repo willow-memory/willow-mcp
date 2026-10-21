@@ -9,7 +9,6 @@ This module pins wire shape, ref derivations, canonical signing bytes, and the
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import re
 from dataclasses import asdict, dataclass
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .onescript_canon import family
+from .onescript_sign import sign as _one_sign
 
 FORMAT_VERSION = "willow-bound-receipt/1"
 DEFAULT_TTL_SECONDS = 300
@@ -363,7 +363,7 @@ def expected_refs(sources: ReceiptSources) -> dict[str, str]:
 
 
 def _sign_hmac_sha256(signing_key: bytes, payload: dict[str, str]) -> str:
-    return hmac.new(signing_key, canonical_signed_bytes(payload), hashlib.sha256).hexdigest()
+    return _one_sign().hmac_hex(signing_key, canonical_signed_bytes(payload))
 
 
 def _utc_now() -> datetime:
@@ -426,7 +426,7 @@ def _check_signature(wire: dict[str, Any], signing_key: bytes) -> Optional[Verif
             detail="only hmac-sha256 verifier implemented",
         )
     expected = _sign_hmac_sha256(signing_key, wire["payload"])
-    if not hmac.compare_digest(expected, sig.get("value") or ""):
+    if not _one_sign().hmac_equal(expected, sig.get("value") or ""):
         return VerificationResult(
             ok=False,
             reason=VerificationReason.SIGNATURE_INVALID.value,
