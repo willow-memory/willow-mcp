@@ -228,6 +228,14 @@ def _strip_tags(text: str) -> str:
     return html.unescape(_TAG_RE.sub("", text or "")).strip()
 
 
+def _is_ddg_host(url: str) -> bool:
+    """DuckDuckGo's own links (ads, settings, related searches), by host, not by
+    substring: a result whose path or query merely names duckduckgo.com is a
+    result (CodeQL: py/incomplete-url-substring-sanitization)."""
+    host = (urlparse(url).hostname or "").lower()
+    return host == "duckduckgo.com" or host.endswith(".duckduckgo.com")
+
+
 def _unwrap_ddg(href: str) -> str:
     href = (href or "").strip()
     if not href:
@@ -364,7 +372,7 @@ def _parse_ddg_html(text: str, max_results: int) -> list[dict[str, Any]]:
     hits: list[dict[str, Any]] = []
     for idx, match in enumerate(links[: max_results + 4]):
         url = _unwrap_ddg(match.group(1))
-        if not url or "duckduckgo.com" in url:
+        if not url or _is_ddg_host(url):
             continue
         title = _strip_tags(match.group(2)) or url
         # This result owns the span from its link up to the next link; a result
