@@ -31,6 +31,33 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.99.0](https://github.com/willow-memory/willow-mcp/compare/v2.98.0...v2.99.0) (2026-10-21)
+
+
+### Added
+
+* **one-script:** willow-mcp carries the one reach's bootstrap (flatten-2 F6.5) ([b5d97d0](https://github.com/willow-memory/willow-mcp/commit/b5d97d0523ba9b5a68ee61e1181d3bfa9c09b949))
+
+
+### Fixed
+
+* **web_search:** skip DuckDuckGo's own links by host, not by substring ([748c484](https://github.com/willow-memory/willow-mcp/commit/748c484f63eeb32a95fa1f3045dd01c53936121e))
+* resync the carried clock copy to the one script's reformatted clock.py ([9869685](https://github.com/willow-memory/willow-mcp/commit/9869685bb6d67787f0b5b548803ef5f09e7dbe32))
+* **one-script:** re-carry sign_local after verify_seal moved into sign.py (record piece) ([5bbfe3e](https://github.com/willow-memory/willow-mcp/commit/5bbfe3e89e54417bbb7526977c146df963e7fa80))
+* **trust:** the trust closure keeps a local scrub; scrub_reach retired (flatten-2 integration) ([2439626](https://github.com/willow-memory/willow-mcp/commit/2439626299e9c21607c42fdb0b3d9ad678b04d11))
+* **trust:** session_signing keeps its own encoding; it is on the trust path (flatten-2 F7) ([d6e1cb7](https://github.com/willow-memory/willow-mcp/commit/d6e1cb739f5f05e903ff2e5595a6ca771ef59629))
+* **trust:** session_signing keeps its own encoding; it is on the trust path (flatten-2 F7) ([a9a7adf](https://github.com/willow-memory/willow-mcp/commit/a9a7adfd3fae133758f56fe9f75aa04aa8446658))
+
+
+### Changed
+
+* **one-script:** willow-mcp carries states, canon, clock and sign beside the reach ([2fbb819](https://github.com/willow-memory/willow-mcp/commit/2fbb81999664efee1292dbbdf95bf381d3476d32))
+* **one-script:** bound_receipt takes the HMAC seal from the one script; trust-owner signing held by parity (flatten-2 F14) ([2d213c3](https://github.com/willow-memory/willow-mcp/commit/2d213c300648a17359ac7df750187a69d70af5ca))
+* **hooks:** one parity test and a sync script for the hooks mirror (flatten-2 F16) ([fce61d4](https://github.com/willow-memory/willow-mcp/commit/fce61d42af2825e1f2e1a127c09b4c993639259b))
+* **one-script:** willow-mcp's non-trust-owner modules take canonical bytes from the one script (flatten-2 F7) ([b23bb85](https://github.com/willow-memory/willow-mcp/commit/b23bb858fbd4f0b89b289a44d46e845d022c9d86))
+* **one-script:** willow-mcp's clock helpers use the one clock (flatten-2 F8) ([b9de574](https://github.com/willow-memory/willow-mcp/commit/b9de574ad32f75ddbb4f673b1ee88371574cf266))
+* **one-script:** willow-mcp's scrubbers take their rules from the one script (flatten-2 F12) ([e8dd15e](https://github.com/willow-memory/willow-mcp/commit/e8dd15e3515512df2f474fbaa8c3b4e43eb4c36c))
+
 ## [2.98.0](https://github.com/willow-memory/willow-mcp/compare/v2.97.0...v2.98.0) (2026-10-12)
 
 
