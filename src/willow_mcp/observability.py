@@ -32,6 +32,8 @@ import os
 import re
 from typing import Any
 
+from . import scrub_local
+
 # --- Deny-by-default allow-lists -------------------------------------------
 
 # Event top-level keys permitted OUT. Anything not listed is dropped.
@@ -45,34 +47,29 @@ _ALLOWED_FRAME_KEYS = frozenset({
     "filename", "module", "function", "lineno", "in_app", "context_line",
 })
 
-# Substrings that mark a key as sensitive — its value is redacted wholesale.
-_SENSITIVE_KEY = re.compile(
-    r"(dsn|token|lease|consent|vault|secret|api[_-]?key|password|passwd|"
-    r"authorization|cookie|session|seed|private|credential)",
-    re.I,
-)
-
-# Path fragments that must never leave the box, wherever they appear.
-_SECRET_PATH = re.compile(
-    r"(sean-data-vault|/\.willow/|/mcp_apps/|/vault/|WILLOW_HOME)",
-    re.I,
-)
-
+# What counts as sensitive is the one script's (flatten-2 F12,
+# ``onescript/scrub.py``: ``sensitive_key`` for key names, the ``secret_path``
+# set for the paths that must never leave the box, ``credentials`` for a
+# credential shape in a string), carried as the parity-tested ``scrub_local``.
 _REDACTED = "[redacted-by-willow-membrane]"
+_STRING_SETS = ("secret_path", "credentials")
+
+
+def _sensitive_key(key: Any) -> bool:
+    return scrub_local.sensitive_key(key)
 
 
 def _redact_str(value: str) -> str:
-    """Redact a string if it exposes a secret path; otherwise return as-is."""
-    if _SECRET_PATH.search(value):
-        return _REDACTED
-    return value
+    """Redact a string if it exposes a secret path (the whole value) or
+    carries a credential shape (that part); otherwise return as-is."""
+    return scrub_local.apply(value, _STRING_SETS, marker=_REDACTED)
 
 
 def _scrub_mapping(data: dict[str, Any]) -> dict[str, Any]:
     """Redact values under sensitive keys or secret-path strings, recursively."""
     out: dict[str, Any] = {}
     for key, val in data.items():
-        if _SENSITIVE_KEY.search(str(key)):
+        if _sensitive_key(key):
             out[key] = _REDACTED
             continue
         out[key] = _scrub_value(val)

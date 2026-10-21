@@ -34,28 +34,28 @@ HELD/redacted as one value — over-matching a same-charset run costs
 nothing since it is never a real ordinary-prose shape); a key followed by
 a lowercase letter stops at 20 chars as before. Leading glue is still
 caught by substring/finditer search regardless of anchor.
+
+Flatten-2 F12: the shapes, their unanchored form and the ``api_key = value``
+rule now live in the one script's ``onescript/scrub.py`` (sets ``credentials``
+and ``assigned_credential``; the operator: "Using the onescript at every
+path."), which keeps every fix above. willow-mcp carries them as ``scrub_local`` (a
+parity-tested byte copy, so an installed server works with no checkout beside
+it; operator: "2 carry copies"). This module keeps the Nest's names for the
+kinds and its fingerprint.
 """
+
 from __future__ import annotations
 
-import re
+from .. import scrub_local
 
-# Ordered: specific shapes first, broad JWT last (so redaction labels are precise).
-_PATTERNS: list[tuple[str, "re.Pattern"]] = [
-    ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
-    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16,}")),
-    ("github_pat", re.compile(r"ghp_[A-Za-z0-9]{36}")),
-    ("google_api_key", re.compile(r"AIza[0-9A-Za-z\-_]{35}")),
-    ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
-    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{20,}")),
-    ("discord_token", re.compile(r"[MN][A-Za-z0-9_-]{23,26}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}")),
-    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}")),
-]
+_SETS = ("credentials_bounded", "assigned_credential")
 
-# key = value style, with placeholder rejection
-_ASSIGNED = re.compile(
-    r"(?i)\b(api[_-]?key|secret|password|passwd|token|bearer)\b['\"]?\s*[:=]\s*['\"]?([A-Za-z0-9_\-]{16,})"
-)
-_PLACEHOLDER = re.compile(r"(?i)(your|example|xxxx+|placeholder|none|null|true|false|changeme|redacted)")
+#: The Nest's names for the kinds the one script names otherwise.
+_KIND = {
+    "aws_access_key_id": "aws_access_key",
+    "github_token": "github_pat",
+    "provider_api_key": "openai_key",
+}
 
 
 def redact_value(v: str) -> str:
@@ -65,31 +65,16 @@ def redact_value(v: str) -> str:
 
 
 def find_secrets(text: str) -> list[tuple[str, str]]:
-    """Return [(kind, raw_value), …] — deduped, in first-seen order."""
+    """Return [(kind, raw_value), …] — deduped, in first-seen order. With the
+    one script out of reach: [("unreachable", why)], so a caller that checks
+    `if found:` holds the item rather than reading "could not look" as clean."""
     if not text:
         return []
-    out: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for kind, rx in _PATTERNS:
-        for m in rx.finditer(text):
-            val = m.group(0)
-            if val not in seen:
-                seen.add(val)
-                out.append((kind, val))
-    for m in _ASSIGNED.finditer(text):
-        val = m.group(2)
-        if val in seen or _PLACEHOLDER.search(val):
-            continue
-        # skip if already caught by a specific pattern above
-        if any(val in v for _, v in out):
-            continue
-        seen.add(val)
-        out.append(("credential", val))
-    return out
+    return [(_KIND.get(k, k), v) for k, v in scrub_local.find(text, _SETS)]
 
 
 def redact_text(text: str) -> str:
     """Replace every detected secret with a typed placeholder."""
-    for kind, val in find_secrets(text):
-        text = text.replace(val, f"[REDACTED:{kind}]")
-    return text
+    if not text:
+        return text
+    return scrub_local.replace_found(text, scrub_local.find(text, _SETS), kind_of=lambda k: _KIND.get(k, k))

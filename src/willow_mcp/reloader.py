@@ -143,6 +143,7 @@ from typing import Callable, Optional
 from . import env_fingerprint as envfp
 from . import paths
 from . import unit_reload_executor as urx
+from .states_local import EMPTY, POPULATED, UNREACHABLE
 
 logger = logging.getLogger(__name__)
 
@@ -257,11 +258,11 @@ def find_sealing_decision(receipt_id: str, db_path: Path) -> dict:
     """
     rid = (receipt_id or "").strip()
     if not rid:
-        return {"state": "empty"}
+        return {"state": EMPTY}
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error as exc:
-        return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
+        return {"state": UNREACHABLE, "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
     try:
         rows = conn.execute(
             "SELECT id, source_norm, target_text, verifier, seal_sig, created_at FROM tm_pairs "
@@ -272,11 +273,11 @@ def find_sealing_decision(receipt_id: str, db_path: Path) -> dict:
             (rid, rid),
         ).fetchall()
     except sqlite3.Error as exc:
-        return {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
+        return {"state": UNREACHABLE, "cause": f"{type(exc).__name__}: {exc}", "path": str(db_path)}
     finally:
         conn.close()
     if not rows:
-        return {"state": "empty"}
+        return {"state": EMPTY}
 
     from . import net_signer
 
@@ -294,9 +295,9 @@ def find_sealing_decision(receipt_id: str, db_path: Path) -> dict:
         # already enforced by the superseded_by='' filter above.
         ok, _reason, _field = net_signer.verify_seal(sealed, ring, max_age_s=None)
         if ok:
-            return {"state": "populated", "pair_id": pair_id, "verifier": verifier,
+            return {"state": POPULATED, "pair_id": pair_id, "verifier": verifier,
                     "sealed_at": created_at, "count": len(rows)}
-    return {"state": "empty"}
+    return {"state": EMPTY}
 
 
 # ── the check ─────────────────────────────────────────────────────────────────
@@ -410,10 +411,10 @@ def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = No
                                  "env_changed receipt is not performed")
 
     state = envfp.read_state()
-    if state["state"] == "unreachable":
+    if state["state"] == UNREACHABLE:
         return _refuse("EUNREACH", f"env-fingerprint state file unreadable: {state.get('cause')}",
                        request_state="none")
-    if state["state"] == "empty":
+    if state["state"] == EMPTY:
         return _refuse("ESTATEEMPTY",
                        "no env-fingerprint state file from the running broker — an older "
                        "broker that predates this, or one that has not started since; "
@@ -422,7 +423,7 @@ def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = No
 
     src = envfp.resolve_env_source(unit, runner=runner)
     live = envfp.fingerprint_source(src)
-    if live["state"] == "unreachable":
+    if live["state"] == UNREACHABLE:
         return _refuse("EUNREACH", f"unit env ({live.get('env_source')}) unreadable: {live.get('cause')}",
                        request_state="none")
 
@@ -454,7 +455,7 @@ def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = No
     # remove.) Refuse rather than file a receipt naming '<empty>' as the
     # target — restarting onto a genuinely absent env is not something this
     # trigger should ever request on its own.
-    if live["state"] != "populated":
+    if live["state"] != POPULATED:
         return _refuse("EMISSING",
                        f"the unit's env ({live.get('env_source')}) is now {live['state']} — a state "
                        f"change (the file was deleted or moved), not a diff to request a restart "
@@ -472,13 +473,13 @@ def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = No
         request_state = "current"
     elif rstate == "stale":
         existing_id = existing.get("id")
-        seal = find_sealing_decision(existing_id, config.nestor_db) if existing_id else {"state": "empty"}
-        if seal["state"] == "unreachable":
+        seal = find_sealing_decision(existing_id, config.nestor_db) if existing_id else {"state": EMPTY}
+        if seal["state"] == UNREACHABLE:
             return _refuse("ESEALS", f"seal store unreachable: {seal.get('cause')}",
                            receipt_id=existing_id, path=seal.get("path"), request_state="stale")
         successor = _mint_env_receipt(ledger, unit=unit, env_path=env_path, recorded=recorded,
                                       live=live, supersedes=existing_id)
-        if seal["state"] == "populated":
+        if seal["state"] == POPULATED:
             # Sealed but the file has moved on: refuse THIS tick (the seal
             # names the stale receipt, not the current file) while leaving
             # a fresh, unsealed successor in the journal for the next one.
@@ -515,7 +516,7 @@ def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = No
                        receipt_id=receipt_id, receipt=content, request_state=request_state)
 
     live_again = envfp.fingerprint_source(envfp.resolve_env_source(unit, runner=runner))
-    if live_again["state"] == "unreachable":
+    if live_again["state"] == UNREACHABLE:
         return _refuse("EUNREACH", f"unit env unreadable: {live_again.get('cause')}",
                        receipt_id=receipt_id, request_state=request_state)
     if envfp.summary(live_again) != content.get("fingerprint_after"):
@@ -525,10 +526,10 @@ def check_env(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = No
                        receipt_id=receipt_id, receipt=content, request_state=request_state)
 
     seal = find_sealing_decision(receipt_id, config.nestor_db)
-    if seal["state"] == "unreachable":
+    if seal["state"] == UNREACHABLE:
         return _refuse("ESEALS", f"seal store unreachable: {seal.get('cause')}",
                        receipt_id=receipt_id, path=seal.get("path"), request_state=request_state)
-    if seal["state"] == "empty":
+    if seal["state"] == EMPTY:
         added, removed = content.get("keys_added") or [], content.get("keys_removed") or []
         summary_bits = [b for b in (
             f"+{','.join(added)}" if added else "",
@@ -634,7 +635,7 @@ def _ruling_sealed_detail(nestor_db: Path) -> tuple[bool, Optional[str]]:
     from . import net_signer
 
     sealed = net_authority.read_sealed_pair(RULING_PAIR_ID, nestor_db)
-    if sealed.get("state") != "populated":
+    if sealed.get("state") != POPULATED:
         return False, None
     if sealed.get("source_lang") != "decision":
         return False, None
@@ -720,7 +721,7 @@ def _pr_for_commit(repo: str, sha: str, *, api, bearer: str) -> dict:
     resp = api("GET", f"{_API}/repos/{repo}/commits/{sha}/pulls", bearer=bearer)
     if not resp.get("ok"):
         cause, reason = _classify_merge_http_failure(resp)
-        return {"state": "unreachable", "reason": cause, "detail": reason}
+        return {"state": UNREACHABLE, "reason": cause, "detail": reason}
     items = resp.get("body")
     items = items if isinstance(items, list) else []
     # F4 (resolved -- the operator, ruling f13f15d9, "a PR merged into
@@ -733,8 +734,8 @@ def _pr_for_commit(repo: str, sha: str, *, api, bearer: str) -> dict:
     for pr in items:
         if pr.get("merged_at") and (pr.get("base") or {}).get("ref") == "master" \
                 and pr.get("merge_commit_sha") == sha:
-            return {"state": "populated", "number": pr.get("number")}
-    return {"state": "empty"}
+            return {"state": POPULATED, "number": pr.get("number")}
+    return {"state": EMPTY}
 
 
 def _checks_all_green(repo: str, sha: str, *, api, bearer: str) -> dict:
@@ -748,9 +749,9 @@ def _checks_all_green(repo: str, sha: str, *, api, bearer: str) -> dict:
     runs, failed = pr_checks._fetch_check_runs(api, repo=repo, sha=sha, bearer=bearer)
     if failed is not None:
         cause, reason = _classify_merge_http_failure(failed)
-        return {"state": "unreachable", "reason": cause, "detail": reason}
+        return {"state": UNREACHABLE, "reason": cause, "detail": reason}
     if not runs:
-        return {"state": "empty", "runs": []}
+        return {"state": EMPTY, "runs": []}
     if any(r.get("status") != "completed" for r in runs):
         return {"state": "pending", "runs": runs}
     bad = [r for r in runs if r.get("conclusion") not in _MERGE_OK_CONCLUSIONS]
@@ -951,21 +952,21 @@ def check_merge(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = 
                        receipt_id=receipt_id)
 
     pr = _pr_for_commit(config.repo, current_head, api=call, bearer=bearer)
-    if pr["state"] == "unreachable":
+    if pr["state"] == UNREACHABLE:
         return _refuse("EUNREACH",
                        f"could not resolve the merged PR for {current_head}: {pr.get('detail')}",
                        receipt_id=receipt_id)
-    if pr["state"] == "empty":
+    if pr["state"] == EMPTY:
         return _refuse("ENOTMERGED",
                        f"{current_head} is not the merge/squash commit of a PR GitHub reports "
                        f"merged into master", receipt_id=receipt_id)
 
     checks = _checks_all_green(config.repo, current_head, api=call, bearer=bearer)
-    if checks["state"] == "unreachable":
+    if checks["state"] == UNREACHABLE:
         return _refuse("EUNREACH",
                        f"could not read check-runs for {current_head}: {checks.get('detail')}",
                        receipt_id=receipt_id, pr_number=pr["number"])
-    if checks["state"] in ("empty", "pending"):
+    if checks["state"] in (EMPTY, "pending"):
         return _refuse("ECHECKS", f"check-runs for {current_head} are not all conclusive yet",
                        receipt_id=receipt_id, pr_number=pr["number"])
     if checks["state"] == "failing":
@@ -1231,7 +1232,7 @@ def _stale_sealed_receipts(ledger, nestor_db, *, repo: str, checkout: str, curre
         if not rid:
             continue
         seal = find_sealing_decision(rid, nestor_db)
-        if seal.get("state") == "populated":
+        if seal.get("state") == POPULATED:
             out.append(rid)
     return out
 
@@ -1364,10 +1365,10 @@ def check(config: ReloaderConfig, *, ledger, runner: Optional[Callable] = None) 
         if not receipt_id:
             continue
         seal = find_sealing_decision(receipt_id, config.nestor_db)
-        if seal["state"] == "unreachable":
+        if seal["state"] == UNREACHABLE:
             return _refuse("ESEALS", f"seal store unreachable: {seal.get('cause')}",
                            receipt_id=receipt_id, path=seal.get("path"), head=current_head)
-        if seal["state"] == "empty":
+        if seal["state"] == EMPTY:
             enoseal_ids.append(receipt_id)
             continue
         sealed_hits.append((receipt_id, receipt["content"], seal))

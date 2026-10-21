@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import sys
+from .states_local import UNREACHABLE
 
 
 EXIT_OK = 0
@@ -66,7 +67,7 @@ def cmd_manifest_grant(args: argparse.Namespace) -> int:
     if args.mg_action == "status":
         result = manifest_grant_executor.manifest_grant_status(args.pair_id)
         print(json.dumps(result, indent=2, default=str))
-        return EXIT_FAIL if result.get("state") in ("not_found", "unreachable") else EXIT_OK
+        return EXIT_FAIL if result.get("state") in ("not_found", UNREACHABLE) else EXIT_OK
 
     if args.mg_action == "retry":
         from .db import get_pg

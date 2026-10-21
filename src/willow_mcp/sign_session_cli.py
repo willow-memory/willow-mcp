@@ -43,11 +43,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
 from typing import Optional
 
 from . import keyring as keyring_mod
 from . import session_signing
+from . import onescript_clock
 
 
 EXIT_OK = 0
@@ -58,12 +58,10 @@ ATTEST_FORMAT_V2 = "orchestrator_session_attestation_v2"
 
 
 def _now_iso_z() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    """In the one script's ``seconds_z`` format, from its one clock (flatten-2 F8:
+    "Using the onescript at every path."). ``$ONESCRIPT_NOW`` pins it. With no one
+    script reachable this falls back to the carried ``clock_local`` and says so (``onescript_clock.SOURCE``)."""
+    return onescript_clock.clock().seconds_z()
 
 
 def _build_payload(session_id: str, verifier: str, attested_at: str) -> dict:

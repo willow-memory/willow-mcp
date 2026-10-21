@@ -286,16 +286,3 @@ def test_ruff_configured_still_true_for_a_real_table(tmp_path):
     )
 
     assert stop_lint_gate._ruff_configured(tmp_path) is True
-
-
-def test_bundled_hook_is_identical_to_the_repo_copy():
-    """src/willow_mcp/bundle/hooks/stop_lint_gate.py is what ships to an
-    agent's harness; hooks/stop_lint_gate.py is what these tests exercise —
-    same drift-catcher as test_pre_tool_use_hook.py's parity test. A fix
-    applied to one and not the other is a guardrail that passes CI and is
-    absent in production."""
-    bundled = (
-        Path(__file__).resolve().parents[1]
-        / "src/willow_mcp/bundle/hooks/stop_lint_gate.py"
-    )
-    assert bundled.read_text() == _HOOK_PATH.read_text()

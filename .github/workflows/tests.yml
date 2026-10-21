@@ -113,11 +113,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # No pip cache in this job: it checks out a willow-bot branch picked by
+      # name (below), and a job that runs code from a branch must not write a
+      # cache the default branch later restores (CodeQL: cache poisoning).
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
 
       - name: Path guard
         run: bash scripts/path_guard.sh
@@ -134,6 +135,29 @@ jobs:
         run: |
           pip install -q pyyaml jsonschema
           python tools/mai_lint.py
+
+      # The one reach's parity test (flatten-2 F6.5) holds this repo's copy of
+      # willow-bot's reach_bootstrap.py to the template, so willow-bot is
+      # checked out here (inside the workspace; ONESCRIPT_HOME names it).
+      # A change that spans repos rides one branch name in each: on a pull
+      # request, take willow-memory/willow-bot's branch of this PR's name when
+      # it has one, else main. Every other event (push, schedule, dispatch)
+      # runs in the default branch's cache scope and takes main only. No step
+      # output feeds a ref (CodeQL: cache poisoning from a computed checkout).
+      - uses: actions/checkout@v7
+        id: bot_same_name
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        with:
+          repository: willow-memory/willow-bot
+          ref: ${{ github.head_ref }}
+          path: willow-bot
+      - uses: actions/checkout@v7
+        if: github.event_name != 'pull_request' || steps.bot_same_name.outcome != 'success'
+        with:
+          repository: willow-memory/willow-bot
+          ref: main
+          path: willow-bot
 
       - name: Install dependencies
         run: |
@@ -172,6 +196,7 @@ jobs:
           # Floor, not target: measured 75.1% on master. Ratchet up, never down.
           coverage report --fail-under=70
         env:
+          ONESCRIPT_HOME: ${{ github.workspace }}/willow-bot/one-script
           PGHOST: localhost
           PGPORT: 5432
           PGUSER: postgres
