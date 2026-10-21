@@ -141,28 +141,18 @@ jobs:
       # A change that spans repos rides one branch name in each: on a pull
       # request, take willow-memory/willow-bot's branch of this PR's name when
       # it has one, else main. Every other event (push, schedule, dispatch)
-      # runs in the default branch's cache scope, so it takes main and nothing
-      # else (CodeQL: cache poisoning from a branch-named checkout).
-      - name: Which willow-bot
-        if: github.event_name == 'pull_request'
-        id: bot_ref
-        shell: bash
-        env:
-          BRANCH: ${{ github.head_ref }}
-        run: |
-          if git ls-remote --exit-code --heads https://github.com/willow-memory/willow-bot "$BRANCH" >/dev/null; then
-            echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=main" >> "$GITHUB_OUTPUT"
-          fi
+      # runs in the default branch's cache scope and takes main only. No step
+      # output feeds a ref (CodeQL: cache poisoning from a computed checkout).
       - uses: actions/checkout@v7
+        id: bot_same_name
         if: github.event_name == 'pull_request'
+        continue-on-error: true
         with:
           repository: willow-memory/willow-bot
-          ref: ${{ steps.bot_ref.outputs.ref }}
+          ref: ${{ github.head_ref }}
           path: willow-bot
       - uses: actions/checkout@v7
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' || steps.bot_same_name.outcome != 'success'
         with:
           repository: willow-memory/willow-bot
           ref: main
