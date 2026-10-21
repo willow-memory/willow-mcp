@@ -113,11 +113,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # No pip cache in this job: it checks out a willow-bot branch picked by
+      # name (below), and a job that runs code from a branch must not write a
+      # cache the default branch later restores (CodeQL: cache poisoning).
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
 
       - name: Path guard
         run: bash scripts/path_guard.sh
