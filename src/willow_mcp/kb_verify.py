@@ -19,8 +19,8 @@ import uuid
 from typing import Optional
 
 from . import kb_curate as kbc
-from . import schema_profile as sp
 from . import onescript_reach
+from . import schema_profile as sp
 from ._kb_sql import KNOWLEDGE_FIELDS, build_select, row_to_dict
 from .training_corpus import (
     SOURCE_KB_VERIFY,

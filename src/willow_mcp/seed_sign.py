@@ -9,8 +9,7 @@ import argparse
 import json
 from typing import Any
 
-from . import pgp
-from . import onescript_reach
+from . import onescript_reach, pgp
 from .paths import willow_home
 from .seed_loader import load_seed_document, seed_path
 
