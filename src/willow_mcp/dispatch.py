@@ -10,7 +10,6 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -25,6 +24,7 @@ from .paths import (
     sessions_dir,
 )
 from . import dispatch_signing
+from . import onescript_reach
 from .human_session import is_orchestrator_app
 from .registry import persona_context
 from .seed_loader import seed_context
@@ -167,7 +167,10 @@ def _pg_mirror_status(dispatch_id: str, status: str) -> None:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    """In the one script's ``seconds_z`` format, from its one clock (flatten-2 F8:
+    "Using the onescript at every path."). ``$ONESCRIPT_NOW`` pins it. With no one
+    script reachable this raises ``onescript_reach.Unreachable``, with why."""
+    return onescript_reach.module("clock").seconds_z()
 
 
 def _write_json(path: Path, data: dict) -> None:

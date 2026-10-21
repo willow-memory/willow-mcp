@@ -298,6 +298,10 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# Left (flatten-2 F8): the one script's clock is not reached from here. This module is
+# the trust owner's manifest.grant apply (trust_owner_verbs), and a privileged step runs
+# only code from its root-owned venv, never a sibling checkout.
+# Same bytes as the one script's `isoformat_utc`; pinned equal by tests/test_onescript_clock.py.
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 

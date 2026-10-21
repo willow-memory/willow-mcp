@@ -271,6 +271,10 @@ def _refuse_registry_mismatch(act: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Left (flatten-2 F8): the one script's clock is not reached from here. This module runs as the trust owner
+# (trust_owner_verbs' envelope.ratify apply half), and a privileged step runs only code
+# from its root-owned venv (tests/test_trust_venv_preflight.py), never a sibling checkout.
+# Same bytes as the one script's `seconds_z`; pinned equal by tests/test_onescript_clock.py.
 def _now_iso() -> str:
     return (
         datetime.now(timezone.utc)
