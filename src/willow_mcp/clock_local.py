@@ -81,7 +81,9 @@ def parse_pin(text: str) -> datetime:
         raise BadPin(
             f"{ENV_NOW} / pin {text!r} is neither an ISO 8601 instant nor epoch seconds"
         ) from e
-    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(
+        timezone.utc
+    )
 
 
 def pinned(env=None) -> datetime | None:
