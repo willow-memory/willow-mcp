@@ -5,7 +5,6 @@ to a copy of the ``json.dumps`` call)."""
 
 from __future__ import annotations
 
-import pytest
 
 from willow_mcp import bound_receipt, onescript_canon
 
@@ -29,15 +28,27 @@ def test_every_family_willow_mcp_uses_exists_in_the_one_script():
         assert onescript_canon.family(name).name == name
 
 
-def test_unreachable_is_said_with_why_and_never_falls_back(tmp_path, monkeypatch):
+def test_beside_the_one_script_answers_and_says_so(monkeypatch):
+    monkeypatch.setattr(onescript_canon, "_canon", None)
+    monkeypatch.setattr(onescript_canon, "SOURCE", None)
+    onescript_canon.family("compact_utf8")
+    assert onescript_canon.SOURCE == "onescript" and onescript_canon.WHY is None
+
+
+def test_absent_the_carried_copy_answers_and_says_so_with_why(tmp_path, monkeypatch):
+    """"2 carry copies": an installed willow-mcp keeps working, and never silently."""
+    from willow_mcp import canon_local
+
     monkeypatch.setenv("ONESCRIPT_HOME", str(tmp_path / "nowhere"))
     monkeypatch.setattr(onescript_canon, "_canon", None)
-    with pytest.raises(onescript_canon.Unreachable) as e:
-        onescript_canon.family("compact_utf8")
-    assert "ONESCRIPT_HOME" in str(e.value)
-    # a hash that cannot be computed the persisted way is not computed another way
-    with pytest.raises(onescript_canon.Unreachable):
-        bound_receipt.ledger_entry_hash("p", "ts", "app", "tool", "out", None)
+    monkeypatch.setattr(onescript_canon, "SOURCE", None)
+    monkeypatch.setattr(onescript_canon, "WHY", None)
+    enc = onescript_canon.family("compact_utf8")
+    assert enc is canon_local.get("compact_utf8")
+    assert onescript_canon.SOURCE == "carried" and onescript_canon.source() == "carried"
+    assert "ONESCRIPT_HOME" in onescript_canon.WHY
+    # the persisted bytes come out the same
+    assert bound_receipt.ledger_entry_hash("p", "ts", "app", "tool", "out", None)
 
 
 def test_importing_willow_mcp_does_not_need_the_one_script(tmp_path):

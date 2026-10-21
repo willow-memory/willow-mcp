@@ -189,6 +189,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from .states_local import EMPTY, POPULATED, UNREACHABLE
 
 VERB = "manifest.grant"
 EVENT = "manifest_granted"
@@ -582,7 +583,7 @@ def _load_sealed_ruling(pair_id: str, *, db_path: Optional[Path] = None) -> dict
 
     resolved = db_path if db_path is not None else seal_handler._nestor_db_path()
     sealed = read_sealed_pair(pair_id, resolved)
-    if sealed.get("state") == "populated":
+    if sealed.get("state") == POPULATED:
         sealed = {**sealed, "pair_id": pair_id}
     return sealed
 
@@ -830,17 +831,17 @@ def _verify_seal_only(pair_id: str, *, db_path: Optional[Path] = None,
                 "(Loki audit 229BE2C1, R2: seal_message covers source_norm/target_text/"
                 "verifier, never pair_id, so this binding is not implied by seal_sig alone)",
             ), None
-        sealed = {"state": "populated", **{k: sealed_row.get(k) for k in _SEALED_ROW_FIELDS}}
+        sealed = {"state": POPULATED, **{k: sealed_row.get(k) for k in _SEALED_ROW_FIELDS}}
     else:
         sealed = _load_sealed_ruling(pair_id, db_path=db_path)
     state = sealed.get("state")
-    if state == "unreachable":
+    if state == UNREACHABLE:
         return _refuse(
             "EUNREACH",
             f"nestor.db unreachable ({sealed.get('cause')}) — cannot bind this "
             "grant to what was actually sealed; the SOIL record alone is not enough",
         ), None
-    if state != "populated":
+    if state != POPULATED:
         return _refuse(
             "EACCES",
             f"pair_id={pair_id!r} is not a populated sealed pair in nestor.db "
@@ -1065,7 +1066,7 @@ def manifest_grant_status(pair_id: str, *, grants_root: Optional[Path] = None) -
     try:
         record = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        return {"state": "unreachable", "pair_id": pair_id, "cause": f"{type(exc).__name__}: {exc}"}
+        return {"state": UNREACHABLE, "pair_id": pair_id, "cause": f"{type(exc).__name__}: {exc}"}
     return {"state": state, "pair_id": pair_id, "path": str(path), **record}
 
 
@@ -2115,7 +2116,7 @@ def manifest_grant_apply(
                     "reason": f"cannot reach {candidate}: {type(exc).__name__}: {exc}",
                     "unreadable_path": str(candidate), "processed": []}
     if not pending_dir.is_dir():
-        return {"ok": True, "state": "empty", "processed": []}
+        return {"ok": True, "state": EMPTY, "processed": []}
     if pair_id:
         files = [p for p in [pending_dir / f"{pair_id}.json"] if p.is_file()]
     else:
@@ -2134,7 +2135,7 @@ def manifest_grant_apply(
                     "unreadable_path": str(pending_dir), "processed": []}
         files = sorted(pending_dir / n for n in names if n.endswith(".json"))
     if not files:
-        return {"ok": True, "state": "empty", "processed": []}
+        return {"ok": True, "state": EMPTY, "processed": []}
 
     processed: list[dict] = []
     for f in files:
@@ -2176,7 +2177,7 @@ def manifest_grant_apply(
                 pass
             processed.append(out)
 
-    return {"ok": all(r.get("ok") for r in processed), "state": "populated", "processed": processed}
+    return {"ok": all(r.get("ok") for r in processed), "state": POPULATED, "processed": processed}
 
 
 # ── retry: failed/ is terminal, but not every failure earned it ────────────

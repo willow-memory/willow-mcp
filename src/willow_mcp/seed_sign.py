@@ -9,7 +9,7 @@ import argparse
 import json
 from typing import Any
 
-from . import onescript_reach, pgp
+from . import onescript_clock, pgp
 from .paths import willow_home
 from .seed_loader import load_seed_document, seed_path
 
@@ -17,8 +17,8 @@ from .seed_loader import load_seed_document, seed_path
 def _utc_now() -> str:
     """In the one script's ``seconds_z`` format, from its one clock (flatten-2 F8:
     "Using the onescript at every path."). ``$ONESCRIPT_NOW`` pins it. With no one
-    script reachable this raises ``onescript_reach.Unreachable``, with why."""
-    return onescript_reach.module("clock").seconds_z()
+    script reachable this falls back to the carried ``clock_local`` and says so (``onescript_clock.SOURCE``)."""
+    return onescript_clock.clock().seconds_z()
 
 
 def sign_seed(

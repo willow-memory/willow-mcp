@@ -17,7 +17,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from . import onescript_reach
+from . import onescript_clock
 from .onescript_canon import family
 from .onescript_sign import sign as _one_sign
 
@@ -370,8 +370,8 @@ def _sign_hmac_sha256(signing_key: bytes, payload: dict[str, str]) -> str:
 def _clock():
     """The one script's clock (flatten-2 F8: "Using the onescript at every
     path."). ``$ONESCRIPT_NOW`` pins it. With no one script reachable this
-    raises ``onescript_reach.Unreachable``, with why."""
-    return onescript_reach.module("clock")
+    falls back to the carried ``clock_local`` and says so (``onescript_clock.SOURCE``)."""
+    return onescript_clock.clock()
 
 
 def _utc_now() -> datetime:

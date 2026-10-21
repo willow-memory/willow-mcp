@@ -4,8 +4,8 @@ each returns the pinned instant in its NAMED format, byte for byte what the
 helper it replaced wrote (D-e: those strings are signed, mirrored and hashed).
 
 ``seconds_z`` is ``2026-10-20T12:00:00Z``; ``isoformat_utc`` keeps the
-microseconds and ``+00:00``. With the one script absent a helper raises
-``Unreachable`` naming ``ONESCRIPT_HOME``; it has no copy to fall back to.
+microseconds and ``+00:00``. With the one script absent a helper uses the carried
+``clock_local`` and says so (``onescript_clock.SOURCE``).
 
 Locally, with no willow-bot beside, these skip and say so; in CI (``CI`` is
 set) they fail instead, because the CI checks willow-bot out for this.
@@ -80,10 +80,23 @@ def test_bound_receipt_clock_and_stamp_format():
 
 
 @pytest.mark.parametrize("mod,name", SECONDS_Z_HELPERS + ISO_UTC_HELPERS)
-def test_no_one_script_is_unreachable_with_why(mod, name, monkeypatch, tmp_path):
+def test_no_one_script_the_carried_clock_answers_and_says_so(mod, name, monkeypatch, tmp_path):
+    """"2 carry copies": the same pinned instant, from ``clock_local``, with
+    ``onescript_clock.SOURCE`` saying ``carried`` and ``WHY`` naming the reach."""
+    from willow_mcp import onescript_clock
+
     monkeypatch.setenv("ONESCRIPT_HOME", str(tmp_path / "nowhere"))
-    with pytest.raises(onescript_reach.Unreachable, match="ONESCRIPT_HOME"):
-        getattr(importlib.import_module(mod), name)()
+    want = SECONDS_Z if (mod, name) in SECONDS_Z_HELPERS else ISO_UTC
+    assert getattr(importlib.import_module(mod), name)() == want
+    assert onescript_clock.SOURCE == "carried"
+    assert "ONESCRIPT_HOME" in onescript_clock.WHY
+
+
+def test_beside_the_one_script_answers_and_says_so():
+    from willow_mcp import onescript_clock
+
+    onescript_clock.clock()
+    assert onescript_clock.SOURCE == "onescript" and onescript_clock.WHY is None
 
 
 @pytest.mark.parametrize("mod,name,named", PRIVILEGED_LEFT)

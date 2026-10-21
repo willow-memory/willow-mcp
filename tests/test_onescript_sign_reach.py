@@ -1,14 +1,18 @@
 """Absence is said: ``bound_receipt``'s sign reach (flatten-2 F14, merge-check gate 5).
 
 ``bound_receipt`` signs and checks its HMAC through ``onescript_sign`` (the one
-reach to the one script's ``sign.py``). With ``ONESCRIPT_HOME`` pointing nowhere
-it must say ``unreachable`` with a reason, and never sign another way. This runs
-in a subprocess so no module the parent already imported (and no cached reach)
-can stand in for the one script.
+reach to the one script's ``sign.py``). "2 carry copies" (operator, 2026-10-21):
+with ``ONESCRIPT_HOME`` pointing nowhere it signs with the carried ``sign_local``
+and SAYS so (``onescript_sign.SOURCE == "carried"``, ``WHY`` naming
+``ONESCRIPT_HOME``); the value is the HMAC the one script gives. This runs in a
+subprocess so no module the parent already imported (and no cached reach) can
+stand in for the one script.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import subprocess
 import sys
@@ -17,24 +21,15 @@ from pathlib import Path
 SRC = str(Path(__file__).resolve().parents[1] / "src")
 
 CODE = """
-import json, sys
-from willow_mcp import bound_receipt
-out = {}
-for name, call in (
-    ("sign", lambda: bound_receipt._sign_hmac_sha256(b"k" * 32, {"a": "b"})),
-    ("check", lambda: bound_receipt._check_signature(
-        {"signature": {"alg": "hmac-sha256", "value": "00"}, "payload": {"a": "b"}}, b"k" * 32)),
-):
-    try:
-        call()
-        out[name] = "signed anyway"
-    except Exception as e:
-        out[name] = [type(e).__name__, str(e)]
-print(json.dumps(out))
+import json
+from willow_mcp import bound_receipt, onescript_sign
+sig = bound_receipt._one_sign().hmac_hex(b"k" * 32, b"msg")
+ok = bound_receipt._one_sign().hmac_equal(sig, sig)
+print(json.dumps({"sig": sig, "ok": ok, "source": onescript_sign.SOURCE, "why": onescript_sign.WHY}))
 """
 
 
-def test_the_sign_reach_says_unreachable_with_why_and_never_signs_another_way(tmp_path):
+def test_the_sign_reach_signs_with_the_carried_copy_and_says_so(tmp_path):
     env = {
         "PATH": "/usr/bin:/bin",
         "PYTHONPATH": SRC,
@@ -46,7 +41,7 @@ def test_the_sign_reach_says_unreachable_with_why_and_never_signs_another_way(tm
     )
     assert r.returncode == 0, r.stderr
     got = json.loads(r.stdout)
-    for name in ("sign", "check"):
-        kind, why = got[name]
-        assert kind == "Unreachable", got
-        assert "ONESCRIPT_HOME" in why and "nowhere" in why, got
+    assert got["source"] == "carried", got
+    assert "ONESCRIPT_HOME" in got["why"] and "nowhere" in got["why"], got
+    assert got["ok"] is True, got
+    assert got["sig"] == hmac.new(b"k" * 32, b"msg", hashlib.sha256).hexdigest()

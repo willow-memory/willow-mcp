@@ -75,6 +75,7 @@ from typing import Optional
 
 from . import egress_authorization as ea
 from . import net_authority as na
+from .states_local import UNREACHABLE
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +374,7 @@ class Signer:
                 seal_pair_id=seal_digest(seal),
             )
         except (OSError, ValueError, PermissionError) as exc:
-            return {"state": "unreachable", "cause": f"signing failed: {type(exc).__name__}: {exc}"}
+            return {"state": UNREACHABLE, "cause": f"signing failed: {type(exc).__name__}: {exc}"}
         return {"state": "minted", "envelope": envelope, "verifier": seal["verifier"],
                 "task_id": sealed_bound["task_id"], "seal_digest": seal_digest(seal)}
 
@@ -406,7 +407,7 @@ class Signer:
                                      issuer=f"seal:{seal['verifier']}",
                                      reason=reason_text)
         except (OSError, ValueError) as exc:
-            return {"state": "unreachable",
+            return {"state": UNREACHABLE,
                     "cause": f"lease root unreachable from the signer: {type(exc).__name__}: {exc}",
                     "path": str(lease_mod._leases_root())}
         return {"state": "minted", "path": str(lease_mod.lease_path(sealed_bound["app_id"])),
@@ -436,7 +437,7 @@ def serve(signer: Signer, sock_path: Path, *, mode: int = 0o660,
                     reply = signer.handle(request)
                 except Exception as exc:  # noqa: BLE001 — one bad request must not kill the signer
                     logger.error("net_signer: request failed", exc_info=True)
-                    reply = {"state": "unreachable", "cause": f"{type(exc).__name__}: {exc}"}
+                    reply = {"state": UNREACHABLE, "cause": f"{type(exc).__name__}: {exc}"}
             self.wfile.write((json.dumps(reply, separators=(",", ":")) + "\n").encode("utf-8"))
 
     class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):

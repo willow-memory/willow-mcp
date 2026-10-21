@@ -46,6 +46,7 @@ from .unit_reload_executor import (
     is_auto_restart_substate,
     show_unit,
 )
+from .states_local import EMPTY, POPULATED, UNREACHABLE
 
 #: Strict full-match unit name (Loki 6ACB1F10 F1): a bare `startswith` let
 #: every trick through as argv to systemctl/journalctl — a glob (`willow-
@@ -203,28 +204,28 @@ def journal_tail(unit: str, journal_lines: int, *, runner: Optional[Callable] = 
             runner=runner, timeout=_JOURNAL_TIMEOUT_S,
         )
     except FileNotFoundError:
-        return {"state": "unreachable", "cause": "systemctl_missing"}
+        return {"state": UNREACHABLE, "cause": "systemctl_missing"}
     except subprocess.TimeoutExpired:
-        return {"state": "unreachable", "cause": "timeout"}
+        return {"state": UNREACHABLE, "cause": "timeout"}
 
     stderr_detail = (proc.stderr or "").strip()
     if _NO_JOURNAL_FILES_MARKER in stderr_detail.lower():
         # rc is 0 here on real systemd — the failure is legible only in the
         # TEXT, never the return code (Loki 6ACB1F10 F4).
-        return {"state": "unreachable", "cause": "journal_unreadable",
+        return {"state": UNREACHABLE, "cause": "journal_unreadable",
                 "detail": stderr_detail[-300:]}
     if proc.returncode != 0:
         detail = stderr_detail or (proc.stdout or "").strip()
-        return {"state": "unreachable", "cause": _classify_failure(detail), "detail": detail[-300:]}
+        return {"state": UNREACHABLE, "cause": _classify_failure(detail), "detail": detail[-300:]}
 
     raw = proc.stdout or ""
     stripped = raw.strip()
     if not stripped or stripped == _NO_ENTRIES_SENTINEL:
-        return {"state": "empty", "lines": []}
+        return {"state": EMPTY, "lines": []}
 
     redacted_text, kinds_found = secret_scan.redact_journal_tail(raw)
     lines = [line for line in redacted_text.splitlines() if line.strip()]
-    out = {"state": "populated", "lines": lines}
+    out = {"state": POPULATED, "lines": lines}
     if kinds_found:
         out["redacted_kinds"] = sorted(kinds_found)
     return out
@@ -235,7 +236,7 @@ def _unit_entry(unit: str, *, journal_lines: int, runner: Optional[Callable],
     state = show_unit(unit, runner=runner)
     if not state.get("ok"):
         return {
-            "unit": unit, "state": "unreachable",
+            "unit": unit, "state": UNREACHABLE,
             "cause": state.get("cause"), "detail": state.get("detail"),
         }
     return {
@@ -281,28 +282,28 @@ def read_unit_status(
 
     if unit:
         entry = _unit_entry(unit, journal_lines=journal_lines, runner=runner, now=now)
-        if entry.get("state") == "unreachable":
+        if entry.get("state") == UNREACHABLE:
             cause = entry.get("cause")
             if cause in ("no_user_bus", "systemctl_missing", "timeout"):
-                return {"state": "unreachable", "cause": cause, "detail": entry.get("detail")}
+                return {"state": UNREACHABLE, "cause": cause, "detail": entry.get("detail")}
             # unit_unknown: the bus answered, this named unit just doesn't
             # exist — "no matching units", not an unreachable desk.
-            return {"state": "empty", "reason": f"{unit!r} is not known to systemd", "units": []}
-        return {"state": "populated", "units": [entry]}
+            return {"state": EMPTY, "reason": f"{unit!r} is not known to systemd", "units": []}
+        return {"state": POPULATED, "units": [entry]}
 
     loaded, err = _list_loaded_units(runner)
     if err is not None:
-        return {"state": "unreachable", **err}
+        return {"state": UNREACHABLE, **err}
     enabled_files, err = _list_enabled_unit_files(runner)
     if err is not None:
-        return {"state": "unreachable", **err}
+        return {"state": UNREACHABLE, **err}
 
     matched = sorted({name for name in (loaded + enabled_files) if _is_allowed(name)})
     if not matched:
-        return {"state": "empty", "reason": "no willow-*/ratatosk-* units found", "units": []}
+        return {"state": EMPTY, "reason": "no willow-*/ratatosk-* units found", "units": []}
 
     units_out = [
         _unit_entry(name, journal_lines=journal_lines, runner=runner, now=now)
         for name in matched
     ]
-    return {"state": "populated", "units": units_out}
+    return {"state": POPULATED, "units": units_out}

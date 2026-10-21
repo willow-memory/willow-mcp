@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
-from . import onescript_reach
+from . import onescript_clock
 
 FLAGGED_MARKER = "kb:flagged"
 RETRACT_TAG = "kb:retracted"
@@ -17,8 +17,8 @@ _VALID_SEVERITIES = frozenset({"info", "low", "medium", "high", "critical"})
 def _utc_now() -> str:
     """In the one script's ``seconds_z`` format, from its one clock (flatten-2 F8:
     "Using the onescript at every path."). ``$ONESCRIPT_NOW`` pins it. With no one
-    script reachable this raises ``onescript_reach.Unreachable``, with why."""
-    return onescript_reach.module("clock").seconds_z()
+    script reachable this falls back to the carried ``clock_local`` and says so (``onescript_clock.SOURCE``)."""
+    return onescript_clock.clock().seconds_z()
 
 
 def normalize_tags(raw: Any) -> list:
