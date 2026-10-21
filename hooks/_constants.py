@@ -7,8 +7,8 @@ Jeles / Nestor / willows-bot imports from here.
 
 `_constants.py` is a plain module import from `hooks/pre_tool_use.py`;
 the bundle twin lives at `src/willow_mcp/bundle/hooks/_constants.py` and
-must be byte-identical (pinned by tests/test_skills_sync.py's hook-parity
-assertion — the same rule that pins the two `pre_tool_use.py` copies).
+must be byte-identical (pinned by tests/test_hook_mirror_parity.py, which
+pins every file in both trees; refresh with scripts/sync_repo_hooks.sh).
 """
 
 # The ratified Jeles corpus federation server. Named in
