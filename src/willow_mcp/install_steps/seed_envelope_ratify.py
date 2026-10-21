@@ -56,6 +56,10 @@ BOUNDS = {"proposal_ids": ["*"]}
 ENVELOPE_ID = "env-envelope.ratify-bootstrap"
 
 
+# Left (flatten-2 F8): the one script's clock is not reached from here. This step runs as root /
+# the trust owner under `python -I` from the root-owned venv at install time, where there is
+# no checkout beside it and a sibling's code must never be executed.
+# Same bytes as the one script's `isoformat_utc`; pinned equal by tests/test_onescript_clock.py.
 def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 

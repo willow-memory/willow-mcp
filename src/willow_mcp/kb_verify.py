@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
 
 from . import kb_curate as kbc
 from . import schema_profile as sp
+from . import onescript_reach
 from ._kb_sql import KNOWLEDGE_FIELDS, build_select, row_to_dict
 from .training_corpus import (
     SOURCE_KB_VERIFY,
@@ -225,7 +225,10 @@ CHECK_KINDS = ("verify_sources", "check_health")
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """In the one script's ``isoformat_utc`` format, from its one clock (flatten-2
+    F8: "Using the onescript at every path."). ``$ONESCRIPT_NOW`` pins it. With no
+    one script reachable this raises ``onescript_reach.Unreachable``, with why."""
+    return onescript_reach.module("clock").isoformat_utc()
 
 
 def record_verification(store, *, record_id: str, outcome: str, check_kind: str,

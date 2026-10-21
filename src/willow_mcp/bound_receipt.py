@@ -17,6 +17,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
+from . import onescript_reach
 from .onescript_canon import family
 from .onescript_sign import sign as _one_sign
 
@@ -303,7 +304,7 @@ def check_freshness(
         return False, reason, detail
     expires = _parse_timestamp(wire["payload"]["expires_at"])
     assert expires is not None
-    now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    now_utc = (now or _utc_now()).astimezone(timezone.utc)
     if now_utc > expires:
         return False, VerificationReason.EXPIRED, "expires_at in the past"
     return True, VerificationReason.OK, "ok"
@@ -366,12 +367,21 @@ def _sign_hmac_sha256(signing_key: bytes, payload: dict[str, str]) -> str:
     return _one_sign().hmac_hex(signing_key, canonical_signed_bytes(payload))
 
 
+def _clock():
+    """The one script's clock (flatten-2 F8: "Using the onescript at every
+    path."). ``$ONESCRIPT_NOW`` pins it. With no one script reachable this
+    raises ``onescript_reach.Unreachable``, with why."""
+    return onescript_reach.module("clock")
+
+
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return _clock().now()
 
 
 def _format_ts(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat()
+    """``issued_at`` / ``expires_at``, in the one script's ``isoformat_utc``
+    format; they sit in the signed payload, so the bytes may not change."""
+    return _clock().isoformat_utc(dt)
 
 
 def write_receipt(

@@ -6,11 +6,11 @@ Slice defaults resolved via exposure.py (AS-8) when slice is omitted.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any
 
 from psycopg2.extras import Json
 
+from . import onescript_reach
 from .exposure import SLICE_PRESETS, apply_slice, preset_denied, resolve_preset
 from .seed_loader import SEED_FORMAT, load_agent_seed, load_seed_document, seed_trusted
 
@@ -22,7 +22,10 @@ _KB_PRESETS = frozenset(p for p in SLICE_PRESETS if p != "custom")
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    """In the one script's ``seconds_z`` format, from its one clock (flatten-2 F8:
+    "Using the onescript at every path."). ``$ONESCRIPT_NOW`` pins it. With no one
+    script reachable this raises ``onescript_reach.Unreachable``, with why."""
+    return onescript_reach.module("clock").seconds_z()
 
 
 def _effective_slice(agent_id: str, slice_name: str) -> str:
