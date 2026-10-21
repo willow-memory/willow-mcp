@@ -138,13 +138,17 @@ jobs:
       # The one reach's parity test (flatten-2 F6.5) holds this repo's copy of
       # willow-bot's reach_bootstrap.py to the template, so willow-bot is
       # checked out here (inside the workspace; ONESCRIPT_HOME names it).
-      # A change that spans repos rides one branch name in each: take
-      # willow-memory/willow-bot's branch of this PR's name when it has one, else main.
+      # A change that spans repos rides one branch name in each: on a pull
+      # request, take willow-memory/willow-bot's branch of this PR's name when
+      # it has one, else main. Every other event (push, schedule, dispatch)
+      # runs in the default branch's cache scope, so it takes main and nothing
+      # else (CodeQL: cache poisoning from a branch-named checkout).
       - name: Which willow-bot
+        if: github.event_name == 'pull_request'
         id: bot_ref
         shell: bash
         env:
-          BRANCH: ${{ github.head_ref || github.ref_name }}
+          BRANCH: ${{ github.head_ref }}
         run: |
           if git ls-remote --exit-code --heads https://github.com/willow-memory/willow-bot "$BRANCH" >/dev/null; then
             echo "ref=$BRANCH" >> "$GITHUB_OUTPUT"
@@ -152,9 +156,16 @@ jobs:
             echo "ref=main" >> "$GITHUB_OUTPUT"
           fi
       - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
         with:
           repository: willow-memory/willow-bot
           ref: ${{ steps.bot_ref.outputs.ref }}
+          path: willow-bot
+      - uses: actions/checkout@v7
+        if: github.event_name != 'pull_request'
+        with:
+          repository: willow-memory/willow-bot
+          ref: main
           path: willow-bot
 
       - name: Install dependencies
