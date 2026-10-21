@@ -29,8 +29,10 @@ Shape, deliberately narrow:
   public export only).
 * **Three states, never collapsed.** ``populated`` (ran, exit 0, output),
   ``empty`` (ran, exit 0, nothing to say) and ``unreachable`` (could not run to
-  a verdict: a missing prerequisite, a timeout, a non-zero exit). The raw
-  ``exit`` and a ``reason`` always ride along.
+  a verdict: a missing prerequisite, a timeout, any other non-zero exit). The
+  raw ``exit`` and a ``reason`` always ride along. Exit 42 (``ESCALATE``) ran
+  to a verdict: it is ``populated`` or ``empty`` like 0, with ``escalate``
+  true, never ``unreachable``.
 * **Ink.** A FRANK ``onescript_run`` receipt per executed step: step, an
   arguments digest (never the text itself), exit, duration, state.
 * **No envelope, no egress, nothing pushed.** Local steps only, like
@@ -88,6 +90,12 @@ MAX_TASK = 2000
 MAX_VALUE = 200
 MAX_CHARS_CAP = 60000  # ratatosk reads at most 64 KiB of served file
 MAX_STDOUT = 200_000
+#: The one script's exit 42, ΔΣ=42. The operator (2026-10-21): "42 just means I
+#: don't have enough information to say a human said this was true." The step
+#: ran and answered; what it answered waits on a human (a `turn`'s proposals,
+#: until sealed). Not a failure: never read as `unreachable`.
+ESCALATE = 42
+ESCALATE_REASON = "exit 42: not enough information to say a human said this was true"
 _JSON_RETURN_CAP = 20_000
 _TAIL_LINES = 20
 
@@ -618,21 +626,22 @@ def _shape(step: str, run: dict) -> dict:
         return {**base, "state": "unreachable", "reason": why, "stdout_json": summary}
     if step == "pooled":
         return _shape_pooled(base, rc, out, err)
-    if rc != 0:
+    if rc not in (0, ESCALATE):
         why = next((ln for ln in out.splitlines() if ln.startswith(("refused:", "BOX WON'T OPEN"))), "")
         return {**base, "state": "unreachable",
                 "reason": _redact(why) or _redact(_tail(err)) or f"{step} exited {rc}",
                 "tail": _redact(_tail(out or err))}
+    said = {"escalate": True, "reason": ESCALATE_REASON} if rc == ESCALATE else {}
     if not out.strip():
-        return {**base, "state": "empty", "reason": f"{step} exited 0 and printed nothing",
-                "tail": _redact(_tail(err))}
+        return {**base, "state": "empty", "reason": f"{step} exited {rc} and printed nothing",
+                "tail": _redact(_tail(err)), **({"escalate": True} if said else {})}
     parsed = None
     if len(out) <= _JSON_RETURN_CAP:
         try:
             parsed = json.loads(out)
         except ValueError:
             parsed = None
-    result = {**base, "state": "populated", "reason": ""}
+    result = {**base, "state": "populated", "reason": "", **said}
     if parsed is not None:
         result["stdout_json"] = parsed
     else:
@@ -888,7 +897,7 @@ def _sealed_pair(env: dict[str, str], subject, caller_pair_id) -> dict:
 
 
 def _finish(step, shaped, digest, ledger, project, app_id, session, *, ran, extra=None) -> dict:
-    out = {"ok": ran and shaped.get("exit") == 0,
+    out = {"ok": ran and shaped.get("exit") in (0, ESCALATE),
            "ran": ran, "step": step, "args_digest": digest, **shaped}
     if extra:
         out.update(extra)
