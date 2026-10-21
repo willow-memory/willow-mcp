@@ -16,6 +16,7 @@ What is here, by name:
     ed25519_sign         raw 32-byte private key -> hex signature
     verifier_pin         the library, its version and the rules, to stamp a record
     hmac_hex, hmac_parts, hmac_equal   the HMAC-SHA256 seal and its constant-time check
+    verify_seal          does `proof` seal `subject` under the human's key (gate's, moved)
 
 THE PINNED VERIFIER. Ed25519 verifiers disagree across libraries: whether a
 non-canonical ``s`` (``s >= L``) is accepted, whether the check is cofactored
@@ -302,3 +303,11 @@ def hmac_equal(a: str | bytes, b: str | bytes) -> bool:
     if isinstance(b, str):
         b = b.encode("utf-8", "replace")
     return hmac.compare_digest(a, b)
+
+
+def verify_seal(subject: str, proof: str, human_key: bytes) -> bool:
+    """Only the human's key produces this. Presence is a label; this is authority.
+    Moved here from `gate.verify_seal` (flatten-2, the record piece) so the record
+    can check an anchor's proof without importing the gate; the bytes are
+    unchanged and `gate.verify_seal` is this function."""
+    return hmac_equal(hmac_parts(human_key, "seal", subject), proof)
