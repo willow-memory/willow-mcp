@@ -401,6 +401,28 @@ def test_three_states_are_distinct(box):
     assert populated["stdout_json"] == {"a": 1}
 
 
+def test_exit_42_answered_and_waits_on_a_human_never_unreachable(box):
+    # the one script's ΔΣ=42: "not enough information to say a human said this
+    # was true" (a turn's proposals, until sealed); it ran to a verdict
+    (box.box / "proposals.jsonl").write_text('{"p": 1}\n', encoding="utf-8")
+    box.set(box.py, stdout='{"turn": 1, "proposals": [{"verdict": "pass"}]}', rc=42)
+    out = box.run("turn", {"bite": "b"})
+    assert (out["state"], out["exit"], out["ok"], out["escalate"]) == (
+        "populated", 42, True, True)
+    assert out["reason"] == ox.ESCALATE_REASON
+    assert out["stdout_json"]["proposals"] == [{"verdict": "pass"}]
+    assert out["proposals_cleared"] is True  # used once, as on exit 0
+    box.set(box.py, stdout="", rc=42)
+    empty = box.run("scope")
+    assert (empty["state"], empty["escalate"], empty["ok"]) == ("empty", True, True)
+    box.set(box.py, stdout="{}", rc=43)  # only 42: any other code is unreachable
+    other = box.run("scope")
+    assert other["state"] == "unreachable" and not other["ok"]
+    assert "escalate" not in other
+    box.set(box.py, stdout="{}")
+    assert "escalate" not in box.run("scope")
+
+
 def test_non_json_output_comes_back_as_a_tail(box):
     box.set(box.py, stdout="\n".join(f"line {i}" for i in range(50)))
     out = box.run("checkin")
