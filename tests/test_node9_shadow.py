@@ -921,13 +921,16 @@ def test_concurrent_appends_and_a_prune_lose_no_fresh_rows(monkeypatch):
 
     n_writers = 50
     old_ts = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=45)).isoformat()
+    # fresh by the clock, not _row's fixed date: the 30-day retention passed
+    # that on 2026-10-28, after which the prune dropped them, as it should
+    fresh_ts = _dt.datetime.now(_dt.UTC).isoformat()
     _write_ledger([_row("allow", "allow", ts=old_ts) for _ in range(20)])
 
     errors = []
 
     def _writer(i):
         try:
-            node9_shadow._append_ledger_row_locked(_row("allow", "allow", rule=f"w{i}"))
+            node9_shadow._append_ledger_row_locked(_row("allow", "allow", rule=f"w{i}", ts=fresh_ts))
         except Exception as e:  # noqa: BLE001
             errors.append(e)
 
