@@ -29,6 +29,14 @@ sets it wants, in the order it wants, and the marker it prints:
                        set to a value, long hex, split hex, mixed base64
   secret_path          a string that names where secrets live (whole value)
   git_trace            a git/curl trace: the Authorization header, ``gh?_`` tokens
+  pii                  a person's data, each kind with its rung (``RUNGS``):
+                       SSN, ITIN, card, birth date, bank and case numbers,
+                       IBAN, passport, driver's licence, medical record,
+                       phone, email, EIN, IP, MAC, a wallet, a location, a
+                       home path, a Discord mention; ``withhold`` keeps what a
+                       ceiling allows and names what it holds back
+  typed_password       a password a person wrote, by its label (``pw:``,
+                       ``$password =``): the label stays, the value goes
 
 and ``redact_url`` for a URL. Observability's sensitive *key* test is
 ``sensitive_key``.
@@ -242,6 +250,32 @@ _PLACEHOLDER = re.compile(
     r"(?i)(your|example|xxxx+|placeholder|none|null|true|false|changeme|redacted)"
 )
 
+# -- typed_password: a password a person wrote, labelled -----------------------
+#
+# The credential shapes are machine-made keys; a password a person typed has
+# no shape, only a label. quick-stupids' the-box (IDEAS 119) carried two past
+# serve: `$password = "password";` and `user: cwcftp pw: widgets1998`. The
+# label stays and the value goes. A comparison (`$p == $password`), a label
+# with no value, and a value that names a source or nothing (`env:`, `None`,
+# a placeholder) are left alone; `pass` alone is too common a word to be a label.
+
+_TYPED_PASSWORD = re.compile(
+    r"(?i)(?<![\w$])(\$?(?:password|passwd|passphrase|pwd|pw)\b['\"]?\s*"
+    r"(?<![=!<>])[:=](?!=)\s*)"
+    r"(?!" + _SKIP_VALUE + r"|\$)"
+    r"(\"[^\"\n]+\"|'[^'\n]+'|[^\s\"',;)}\]]+)"
+)
+
+
+def _p_typed_password(text: str, ctx: Ctx) -> str:
+    def one(m: re.Match) -> str:
+        if _PLACEHOLDER.search(m.group(2)):
+            return m.group(0)
+        return m.group(1) + ctx.mark("password")
+
+    return _TYPED_PASSWORD.sub(one, text)
+
+
 # -- secret_path / git_trace --------------------------------------------------
 
 _SECRET_PATH = re.compile(
@@ -381,6 +415,214 @@ _GENERIC = (
     Rule("base64", fn=_g_b64),
 )
 
+# -- pii: a person's data, each kind with its rung (IDEAS 119) -----------------
+#
+# The union of the fleet's personal-data checks, under this module's rule (it
+# may never catch less than any copy did; `test_scrub.py` keeps each copy's
+# positives): homestead `keep/advise.py` (the rungs and the labelled-only
+# kinds), willow-2.0 `core/pii_detect.py` (the bare card with a Luhn check, a
+# `+1` phone), its nest `pipeline/scrub.py` (account and case numbers),
+# corpus-lens `egress_shapes.py` (a home path, which carries a username) and
+# hermes-agent `agent/redact.py` (an E.164 phone, a Discord mention).
+# willow-2.0's `scripts/pii_check.py` is left out: its rules are one person's
+# literals, not shapes. A calendar date is left out too: a bare date is a
+# hearing date far more often than a birth date (homestead's reason).
+#
+# Rungs are homestead's (L1 lowest, L5 never crosses). A labelled kind is
+# matched only beside its label, and runs first, so `account 123456789` is a
+# bank number and not also a bare SSN.
+
+_DOB_LABEL = r"\b(?:dob|d\.o\.b\.?|date of birth|birth\s?date|born(?:\s+on)?)\b"
+_DOB = re.compile(
+    _DOB_LABEL + r"[\s:]*(?:\d{1,4}[-/]\d{1,2}[-/]\d{1,4}"
+    r"|[A-Za-z]+\.?\s+\d{1,2},?\s+\d{4})",
+    re.IGNORECASE,
+)
+_BANK = re.compile(
+    r"\b(?:routing|aba|acct|account(?:\s*(?:no|number|#))?)\b[\s#:.]*\d{4,17}\b",
+    re.IGNORECASE,
+)
+_SSN_LABELLED = re.compile(
+    r"\b(?:ssn|social security(?: number| no\.?)?)\b[\s#:.]*\d{3}-?\d{2}-?\d{4}\b",
+    re.IGNORECASE,
+)
+_CASE_NO = re.compile(r"\b(?:case|claim)\s*(?:no|number|#)[:\s]*[\w\-]+\b", re.I)
+_SSN = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
+_CARD_GROUPS = re.compile(r"\b(?:\d{4}[-\s]){3}\d{4}\b")
+_CARD_BARE = re.compile(r"\b\d{13,19}\b")
+_EIN = re.compile(r"\b\d{2}-\d{7}\b")
+_PHONE = re.compile(
+    r"(?<![\d+])(?:\+?1[-.\s]?)?(?:\(\d{3}\)\s?|\d{3}[-.\s])\d{3}[-.\s]\d{4}(?!\d)"
+)
+_E164 = re.compile(r"\+[1-9]\d{6,14}(?![A-Za-z0-9])")
+_EMAIL = re.compile(r"[^\s@\"'<>()\[\],;:]+@[^\s@\"'<>()\[\],;:]+\.[A-Za-z]{2,}\b")
+_HOME_PATH = re.compile(r"(?:/home/|/Users/|[A-Za-z]:\\Users\\)[^/\\\s\"']+")
+_DISCORD_USER = re.compile(r"<@!?\d{17,20}>")
+
+# The baseline kinds no copy had (the detector catalogues' common set: IP,
+# IBAN, ITIN, passport, driver's licence, medical record, MAC, a crypto
+# wallet, a location). A labelled kind needs its label; a shape that random
+# text can wear (an IBAN) needs its checksum. Loopback and unspecified
+# addresses name no one and are left.
+_ITIN = re.compile(r"\b9\d{2}[-\s](?:5\d|6[0-5]|7\d|8[0-8]|9[0-24-9])[-\s]\d{4}\b")
+_PASSPORT = re.compile(
+    r"\bpassport(?:\s*(?:no\.?|number|#))?[\s#:.]*[A-Z0-9]{6,9}\b", re.I
+)
+_DRIVER_LICENSE = re.compile(
+    r"\b(?:driver'?s?\s+licen[cs]e|DL\s*(?:no\.?|number|#))"
+    r"(?:\s*(?:no\.?|number|#))?[\s#:.]*[A-Z0-9-]{5,15}\b",
+    re.I,
+)
+_MRN = re.compile(
+    r"\b(?:MRN|medical record(?:\s*(?:no\.?|number|#))?)[\s#:.]*[A-Z0-9-]{5,12}\b",
+    re.I,
+)
+_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+_IPV4 = re.compile(rf"(?<![\d.]){_OCTET}(?:\.{_OCTET}){{3}}(?![\d.])")
+_IPV6 = re.compile(
+    r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![\w:])"
+    r"|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){1,6}:(?:[0-9A-Fa-f]{1,4}:){0,5}"
+    r"[0-9A-Fa-f]{1,4}(?![\w:])"
+)
+_NOT_A_HOST = re.compile(r"^(?:127\.|0\.0\.0\.0$|255\.255\.255\.255$)")
+_MAC = re.compile(r"(?<![\w:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![\w:-])")
+_IBAN = re.compile(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?\b")
+_WALLET = re.compile(r"\b(?:bc1[a-z0-9]{25,59}|0x[0-9a-fA-F]{40})\b")
+_LATLON = re.compile(r"(?<![\d.])-?\d{1,2}\.\d{4,},\s*-?\d{1,3}\.\d{4,}(?![\d.])")
+
+
+def _host(value: str) -> bool:
+    """An address that names a machine: not loopback or unspecified, and an
+    IPv6 one with at least three groups (``a::b`` is C++, not a host)."""
+    if _NOT_A_HOST.match(value):
+        return False
+    return ":" not in value or len([g for g in value.split(":") if g]) >= 3
+
+
+def _p_ip(text: str, ctx: Ctx) -> str:
+    """An IPv4 or IPv6 address that names a machine (`_host`)."""
+    for rx in (_IPV4, _IPV6):
+        text = rx.sub(
+            lambda m: ctx.mark("ip") if _host(m.group(0)) else m.group(0), text
+        )
+    return text
+
+
+def _iban_ok(value: str) -> bool:
+    s = value.replace(" ", "")
+    if not 15 <= len(s) <= 34:
+        return False
+    digits = "".join(str(int(c, 36)) for c in s[4:] + s[:4])
+    return int(digits) % 97 == 1
+
+
+def _p_iban(text: str, ctx: Ctx) -> str:
+    """An IBAN only when its mod-97 check holds."""
+    return _IBAN.sub(
+        lambda m: ctx.mark("iban") if _iban_ok(m.group(0)) else m.group(0), text
+    )
+
+
+def _luhn(digits: str) -> bool:
+    total = 0
+    for i, d in enumerate(int(c) for c in reversed(digits)):
+        total += (d * 2 - 9 if d * 2 > 9 else d * 2) if i % 2 else d
+    return total % 10 == 0
+
+
+def _p_card_bare(text: str, ctx: Ctx) -> str:
+    """A run of 13-19 digits is a card only when its Luhn check holds."""
+    return _CARD_BARE.sub(
+        lambda m: ctx.mark("credit_card") if _luhn(m.group(0)) else m.group(0), text
+    )
+
+
+_PII = (
+    Rule("ssn", _SSN_LABELLED),
+    Rule("dob", _DOB),
+    Rule("bank", _BANK),
+    Rule("passport", _PASSPORT),
+    Rule("driver_license", _DRIVER_LICENSE),
+    Rule("medical_record", _MRN),
+    Rule("case_no", _CASE_NO),
+    Rule("iban", fn=_p_iban),
+    Rule("itin", _ITIN),
+    Rule("ssn", _SSN),
+    Rule("credit_card", _CARD_GROUPS),
+    Rule("credit_card", fn=_p_card_bare),
+    Rule("ein", _EIN),
+    Rule("phone", _PHONE),
+    Rule("phone", _E164),
+    Rule("email", _EMAIL),
+    Rule("home_path", _HOME_PATH),
+    Rule("discord_user", _DISCORD_USER),
+    Rule("wallet", _WALLET),
+    Rule("mac", _MAC),
+    Rule("ip", fn=_p_ip),
+    Rule("location", _LATLON),
+)
+
+#: Each pii kind's rung: 5 never crosses; 4 is money and birth; 3 resolves to a
+#: person; 2 names a matter.
+RUNGS: dict[str, int] = {
+    "ssn": 5,
+    "itin": 5,
+    "credit_card": 4,
+    "dob": 4,
+    "bank": 4,
+    "iban": 4,
+    "passport": 4,
+    "driver_license": 4,
+    "medical_record": 4,
+    "wallet": 4,
+    "phone": 3,
+    "email": 3,
+    "ein": 3,
+    "home_path": 3,
+    "discord_user": 3,
+    "ip": 3,
+    "mac": 3,
+    "location": 3,
+    "name": 3,
+    "case_no": 2,
+}
+
+#: The marker for a withheld kind: what it was and its rung, never the value.
+WITHHELD_PII = "[withheld: {kind}, L{rung}]"
+
+
+def names_rule(names) -> Rule | None:
+    """A ``name`` rule for the names a person gives (their household, their
+    clients): each whole, any case, longest first so "Jose Aguirre" goes
+    before "Jose". No pattern finds a name; a list of the ones that matter
+    does (willow-2.0's ``pii_check`` configured names). The list is the
+    caller's and is never kept here."""
+    names = sorted({n.strip() for n in names if n and n.strip()}, key=len, reverse=True)
+    if not names:
+        return None
+    alt = "|".join(r"\s+".join(map(re.escape, n.split())) for n in names)
+    return Rule("name", re.compile(rf"(?<!\w)(?:{alt})(?!\w)", re.IGNORECASE))
+
+
+def withhold(text: Any, ceiling: int, *, names=(), found: set | None = None):
+    """``text`` with every pii kind whose rung is over ``ceiling`` withheld and
+    named (``[withheld: ssn, L5]``); kinds at or under it stay, since what is
+    allowed depends on where the text is going. ``names``, when given, are
+    withheld as ``name`` (`names_rule`). ``found`` gets the withheld kinds.
+    ``ceiling`` 5 withholds nothing; 0 withholds every kind."""
+    if not isinstance(text, str) or not text:
+        return text
+    ctx = Ctx(
+        lambda kind: WITHHELD_PII.format(kind=kind, rung=RUNGS[kind]),
+        found=found,
+    )
+    rules = _PII + ((r,) if (r := names_rule(names)) else ())
+    for rule in rules:
+        if RUNGS[rule.kind] > ceiling:
+            text = _run(rule, text, ctx)
+    return text
+
+
 #: Every named set. A caller lists the sets it wants, in order, to ``apply``.
 SETS: dict[str, tuple] = {
     "hash64": (Rule("hash64", _HASH64),),
@@ -393,6 +635,8 @@ SETS: dict[str, tuple] = {
     "generic": _GENERIC,
     "secret_path": (Rule("secret_path", _SECRET_PATH, whole=True),),
     "git_trace": _GIT_TRACE,
+    "pii": _PII,
+    "typed_password": (Rule("password", fn=_p_typed_password),),
 }
 
 
