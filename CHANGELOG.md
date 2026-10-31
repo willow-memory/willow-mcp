@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.99.3](https://github.com/willow-memory/willow-mcp/compare/v2.99.2...v2.99.3) (2026-10-31)
+
+
+### Fixed
+
+* **gate_request:** an expired ask is dismissed when the same gate and task is asked again ([0c72059](https://github.com/willow-memory/willow-mcp/commit/0c7205972a531f4ceeee8dda366e6df882c37783))
+
 ## [2.99.2](https://github.com/willow-memory/willow-mcp/compare/v2.99.1...v2.99.2) (2026-10-31)
 
 
