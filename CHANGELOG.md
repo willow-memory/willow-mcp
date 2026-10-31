@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.99.4](https://github.com/willow-memory/willow-mcp/compare/v2.99.3...v2.99.4) (2026-10-31)
+
+
+### Fixed
+
+* **scrub_local:** carry the one script's github_pat rule and case-number fix ([b1079ef](https://github.com/willow-memory/willow-mcp/commit/b1079efd2f240546eec33e31468b08f9b96821ce))
+
 ## [2.99.3](https://github.com/willow-memory/willow-mcp/compare/v2.99.2...v2.99.3) (2026-10-31)
 
 
