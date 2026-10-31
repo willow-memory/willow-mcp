@@ -320,10 +320,25 @@ def _load_registry() -> dict:
     actually split in two. Both read paths routed through
     :func:`envelopes._load`, which itself routes through
     ``paths.trusted_read`` — a writable/symlinked/unsigned-when-required
-    source is a forged-envelope vector and the read refuses it."""
+    source is a forged-envelope vector and the read refuses it.
+
+    The two reads differ in one thing. The active register is a governance
+    input: on a trust-provisioned host (Loki D06A0EF3) it must be owned by
+    the trust owner or root and carry a verifying signature. The proposals
+    sidecar is not: it is broker-owned end to end and never signed
+    (:func:`_proposals_path`), so it is read with ``governance=False`` —
+    still refused when symlinked, group/other-writable, or owned by anyone
+    but this process or the signed trust owner. Reading it as governance
+    refused the broker its own file on every provisioned host, and no
+    envelope could be proposed there. A proposal's CONTENT is held by the
+    digest and FRANK's ``envelope_proposed`` row, checked at the ratify click
+    (``trust_owner_verbs.envelope_ratify_click_request``) and again at apply
+    (``_apply_envelope_ratify``), not by who owns the sidecar."""
     active_doc = _envelopes._load(_envelopes.registry_path())
     proposals_path = _proposals_path()
-    proposals_doc = _envelopes._load(proposals_path) if proposals_path.is_file() else {}
+    proposals_doc = (
+        _envelopes._load(proposals_path, governance=False) if proposals_path.is_file() else {}
+    )
     return {
         "active": active_doc.get("active") or [],
         "proposals": proposals_doc.get("proposals") or [],
