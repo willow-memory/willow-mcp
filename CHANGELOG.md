@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **gate_request:** an expired ask is dismissed when the same gate and task is asked again ([b028411](https://github.com/willow-memory/willow-mcp/commit/b028411aee1f5705b1e430f9fdaeac0358cf5395))
 * **gate_request:** an expired ask is dismissed when the same gate and task is asked again ([0c72059](https://github.com/willow-memory/willow-mcp/commit/0c7205972a531f4ceeee8dda366e6df882c37783))
 
 ## [2.99.2](https://github.com/willow-memory/willow-mcp/compare/v2.99.1...v2.99.2) (2026-10-31)
