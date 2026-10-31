@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.99.5](https://github.com/willow-memory/willow-mcp/compare/v2.99.4...v2.99.5) (2026-10-31)
+
+
+### Fixed
+
+* **web_search:** decide raw.githubusercontent.com, jeles 0.17.1's almanac host ([7c68306](https://github.com/willow-memory/willow-mcp/commit/7c68306e6421e2535ef5daeb1c02250737305f39))
+
 ## [2.99.4](https://github.com/willow-memory/willow-mcp/compare/v2.99.3...v2.99.4) (2026-10-31)
 
 
