@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **pull:** sweep a trigger flag's named clone when its folder isn't the repo's name ([4ac21ac](https://github.com/willow-memory/willow-mcp/commit/4ac21aca921046a629c3bc33299cd4deb1627b81))
 * **pull:** sweep a trigger flag's named clone when its folder isn't the repo's name ([6a94a35](https://github.com/willow-memory/willow-mcp/commit/6a94a35a7bb4e588b0a8286dd87ba802fbbe3f14))
 
 ## [2.99.5](https://github.com/willow-memory/willow-mcp/compare/v2.99.4...v2.99.5) (2026-10-31)
