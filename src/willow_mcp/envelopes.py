@@ -36,10 +36,12 @@ def syscall_path() -> Path:
     return registry_path().with_name(syscall_table_path().name)
 
 
-def _load(path: Path) -> dict:
+def _load(path: Path, *, governance: bool = True) -> dict:
     # Authenticate the input's trust root before believing its bytes (§4.6): a
     # writable/symlinked registry or syscall table is a forged-envelope vector.
-    trusted_read(path)
+    # ``governance=False`` is for the broker-owned proposals sidecar only (see
+    # envelope_authoring._load_registry): never the register or the table.
+    trusted_read(path, governance=governance)
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"{path.name} must contain an object")
