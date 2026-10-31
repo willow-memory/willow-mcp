@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.99.2](https://github.com/willow-memory/willow-mcp/compare/v2.99.1...v2.99.2) (2026-10-31)
+
+
+### Fixed
+
+* **envelopes:** read the proposals sidecar as the broker's own file on a provisioned host ([f17da5f](https://github.com/willow-memory/willow-mcp/commit/f17da5fa56d510f4b3ab8545b35b6c8faaa39e8d))
+
 ## [2.99.1](https://github.com/willow-memory/willow-mcp/compare/v2.99.0...v2.99.1) (2026-10-21)
 
 
