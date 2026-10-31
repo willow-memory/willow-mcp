@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **envelopes:** read the proposals sidecar as the broker's own file on a provisioned host ([ddef8ea](https://github.com/willow-memory/willow-mcp/commit/ddef8ea8b456153d4d4a72546afa1ed255f90f47))
 * **envelopes:** read the proposals sidecar as the broker's own file on a provisioned host ([f17da5f](https://github.com/willow-memory/willow-mcp/commit/f17da5fa56d510f4b3ab8545b35b6c8faaa39e8d))
 
 ## [2.99.1](https://github.com/willow-memory/willow-mcp/compare/v2.99.0...v2.99.1) (2026-10-21)
