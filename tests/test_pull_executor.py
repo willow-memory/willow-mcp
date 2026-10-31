@@ -7,6 +7,7 @@ touches a remote.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
@@ -370,6 +371,50 @@ def test_sweep_reports_a_flag_with_no_clone(tmp_path):
                              runner=_MultiGit({}))
     r = out["swept"][0]
     assert r["error"] == "ENOCLONE" and r["flag"] == "trigger-someone-nowhere.flag"
+
+
+def _clone_flag(triggers, repo, clone):
+    flag = triggers / f"trigger-{repo.replace('/', '-')}.flag"
+    flag.write_text(json.dumps({"at": "2026-10-20T12:40:14Z", "repo": repo,
+                                "clone": str(clone), "layout": "scan"}))
+    return flag
+
+
+def test_sweep_pulls_the_clone_a_flag_names_when_its_folder_isnt_the_repos_name(tmp_path):
+    """2026-10-31: rudi193-cmd/safe-app-store lives at github/safe-app-store-public;
+    the flag said so, the sweep read only the flag's name, and refused it
+    ENOCLONE every tick for eleven days."""
+    root = tmp_path / "github"
+    public = root / "safe-app-store-public"
+    (public / ".git").mkdir(parents=True)
+    triggers = tmp_path / "gitsync"
+    triggers.mkdir()
+    flag = _clone_flag(triggers, "rudi193-cmd/safe-app-store", public)
+    git = _MultiGit({str(public): _FakeGit(
+        remote_url="https://github.com/rudi193-cmd/safe-app-store.git", current="master")})
+    out = plx.sweep_triggers("willow", project="fleet", root=root, triggers=triggers, runner=git)
+    r = out["swept"][0]
+    assert r["ok"] and r["repo"] == "rudi193-cmd/safe-app-store" and r["checkout"] == str(public)
+    assert not flag.exists()
+
+
+@pytest.mark.parametrize("why", ["other-remote", "outside-root", "not-its-flag"])
+def test_a_flags_named_clone_is_used_only_when_it_verifies(tmp_path, why):
+    root = tmp_path / "github"
+    public = (tmp_path / "elsewhere" if why == "outside-root" else root) / "safe-app-store-public"
+    (public / ".git").mkdir(parents=True)
+    root.mkdir(exist_ok=True)
+    triggers = tmp_path / "gitsync"
+    triggers.mkdir()
+    flag = _clone_flag(triggers, "rudi193-cmd/safe-app-store", public)
+    if why == "not-its-flag":
+        flag = flag.rename(triggers / "trigger-someone-nowhere.flag")
+    url = ("https://github.com/someone/else.git" if why == "other-remote"
+           else "https://github.com/rudi193-cmd/safe-app-store.git")
+    git = _MultiGit({str(public): _FakeGit(remote_url=url, current="master")})
+    r = plx.sweep_triggers("willow", project="fleet", root=root, triggers=triggers,
+                           runner=git)["swept"][0]
+    assert r["error"] == "ENOCLONE" and flag.exists()
 
 
 def test_sweep_says_absent_when_there_is_no_trigger_dir(tmp_path):
