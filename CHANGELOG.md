@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **web_search:** decide raw.githubusercontent.com, jeles 0.17.1's almanac host ([d663c4e](https://github.com/willow-memory/willow-mcp/commit/d663c4e391217a3ecf797a719b66cb86084e5f65))
 * **web_search:** decide raw.githubusercontent.com, jeles 0.17.1's almanac host ([7c68306](https://github.com/willow-memory/willow-mcp/commit/7c68306e6421e2535ef5daeb1c02250737305f39))
 
 ## [2.99.4](https://github.com/willow-memory/willow-mcp/compare/v2.99.3...v2.99.4) (2026-10-31)
