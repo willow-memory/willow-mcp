@@ -59,6 +59,7 @@ never a reason to treat the pull itself as failed.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -407,6 +408,39 @@ def resolve_clone_status(repo: str, *, root: Optional[Path] = None,
     return {"clone": None, "error": None, "candidates": []}
 
 
+def _flag_named_clone(flag: Path, *, root: Path,
+                      runner: Optional[Callable] = None) -> tuple[str, Optional[Path]]:
+    """``(repo, clone)`` from a flag whose body is ``{"repo": ..., "clone": ...}``,
+    when that clone sits under ``root`` and its ``origin`` is that repo. A clone
+    whose folder isn't named for its repo (``safe-app-store-public`` holding
+    ``rudi193-cmd/safe-app-store``) is found this way and no other. Verified
+    by remote URL like every other match; ``("", None)`` for a plain flag or
+    one whose named clone doesn't verify, or whose repo isn't the flag's own
+    name."""
+    from .push_executor import _repo_matches_remote, inspect_checkout
+
+    try:
+        body = json.loads(flag.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return "", None
+    if not isinstance(body, dict):
+        return "", None
+    repo, named = body.get("repo"), body.get("clone")
+    if not (isinstance(repo, str) and repo.count("/") == 1 and isinstance(named, str) and named):
+        return "", None
+    if f"trigger-{repo.replace('/', '-')}.flag".lower() != flag.name.lower():
+        return "", None
+    cand = Path(named).expanduser()
+    if not cand.is_absolute() or not cand.resolve().is_relative_to(root.resolve()):
+        return "", None
+    if not (cand / ".git").exists():
+        return "", None
+    facts = inspect_checkout(cand, runner=runner)
+    if not (facts.get("ok") and _repo_matches_remote(facts["remote_url"], repo)):
+        return "", None
+    return repo, cand
+
+
 def resolve_clone(repo: str, *, root: Optional[Path] = None,
                   runner: Optional[Callable] = None) -> Optional[Path]:
     """Backward-compatible wrapper over :func:`resolve_clone_status`: the
@@ -437,8 +471,9 @@ def sweep_triggers(app_id: str, *, project: str, session: str = "", ledger=None,
         # willow-bot writes owner-repo with '/' -> '-'; owners do not contain
         # '-' in this fleet's orgs except as a real hyphen, so split on the
         # first '-' that yields an existing clone.
-        repo, clone, ambiguous = "", None, None
-        parts = stem.split("-")
+        repo, clone = _flag_named_clone(flag, root=root or _github_root(), runner=runner)
+        ambiguous = None
+        parts = [] if clone is not None else stem.split("-")
         for i in range(1, len(parts)):
             cand = f"{'-'.join(parts[:i])}/{'-'.join(parts[i:])}"
             status = resolve_clone_status(cand, root=root, runner=runner)
