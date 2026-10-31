@@ -36,7 +36,7 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **scrub_local:** carry the one script's github_pat rule and case-number fix ([c1f89fa](https://github.com/willow-memory/willow-mcp/commit/c1f89fa627c907146489a3651f197c29c8ed9dcd))
+* **scrub_local:** carry the one script's github_pat rule and case-number fix ([b1079ef](https://github.com/willow-memory/willow-mcp/commit/b1079efd2f240546eec33e31468b08f9b96821ce))
 
 ## [2.99.3](https://github.com/willow-memory/willow-mcp/compare/v2.99.2...v2.99.3) (2026-10-31)
 
