@@ -38,6 +38,7 @@ they like; what they must never do is let it change whether they refuse.
 """
 from __future__ import annotations
 
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -137,6 +138,35 @@ def _open_duplicate(store, gate_id: str, task_id: str) -> Optional[dict]:
     return None
 
 
+#: The suffix a repeated ask carries, read back so a count carries forward.
+_ASKED_RE = re.compile(r"\(asked (\d+) times since (\d{4}-\d{2}-\d{2});")
+
+
+def _expired_asks(store, gate_id: str, task_id: str) -> list[dict]:
+    """Open requests naming this (gate_id, task_id) whose own expiry has
+    passed, oldest first.
+
+    An expired ask cannot be granted ("an expired request is a denial, never
+    a grant"), and the panel's own advice for one is "dismiss it and ask
+    again". A denial that asks again is that second half, so it is where the
+    expired rows are dismissed. Left open, each expiry let the next denial
+    file a fresh row beside them: 86 open asks in 45 pairs on the operator's
+    box (2026-10-31), `lease.willow` alone twelve times.
+    """
+    from . import gates_panel
+
+    out = []
+    for item in gates_panel.open_requests(store):
+        req = item.get("request") or {}
+        if req.get("gate_id") != gate_id or req.get("task_id", "") != task_id:
+            continue
+        left = gates_panel._expiry_seconds(req.get("expires_at", ""))
+        if left is not None and left <= 0:
+            out.append(item)
+    out.sort(key=lambda i: str(i.get("created_at") or ""))
+    return out
+
+
 def open_request(
     app_id: str,
     gate_id: str,
@@ -181,6 +211,17 @@ def open_request(
 
         title = f"Request: {gate_id}"
         summary = reason or f"{app_id or 'an app'} was refused for want of {gate_id}"
+        expired = _expired_asks(store, gate_id, task_id)
+        if expired:
+            # The new row says it is a repeat, so dismissing the old rows
+            # loses nothing the operator was shown. A row that was itself a
+            # repeat carries its count forward.
+            times, since = 1, []
+            for old in expired:
+                m = _ASKED_RE.search(str(old.get("summary") or ""))
+                times += int(m.group(1)) if m else 1
+                since.append(m.group(2) if m else str(old.get("created_at") or "")[:10])
+            summary += f" (asked {times} times since {min(since)}; earlier asks expired unanswered)"
         item = human_loop.enqueue(
             store,
             kind=gates_panel.REQUEST_QUEUE_KIND,
@@ -194,8 +235,24 @@ def open_request(
                 expires_at=expires_at,
             ),
         )
-        return {"queued": True, "id": item.get("id"), "gate_id": gate_id,
-                "expires_at": expires_at}
+        dismissed = []
+        for old in expired:
+            # After the new row exists, never before: a failed enqueue leaves
+            # the expired rows exactly as they were. A failed dismissal leaves
+            # one open, which the next ask dismisses.
+            try:
+                human_loop.resolve(
+                    store, old["id"], resolved_by="willow-mcp", status="dismissed",
+                    note=f"expired unanswered; asked again as {item.get('id')}",
+                )
+                dismissed.append(old["id"])
+            except Exception:  # noqa: BLE001 — the new ask is already queued
+                continue
+        out = {"queued": True, "id": item.get("id"), "gate_id": gate_id,
+               "expires_at": expires_at}
+        if dismissed:
+            out["dismissed_expired"] = dismissed
+        return out
     except Exception as e:  # noqa: BLE001 — see the module docstring
         # The caller is mid-refusal. An exception raised here would turn a
         # clean denial into a traceback, which is the one outcome worse than
