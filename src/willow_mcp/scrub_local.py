@@ -130,6 +130,9 @@ _CREDENTIALS = (
     ),
     Rule("aws_access_key_id", re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16,}")),
     Rule("github_token", re.compile(r"gh[posur]_[A-Za-z0-9]{36,}")),
+    # A fine-grained personal access token: `github_pat_`, 22, `_`, 59. Not a
+    # `gh?_` shape, so the rule above never saw one (2026-10-31).
+    Rule("github_pat", re.compile(r"github_pat_[A-Za-z0-9_]{22,}")),
     Rule("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
     Rule("google_api_key", re.compile(r"AIza[0-9A-Za-z_\-]{35,}")),
     Rule("stripe_key", re.compile(r"(?:sk|rk)_live_[0-9a-zA-Z]{16,}")),
@@ -158,6 +161,7 @@ _CREDENTIALS = (
 #: what that does.
 _BOUNDED = {
     "github_token": re.compile(r"gh[posur]_[A-Za-z0-9]{36}"),
+    "github_pat": re.compile(r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}"),
     "google_api_key": re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
 }
 _CREDENTIALS_BOUNDED = tuple(
@@ -446,7 +450,11 @@ _SSN_LABELLED = re.compile(
     r"\b(?:ssn|social security(?: number| no\.?)?)\b[\s#:.]*\d{3}-?\d{2}-?\d{4}\b",
     re.IGNORECASE,
 )
-_CASE_NO = re.compile(r"\b(?:case|claim)\s*(?:no|number|#)[:\s]*[\w\-]+\b", re.I)
+# The number must hold a digit, and `no` must end there: "the claim no longer
+# open" is prose, and read as claim number "longer" it was marked (2026-10-31).
+_CASE_NO = re.compile(
+    r"\b(?:case|claim)\s*(?:no\b\.?|number\b|#)[:\s#]*(?=[\w\-]*\d)[\w\-]+\b", re.I
+)
 _SSN = re.compile(r"\b\d{3}[-\s]\d{2}[-\s]\d{4}\b")
 _CARD_GROUPS = re.compile(r"\b(?:\d{4}[-\s]){3}\d{4}\b")
 _CARD_BARE = re.compile(r"\b\d{13,19}\b")
