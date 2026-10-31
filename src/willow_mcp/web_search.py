@@ -138,6 +138,14 @@ _NOT_TRUST_EVIDENCE = {
         "A third-party API over IMDb's data, not the publisher — the gutendex "
         "precedent exactly. Its results point at imdb.com, which is trusted "
         "above.",
+    # Full host, not the registrable domain: `githubusercontent.com` serves any
+    # GitHub user's files, so excluding (or trusting) the whole domain would be
+    # a statement about every repository on GitHub.
+    "raw.githubusercontent.com":
+        "jeles' `almanac` source reads the Almanac's generated catalog.json "
+        "files from here. It is a query endpoint, never a citation: every "
+        "almanac hit points at the dataset publisher's own canonical URL, "
+        "which is judged on its own host like any other result.",
 }
 
 
