@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **onescript:** the one-script child is told where one-script is ([34df934](https://github.com/willow-memory/willow-mcp/commit/34df934f135394e6da925cd753424d5c8bae6c9a))
 * **onescript:** the one-script child is told where one-script is ([47e84f1](https://github.com/willow-memory/willow-mcp/commit/47e84f1934c57dd3acb145c8e0d8806baaca3cd6))
 
 ## [2.102.0](https://github.com/willow-memory/willow-mcp/compare/v2.101.0...v2.102.0) (2026-11-01)
