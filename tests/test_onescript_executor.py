@@ -230,6 +230,20 @@ def test_rat_turn_max_turns_is_passed_before_the_task(box):
     assert call["argv"][-3:] == ["--max-turns", "6", "four rows"]
 
 
+def test_rat_turn_ctx_is_passed_before_the_task(box):
+    box.set(box.rat, stdout="[onescript] done\n")
+    box.run("rat_turn", {"model": "qwen3:4b", "task": "four rows", "max_turns": 6,
+                         "ctx": 8192})
+    [call] = box.calls(box.rat)
+    assert call["argv"][-5:] == ["--max-turns", "6", "--ctx", "8192", "four rows"]
+
+
+def test_rat_turn_without_ctx_leaves_it_to_ratatosk(box):
+    box.set(box.rat, stdout="[onescript] done\n")
+    box.run("rat_turn", {"model": "qwen3:4b", "task": "t"})
+    assert "--ctx" not in box.calls(box.rat)[0]["argv"]
+
+
 def _lines(*entries) -> str:
     return "".join(json.dumps(e) + "\n" for e in entries)
 
@@ -368,6 +382,11 @@ def test_unknown_or_path_arguments_are_refused(box, step, args):
     ("rat_turn", {"model": "qwen3:4b", "task": "t", "max_turns": "6"}),
     ("rat_turn", {"model": "qwen3:4b", "task": "t", "max_turns": True}),
     ("rat_turn", {"model": "qwen3:4b", "task": "t", "max_turns": 6.0}),
+    ("rat_turn", {"model": "qwen3:4b", "task": "t", "ctx": 511}),
+    ("rat_turn", {"model": "qwen3:4b", "task": "t", "ctx": 16385}),
+    ("rat_turn", {"model": "qwen3:4b", "task": "t", "ctx": "8192"}),
+    ("rat_turn", {"model": "qwen3:4b", "task": "t", "ctx": True}),
+    ("rat_turn", {"model": "qwen3:4b", "task": "t", "ctx": 8192.0}),
 ])
 def test_bad_values_are_refused_before_anything_runs(box, step, args):
     out = box.run(step, args)

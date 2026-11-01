@@ -94,6 +94,13 @@ MAX_CHARS_CAP = 60000  # ratatosk reads at most 64 KiB of served file
 #: more to stop, so ratatosk's default of 4 caps a clean run at 3 rows. The
 #: ceiling is ratatosk's own MAX_PROPOSALS (16); its 180 s wall clock still binds.
 MAX_TURNS_CAP = 16
+#: ``rat_turn``'s optional ``ctx``, passed as ratatosk's ``--ctx`` (Ollama's
+#: ``num_ctx``). Every turn resends the whole conversation, so a run that has
+#: written its rows can still end ``ctx_full`` on the request that lets it stop
+#: (rat_turn 49e7eb23: four correct rows, then "the next request would overflow
+#: ctx" at 4096). The floor is ratatosk's own (it refuses under 512); the
+#: ceiling keeps the KV cache inside what a 4 GB card plus RAM will hold.
+MIN_CTX, MAX_CTX = 512, 16384
 #: ``rat_turn`` runs ratatosk with ``-v``, which writes the run's transcript to
 #: stderr as JSON lines. The desk gets what each turn did — the model's text,
 #: each refusal and its reason, each row recorded — so a silent, capped or
@@ -371,13 +378,16 @@ def _model_shape(model) -> str:
 
 def _rat_args(args: dict) -> tuple[str, str, list[str]]:
     """(task, model, flags), every argument checked before the proposals file is
-    touched. ``max_turns`` is optional; left out, ratatosk keeps its default."""
-    _only(args, {"model", "task", "max_turns"})
+    touched. ``max_turns`` and ``ctx`` are optional; left out, ratatosk keeps
+    its defaults."""
+    _only(args, {"model", "task", "max_turns", "ctx"})
     task = _text(args.get("task"), "task", MAX_TASK)
     model = _model_shape(args.get("model"))
     flags: list[str] = []
     if args.get("max_turns") is not None:
-        flags = ["--max-turns", str(_int(args["max_turns"], "max_turns", 1, MAX_TURNS_CAP))]
+        flags += ["--max-turns", str(_int(args["max_turns"], "max_turns", 1, MAX_TURNS_CAP))]
+    if args.get("ctx") is not None:
+        flags += ["--ctx", str(_int(args["ctx"], "ctx", MIN_CTX, MAX_CTX))]
     return task, model, flags
 
 
