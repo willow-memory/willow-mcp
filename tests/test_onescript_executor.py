@@ -421,6 +421,17 @@ def test_child_env_is_the_allowlist_only(box, monkeypatch):
     assert not any("canary" in v or "proxy" in v for v in env.values())
 
 
+@pytest.mark.parametrize("step", ["checkin", "rat_turn"])
+def test_onescript_home_is_the_verified_clone_never_inherited(box, monkeypatch, step):
+    # rat_turn f3690c36: ratatosk walked up to the vault's .git and looked for a
+    # one-script there, so its redact hid the provider's error
+    monkeypatch.setenv("ONESCRIPT_HOME", "/elsewhere/one-script")
+    which = box.rat if step == "rat_turn" else box.py
+    box.set(which, stdout="ok\n")
+    box.run(step, {"model": "qwen3:4b", "task": "t"} if step == "rat_turn" else None)
+    assert box.calls(which)[0]["env"]["ONESCRIPT_HOME"] == str(box.bot / "one-script")
+
+
 def test_non_loopback_ollama_host_is_not_passed_and_blocks_rat(box, monkeypatch):
     monkeypatch.setenv("OLLAMA_HOST", "http://203.0.113.9:11434")
     box.set(box.py, stdout="ok\n")
