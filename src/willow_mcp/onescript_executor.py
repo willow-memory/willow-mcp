@@ -23,7 +23,8 @@ Shape, deliberately narrow:
   file and the proposals file sit under that checkout's ``.flow/onescript``;
   the signing keyring and its public export sit under ``$WILLOW_HOME``.
 * **A minimal child environment.** ``HOME``, ``PATH``, ``WILLOW_HOME``,
-  ``NESTOR_DB``/``WILLOW_NESTOR_DB``, ``ONESCRIPT_GROVE`` and a loopback
+  ``NESTOR_DB``/``WILLOW_NESTOR_DB``, ``ONESCRIPT_GROVE``, ``ONESCRIPT_HOME``
+  (the verified clone's ``one-script``, never inherited) and a loopback
   ``OLLAMA_HOST`` — no provider keys, no proxy variables, and in particular no
   ``WILLOW_KEYRING`` (it names the *signing* ring; the one-script reads the
   public export only).
@@ -83,6 +84,12 @@ STEPS = tuple(TIMEOUTS)
 ENV_ALLOW = (
     "HOME", "PATH", "WILLOW_HOME", "NESTOR_DB", "WILLOW_NESTOR_DB",
     "ONESCRIPT_GROVE", "OLLAMA_HOST",
+    # Always overwritten with the verified clone's one-script (`_run_locked`):
+    # ratatosk's reach otherwise walks up to the first `.git` from its installed
+    # package, and on this box that is the vault, not the repos (rat_turn
+    # f3690c36: "no one-script at …/sean-data-vault/willow-bot/one-script"), so
+    # its redact failed closed and hid every provider error.
+    "ONESCRIPT_HOME",
 )
 
 WS = ("who", "what", "when", "where")
@@ -807,6 +814,7 @@ def _run_locked(step, args, ctx, home, digest, pair_id, locked, lister,
     if "result" in plan:
         return _finish(step, plan["result"], digest, ledger, project, app_id, session, ran=False)
     env = _child_env(home)
+    env["ONESCRIPT_HOME"] = str(ctx.one_script)  # the verified clone, never inherited
     run = _run_child(plan["argv"], env=env, cwd=plan["cwd"], timeout=TIMEOUTS[step])
     transcript: Optional[tuple[list[dict], bool]] = None
     if step == "rat_turn" and "err" in run:
