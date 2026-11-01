@@ -220,6 +220,13 @@ def test_rat_turn_argv(box):
         "summarise the stack"]
 
 
+def test_rat_turn_max_turns_is_passed_before_the_task(box):
+    box.set(box.rat, stdout="[onescript] done\n")
+    box.run("rat_turn", {"model": "qwen3:4b", "task": "four rows", "max_turns": 6})
+    [call] = box.calls(box.rat)
+    assert call["argv"][-3:] == ["--max-turns", "6", "four rows"]
+
+
 def test_turn_argv_with_proposals(box):
     box.set(box.py, stdout="{}")
     (box.box / "proposals.jsonl").write_text("", encoding="utf-8")
@@ -285,6 +292,11 @@ def test_unknown_or_path_arguments_are_refused(box, step, args):
     ("rat_turn", {"model": "qwen3:4b", "task": "--model other"}),
     ("rat_turn", {"model": "qwen3:4b", "task": "x" * 2001}),
     ("rat_turn", {"model": "qwen3:4b"}),
+    ("rat_turn", {"model": "qwen3:4b", "task": "t", "max_turns": 0}),
+    ("rat_turn", {"model": "qwen3:4b", "task": "t", "max_turns": 17}),
+    ("rat_turn", {"model": "qwen3:4b", "task": "t", "max_turns": "6"}),
+    ("rat_turn", {"model": "qwen3:4b", "task": "t", "max_turns": True}),
+    ("rat_turn", {"model": "qwen3:4b", "task": "t", "max_turns": 6.0}),
 ])
 def test_bad_values_are_refused_before_anything_runs(box, step, args):
     out = box.run(step, args)

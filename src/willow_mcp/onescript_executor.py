@@ -89,6 +89,11 @@ WS = ("who", "what", "when", "where")
 MAX_TASK = 2000
 MAX_VALUE = 200
 MAX_CHARS_CAP = 60000  # ratatosk reads at most 64 KiB of served file
+#: ``rat_turn``'s optional ``max_turns``, passed as ratatosk's ``--max-turns``.
+#: A model that proposes one row a request needs N turns for N rows and one
+#: more to stop, so ratatosk's default of 4 caps a clean run at 3 rows. The
+#: ceiling is ratatosk's own MAX_PROPOSALS (16); its 180 s wall clock still binds.
+MAX_TURNS_CAP = 16
 MAX_STDOUT = 200_000
 #: The one script's exit 42, ΔΣ=42. The operator (2026-10-21): "42 just means I
 #: don't have enough information to say a human said this was true." The step
@@ -356,11 +361,16 @@ def _model_shape(model) -> str:
     return model
 
 
-def _rat_args(args: dict) -> tuple[str, str]:
-    """(task, model), every argument checked before the proposals file is touched."""
-    _only(args, {"model", "task"})
+def _rat_args(args: dict) -> tuple[str, str, list[str]]:
+    """(task, model, flags), every argument checked before the proposals file is
+    touched. ``max_turns`` is optional; left out, ratatosk keeps its default."""
+    _only(args, {"model", "task", "max_turns"})
     task = _text(args.get("task"), "task", MAX_TASK)
-    return task, _model_shape(args.get("model"))
+    model = _model_shape(args.get("model"))
+    flags: list[str] = []
+    if args.get("max_turns") is not None:
+        flags = ["--max-turns", str(_int(args["max_turns"], "max_turns", 1, MAX_TURNS_CAP))]
+    return task, model, flags
 
 
 def _turn_args(args: dict) -> tuple[str, bool]:
@@ -547,7 +557,7 @@ def _plan(step: str, args: dict, ctx: _Ctx, lister: Callable) -> dict:
             argv += ["--proposal", str(ctx.proposals)]
         return {"argv": argv, "cwd": cwd, "uses_proposals": use}
     if step == "rat_turn":
-        task, model = _rat_args(args)
+        task, model, flags = _rat_args(args)
         early = _check_model(model, lister)
         if early is not None:
             return {"result": early}
@@ -557,7 +567,7 @@ def _plan(step: str, args: dict, ctx: _Ctx, lister: Callable) -> dict:
             return {"result": _unreachable(
                 f"ratatosk is not installed at {ctx.venv_absent(RAT_VENV) or ctx.rat}; the onescript model seat cannot run")}
         return {"argv": [str(ctx.rat), "--onescript", "--served", str(ctx.served),
-                         "--out", str(ctx.proposals), "--model", model, task],
+                         "--out", str(ctx.proposals), "--model", model, *flags, task],
                 "cwd": ctx.home}
     raise _Refusal("EINVAL", f"unknown step {step!r}; steps are {list(STEPS)}")
 
