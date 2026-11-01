@@ -36,6 +36,7 @@ for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done
 if [ -f "$d/grandchild" ]; then setsid sleep 60 & echo $! > "$d/grandchild.pid"; fi
 [ -f "$d/sleep" ] && sleep 30
 [ -f "$d/stdout" ] && cat "$d/stdout"
+[ -f "$d/stderr" ] && cat "$d/stderr" >&2
 [ -f "$d/rc" ] && exit "$(cat "$d/rc")"
 exit 0
 """
@@ -78,9 +79,11 @@ class Box:
         self.ledger = _Ledger()
 
     def set(self, which: Path, *, stdout: str = "", rc: int | None = None, sleep: bool = False,
-            append: str | None = None, grandchild: bool = False):
+            append: str | None = None, grandchild: bool = False, stderr: str | None = None):
         d = which.parent
         (d / "stdout").write_text(stdout, encoding="utf-8")
+        if stderr is not None:
+            (d / "stderr").write_text(stderr, encoding="utf-8")
         if append is not None:
             (d / "append").write_text(append, encoding="utf-8")
         if grandchild:
@@ -216,7 +219,7 @@ def test_rat_turn_argv(box):
     [call] = box.calls(box.rat)
     assert call["argv"] == [
         "--onescript", "--served", str(box.box / "served.json"),
-        "--out", str(box.box / "proposals.jsonl"), "--model", "qwen3:4b",
+        "--out", str(box.box / "proposals.jsonl"), "-v", "--model", "qwen3:4b",
         "summarise the stack"]
 
 
@@ -225,6 +228,63 @@ def test_rat_turn_max_turns_is_passed_before_the_task(box):
     box.run("rat_turn", {"model": "qwen3:4b", "task": "four rows", "max_turns": 6})
     [call] = box.calls(box.rat)
     assert call["argv"][-3:] == ["--max-turns", "6", "four rows"]
+
+
+def _lines(*entries) -> str:
+    return "".join(json.dumps(e) + "\n" for e in entries)
+
+
+def test_rat_turn_returns_what_each_turn_did(box):
+    box.set(box.rat, stdout="[onescript] model=m proposals=1 turns=3 end=done\n", stderr=_lines(
+        {"role": "user", "text": "[served block + task]"},
+        {"role": "assistant", "text": "I will propose."},
+        {"role": "refused", "tool": "propose", "text": "refused: claim must be one non-empty sentence"},
+        {"role": "nudge", "text": "Call propose now"},
+        {"role": "propose", "row": {"path": "a.md", "data": "SECRET-DATA", "cites": ["x"],
+                                    "claim": "one claim"}},
+    ) + "not json at all\n")
+    out = box.run("rat_turn", {"model": "qwen3:4b", "task": "t"})
+    assert out["transcript"] == [
+        {"role": "assistant", "text": "I will propose."},
+        {"role": "refused", "tool": "propose",
+         "text": "refused: claim must be one non-empty sentence"},
+        {"role": "nudge", "text": "Call propose now"},
+        {"role": "propose", "path": "a.md", "text": "one claim"},
+    ]
+    assert "transcript_truncated" not in out
+    assert "SECRET-DATA" not in json.dumps(out)
+
+
+def test_a_failed_rat_turn_keeps_its_transcript_and_its_old_reason(box):
+    box.set(box.rat, rc=1, stdout="[onescript] proposals=0 turns=4 end=ctx_full\n",
+            stderr=_lines({"role": "refused", "tool": "propose",
+                           "text": "refused: cites must be a list of served table id strings"},
+                          {"role": "error", "text": "the next request would overflow ctx"}))
+    out = box.run("rat_turn", {"model": "qwen3:4b", "task": "t"})
+    assert out["state"] == "unreachable" and out["partial_rows_discarded"] is True
+    assert [e["role"] for e in out["transcript"]] == ["refused", "error"]
+    assert out["reason"].startswith("rat_turn exited 1;")
+    assert "{" not in out["reason"]
+
+
+def test_the_transcript_is_bounded_redacted_and_kept_out_of_the_receipt(box):
+    hexrun = "ab" * 32
+    box.set(box.rat, stdout="done\n", stderr=_lines(
+        {"role": "assistant", "text": "x" * 1000},
+        {"role": "assistant", "text": "key " + hexrun},
+        *[{"role": "refused", "tool": "propose", "text": f"refused {i}"} for i in range(60)]))
+    out = box.run("rat_turn", {"model": "qwen3:4b", "task": "t"})
+    assert len(out["transcript"]) == ox.MAX_TRANSCRIPT and out["transcript_truncated"] is True
+    first = out["transcript"][0]["text"]
+    assert len(first) == ox.MAX_TRANSCRIPT_TEXT + 1 and first.endswith("…")
+    assert out["transcript"][1]["text"] == "key [hex withheld]"
+    assert all("transcript" not in json.dumps(r["content"]) for r in box.ledger.rows)
+    assert all("refused 0" not in json.dumps(r["content"]) for r in box.ledger.rows)
+
+
+def test_only_rat_turn_carries_a_transcript(box):
+    box.set(box.py, stdout="{}", stderr=_lines({"role": "assistant", "text": "x"}))
+    assert "transcript" not in box.run("scope")
 
 
 def test_turn_argv_with_proposals(box):
