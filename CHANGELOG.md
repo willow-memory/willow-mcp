@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.102.1](https://github.com/willow-memory/willow-mcp/compare/v2.102.0...v2.102.1) (2026-11-01)
+
+
+### Fixed
+
+* **onescript:** the one-script child is told where one-script is ([47e84f1](https://github.com/willow-memory/willow-mcp/commit/47e84f1934c57dd3acb145c8e0d8806baaca3cd6))
+
 ## [2.102.0](https://github.com/willow-memory/willow-mcp/compare/v2.101.0...v2.102.0) (2026-11-01)
 
 
