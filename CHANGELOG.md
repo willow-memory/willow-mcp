@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **onescript:** rat_turn returns the run's transcript ([ea3e388](https://github.com/willow-memory/willow-mcp/commit/ea3e388d8d572fb713a8f797ed47fe638e742e81))
 * **onescript:** rat_turn returns the run's transcript ([fafb75c](https://github.com/willow-memory/willow-mcp/commit/fafb75c7061a324763f4617b228b78a84eab01dd))
 
 
