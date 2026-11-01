@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Added
 
-* **onescript:** rat_turn takes an optional max_turns ([5c923af](https://github.com/willow-memory/willow-mcp/commit/5c923af8fd33c7937e0d0122b58ec87d5685e924))
 * **onescript:** rat_turn takes an optional max_turns ([3a1d44c](https://github.com/willow-memory/willow-mcp/commit/3a1d44cf20a8fc4c1fa34f9e2f435753ef2b3ca7))
 
 ## [2.99.6](https://github.com/willow-memory/willow-mcp/compare/v2.99.5...v2.99.6) (2026-10-31)
