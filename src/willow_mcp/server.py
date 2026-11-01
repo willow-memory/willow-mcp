@@ -6099,7 +6099,8 @@ def onescript_run_execute(
     `keys_export` (public half of the signing keyring only), `checkin`,
     `scope`, `seal` (subject + optional pair_id), `serve` (by/match/upto +
     max_chars), `rat_turn` (model = an installed local Ollama tag, task =
-    bounded text, optional max_turns 1-16, else ratatosk's 4), `turn` (bite),
+    bounded text, optional max_turns 1-16, else ratatosk's 4, optional ctx
+    512-16384 tokens, else the rung's or 4096), `turn` (bite),
     `checkout`. `args` is validated per step
     against a closed shape; argv, interpreter, paths and environment are fixed
     by the verb, never the caller's (willow-bot's `one-script` from the bot
