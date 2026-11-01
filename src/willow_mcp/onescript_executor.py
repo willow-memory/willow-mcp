@@ -507,7 +507,9 @@ def _rat_transcript(err: str) -> tuple[list[dict], bool]:
     not kept. A recorded row is its path and claim, not its data."""
     entries: list[dict] = []
     truncated = False
-    for line in err.splitlines():
+    # "\n" only: ratatosk writes ensure_ascii=False, so a model's U+2028/U+2029
+    # or \x85 sits raw inside one JSON line, and splitlines() would cut it there.
+    for line in err.split("\n"):
         try:
             obj = json.loads(line)
         except ValueError:
@@ -801,7 +803,7 @@ def _run_locked(step, args, ctx, home, digest, pair_id, locked, lister,
         # -v's JSON lines are the transcript, not an error: take them out of
         # stderr so a failed run's reason and tail read as they did before -v.
         transcript = _rat_transcript(run["err"])
-        run = {**run, "err": "\n".join(ln for ln in run["err"].splitlines()
+        run = {**run, "err": "\n".join(ln for ln in run["err"].split("\n")
                                        if not ln.lstrip().startswith("{"))}
     shaped = _shape(step, run)
     if transcript is not None:

@@ -282,6 +282,17 @@ def test_the_transcript_is_bounded_redacted_and_kept_out_of_the_receipt(box):
     assert all("refused 0" not in json.dumps(r["content"]) for r in box.ledger.rows)
 
 
+@pytest.mark.parametrize("sep", [" ", " ", "\x85"])
+def test_a_unicode_line_break_in_model_text_stays_inside_its_entry(box, sep):
+    # ratatosk writes ensure_ascii=False: the break is raw inside one JSON line
+    line = json.dumps({"role": "assistant", "text": f"before{sep}SECRET-FRAGMENT"},
+                      ensure_ascii=False)
+    box.set(box.rat, rc=1, stdout="[onescript] end=ctx_full\n", stderr=line + "\n")
+    out = box.run("rat_turn", {"model": "qwen3:4b", "task": "t"})
+    assert out["transcript"] == [{"role": "assistant", "text": f"before{sep}SECRET-FRAGMENT"}]
+    assert "SECRET-FRAGMENT" not in out["reason"] + out.get("tail", "")
+
+
 def test_only_rat_turn_carries_a_transcript(box):
     box.set(box.py, stdout="{}", stderr=_lines({"role": "assistant", "text": "x"}))
     assert "transcript" not in box.run("scope")
