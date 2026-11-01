@@ -94,6 +94,14 @@ MAX_CHARS_CAP = 60000  # ratatosk reads at most 64 KiB of served file
 #: more to stop, so ratatosk's default of 4 caps a clean run at 3 rows. The
 #: ceiling is ratatosk's own MAX_PROPOSALS (16); its 180 s wall clock still binds.
 MAX_TURNS_CAP = 16
+#: ``rat_turn`` runs ratatosk with ``-v``, which writes the run's transcript to
+#: stderr as JSON lines. The desk gets what each turn did — the model's text,
+#: each refusal and its reason, each row recorded — so a silent, capped or
+#: ctx-full run can be read instead of guessed at. Bounded and redacted; it
+#: rides on the result only, never into the FRANK receipt.
+TRANSCRIPT_ROLES = ("assistant", "refused", "nudge", "error", "propose", "escalate")
+MAX_TRANSCRIPT = 40
+MAX_TRANSCRIPT_TEXT = 300
 MAX_STDOUT = 200_000
 #: The one script's exit 42, ΔΣ=42. The operator (2026-10-21): "42 just means I
 #: don't have enough information to say a human said this was true." The step
@@ -485,6 +493,45 @@ def _tail(text: str) -> str:
     return "\n".join(text.strip().splitlines()[-_TAIL_LINES:])
 
 
+def _clip(value) -> str:
+    text = _redact(value if isinstance(value, str) else "")
+    return text if len(text) <= MAX_TRANSCRIPT_TEXT else text[:MAX_TRANSCRIPT_TEXT] + "…"
+
+
+def _rat_transcript(err: str) -> tuple[list[dict], bool]:
+    """ratatosk ``-v``'s JSON lines, kept to the roles that say what a turn did.
+
+    A line that is not a JSON object with a known role is skipped (stderr also
+    carries ratatosk's own ``[onescript] refused:`` lines). The served block is
+    never in it: ratatosk logs the user turn as a placeholder, and that role is
+    not kept. A recorded row is its path and claim, not its data."""
+    entries: list[dict] = []
+    truncated = False
+    # "\n" only: ratatosk writes ensure_ascii=False, so a model's U+2028/U+2029
+    # or \x85 sits raw inside one JSON line, and splitlines() would cut it there.
+    for line in err.split("\n"):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("role") not in TRANSCRIPT_ROLES:
+            continue
+        if len(entries) >= MAX_TRANSCRIPT:
+            truncated = True
+            break
+        entry = {"role": obj["role"]}
+        if isinstance(obj.get("tool"), str):
+            entry["tool"] = _clip(obj["tool"])
+        row = obj.get("row")
+        if isinstance(row, dict):
+            entry["path"] = _clip(row.get("path"))
+            entry["text"] = _clip(row.get("claim"))
+        else:
+            entry["text"] = _clip(obj.get("text"))
+        entries.append(entry)
+    return entries, truncated
+
+
 def _digest(step: str, args: dict) -> str:
     blob = json.dumps({"step": step, "args": args}, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
@@ -567,7 +614,7 @@ def _plan(step: str, args: dict, ctx: _Ctx, lister: Callable) -> dict:
             return {"result": _unreachable(
                 f"ratatosk is not installed at {ctx.venv_absent(RAT_VENV) or ctx.rat}; the onescript model seat cannot run")}
         return {"argv": [str(ctx.rat), "--onescript", "--served", str(ctx.served),
-                         "--out", str(ctx.proposals), "--model", model, *flags, task],
+                         "--out", str(ctx.proposals), "-v", "--model", model, *flags, task],
                 "cwd": ctx.home}
     raise _Refusal("EINVAL", f"unknown step {step!r}; steps are {list(STEPS)}")
 
@@ -751,7 +798,18 @@ def _run_locked(step, args, ctx, home, digest, pair_id, locked, lister,
         return _finish(step, plan["result"], digest, ledger, project, app_id, session, ran=False)
     env = _child_env(home)
     run = _run_child(plan["argv"], env=env, cwd=plan["cwd"], timeout=TIMEOUTS[step])
+    transcript: Optional[tuple[list[dict], bool]] = None
+    if step == "rat_turn" and "err" in run:
+        # -v's JSON lines are the transcript, not an error: take them out of
+        # stderr so a failed run's reason and tail read as they did before -v.
+        transcript = _rat_transcript(run["err"])
+        run = {**run, "err": "\n".join(ln for ln in run["err"].split("\n")
+                                       if not ln.lstrip().startswith("{"))}
     shaped = _shape(step, run)
+    if transcript is not None:
+        shaped["transcript"], truncated = transcript
+        if truncated:
+            shaped["transcript_truncated"] = True
     extra: dict = dict(put_back)
     if step == "turn" and plan.get("uses_proposals"):
         # A run's rows are used once: whatever `turn` read, success or refusal,

@@ -6113,7 +6113,10 @@ def onescript_run_execute(
     its OWN name (`onescript_run_execute`) like `git_pull_execute`;
     only `orchestrator` carries it (not `full_access`, not `steward_sweep`).
     `rat_turn` starts from an emptied proposals file and discards a failed or
-    capped run's partial rows. `checkin` takes an optional
+    capped run's partial rows, and returns the run's `transcript` (the model's
+    text, each refusal and its reason, each row's path and claim; at most 40
+    entries of 300 characters, redacted, never in the receipt), failed runs
+    included. `checkin` takes an optional
     `resolve="put_back"` that removes a stray `proposals.jsonl` (a prior
     `rat_turn`'s leftover that otherwise HARD CLOSES the box as "written
     outside the run") before the review runs, so the box opens headless; the
