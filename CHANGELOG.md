@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.102.0](https://github.com/willow-memory/willow-mcp/compare/v2.101.0...v2.102.0) (2026-11-01)
+
+
+### Added
+
+* **onescript:** rat_turn takes an optional ctx ([fba4dba](https://github.com/willow-memory/willow-mcp/commit/fba4dbab52f283bcbc7f5e660da9e4b5068773e2))
+
 ## [2.101.0](https://github.com/willow-memory/willow-mcp/compare/v2.100.0...v2.101.0) (2026-11-01)
 
 
