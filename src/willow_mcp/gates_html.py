@@ -265,7 +265,9 @@ function buildSummary(rows) {
   if (worker) {
     const workerChip = document.createElement("div");
     workerChip.className = "chip " + (worker.state === "on" ? "ok" : (worker.state === "warn" ? "bad" : ""));
-    workerChip.innerHTML = `<span>Worker</span><span class="n">${worker.state_label}</span>`;
+    // the label is the row's text, set as text: never parsed as HTML
+    workerChip.innerHTML = `<span>Worker</span><span class="n"></span>`;
+    workerChip.querySelector(".n").textContent = worker.state_label;
     wrap.appendChild(workerChip);
   }
 

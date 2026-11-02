@@ -51,3 +51,14 @@ def test_category_order_js_matches_python_source_of_truth():
 
     for key, title in CATEGORY_ORDER:
         assert f'["{key}", "{title}"]' in gates_html.SHARED_JS
+
+
+def test_a_rows_label_is_set_as_text_never_as_html():
+    """A row's state_label is text: the buttons set it with textContent, and so
+    does the worker chip, so a label holding markup shows as itself."""
+    html = gates_html.page(title="t", subtitle="s", top_extra="", body_scripts="")
+    assert "${worker.state_label}" not in html
+    assert 'querySelector(".n").textContent = worker.state_label' in html
+    assert "innerHTML" not in "".join(
+        line for line in html.splitlines() if "state_label" in line
+    )
