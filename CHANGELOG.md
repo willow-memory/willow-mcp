@@ -31,6 +31,13 @@ merge-commit title while omitting `0073767`, a genuine fix. The version numbers
 and the tags were right; only the prose was wrong. Corrections are made in a
 `docs:` commit, which is hidden and cuts no release of its own.
 
+## [2.102.2](https://github.com/willow-memory/willow-mcp/compare/v2.102.1...v2.102.2) (2026-11-03)
+
+
+### Fixed
+
+* **gates:** the worker chip sets its label as text, not HTML ([eb16b26](https://github.com/willow-memory/willow-mcp/commit/eb16b26fe201a2f083a482ea43daaaa31e2e4ae9))
+
 ## [2.102.1](https://github.com/willow-memory/willow-mcp/compare/v2.102.0...v2.102.1) (2026-11-01)
 
 
