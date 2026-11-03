@@ -36,7 +36,6 @@ and the tags were right; only the prose was wrong. Corrections are made in a
 
 ### Fixed
 
-* **gates:** the worker chip sets its label as text, not HTML ([ef7ecd9](https://github.com/willow-memory/willow-mcp/commit/ef7ecd9ee1e75ce169f7ee1d5a482c83b9128df3))
 * **gates:** the worker chip sets its label as text, not HTML ([eb16b26](https://github.com/willow-memory/willow-mcp/commit/eb16b26fe201a2f083a482ea43daaaa31e2e4ae9))
 
 ## [2.102.1](https://github.com/willow-memory/willow-mcp/compare/v2.102.0...v2.102.1) (2026-11-01)
