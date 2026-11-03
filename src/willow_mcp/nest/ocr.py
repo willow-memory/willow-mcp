@@ -75,11 +75,18 @@ def _ocr_image(path: Path) -> tuple[str, str]:
 
 
 def _extract_pdf(path: Path) -> tuple[str, str]:
+    """A PDF's text, one page at a time, so memory stays about one page's
+    worth however long the PDF is. Rendering every page of a scanned book
+    at once (300 pages at 200 dpi is over 3 GB) once filled a 14 GB machine
+    and froze it; a page's text layer is freed as soon as it is read."""
     # Try pdfplumber first (native text layer)
     try:
         import pdfplumber
+        pages = []
         with pdfplumber.open(path) as pdf:
-            pages = [p.extract_text() or "" for p in pdf.pages]
+            for page in pdf.pages:
+                pages.append(page.extract_text() or "")
+                page.close()  # its cached objects go with it
         text = "\n\n".join(pages).strip()
         if text:
             return text, "pdfplumber"
@@ -88,12 +95,17 @@ def _extract_pdf(path: Path) -> tuple[str, str]:
     except Exception:
         logger.debug("pdfplumber failed for %s", path, exc_info=True)
 
-    # Fallback: pdf2image + tesseract (scanned PDFs)
+    # Fallback: pdf2image + tesseract (scanned PDFs), a page rendered, read
+    # and let go before the next
     try:
-        from pdf2image import convert_from_path
+        from pdf2image import convert_from_path, pdfinfo_from_path
         import pytesseract
-        images = convert_from_path(str(path), dpi=200)
-        pages = [pytesseract.image_to_string(img) for img in images]
+        count = int(pdfinfo_from_path(str(path))["Pages"])
+        pages = []
+        for n in range(1, count + 1):
+            for img in convert_from_path(str(path), dpi=200, first_page=n, last_page=n):
+                pages.append(pytesseract.image_to_string(img))
+                img.close()
         text = "\n\n".join(pages).strip()
         return text, "pdf2image+tesseract"
     except ImportError:
